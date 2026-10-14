@@ -462,7 +462,7 @@ plugins.toml 里写一个光秃秃的 `[plugins."aca.core"]`(不写 source)换�
 | `aca.delegate` | `/aca:delegate`(Claude 是斜杠命令,敲 `/dele` 补全就是它;Codex 是一个 skill):领头的规划、经 aca 派 worker、验收、汇报;worker 临时失败自动续。设置:`worker`(派给谁,默认 `codex`)、`language`(回你用哪种话,空 = 跟着你)、`say`(替它说的那句)、`max_continue`、`delay` |
 | `aca.core` | 把 aca 的核心能力给 agent 当工具(两家都行):`sessions` 看会话、`dispatch` 派 worker(挂在调用者下面,可以带 worktree 分支)、`message` 递话、`wait` 等(最多 240 秒一次)、`answer` 替它回答、`interrupt` 中止。替谁回答、中止谁,只能是调用者自己派出去的 |
 | `aca.gateway` | MCP gateway,见下一节 |
-| `aca.remote` | 远端任务,整个在插件的脚本里(sh + jq + curl + ssh):把长任务派到别的机器上后台跑,结束时结果作为一条消息放进派它的会话的收件箱。`:` 菜单里 `r` 派、`t` 列表(⏎ 复制看日志的命令、`x` 撤掉、`r` 现在去取)、「测一下 server」;agent 有 `run`、`list` 两个工具。回调先落在一台一直在线的 server 上(仓库的 `hub/`),设置:`url`、`token`。有在等的才开着每 5 分钟去取的定时 |
+| `aca.remote` | 远端任务,整个在插件的脚本里(sh + jq + curl + ssh):把长任务派到别的机器上后台跑,结束时结果作为一条消息放进派它的会话的收件箱。`:` 菜单里 `r` 派、`t` 列表(⏎ 复制看日志的命令、`x` 撤掉、`r` 现在去取)、「测一下 server」;agent 有 `run`、`list` 两个工具。回调先落在一台一直在线的 server 上([jobhook](https://github.com/cheny-00/jobhook)),设置:`url`、`token`。有在等的才开着每 5 分钟去取的定时 |
 | `aca.tailnet` | tailnet 挂载,整个在插件的脚本里(sh + jq,要 `jq`):`:` 菜单里 `m` 是列表,一行一条 `tailscale serve`(目标在不在听),⏎ 复制地址、`x` 撤掉(写出怎么加回去)、`a` 把本机端口挂出去、`p` 开关发布(装了 tpub)。agent 能列;挂端口是 `agent?`,你点了名才给(`aca plugin allow aca.tailnet add`) |
 | `aca.bark` | 跑完了、在等你确认、出错了用 Bark 推到手机(有人正连着那个会话就不推)。设置:`url`(推送地址)、`workers`(派出去的 worker 也推)、`group`;`: 菜单`里「推一条试试」 |
 | `aca.discord` | 同样三件事发到 Discord 频道(webhook;有人正连着那个会话就不发)。设置:`url`(webhook 地址)、`mention`(在等你确认时 @ 的用户 id)、`workers`、`username`。只往外发;在 Discord 里回话发进会话还没做 |

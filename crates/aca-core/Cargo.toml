@@ -4,6 +4,7 @@ description = "aca 的会话后端:登记表、tmux、各家 agent 的适配、�
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 libc.workspace = true

@@ -1,8 +1,11 @@
 //! `aca statusline`:Claude 的状态栏,一个进程里记额度(见 limits)、画两行。
 //!
-//! 每个会话每回一条消息都跑一次(设了 refreshInterval 还按秒跑),十几个会话一起就不少,所以不起 bash / jq,要起 git 的也尽量少:
+//! 每个会话每回一条消息都跑一次(设了 refreshInterval 还按秒跑),几十个会话一起就不少,所以不起 bash / jq,要起 git 的也尽量少:
 //! - 分支每次直接读 HEAD 文件,不起 git、不进缓存:切了分支下次刷新就对,也读不到别的目录的
-//! - 改了几个文件、几行、领先落后要起 git,按目录缓存 5 秒;开在同一个目录的会话共用一份
+//! - 改了几个文件、几行、领先落后要起 git(大仓库里两个 git 一百多毫秒 CPU),按工作区的根缓存:开在同一个工作区里的会话,
+//!   不管在哪一层目录,共用一份。这个会话在对话(对话记录刚动过)的缓存 5 秒;闲着的只是定时器在叫它,放宽到 60 秒 ——
+//!   旁边有会话在干活的话,它读到的还是那边 5 秒内算的。HEAD、index 动了(提交、暂存、切分支)不等到期,马上重算。
+//!   2026-10-14 实测:35 个会话(28 个闲着)光这两个 git 就占 15% 个核,闲了 20 小时的也在每 10 秒算一遍
 //! - Python 的版本读 .venv/pyvenv.cfg;node 的版本按 node 程序的路径和修改时间记着,换了才重问
 //!
 //! 额度那段写的是这个账号所有会话里最新的那份,不是这个会话自己手里的(闲着的会话手里是旧数)。
@@ -39,8 +42,12 @@ const I_DIR: char = '\u{F024B}';
 const I_PY: char = '\u{F0320}';
 const I_NODE: char = '\u{F0399}';
 
-/// git 的数多久重算一次(秒)
+/// git 的数多久重算一次(秒):这个会话在对话时
 const GIT_TTL: u64 = 5;
+/// 这个会话闲着时(别的会话算过的照样用,见 `git_ttl`)
+const GIT_IDLE_TTL: u64 = 60;
+/// 对话记录这么久没动 = 闲着。比 refreshInterval(10 秒)长几拍:一轮刚完,格式化之类收尾的改动还赶得上
+const ACTIVE: u64 = 30;
 
 /// 工作区里的数:暂存了、改了没暂存、没跟踪的文件各几个,没暂存的改动加减几行,比上游领先落后几个提交
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -81,14 +88,19 @@ pub fn run() -> i32 {
     let (dir, project) = (path("/workspace/current_dir"), path("/workspace/project_dir"));
     let home = std::env::var("HOME").unwrap_or_default();
     let cache = std::env::temp_dir().join("aca-statusline");
-    let branch = dir.as_deref().and_then(head_file).and_then(|h| branch(&h));
-    let git = match (&dir, &branch) {
-        (Some(d), Some(_)) => cached(&cache, "git", &d.to_string_lossy(), GIT_TTL, || count(d)),
+    let transcript = path("/transcript_path");
+    let found = dir.as_deref().and_then(repo);
+    let branch = found.as_ref().and_then(|(_, head)| branch(head));
+    let git = match (&found, &branch) {
+        (Some((root, head)), Some(_)) => {
+            let ttl = git_ttl(transcript.as_deref().and_then(idle_secs));
+            cached(&cache, "git", &root.to_string_lossy(), &stamp(head), ttl, || count(root))
+        }
         _ => Counts::default(),
     };
     let quota = limits.and_then(|d| {
         let srcs = crate::usage::sources(&crate::data::accounts(&aca_core::config::load()), &home);
-        crate::limits::quota_for(&d, &srcs, path("/transcript_path").as_deref(), now)
+        crate::limits::quota_for(&d, &srcs, transcript.as_deref(), now)
     });
     let active = std::env::var_os("VIRTUAL_ENV").filter(|x| !x.is_empty()).map(PathBuf::from);
     let facts = Facts {
@@ -233,19 +245,41 @@ fn left(secs: i64) -> String {
     if s < 3600 { format!("{}m", s / 60) } else { span(s) }
 }
 
-/// 从这个目录往上找 `.git`,回仓库的 HEAD 文件。`.git` 是文件的(worktree、子模块)里面写着真的在哪
-fn head_file(dir: &Path) -> Option<PathBuf> {
+/// 从这个目录往上找 `.git`,回(工作区的根, 它的 HEAD 文件)。`.git` 是文件的(worktree、子模块)里面写着真的在哪
+fn repo(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     for d in dir.ancestors() {
         let g = d.join(".git");
         let Ok(meta) = std::fs::metadata(&g) else { continue };
         if meta.is_dir() {
-            return Some(g.join("HEAD"));
+            return Some((d.to_path_buf(), g.join("HEAD")));
         }
         let text = std::fs::read_to_string(&g).ok()?;
         let real = Path::new(text.trim().strip_prefix("gitdir:")?.trim());
-        return Some(if real.is_absolute() { real.to_path_buf() } else { d.join(real) }.join("HEAD"));
+        return Some((d.to_path_buf(), if real.is_absolute() { real.to_path_buf() } else { d.join(real) }.join("HEAD")));
     }
     None
+}
+
+/// 这个文件多少秒没动了;没有这个文件、读不到 = None
+fn idle_secs(p: &Path) -> Option<u64> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs())
+}
+
+/// git 的数这一回认多久以内算过的:对话记录多久没动了(`idle`)。闲着的会话不为自己重算 ——
+/// 同一个工作区里有会话在干活,缓存就是它 5 秒内写的;都闲着,一分钟一次也看不出差别。
+/// 输入里没给对话记录(刚开的会话)的照原来的 5 秒
+fn git_ttl(idle: Option<u64>) -> u64 {
+    if idle.is_some_and(|s| s >= ACTIVE) { GIT_IDLE_TTL } else { GIT_TTL }
+}
+
+/// HEAD 和它旁边的 index 各自的修改时间:提交、暂存、切分支、变基都会动其中一个,对不上就不等到期。
+/// 光改工作区里的文件动不到它们,那个靠到期。自己起的 git 带 `--no-optional-locks`,不会去写 index
+fn stamp(head: &Path) -> String {
+    let at = |p: &Path| {
+        let t = std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos())
+    };
+    format!("{}:{}", at(head), at(&head.with_file_name("index")))
 }
 
 /// HEAD 里写的:分支名;没在分支上(变基到一半、检出了某个提交)是 `@` 加短提交号
@@ -330,22 +364,25 @@ fn node(cache: &Path) -> Option<String> {
     let real = std::fs::canonicalize(&bin).ok()?;
     let mtime =
         std::fs::metadata(&real).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())?.as_secs();
-    let ver = cached(cache, "node", &format!("{}:{mtime}", real.display()), u64::MAX, || {
+    let ver = cached(cache, "node", &format!("{}:{mtime}", real.display()), "", u64::MAX, || {
         let out = Command::new(&bin).arg("--version").stdin(Stdio::null()).stderr(Stdio::null()).output().ok();
         out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
     });
     Some(ver).filter(|v| !v.is_empty())
 }
 
-/// 存下来的一份:`key` 也写进去,读的时候对一遍(文件名只是它的散列)
+/// 存下来的一份:`key` 也写进去,读的时候对一遍(文件名只是它的散列);`stamp` 是算的时候它依据的东西的样子
 #[derive(Serialize, Deserialize)]
 struct Entry<T> {
     key: String,
+    #[serde(default)]
+    stamp: String,
     value: T,
 }
 
-/// `ttl` 秒内算过这个 `key` 就用算过的,没有就算一次存下来。一个 key 一个文件,放系统的临时目录:丢了只是重算
-fn cached<T: Serialize + DeserializeOwned>(dir: &Path, kind: &str, key: &str, ttl: u64, compute: impl FnOnce() -> T) -> T {
+/// `ttl` 秒内算过这个 `key`、`stamp` 也还是那时的,就用算过的,不然算一次存下来。`stamp` 要在算之前取:
+/// 算的途中又变了的,下回对不上再算一次。一个 key 一个文件,放系统的临时目录:丢了只是重算
+fn cached<T: Serialize + DeserializeOwned>(dir: &Path, kind: &str, key: &str, stamp: &str, ttl: u64, compute: impl FnOnce() -> T) -> T {
     // FNV-1a:只用来起文件名
     let hash = key.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
     let path = dir.join(format!("{kind}-{hash:016x}.json"));
@@ -354,10 +391,11 @@ fn cached<T: Serialize + DeserializeOwned>(dir: &Path, kind: &str, key: &str, tt
     if fresh
         && let Some(e) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Entry<T>>(&b).ok())
         && e.key == key
+        && e.stamp == stamp
     {
         return e.value;
     }
-    let e = Entry { key: key.to_string(), value: compute() };
+    let e = Entry { key: key.to_string(), stamp: stamp.to_string(), value: compute() };
     if let Ok(text) = serde_json::to_string(&e) {
         let _ = crate::state::write_atomic(&path, &text);
     }
@@ -466,14 +504,19 @@ mod tests {
         std::fs::create_dir_all(repo.join(".git/worktrees/wt")).unwrap();
         std::fs::create_dir_all(repo.join("src/deep")).unwrap();
         std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feature/x\n").unwrap();
-        let at = |d: &Path| head_file(d).and_then(|h| branch(&h));
+        let at = |d: &Path| super::repo(d).and_then(|(_, h)| branch(&h));
+        let root_of = |d: &Path| super::repo(d).map(|(r, _)| r);
         assert_eq!(at(&repo.join("src/deep")).as_deref(), Some("feature/x"));
+        // 在哪一层目录里,工作区的根都是同一个(git 的数按它缓存);worktree 的根是它自己,不是主仓库
+        assert_eq!(root_of(&repo.join("src/deep")), Some(repo.clone()));
+        assert_eq!(root_of(&repo), Some(repo.clone()));
         // worktree:.git 是个文件,指到主仓库里它自己的那份 HEAD(绝对的、相对的都有)
         let wt = root.join("wt");
         std::fs::create_dir_all(wt.join("sub")).unwrap();
         std::fs::write(repo.join(".git/worktrees/wt/HEAD"), "ref: refs/heads/comms\n").unwrap();
         std::fs::write(wt.join(".git"), format!("gitdir: {}\n", repo.join(".git/worktrees/wt").display())).unwrap();
         assert_eq!(at(&wt.join("sub")).as_deref(), Some("comms"));
+        assert_eq!(root_of(&wt.join("sub")), Some(wt.clone()));
         std::fs::write(wt.join(".git"), "gitdir: ../repo/.git/worktrees/wt\n").unwrap();
         assert_eq!(at(&wt).as_deref(), Some("comms"));
         std::fs::write(repo.join(".git/HEAD"), "8ebb433c0ffee0000000000000000000000000aa\n").unwrap();
@@ -510,13 +553,13 @@ mod tests {
     fn two_directories_inside_the_ttl_each_keep_their_own_numbers() {
         let dir = tmp("cache");
         let of = |n: u32| Counts { modified: n, ..Counts::default() };
-        assert_eq!(cached(&dir, "git", "/w/a", 5, || of(1)), of(1));
-        assert_eq!(cached(&dir, "git", "/w/b", 5, || of(2)), of(2));
+        assert_eq!(cached(&dir, "git", "/w/a", "1:1", 5, || of(1)), of(1));
+        assert_eq!(cached(&dir, "git", "/w/b", "1:1", 5, || of(2)), of(2));
         // 还没过期:不重算,也不是另一个目录的
-        assert_eq!(cached(&dir, "git", "/w/a", 5, || -> Counts { panic!("重算了") }), of(1));
-        assert_eq!(cached(&dir, "git", "/w/b", 5, || -> Counts { panic!("重算了") }), of(2));
+        assert_eq!(cached(&dir, "git", "/w/a", "1:1", 5, || -> Counts { panic!("重算了") }), of(1));
+        assert_eq!(cached(&dir, "git", "/w/b", "1:1", 5, || -> Counts { panic!("重算了") }), of(2));
         // 过期了(ttl 0)重算;文件里记的 key 对不上的(散列撞了)不认
-        assert_eq!(cached(&dir, "git", "/w/a", 0, || of(3)), of(3));
+        assert_eq!(cached(&dir, "git", "/w/a", "1:1", 0, || of(3)), of(3));
         let file = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -524,7 +567,57 @@ mod tests {
             .find(|p| std::fs::read_to_string(p).unwrap().contains("/w/b"))
             .unwrap();
         std::fs::write(&file, std::fs::read_to_string(&file).unwrap().replace("/w/b", "/w/z")).unwrap();
-        assert_eq!(cached(&dir, "git", "/w/b", 5, || of(4)), of(4));
+        assert_eq!(cached(&dir, "git", "/w/b", "1:1", 5, || of(4)), of(4));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_commit_or_a_checkout_recomputes_at_once_and_an_idle_session_waits_longer() {
+        let dir = tmp("stamp");
+        let of = |n: u32| Counts { modified: n, ..Counts::default() };
+        // 还没到期,但 HEAD / index 动过了(记号对不上):重算,存的是新记号,同一个文件(不是一动就多一个)
+        assert_eq!(cached(&dir, "git", "/w/a", "1:1", 60, || of(1)), of(1));
+        assert_eq!(cached(&dir, "git", "/w/a", "1:2", 60, || of(2)), of(2));
+        assert_eq!(cached(&dir, "git", "/w/a", "1:2", 60, || -> Counts { panic!("重算了") }), of(2));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // 旧版存的没有记号那一项:读得了,当成空的记号(node 的版本一直这么存)
+        let file = std::fs::read_dir(&dir).unwrap().flatten().next().unwrap().path();
+        std::fs::write(
+            &file,
+            r#"{"key":"/w/a","value":{"staged":0,"modified":7,"untracked":0,"added":0,"removed":0,"ahead":0,"behind":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(cached(&dir, "git", "/w/a", "", 60, || -> Counts { panic!("重算了") }), of(7));
+        assert_eq!(cached(&dir, "git", "/w/a", "1:2", 60, || of(8)), of(8));
+
+        // 对话记录 30 秒内动过 = 在对话,5 秒;再久 = 闲着,60 秒;输入里没给的照 5 秒
+        assert_eq!([None, Some(0), Some(29), Some(30), Some(72000)].map(git_ttl), [5, 5, 5, 60, 60]);
+        let log = dir.join("t.jsonl");
+        assert_eq!(idle_secs(&log), None);
+        std::fs::write(&log, "{}\n").unwrap();
+        assert!(idle_secs(&log).is_some_and(|s| s < 5));
+        let ago = |p: &Path, secs: u64| {
+            let f = std::fs::File::options().write(true).open(p).unwrap();
+            f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs)).unwrap();
+        };
+        ago(&log, 100);
+        assert!(idle_secs(&log).is_some_and(|s| (100..110).contains(&s)));
+
+        // 记号 = HEAD 和它旁边 index 的修改时间:哪个动了都变;还没有 index 的新仓库也有记号
+        let git = dir.join("repo/.git");
+        std::fs::create_dir_all(&git).unwrap();
+        let (head, index) = (git.join("HEAD"), git.join("index"));
+        std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
+        let new = stamp(&head);
+        assert!(new.ends_with(":0"), "{new}");
+        std::fs::write(&index, "").unwrap();
+        let a = stamp(&head);
+        ago(&index, 50);
+        let b = stamp(&head);
+        ago(&head, 50);
+        let c = stamp(&head);
+        assert!(new != a && a != b && b != c, "{new} {a} {b} {c}");
+        assert_eq!(c, stamp(&head));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

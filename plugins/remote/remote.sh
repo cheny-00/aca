@@ -11,8 +11,8 @@
 #   collect   去 server 取一次,结束的发进登记它的会话。定时 collect 每 5 分钟跑它:有在等的才开着,都了结了关掉
 #   check     测一下 server:连不连得上、口令对不对
 #
-# 为什么绕一个 server(jobhook,跑在一台一直在线的机器上):这台 Mac 会合盖、会被带出门,
-# 远端也连不到它。所以远端结束时把结果交给 server(server 立刻用 Bark 推给人),这边到点了再去取(只有这边往外连)。
+# 为什么绕一个 server(jobhook,https://github.com/cheny-00/jobhook,跑在一台一直在线的机器上):这台 Mac 会合盖、
+# 会被带出门,远端也连不到它。所以远端结束时把结果交给 server(server 立刻推通知给人),这边到点了再去取(只有这边往外连)。
 #
 # 一个 id 一个文件 $ACA_PLUGIN_STATE_DIR/tasks/<id>.json,state 是它的一生:
 #   waiting  登记了,远端还没回调
@@ -554,23 +554,29 @@ cmd_collect() {
   [ -z "$offline" ] || printf '%s%s\n' "$(t '这次没取到:' 'nothing fetched this time: ')" "$offline"
 }
 
-# 拿管理口令问一次 server(列它那边还没取走的):连得上、口令对才算成
+# 先问 /ping(不要口令,新的 jobhook 报出名字和版本),再拿管理口令列一次它那边还没取走的:连得上、口令对才算成
 cmd_check() {
   need_conf
+  not_it=$(t '这个地址后面是 jobhook 吗' 'is jobhook behind this address?')
+  odd=$(t '连上了,可回的不像 jobhook:' "connected, but the reply doesn't look like jobhook: ")$not_it
+  http GET /ping || die "$NET"
+  [ "$CODE" = 200 ] || die "$(t "连上了,可它回的是 $CODE:" "connected, but it replied $CODE: ")$not_it"
+  jq -e '.ok == true' "$TMP/body" >/dev/null 2>&1 || die "$odd"
+  ver=$(jq -r 'select(.service == "jobhook") | .version // empty' "$TMP/body" 2>/dev/null)
   http GET /hooks || die "$NET"
   case $CODE in
     200)
-      n=$(jq -er '.hooks | length' "$TMP/body" 2>/dev/null) ||
-        die "$(t '连上了,可回的不像 jobhook:地址对吗' "connected, but the reply doesn't look like jobhook: is the address right?")"
+      n=$(jq -er '.hooks | length' "$TMP/body" 2>/dev/null) || die "$odd"
       if [ "$n" = 0 ]; then
         t '连上了,口令也对' 'connected, and the token is right'
       else
         t "连上了,口令也对 · server 上有 $n 个还没取走" "connected, and the token is right · $n waiting on the server"
       fi
+      [ -z "$ver" ] || printf ' · jobhook %s' "$ver"
       echo
       ;;
     401) die "$(t '连上了,可口令不对:要和 server 的 JOBHOOK_TOKEN 一样' 'connected, but the token is wrong: it must match the server'"'"'s JOBHOOK_TOKEN')" ;;
-    *) die "$(t "连上了,可它回的是 $CODE:这个地址后面是 jobhook 吗" "connected, but it replied $CODE: is jobhook behind this address?")" ;;
+    *) die "$(t "连上了,可它回的是 $CODE:" "connected, but it replied $CODE: ")$not_it" ;;
   esac
 }
 

@@ -40,6 +40,7 @@ reply() {
 admin() { [ -n "$tok" ] && [ "$tok" = "$(cat "$FAKE/token" 2>/dev/null)" ] || reply 401 '{"error": "口令不对"}'; }
 now=$(date +%s)
 case "$method $path" in
+  "GET /ping") reply 200 '{"ok": true, "service": "jobhook", "api": 1, "version": "0.1.0"}' ;;
   "GET /hooks")
     admin
     set -- "$H"/*.json

@@ -1,7 +1,7 @@
 //! 列表:把登记表、tmux 里实际在的窗格、hook 写的状态、屏幕上看到的,合成一行一个会话。
 //!
-//! 一次刷新 = 一条 `tmux list-panes -a` + 读一次库 + 每个会话一个小文件 + (要读屏幕时)每个在跑的会话一条 `capture-pane`,
-//! 读屏幕是并行的。不读屏幕(`--no-screen`)就只剩前三样,几毫秒。
+//! 一次刷新 = 一条 `tmux list-panes -a` + 读一次库 + 每个会话一个小文件 + (要读屏幕时)一条 tmux 命令把在跑的会话的屏幕
+//! 一起抓回来(`tmux::capture_many`)。不读屏幕(`--no-screen`)就只剩前三样,几毫秒。
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -214,19 +214,18 @@ pub fn collect(store: &Store, cfg: &Config, read_screen: bool) -> Res<Vec<Row>> 
     let now = paths::now();
     let picked: Vec<Option<&Pane>> = sessions.iter().map(|s| tmux::agent_pane(&panes, &s.id)).collect();
     let agents: Vec<Option<Handle>> = sessions.iter().map(|s| if read_screen { agent_of(cfg, s) } else { None }).collect();
-    // 逐个读屏幕并行:一条 capture-pane 几毫秒,十几个会话排着队就是几十毫秒
-    let seen: Vec<Option<Seen>> = std::thread::scope(|sc| {
-        let hs: Vec<_> = agents
-            .iter()
-            .zip(&picked)
-            .map(|(a, p)| {
-                let agent: &dyn Agent = a.as_deref()?;
-                let p = p.filter(|p| !p.dead)?;
-                Some(sc.spawn(move || agent.screen(&tmux::capture(&p.pane))))
-            })
-            .collect();
-        hs.into_iter().map(|h| h.and_then(|h| h.join().ok())).collect()
-    });
+    // 要读屏幕的那些格一条 tmux 命令抓回来:一格起一个 tmux 的话,几十个会话每刷新一次就是几十个进程
+    let want: Vec<Option<&Pane>> = agents.iter().zip(&picked).map(|(a, p)| a.as_ref().and_then(|_| p.filter(|p| !p.dead))).collect();
+    let ids: Vec<&str> = want.iter().flatten().map(|p| p.pane.as_str()).collect();
+    let mut screens = tmux::capture_many(&ids, false).into_iter();
+    let seen: Vec<Option<Seen>> = agents
+        .iter()
+        .zip(&want)
+        .map(|(a, w)| {
+            let agent: &dyn Agent = a.as_deref()?;
+            w.and_then(|_| screens.next()).map(|out| agent.screen(&tmux::plain_lines(&out)))
+        })
+        .collect();
     let rank: HashMap<String, i64> = store.groups()?.into_iter().map(|g| (g.path, g.order)).collect();
     let mut rows: Vec<Row> = sessions
         .iter()

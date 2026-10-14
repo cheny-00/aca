@@ -359,7 +359,8 @@ Codex conversations live in their own directories and are not affected.
 - `aca help`, `aca help <command>`, `aca help keys`, `aca help config`: the complete reference, always
   matching the version you have installed
 - [docs/plugins.md](docs/plugins.md): using and writing plugins (in Chinese)
-- [hub/README.md](hub/README.md): the small server behind the remote tasks plugin (in Chinese)
+- [jobhook](https://github.com/cheny-00/jobhook): the small server behind the remote tasks plugin (`aca.remote`),
+  a separate project
 
 ## Development
 
@@ -385,3 +386,7 @@ account's login. aca strips these itself when it starts an agent; hand-written t
 
 To publish a release, push a tag such as `v0.1.0`. The workflow in `.github/workflows/release.yml` builds
 the binaries that the install script downloads.
+
+## License
+
+[MIT](LICENSE)

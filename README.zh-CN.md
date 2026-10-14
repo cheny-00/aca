@@ -336,7 +336,7 @@ rm -rf ~/.config/aca ~/.local/share/aca ~/.local/state/aca ~/.cache/aca
 - [上手指南](docs/onboarding.zh-CN.md):最初的十五分钟
 - `aca help`、`aca help <命令>`、`aca help keys`、`aca help config`:完整的参考,内容始终和你安装的版本一致
 - [docs/plugins.md](docs/plugins.md):使用和编写插件
-- [hub/README.md](hub/README.md):远程任务插件背后的小型服务端
+- [jobhook](https://github.com/cheny-00/jobhook):远程任务插件(`aca.remote`)背后的小型服务端,是一个单独的项目
 
 ## 开发
 
@@ -359,3 +359,7 @@ tmux 服务会把自己启动时的环境变量传给每一个会话,其中 `CLA
 会让里面启动的 Claude 使用外层账号的登录。aca 自己启动 agent 时会去掉这些变量,但手写的测试脚本不会。
 
 发布新版本:推送一个形如 `v0.1.0` 的 tag。`.github/workflows/release.yml` 里的流程会编译出安装脚本要下载的那些文件。
+
+## 许可证
+
+[MIT](LICENSE)

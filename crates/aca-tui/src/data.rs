@@ -605,11 +605,6 @@ pub fn screen_state(lines: &[String]) -> (Option<State>, String, u64) {
     (None, String::new(), 0)
 }
 
-/// 带颜色 / 链接的转义序列(-e),预览照原样上色;判断状态时再去掉
-fn capture(pane: &str) -> Vec<String> {
-    trim_tail(tmux(&["capture-pane", "-p", "-e", "-t", pane]))
-}
-
 /// 去掉末尾的空行(带着转义序列的「空」行也算)
 fn trim_tail(out: String) -> Vec<String> {
     let mut lines: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
@@ -871,11 +866,12 @@ pub fn collect() -> Vec<Session> {
     let panes = aca_core::tmux::panes();
     // 窗格标题上的标题变了的先记下(下面读状态文件时就是新的);会话名跟着改了也不用重新列,登记过的不按会话名认
     status::follow_titles(&cfg, &sessions, &panes);
-    // 逐个读屏幕并行;查进程表、连着的客户端同时做
+    // 全部窗格的屏幕一条 tmux 命令抓回来(一格起一个的话每刷新一次就是几十个进程);查进程表、连着的客户端同时做。
+    // 带颜色 / 链接的转义序列(-e):预览照原样上色,判断状态时再去掉
     let (screens, (attached, kids)) = thread::scope(|s| {
         let other = s.spawn(|| (attached_sessions(), proc::fg_kids()));
-        let hs: Vec<_> = panes.iter().map(|p| s.spawn(move || capture(&p.pane))).collect();
-        let screens: Vec<Vec<String>> = hs.into_iter().map(|h| h.join().unwrap_or_default()).collect();
+        let ids: Vec<&str> = panes.iter().map(|p| p.pane.as_str()).collect();
+        let screens: Vec<Vec<String>> = aca_core::tmux::capture_many(&ids, true).into_iter().map(trim_tail).collect();
         (screens, other.join().unwrap_or_default())
     });
     // 它没报的那一轮结束(Codex 出错的、Stop hook 没被信任的)先补上:下面读状态文件时就是新的

@@ -2146,7 +2146,8 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     let (good, out) = run(&["plugin", "run", "aca.remote.check"]);
     assert!(!good && out.contains("口令不对"), "{out}");
     write(&fake.join("token"), "right-token-0123456789");
-    assert!(ok(&["plugin", "run", "aca.remote.check"]).contains("连上了,口令也对"));
+    let out = ok(&["plugin", "run", "aca.remote.check"]);
+    assert!(out.contains("连上了,口令也对 · jobhook 0.1.0"), "{out}");
 
     // 连不上那台机器:说为什么,刚登记的撤掉(server、本机都没留),定时没开着
     let (good, out) = run(&["plugin", "run", "aca.remote.run", "--session", &lead, "host=nohost", "command=true"]);

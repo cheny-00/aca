@@ -1,12 +1,12 @@
 id = "aca.remote"
 name = "Remote tasks"
-version = "0.3.0"
+version = "0.3.1"
 api = 1
 description = "把长任务派到别的机器上后台跑(ssh),结束时结果作为一条消息发回派它的会话。你在界面 : 菜单里派,agent 用工具派"
 needs = ["jq", "curl", "ssh"]
 
 # 整个功能就是 remote.sh(sh + jq + curl + ssh),aca 里没有远端任务的代码,用的只是插件接口。
-# 回调先落在一台一直在线的 server 上(装法见仓库的 hub/README.md),地址和口令是下面两个设置。
+# 回调先落在一台一直在线的 server 上(jobhook,装法见 https://github.com/cheny-00/jobhook),地址和口令是下面两个设置。
 
 [settings.url]
 default = ""

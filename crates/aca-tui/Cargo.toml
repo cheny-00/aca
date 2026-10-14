@@ -4,6 +4,7 @@ description = "aca 的界面:列表、预览、看输出 / 改动 / 对话记录
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 aca-core.workspace = true

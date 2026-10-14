@@ -159,12 +159,75 @@ pub fn sync_name(id: &str, title: &str) -> Option<String> {
 
 /// 屏幕上现在的字(不带颜色):判断状态用
 pub fn capture(pane: &str) -> Vec<String> {
-    let out = run(&["capture-pane", "-p", "-t", pane]).unwrap_or_default();
+    plain_lines(&run(&["capture-pane", "-p", "-t", pane]).unwrap_or_default())
+}
+
+/// `capture-pane -p` 打出来的 → 一行一行的字:行尾的空白、末尾的空行不要
+pub fn plain_lines(out: &str) -> Vec<String> {
     let mut lines: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
     lines
+}
+
+/// 好几格的屏幕一条 tmux 命令抓回来(`ansi` = 带颜色,`capture-pane -e`):顺序同 `panes`,一格一段,
+/// 就是单独抓它时打出来的那些字;抓不到的那格是空的。
+/// 一格起一个 tmux 的话,列表每刷新一次就是三十几个进程(2026-10-14 实测 37 格 143 毫秒 CPU,合成一条 3.6 毫秒)
+pub fn capture_many(panes: &[&str], ansi: bool) -> Vec<String> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    // 记号每次现编:屏幕上碰巧有一样的一行(正开着这份源码)也分不错
+    let mark = format!("aca-cut-{:x}-{:x}-{:x}", std::process::id(), nanos, N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    capture_with(panes, ansi, &mark, |args| {
+        cmd().args(args).stderr(Stdio::null()).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
+    })
+}
+
+/// 每格抓完跟一条 `display-message -p` 打一行记号,回来靠它分段。
+/// 记号里不能有 `#`、`%`(display-message 会当格式展开)和词尾的 `;`
+fn capture_args(panes: &[&str], ansi: bool, mark: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![];
+    for p in panes {
+        if !args.is_empty() {
+            args.push(";".into());
+        }
+        args.extend(["capture-pane", "-p"].map(String::from));
+        if ansi {
+            args.push("-e".into());
+        }
+        args.extend(["-t", p, ";", "display-message", "-p", "-t", p, mark].map(String::from));
+    }
+    args
+}
+
+/// 打出来的那一长串按记号行切开;最后没等到记号的半段不算
+fn split_marked(out: &str, mark: &str) -> Vec<String> {
+    let (mut segs, mut cur) = (vec![], String::new());
+    for l in out.split_inclusive('\n') {
+        if l.trim_end_matches(['\n', '\r']) == mark {
+            segs.push(std::mem::take(&mut cur));
+        } else {
+            cur.push_str(l);
+        }
+    }
+    segs
+}
+
+/// 有一格抓不到(刚关掉的)tmux 就停在那儿,后面的命令不跑了:那格记成空的,从下一格接着抓。
+/// 每一轮至少往前一格,全都抓不到也就是一格一个进程(和原来一样)
+fn capture_with(panes: &[&str], ansi: bool, mark: &str, mut run: impl FnMut(&[String]) -> String) -> Vec<String> {
+    let mut got: Vec<String> = Vec::with_capacity(panes.len());
+    while got.len() < panes.len() {
+        let rest = &panes[got.len()..];
+        let segs = split_marked(&run(&capture_args(rest, ansi, mark)), mark);
+        let whole = segs.len() >= rest.len();
+        got.extend(segs.into_iter().take(rest.len()));
+        if !whole {
+            got.push(String::new());
+        }
+    }
+    got
 }
 
 /// 交给插件的字(`input = "screen" / "scrollback"`):折了行的接回一行(网址不断开),`back` = 连回滚一起(最多这么多行)
@@ -434,5 +497,52 @@ mod tests {
         assert_eq!(arg(";"), "\\;");
         assert_eq!(arg("echo hi;"), "echo hi\\;");
         assert_eq!(arg("a;b"), "a;b");
+    }
+
+    #[test]
+    fn many_panes_are_captured_by_one_tmux_and_a_pane_that_is_gone_costs_one_more() {
+        let words = |a: &[String]| a.join(" ");
+        assert_eq!(
+            words(&capture_args(&["%1", "%2"], true, "CUT")),
+            "capture-pane -p -e -t %1 ; display-message -p -t %1 CUT ; capture-pane -p -e -t %2 ; display-message -p -t %2 CUT"
+        );
+        assert_eq!(words(&capture_args(&["%1"], false, "CUT")), "capture-pane -p -t %1 ; display-message -p -t %1 CUT");
+        // 一段就是单独抓那格时打出来的字;空屏也是一段;最后没等到记号的半段不算;别的记号只是屏幕上的一行字
+        assert_eq!(split_marked("a\n  b  \n\nCUT\n\nCUT\nCUT-old\nCUT\n半段\n", "CUT"), ["a\n  b  \n\n", "\n", "CUT-old\n"]);
+        assert_eq!(plain_lines("a  \n\n b\n\n\n"), ["a", "", " b"]);
+
+        // 假的 tmux:命令一条一条跑,碰到抓不到的那格就停,后面的不跑
+        let screen = |p: &str| match p {
+            "%1" => Some("一\n"),
+            "%3" => Some("\n"),
+            "%4" => Some("四\n"),
+            _ => None,
+        };
+        let fake = |calls: &mut Vec<usize>, args: &[String]| {
+            calls.push(args.iter().filter(|a| *a == "capture-pane").count());
+            let mut out = String::new();
+            for c in args.split(|a| a == ";") {
+                match (c[0].as_str(), c.last().unwrap().as_str()) {
+                    ("capture-pane", p) => match screen(p) {
+                        Some(s) => out.push_str(s),
+                        None => break,
+                    },
+                    (_, mark) => out.push_str(&format!("{mark}\n")),
+                }
+            }
+            out
+        };
+        let mut calls = vec![];
+        assert_eq!(capture_with(&["%1", "%2", "%3", "%4"], false, "CUT", |a| fake(&mut calls, a)), ["一\n", "", "\n", "四\n"]);
+        // 都在的话就一个进程;%2 没了:它前面的那次白跑了后半截,从 %3 接着再来一次
+        assert_eq!(calls, [4, 2]);
+        let mut calls = vec![];
+        assert_eq!(capture_with(&["%1", "%3", "%4"], false, "CUT", |a| fake(&mut calls, a)).len(), 3);
+        assert_eq!(calls, [3]);
+        // 一格都抓不到(tmux 没了):一格一次,不会转不出来;没有格就不起 tmux
+        let mut calls = vec![];
+        assert_eq!(capture_with(&["%8", "%9"], false, "CUT", |a| fake(&mut calls, a)), ["", ""]);
+        assert_eq!(calls, [2, 1]);
+        assert!(capture_with(&[], false, "CUT", |_| panic!("起了 tmux")).is_empty());
     }
 }
