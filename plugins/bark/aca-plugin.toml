@@ -1,0 +1,39 @@
+id = "aca.bark"
+name = "Bark"
+version = "0.1.0"
+api = 1
+needs = ["curl", "jq"]
+description = "跑完了、在等你确认、出错了,用 Bark 推一条到手机。有人正连着那个会话(在看)就不推"
+
+# 地址在 plugins.toml 里填:[plugins."aca.bark"] settings = { url = "https://api.day.app/<你的 key>" }
+
+[settings.url]
+default = ""
+secret = true
+desc = "Bark 的推送地址:https://api.day.app/<你的 key>(自建的 Bark server 也行)。空着不推"
+
+[settings.workers]
+default = false
+desc = "派出去的 worker(有 parent 的)也推。默认不推:它们跑完会告诉派它们的那个会话"
+
+[settings.group]
+default = "aca"
+desc = "推送在手机上归到哪一组"
+
+[[events]]
+on = "turn.done"
+command = ["sh", "push.sh"]
+
+[[events]]
+on = "agent.waiting"
+command = ["sh", "push.sh"]
+
+[[events]]
+on = "turn.failed"
+command = ["sh", "push.sh"]
+
+[[commands]]
+id = "test"
+title = "推一条试试"
+desc = "Push a test notification to check the Bark URL."
+command = ["sh", "push.sh", "test"]

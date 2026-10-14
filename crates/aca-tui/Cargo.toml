@@ -1,0 +1,28 @@
+[package]
+name = "aca-tui"
+description = "aca 的界面:列表、预览、看输出 / 改动 / 对话记录、计费"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aca-core.workspace = true
+anyhow = "1.0.104"
+memchr = "2.8.3"
+portable-pty = "0.9.0"
+ratatui = "0.30.2"
+regex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "regex-onig"] }
+toml.workspace = true
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-onig"] }
+unicode-width = "0.2.2"
+vt100 = "0.16.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

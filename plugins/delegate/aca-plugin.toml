@@ -1,0 +1,52 @@
+id = "aca.delegate"
+name = "Delegate"
+version = "0.4.0"
+api = 1
+needs = ["jq"]                   # 只有替 worker 续跑那段(continue.sh)要用
+description = "你开的 Claude(或 Codex)规划、派 worker 干活、自己验收、汇报(agent 里用 /aca:delegate)。worker 遇到限流 / 过载自动接着干"
+
+# 可以在 plugins.toml 里改:[plugins."aca.delegate"] settings = { worker = "codex:work", max_continue = 3 }
+# 或者 aca plugin setting aca.delegate worker codex:work
+[settings.worker]
+default = "codex"
+desc = "派给谁:aca new 认的工具(:账号),比如 codex、codex:work、claude:work"
+
+[settings.auto]
+default = true
+desc = "agent 自己能不能用 /aca:delegate:开 = 你说「用 delegate 派出去」它就走这份;关 = 只有你敲这个斜杠命令才算(只管 Claude,改了对新起、重启的会话生效)"
+
+[settings.language]
+default = ""
+desc = "领头的回你、写报告和计划用哪种话(比如 简体中文);空 = 跟着你说的话"
+
+[settings.say]
+default = "continue"
+desc = "worker 临时失败时替它说的那句"
+
+[settings.max_continue]
+default = 5
+desc = "worker 一轮因为限流 / 过载失败时,最多替它说几次「继续」"
+
+[settings.delay]
+default = 30
+desc = "第 n 次替它说之前等 n × 这么多秒"
+
+# /aca:delegate:aca 起 Claude 时带上(只对那一次启动;敲 /dele 补全就是它:Claude Code 的插件命令带插件名)。
+# 命令文件头上写着「只有你敲才进上下文」,设置 auto 开着时不作数:Claude 自己也看得到它,你说「用 delegate」就走这份。
+# Codex 那边是一个叫 delegate 的 skill,一直在它的 skill 列表里
+[agent]
+for = ["claude", "codex"]
+dir = "claude"
+auto = "auto"
+
+# 派出去的 worker(有 parent)一轮出错、是临时的(限流、过载、断流):过一阵替它说一句「继续」
+[[events]]
+on = "turn.failed"
+if = { kind = "transient", parent = true }
+command = ["sh", "continue.sh"]
+
+# 派出去的 worker 正常跑完一轮:次数清零
+[[events]]
+on = "turn.done"
+if = { parent = true }
+command = ["sh", "continue.sh"]

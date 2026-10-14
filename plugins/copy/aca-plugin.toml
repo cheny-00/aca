@@ -1,0 +1,55 @@
+id = "aca.copy"
+name = "Copy"
+version = "0.1.0"
+api = 1
+needs = ["fzf"]
+description = "在会话里按一个键,把最后一条回复里的命令 / 代码块挑一段复制,不用在屏幕上拖着选"
+
+# 整个功能在 copy.sh 里,aca 里没有它的代码。不认屏幕(屏幕上的代码块没有记号,长的还折了行),认回复的原文:
+# ``` 围起来的代码块整块给,行内的 `…` 默认只要带空格的。只认出一条就直接复制,多了才弹出来挑(数字键)。
+#
+# 在会话里按 Ctrl+Alt+Y(往上翻着看的时候也行;y = yank,和 : 菜单里的 y 一个字母)。这是个热键:aca 把它绑在 tmux 上,
+# 只在 aca 的会话里拦;装上就有,停掉、删掉插件它就解了,不用动 tmux.conf。
+#   换一个键:aca plugin hotkey aca.copy pick M-y        不要键:aca plugin hotkey aca.copy pick --none
+# 想按终端自己的键(tmux 收不到 cmd):让终端把它换成这个键发过来。kitty.conf:
+#   map cmd+shift+c send_text all \x1b\x19
+
+[settings.inline]
+default = "spaced"
+desc = "行内的 `…` 要哪些:spaced 只要带空格的(多半是一条命令)/ all 都要 / none 只要代码块"
+
+[settings.lines]
+default = true
+desc = "shell 的代码块里有几条命令时,每一条也单独列出来(可以只复制其中一条)"
+
+[settings.copy]
+default = ""
+desc = "用什么命令复制(内容从标准输入给它)。空着 = tmux 的缓冲区 + OSC 52 给外层终端 + 本机的 pbcopy / wl-copy / xclip"
+
+[[panes]]
+id = "pick"
+title = "复制命令"
+contexts = ["session"]
+placement = "popup"
+width = "80%"
+height = "60%"
+input = "reply"
+command = ["sh", "copy.sh", "pick"]
+
+[[commands]]
+id = "list"
+title = "回复里的命令"
+desc = "List the commands and code blocks found in this session's last reply, one per line."
+contexts = ["session"]
+input = "reply"
+command = ["sh", "copy.sh", "list"]
+
+# 在会话里面直接按
+[[hotkeys]]
+key = "C-M-y"
+run = "pick"
+
+# 界面的 : 菜单里
+[[keys]]
+key = "y"
+run = "pick"

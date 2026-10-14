@@ -1,0 +1,36 @@
+id = "aca.notify"
+name = "Notify"
+version = "0.1.0"
+api = 1
+needs = ["jq"]
+description = "跑完了、在等你确认、出错了,在这台机器上弹一条桌面通知。你正连着那个会话(在看)就不弹"
+
+[settings.command]
+default = ""
+desc = "换一个弹通知的命令,标题和正文是它的两个参数(比如你自己写的一个脚本)。空着,或者它发不出去(退出码不是 0):macOS 用 osascript,Linux 用 notify-send"
+
+[settings.workers]
+default = false
+desc = "派出去的 worker(有 parent 的)也弹。默认不弹:它们跑完会告诉派它们的那个会话"
+
+[settings.attached]
+default = false
+desc = "你正连着那个会话时也弹。默认不弹"
+
+[[events]]
+on = "turn.done"
+command = ["sh", "notify.sh"]
+
+[[events]]
+on = "agent.waiting"
+command = ["sh", "notify.sh"]
+
+[[events]]
+on = "turn.failed"
+command = ["sh", "notify.sh"]
+
+[[commands]]
+id = "test"
+title = "弹一条试试"
+desc = "Show a test notification."
+command = ["sh", "notify.sh", "test"]

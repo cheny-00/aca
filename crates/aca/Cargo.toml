@@ -1,0 +1,14 @@
+[package]
+name = "aca"
+description = "一屏管住所有 agent 会话:命令行和界面的入口"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aca-core.workspace = true
+aca-tui.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

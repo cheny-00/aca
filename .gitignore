@@ -1,0 +1,10 @@
+/target
+__pycache__/
+
+# 编辑器、系统留下的
+*.swp
+*.swo
+.DS_Store
+
+# Claude Code 在仓库里留下的本地状态
+/.claude/

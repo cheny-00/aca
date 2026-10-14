@@ -1,0 +1,3 @@
+# 一行放得下就不折:这个项目的写法是「一件事一行」
+max_width = 140
+use_small_heuristics = "Max"

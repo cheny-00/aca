@@ -1,0 +1,44 @@
+# 推一个 v 开头的 tag(git tag v0.1.0 && git push origin v0.1.0)就编四个平台的 aca,挂到那一版的 release 上。
+# install.sh 下载的就是这里出的文件:aca-<平台>.tar.gz(里面只有 aca 一个文件)和它的 .sha256。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      # 一个平台编不过,别的照样发
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "$TARGET"
+      - name: Build
+        run: cargo build --release --locked -p aca --target "$TARGET"
+      - name: Package
+        run: |
+          tar -czf "aca-$TARGET.tar.gz" -C "target/$TARGET/release" aca
+          shasum -a 256 "aca-$TARGET.tar.gz" > "aca-$TARGET.tar.gz.sha256"
+      - name: Upload
+        run: |
+          # 四个平台各跑各的,谁先到谁建 release,后到的只传文件
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true
+          gh release upload "$GITHUB_REF_NAME" "aca-$TARGET.tar.gz" "aca-$TARGET.tar.gz.sha256" --clobber

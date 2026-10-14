@@ -1,0 +1,57 @@
+id = "aca.core"
+name = "aca core tools"
+version = "0.1.0"
+api = 1
+description = "把 aca 的核心能力给 agent 当工具用:看会话、派 worker、递话、等它、替它回答、中止它。默认不装;装了 Claude、Codex 都能用"
+
+# 每个工具就是一条 aca 命令(core.sh),调用的会话就是 ACA_SESSION_ID:新开的 worker 挂在它下面,
+# 替谁回答、中止谁,只能是它自己派出去的那些(aca answer / interrupt 自己就是这么查的)。
+# 只想给某几个账号:plugins.toml 里 [plugins."aca.core"] agents = ["claude:work"]
+
+[[commands]]
+id = "sessions"
+title = "看 aca 的会话"
+desc = "List aca sessions (id, title, state, tool, parent, dir) as JSON; with id, show one session including its last reply."
+args = { id = "string?" }
+expose = ["agent"]
+command = ["sh", "core.sh", "sessions"]
+
+[[commands]]
+id = "dispatch"
+title = "派一个 worker"
+desc = "Start a worker agent session as your child and send it the task. tool: claude / codex / a tool name from aca (tool:account works). branch: start it in its own git worktree on that branch. dir defaults to your own directory. Returns the new session id; use wait to know when it's done and sessions to read its reply."
+args = { tool = "string", task = "string", dir = "path?", branch = "string?", title = "string?" }
+expose = ["agent"]
+command = ["sh", "core.sh", "dispatch"]
+
+[[commands]]
+id = "message"
+title = "给别的会话递一句话"
+desc = "Pass a message to another session's inbox (to: a session id, or parent for the one that dispatched you). It's delivered when that agent is free; nothing is typed into its input box."
+args = { to = "string", text = "string" }
+expose = ["agent"]
+command = ["sh", "core.sh", "message"]
+
+[[commands]]
+id = "wait"
+title = "等 worker"
+desc = "Wait up to 240 s for sessions (ids separated by spaces) to finish a turn, wait for confirmation, fail or exit. Prints what happened and the exit code: 0 finished a turn, 2 waiting for confirmation, 3 failed, 4 exited, 124 still running (call again)."
+args = { ids = "string", any = "bool?" }
+expose = ["agent"]
+command = ["sh", "core.sh", "wait"]
+
+[[commands]]
+id = "answer"
+title = "替 worker 回答"
+desc = "Without answer: show what a session you dispatched is asking. With answer: a choice number, or yes / no for a permission prompt."
+args = { id = "string", answer = "string?" }
+expose = ["agent"]
+command = ["sh", "core.sh", "answer"]
+
+[[commands]]
+id = "interrupt"
+title = "中止 worker 这一轮"
+desc = "Stop the current turn of a session you dispatched (it went the wrong way). It stays idle; message it or dispatch again."
+args = { id = "string" }
+expose = ["agent"]
+command = ["sh", "core.sh", "interrupt"]

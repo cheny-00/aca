@@ -1,0 +1,58 @@
+#!/bin/sh
+# 假的 tailscale:挂载记在 $FAKE/serve.json(off、--bg 真的改它),状态在 $FAKE/status.json;
+# 改挂载的命令记在 $FAKE/log。$FAKE/down 在 = 没在跑;off_ignored = off 报成功但不撤;off_wipes = off 清掉整份
+F=${FAKE:?}
+case "$1 ${2:-}" in
+  "status --json")
+    if [ -e "$F/down" ]; then
+      echo "failed to connect to local Tailscale service; is Tailscale running?" >&2
+      exit 1
+    fi
+    cat "$F/status.json"
+    exit 0
+    ;;
+  "serve status")
+    cat "$F/serve.json"
+    exit 0
+    ;;
+esac
+echo "$*" >>"$F/log"
+for last; do :; done
+if [ "$last" = off ]; then
+  [ -e "$F/off_ignored" ] && exit 0
+  if [ -e "$F/off_wipes" ]; then
+    echo '{}' >"$F/serve.json"
+    exit 0
+  fi
+  tcp= port= path=
+  for a; do
+    case $a in
+      --tcp=*) tcp=${a#--tcp=} ;;
+      --https=* | --http=*) port=${a#*=} ;;
+      --set-path=*) path=${a#--set-path=} ;;
+    esac
+  done
+  if [ -n "$tcp" ]; then
+    jq --arg p "$tcp" 'del(.TCP[$p])' "$F/serve.json" >"$F/serve.new" && mv "$F/serve.new" "$F/serve.json"
+    exit 0
+  fi
+  hp="mac.tail.ts.net:$port"
+  if ! jq -e --arg hp "$hp" --arg path "$path" '.Web[$hp].Handlers[$path] != null' "$F/serve.json" >/dev/null; then
+    echo "error: handler does not exist" >&2
+    exit 1
+  fi
+  jq --arg hp "$hp" --arg path "$path" --arg port "$port" \
+    'del(.Web[$hp].Handlers[$path]) | if (.Web[$hp].Handlers | length) == 0 then del(.Web[$hp]) | del(.TCP[$port]) else . end' \
+    "$F/serve.json" >"$F/serve.new" && mv "$F/serve.new" "$F/serve.json"
+  exit 0
+fi
+if [ "$1" = serve ] && [ "${2:-}" = --bg ]; then
+  port=${3#--https=}
+  jq --arg p "$port" --arg to "$4" '.TCP[$p] = {HTTPS: true} | .Web["mac.tail.ts.net:" + $p] = {Handlers: {"/": {Proxy: $to}}}' \
+    "$F/serve.json" >"$F/serve.new" && mv "$F/serve.new" "$F/serve.json"
+  exit 0
+fi
+echo "error: 假的不认识 $*" >&2
+echo "" >&2
+echo "try \`tailscale serve --help\` for usage info" >&2
+exit 1

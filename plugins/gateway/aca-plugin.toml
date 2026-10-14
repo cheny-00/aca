@@ -1,0 +1,17 @@
+id = "aca.gateway"
+name = "MCP Gateway"
+version = "0.1.0"
+api = 1
+description = "MCP 注册中心:每个 MCP 只起一份,所有 agent 从一个入口用;插件的 MCP 和能力都经它走"
+
+# 开着它:aca 给 agent 只挂一个 MCP(到 gateway 的转接),插件的 MCP、能力、下面点了名的 [mcps.*] 都在 gateway 下面。
+# 停了它:照旧各自直接挂到 agent 上。gateway 是按需起的进程,没人连着过 idle_minutes 分钟自己退出。
+# 看它:aca plugin gateway status;改设置:plugins.toml 里 [plugins."aca.gateway"] settings = { servers = ["web"] }
+
+[settings.servers]
+default = []
+desc = "经 gateway 给 agent 的 MCP:config.toml 里 [mcps.<名字>] 的名字(scope = \"session\" 的每个会话一份)"
+
+[settings.idle_minutes]
+default = 10
+desc = "没有 agent 连着多久后 gateway 自己退出"

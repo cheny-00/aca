@@ -1,0 +1,19 @@
+#!/bin/sh
+# 假的 ssh:`ssh -o … -- 机器 'sh -s'` 在本机跑标准输入里的脚本,HOME 换成 $FAKE/remote(远端那台的家)。
+# 机器叫 nohost 的连不上
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o) shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+host=$1
+shift
+echo "$host $*" >>"$FAKE/ssh.log"
+if [ "$host" = nohost ]; then
+  echo "ssh: Could not resolve hostname nohost: nodename nor servname provided, or not known" >&2
+  exit 255
+fi
+mkdir -p "$FAKE/remote"
+HOME="$FAKE/remote" exec sh -s

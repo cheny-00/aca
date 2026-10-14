@@ -1,0 +1,28 @@
+#!/bin/sh
+# 假的 tpub:现在的状态在 $FAKE/tpub(on / off / half / broken / busy);$FAKE/pub_stuck 在 = on / off 报成功但不变
+F=${FAKE:?}
+now=$(cat "$F/tpub")
+note=
+[ "$now" = half ] && note="本机服务在跑,tailnet 上没挂"
+case "$*" in
+  "status --json")
+    if [ "$now" = broken ]; then
+      echo "Traceback (most recent call last):"
+    else
+      printf '{"state": "%s", "count": 2, "note": "%s"}\n' "$now" "$note"
+    fi
+    ;;
+  on | off)
+    echo "tpub $*" >>"$F/log"
+    if [ "$now" = busy ]; then
+      echo "tailnet 的 :8443 上挂着别的东西,没动它" >&2
+      exit 1
+    fi
+    [ -e "$F/pub_stuck" ] || echo "$1" >"$F/tpub"
+    if [ "$1" = on ]; then echo "发布已打开 https://mac.tail.ts.net:8443/"; else echo "发布已关上(~/pub 里的 2 样还在,再打开就又能看)"; fi
+    ;;
+  *)
+    echo "假的不认识 tpub $*" >&2
+    exit 1
+    ;;
+esac

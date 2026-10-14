@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+
+# 依赖的版本只在这里写一次,各 crate 里 `xxx.workspace = true`
+[workspace.dependencies]
+aca-core = { path = "crates/aca-core" }
+aca-tui = { path = "crates/aca-tui" }
+libc = "0.2"
+regex = "1.13.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order", "raw_value"] }
+toml = "1.1.6"
+
+[workspace.lints.clippy]
+# 这个项目里一行长、参数多的函数是有意的;别的照 clippy 默认
+too_many_arguments = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

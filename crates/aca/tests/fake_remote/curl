@@ -1,0 +1,77 @@
+#!/bin/sh
+# 假的 curl:当 server(jobhook 的那几个接口),记录放在 $FAKE/hub/<id>.json,口令在 $FAKE/token。
+# 只认 aca.remote 和远端包装用到的写法:配置从标准输入来(-K -),-w 带上状态码,--data-binary @文件。
+# $FAKE/down 在 = 连不上
+set -u
+H="$FAKE/hub"
+mkdir -p "$H"
+if [ -e "$FAKE/down" ]; then
+  echo "curl: (7) Failed to connect to hook.test port 443: Connection refused" >&2
+  exit 7
+fi
+method=GET datafile='' wcode='' fail=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    -X) method=$2; shift ;;
+    --data-binary) datafile=${2#@}; shift ;;
+    -w) wcode=1; shift ;;
+    -fsS) fail=1 ;;
+    -K | -m | --connect-timeout | --retry | --retry-delay) shift ;;
+  esac
+  shift
+done
+cfg=$(cat)
+# 配置里的值去掉引号、去掉一层 \ 转义
+val() { printf '%s\n' "$cfg" | sed -n "s/^$1 = \"\\(.*\\)\"\$/\\1/p" | sed 's/\\\(.\)/\1/g'; }
+url=$(val url | head -n 1)
+req=$(val request | head -n 1)
+[ -n "$req" ] && method=$req
+tok=$(val header | sed -n 's/^X-Jobhook-Token: //p' | head -n 1)
+body=$(val data-binary)
+[ -n "$datafile" ] && body=$(cat "$datafile")
+path=/${url#*://*/}
+echo "$method $path" >>"$FAKE/curl.log"
+reply() {
+  printf '%s' "$2"
+  [ -n "$wcode" ] && printf '\n%s' "$1"
+  if [ -n "$fail" ] && [ "$1" -ge 400 ]; then exit 22; fi
+  exit 0
+}
+admin() { [ -n "$tok" ] && [ "$tok" = "$(cat "$FAKE/token" 2>/dev/null)" ] || reply 401 '{"error": "口令不对"}'; }
+now=$(date +%s)
+case "$method $path" in
+  "GET /hooks")
+    admin
+    set -- "$H"/*.json
+    if [ -e "$1" ]; then reply 200 "$(jq -sc --argjson now "$now" '{now: $now, hooks: .}' "$@")"; else reply 200 "{\"now\": $now, \"hooks\": []}"; fi
+    ;;
+  "PUT /h/"*)
+    admin
+    id=${path#/h/}
+    printf '%s' "$body" | jq -c --arg id "$id" --argjson now "$now" \
+      '{id: $id, note: .note, host: .host, created: $now, deadline: (if .within > 0 then $now + .within else 0 end), state: "waiting"}' >"$H/$id.json"
+    reply 200 "$(cat "$H/$id.json")"
+    ;;
+  "POST /h/"*/ack)
+    admin
+    id=${path#/h/}
+    rm -f "$H/${id%/ack}.json"
+    reply 200 '{"ok": true}'
+    ;;
+  "DELETE /h/"*)
+    admin
+    rm -f "$H/${path#/h/}.json"
+    reply 200 '{"ok": true}'
+    ;;
+  "POST /h/"*)
+    # 远端的回调:/h/<id>?rc=N,正文是日志末尾,不用口令
+    id=${path#/h/}
+    id=${id%%\?*}
+    rc=${path##*rc=}
+    [ -e "$H/$id.json" ] || reply 404 '{"error": "没有这个 id"}'
+    jq -c --argjson rc "$rc" --arg tail "$body" --argjson now "$now" '.state = "done" | .rc = $rc | .tail = $tail | .ended = $now' \
+      "$H/$id.json" >"$H/$id.tmp" && mv "$H/$id.tmp" "$H/$id.json"
+    reply 200 '{"ok": true}'
+    ;;
+  *) reply 404 '{"error": "没有这个地址"}' ;;
+esac

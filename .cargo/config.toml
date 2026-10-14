@@ -1,0 +1,4 @@
+# 测试比对的是中文:不管 config.toml 里写了哪种话,cargo test 都用中文跑。
+# 想看英文:ACA_LANG=en cargo run …(已经设了的环境变量压过这里)
+[env]
+ACA_LANG = "zh"
