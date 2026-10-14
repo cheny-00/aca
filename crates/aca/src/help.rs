@@ -1058,7 +1058,7 @@ The environment variable ACA_THEME=<name> overrides the config (dark / light are
                     "  -f         一直跟着读
   -n 行数    先打最近几行(默认 20;带 -f 时默认不打)
 
-有哪些事件、各带什么字段:docs/plugins.md。",
+有哪些事件、各带什么字段:docs/plugins.zh-CN.md。",
                     "  -f          keep following
   -n LINES    print the last few lines first (default 20; with -f, none by default)
 
@@ -1137,7 +1137,7 @@ Which events there are and their fields: docs/plugins.md.",
                 more: Tr::new(
                     "\
 插件 = 一个目录 + 一份 aca-plugin.toml(能力、事件钩子、定时、窗格、设置、给 agent 带的目录和 MCP),回头调 aca 的命令行。
-写法:docs/plugins.md。要哪些插件、给哪些 agent、设置写在 ~/.config/aca/plugins.toml;下面这些命令也会改它。
+写法:docs/plugins.zh-CN.md。要哪些插件、给哪些 agent、设置写在 ~/.config/aca/plugins.toml;下面这些命令也会改它。
 不想建插件:~/.config/aca/user/aca-plugin.toml 写上就有(id 总是 user,不用 link),删了就没。
 
   install        git 的克隆到 ~/.local/share/aca/plugins/<id>;owner/repo 是 GitHub 上的;本地目录就是 link;

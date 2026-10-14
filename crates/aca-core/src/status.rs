@@ -292,7 +292,7 @@ pub fn settle(cfg: &Config, sessions: &[Session], panes: &[Pane], screen: &dyn F
 mod tests {
     use super::*;
 
-    /// `aca ls --json` / `aca show --json` 外面那一层是插件接口:每个字段 docs/plugins.md「接口约定」里都写了。
+    /// `aca ls --json` / `aca show --json` 外面那一层是插件接口:每个字段 docs/plugins.md(英文)和 plugins.zh-CN.md「接口约定」里都写了。
     /// Row 加了字段这里编不过 —— 补上,再去文档里写一句
     #[test]
     fn every_field_of_a_listed_session_is_in_the_plugin_contract() {
@@ -319,11 +319,15 @@ mod tests {
             order: 0,
             tokens: BTreeMap::new(),
         };
-        let docs = include_str!("../../../docs/plugins.md");
-        let at = docs.find("**aca 打出来的 JSON**").expect("docs/plugins.md「接口约定」");
-        let part = &docs[at..at + docs[at..].find("**名字**").unwrap()];
-        for k in serde_json::to_value(&r).unwrap().as_object().unwrap().keys() {
-            assert!(part.contains(&format!("`{k}`")), "docs/plugins.md 没写 aca ls --json 的 {k}");
+        for (file, docs, from, to) in [
+            ("plugins.md", include_str!("../../../docs/plugins.md"), "**JSON that aca prints**", "**Names**"),
+            ("plugins.zh-CN.md", include_str!("../../../docs/plugins.zh-CN.md"), "**aca 打出来的 JSON**", "**名字**"),
+        ] {
+            let at = docs.find(from).unwrap_or_else(|| panic!("{file} 里没有 {from}"));
+            let part = &docs[at..at + docs[at..].find(to).unwrap()];
+            for k in serde_json::to_value(&r).unwrap().as_object().unwrap().keys() {
+                assert!(part.contains(&format!("`{k}`")), "{file} 没写 aca ls --json 的 {k}");
+            }
         }
     }
 

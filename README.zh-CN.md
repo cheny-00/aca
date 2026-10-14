@@ -12,6 +12,8 @@ aca 把所有会话放进一个列表,选中哪个就显示它的实时画面,�
 每个会话都是一个普通的 tmux 会话。关掉 aca,agent 照常运行;你也可以直接用 tmux 进去,
 包括从另一台电脑或者手机上通过 SSH 连进去。
 
+aca 是参考 [agent-deck](https://github.com/asheshgoplani/agent-deck) 做的,见[致谢](#致谢)。
+
 ## 它能做什么
 
 - **一个列表,状态一眼看清。** `●` 正在干活 · `◐` 在等你,或者做完了你还没看 · `○` 空闲 · `✕` 出错 · `■` 没在运行。
@@ -335,7 +337,7 @@ rm -rf ~/.config/aca ~/.local/share/aca ~/.local/state/aca ~/.cache/aca
 
 - [上手指南](docs/onboarding.zh-CN.md):最初的十五分钟
 - `aca help`、`aca help <命令>`、`aca help keys`、`aca help config`:完整的参考,内容始终和你安装的版本一致
-- [docs/plugins.md](docs/plugins.md):使用和编写插件
+- [docs/plugins.zh-CN.md](docs/plugins.zh-CN.md):使用和编写插件
 - [jobhook](https://github.com/cheny-00/jobhook):远程任务插件(`aca.remote`)背后的小型服务端,是一个单独的项目
 
 ## 开发
@@ -359,6 +361,12 @@ tmux 服务会把自己启动时的环境变量传给每一个会话,其中 `CLA
 会让里面启动的 Claude 使用外层账号的登录。aca 自己启动 agent 时会去掉这些变量,但手写的测试脚本不会。
 
 发布新版本:推送一个形如 `v0.1.0` 的 tag。`.github/workflows/release.yml` 里的流程会编译出安装脚本要下载的那些文件。
+
+## 致谢
+
+aca 是参考 [agent-deck](https://github.com/asheshgoplani/agent-deck) 做的:把所有 agent 会话放在一个终端界面里、每个会话跑在自己的 tmux 会话里,
+以及接入其他 agent 的方式,都来自 agent-deck。aca 是用 Rust 另外写的独立程序,不是它的分支(fork)。
+感谢 agent-deck 和它的贡献者。
 
 ## 许可证
 

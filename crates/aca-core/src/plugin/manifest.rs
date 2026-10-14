@@ -1159,15 +1159,19 @@ scope = "session"
         });
     }
 
-    /// docs/plugins.md「清单」那份写全了的例子:读得进来,一条提醒都没有(字段表和文档对得上)
+    /// docs/plugins.md(英文)和 plugins.zh-CN.md「清单」那份写全了的例子:读得进来,一条提醒都没有(字段表和文档对得上)
     #[test]
     fn the_full_example_in_the_docs_reads_without_a_single_note() {
-        let docs = include_str!("../../../../docs/plugins.md");
-        let start = docs.find("## 清单\n\n```toml\n").expect("docs/plugins.md 里「清单」那一节") + "## 清单\n\n```toml\n".len();
-        let text = &docs[start..start + docs[start..].find("```").unwrap()];
-        let (m, warn) = parse(text).unwrap();
-        assert!(warn.is_empty(), "{warn:?}");
-        assert_eq!((m.api, m.requires.as_slice()), (Some(API), ["aca.core".to_string()].as_slice()));
+        for (docs, head) in [
+            (include_str!("../../../../docs/plugins.md"), "## The manifest\n\n```toml\n"),
+            (include_str!("../../../../docs/plugins.zh-CN.md"), "## 清单\n\n```toml\n"),
+        ] {
+            let start = docs.find(head).unwrap_or_else(|| panic!("文档里没有 {head:?} 那一节")) + head.len();
+            let text = &docs[start..start + docs[start..].find("```").unwrap()];
+            let (m, warn) = parse(text).unwrap();
+            assert!(warn.is_empty(), "{head:?}: {warn:?}");
+            assert_eq!((m.api, m.requires.as_slice()), (Some(API), ["aca.core".to_string()].as_slice()));
+        }
     }
 
     #[test]

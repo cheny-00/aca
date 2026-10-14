@@ -26,11 +26,11 @@ fn id_from(dir: &Path) -> String {
 fn manifest_text(id: &str, name: &str) -> String {
     let (zh, en) = (
         format!(
-            r#"# aca 插件的清单(写法:aca help plugin、docs/plugins.md)。改了脚本马上生效,改了清单 aca plugin link 一次
+            r#"# aca 插件的清单(写法:aca help plugin、docs/plugins.zh-CN.md)。改了脚本马上生效,改了清单 aca plugin link 一次
 id = "{id}"
 name = "{name}"
 version = "0.1.0"
-api = 1                          # 照着插件接口第几版写的(docs/plugins.md「接口约定」)
+api = 1                          # 照着插件接口第几版写的(docs/plugins.zh-CN.md「接口约定」)
 description = "一句话说它干什么"
 # needs = ["jq"]                 # 要用到的外面的程序:装的时候、aca plugin check、插件页说缺了哪个
 
@@ -100,7 +100,7 @@ desc = "What to greet with"
 fn script_text() -> &'static str {
     t!(
         r#"#!/bin/sh
-# 环境里有会话、设置、参数(ACA_SESSION_ID、ACA_SETTING_<名字>、ACA_ARG_<名字>…,见 docs/plugins.md「交给命令的环境」);
+# 环境里有会话、设置、参数(ACA_SESSION_ID、ACA_SETTING_<名字>、ACA_ARG_<名字>…,见 docs/plugins.zh-CN.md「交给命令的环境」);
 # 界面用哪种话在 ACA_LANG(zh / en)。要 aca 做什么就调 "$ACA_BIN"(aca show "$ACA_SESSION_ID" --json、aca send …)
 lines=$(wc -l | tr -d ' ')
 echo "${ACA_SETTING_GREETING:-你好}!会话 ${ACA_SESSION_ID:-(没有)} 的最后一条回复有 $lines 行"

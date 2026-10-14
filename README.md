@@ -13,6 +13,8 @@ list, shows a live view of the one you select, and takes you into it when you pr
 Each session is an ordinary tmux session. If you close aca, the agents keep running, and you can still
 reach them with plain tmux, including over SSH from another machine or your phone.
 
+aca is modeled on [agent-deck](https://github.com/asheshgoplani/agent-deck); see [Acknowledgements](#acknowledgements).
+
 ## What you get
 
 - **One list with clear states.** `●` working · `◐` waiting for you, or finished and not read yet ·
@@ -358,7 +360,7 @@ Codex conversations live in their own directories and are not affected.
 - [Getting started](docs/onboarding.md): the first fifteen minutes
 - `aca help`, `aca help <command>`, `aca help keys`, `aca help config`: the complete reference, always
   matching the version you have installed
-- [docs/plugins.md](docs/plugins.md): using and writing plugins (in Chinese)
+- [docs/plugins.md](docs/plugins.md): using and writing plugins
 - [jobhook](https://github.com/cheny-00/jobhook): the small server behind the remote tasks plugin (`aca.remote`),
   a separate project
 
@@ -386,6 +388,13 @@ account's login. aca strips these itself when it starts an agent; hand-written t
 
 To publish a release, push a tag such as `v0.1.0`. The workflow in `.github/workflows/release.yml` builds
 the binaries that the install script downloads.
+
+## Acknowledgements
+
+aca was built with [agent-deck](https://github.com/asheshgoplani/agent-deck) as its reference. The idea of one terminal screen for all your
+agent sessions, each running in its own tmux session, and the way other agents are plugged in, come from
+agent-deck. aca is a separate program written in Rust, not a fork of it. Thanks to agent-deck and its
+contributors.
 
 ## License
 

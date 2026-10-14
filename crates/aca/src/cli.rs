@@ -258,7 +258,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             for (c, what) in next {
                 println!("  {c:<w$}  {what}");
             }
-            println!("{}", t!("写法:docs/plugins.md(aca help plugin)", "How to write one: docs/plugins.md (aca help plugin)"));
+            println!("{}", t!("写法:docs/plugins.zh-CN.md(aca help plugin)", "How to write one: docs/plugins.md (aca help plugin)"));
         }
         "check" => {
             let target = a.maybe().unwrap_or_else(|| ".".into());

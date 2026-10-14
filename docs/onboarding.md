@@ -187,7 +187,7 @@ directories. aca never installs these for you. Install the ones you want yoursel
 each one adds is in the [README](../README.md#optional-tools).
 
 **Plugins.** Press `P` in the interface to see what is available. For example `aca.notify` sends a desktop
-notification when a session finishes or needs you. See [plugins.md](plugins.md) (in Chinese).
+notification when a session finishes or needs you. See [plugins.md](plugins.md).
 
 ## 9. Sessions you already have running
 

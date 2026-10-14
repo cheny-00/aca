@@ -2688,14 +2688,16 @@ manual = true
     let text = reply["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{out}"));
     assert_eq!(names(text), want(&command[1..]), "{text}");
     assert!(text.contains(&format!("parent={lead}")), "{text}");
-    // 上面出现过的每一个,文档「交给命令的环境」里都有
-    let docs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/plugins.md")).unwrap();
-    for n in want(&["ACA_PLUGIN_EVENT", "ACA_PLUGIN_EVENT_JSON", "ACA_INPUT_FILE"])
-        .iter()
-        .chain(command.iter().map(|s| s.to_string()).collect::<Vec<_>>().iter())
-    {
-        let n = n.strip_prefix("ACA_ARG_").map(|_| "ACA_ARG_<").or(n.strip_prefix("ACA_SETTING_").map(|_| "ACA_SETTING_<")).unwrap_or(n);
-        assert!(docs.contains(&format!("`{n}")), "docs/plugins.md 没写 {n}");
+    // 上面出现过的每一个,文档(英文 plugins.md、中文 plugins.zh-CN.md)「交给命令的环境」里都有
+    for file in ["plugins.md", "plugins.zh-CN.md"] {
+        let docs = std::fs::read_to_string(format!("{}/../../docs/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        for n in want(&["ACA_PLUGIN_EVENT", "ACA_PLUGIN_EVENT_JSON", "ACA_INPUT_FILE"])
+            .iter()
+            .chain(command.iter().map(|s| s.to_string()).collect::<Vec<_>>().iter())
+        {
+            let n = n.strip_prefix("ACA_ARG_").map(|_| "ACA_ARG_<").or(n.strip_prefix("ACA_SETTING_").map(|_| "ACA_SETTING_<")).unwrap_or(n);
+            assert!(docs.contains(&format!("`{n}")), "docs/{file} 没写 {n}");
+        }
     }
 
     // 列表视图跑成了只读标准输出:标准错误写进插件的日志,不搅进 JSON

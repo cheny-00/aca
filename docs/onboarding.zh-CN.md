@@ -178,7 +178,7 @@ aca 不会替你安装这些工具,想用哪个请自己安装。完整的列表
 见 [README](../README.zh-CN.md#可选的工具)。
 
 **插件。** 在界面里按 `P` 查看有哪些可用。例如 `aca.notify` 会在某个会话做完或者需要你处理时发一条桌面通知。
-详见 [plugins.md](plugins.md)。
+详见 [plugins.zh-CN.md](plugins.zh-CN.md)。
 
 ## 9. 已经在运行的会话
 

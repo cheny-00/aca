@@ -108,19 +108,23 @@ pub fn matches(on: &str, name: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// 每个事件都登记了字段,docs/plugins.md「事件」那张表里每一行把它的字段都写了
+    /// 每个事件都登记了字段,docs/plugins.md(英文)和 plugins.zh-CN.md 的事件表里每一行把它的字段都写了
     #[test]
     fn every_event_declares_its_fields_and_the_docs_list_them() {
         let names: Vec<&str> = FIELDS.iter().map(|(n, _)| *n).collect();
         assert_eq!(names, KNOWN);
-        let docs = include_str!("../../../docs/plugins.md");
-        for (name, fields) in FIELDS {
-            let row = docs
-                .lines()
-                .find(|l| l.starts_with('|') && l.contains(&format!("`{name}`")))
-                .unwrap_or_else(|| panic!("文档的事件表里没有 {name}"));
-            for f in *fields {
-                assert!(row.contains(&format!("`{f}`")), "文档里 {name} 那一行没写 {f}:{row}");
+        for (file, docs) in [
+            ("plugins.md", include_str!("../../../docs/plugins.md")),
+            ("plugins.zh-CN.md", include_str!("../../../docs/plugins.zh-CN.md")),
+        ] {
+            for (name, fields) in FIELDS {
+                let row = docs
+                    .lines()
+                    .find(|l| l.starts_with('|') && l.contains(&format!("`{name}`")))
+                    .unwrap_or_else(|| panic!("{file} 的事件表里没有 {name}"));
+                for f in *fields {
+                    assert!(row.contains(&format!("`{f}`")), "{file} 里 {name} 那一行没写 {f}:{row}");
+                }
             }
         }
     }
