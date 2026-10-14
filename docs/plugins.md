@@ -380,7 +380,7 @@ One JSON object per line. Common fields: `ts` (milliseconds), `event`, `session`
 | `session.renamed` | `title` `tmux` | you renamed it |
 | `session.titled` | `title` `tmux` | the agent set or changed its own title |
 | `session.moved` | `group` | moved to another group |
-| `session.rehomed` | `tool` `account` `from` (the previous `tool:account`) | carried on under another account (`aca restart --as`, or picking another account of the same kind under `H` in the interface): the conversation is copied to the new account and the session restarts in place |
+| `session.rehomed` | `tool` `account` `from` (the previous `tool:account`) | carried on under another account (`aca restart --as`, or `X` in the interface): the conversation is copied to the new account and the session restarts in place |
 | `session.archived` / `session.removed` | a removal carries `title`; a session let go with `aca release` adds `released` (its tmux session is still there) | |
 | `turn.started` | `prompt` | you sent a message |
 | `turn.done` | `last` (the last reply) `bg` (background tasks still running) `secs` | a turn finished |

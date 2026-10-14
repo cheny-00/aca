@@ -56,6 +56,10 @@ fn days_label(d: u64) -> String {
     tr!("{d} 天", "{d}d")
 }
 const REFRESH: Duration = Duration::from_secs(2);
+/// 底栏那句话留多久
+const FLASH: Duration = Duration::from_secs(3);
+/// 上次的界面怎么没的、后台出了错:开界面那一下人可能还没看过来,留久一点
+const NOTICE: Duration = Duration::from_secs(12);
 /// 多久看一眼事件流的文件变没变(一次 stat);变了就不等 REFRESH,马上重读
 const EVENT_TICK: Duration = Duration::from_millis(150);
 /// 事件触发的刷新最密隔这么久
@@ -771,7 +775,28 @@ fn row_segments(
         let q = clip(&s.question, width.saturating_sub(lead_w + cont.width() + 1)).trim_end().to_string();
         lines.push(vec![(" ".repeat(lead_w), Style::new()), (cont.into(), theme::faint()), (q, Style::new().fg(theme::pal().red))]);
     }
+    // 额度用完 / 没登录停下的:原话,后面写能干什么
+    if can_rehome(s) {
+        let hint = t!("  X 换账号", "  X switch account");
+        let room = width.saturating_sub(lead_w + cont.width() + 1 + hint.width());
+        let e = clip(&s.error, room).trim_end().to_string();
+        lines.push(vec![
+            (" ".repeat(lead_w), Style::new()),
+            (cont.into(), theme::faint()),
+            (e, Style::new().fg(theme::pal().red)),
+            (hint.into(), theme::accent().add_modifier(Modifier::BOLD)),
+        ]);
+    }
     lines
+}
+
+/// 因为账号(额度用完、没登录、欠费)停下的登记的 Claude / Codex 会话:换个账号就能接着跑(`X`)
+fn can_rehome(s: &Session) -> bool {
+    s.state == State::Error
+        && s.error_kind == "account"
+        && s.sub.is_none()
+        && !s.deck_id.is_empty()
+        && matches!(s.agent, Agent::Claude | Agent::Codex)
 }
 
 /// 标题前面那一小段:窗口 / 窗格写 tmux 的编号(#2 / #2.1);子代理没有编号,是别的子代理再起的写个 ↳
@@ -838,6 +863,7 @@ fn state_word(s: &Session) -> String {
         State::Running => t!("运行中", "running").into(),
         State::Unread => tr!("未读 · {}", "unread · {}", ago(s.idle_for)),
         State::Idle => tr!("空闲 · {}", "idle · {}", ago(s.idle_for)),
+        State::Error if s.error_kind == "account" => t!("出错 · 额度 / 登录", "error · quota / login").into(),
         State::Error => t!("出错", "error").into(),
         State::Exited => tr!("已退出 · {}", "exited · {}", ago(s.idle_for)),
         State::Stopped => t!("已停止", "stopped").into(),
@@ -1016,6 +1042,27 @@ fn preview_head(s: &Session, g: Option<&Glance>, note: Option<&str>, editing: bo
             Fork::Of(t) => out.push(Line::styled(clip(&tr!("分自「{t}」", "forked from “{t}”"), w).trim_end().to_string(), dim())),
             Fork::Gone => out.push(Line::styled(t!("分叉出来的 · 原会话已删", "a fork · original deleted"), dim())),
             Fork::No => {}
+        }
+    }
+    // 出错停下的:原话(最多两行);因为账号停下的,写上 X 能干什么
+    if s.state == State::Error && !s.error.is_empty() {
+        let red = Style::new().fg(theme::pal().red);
+        for (i, l) in wrap_width(&s.error, w.saturating_sub(2)).into_iter().take(2).enumerate() {
+            out.push(Line::from(vec![Span::styled(if i == 0 { "✕ " } else { "  " }, red), Span::styled(l, red)]));
+        }
+        if can_rehome(s) {
+            out.push(Line::from(vec![
+                button(t!("X 换账号", "X switch account"), theme::pal().accent),
+                Span::raw(" "),
+                Span::raw(
+                    clip(
+                        t!("对话整段带到别的账号,在原地接着跑", "carry the whole conversation on under another account, in place"),
+                        w.saturating_sub(14),
+                    )
+                    .trim_end()
+                    .to_string(),
+                ),
+            ]));
         }
     }
     let warn = theme::warn();
@@ -1676,15 +1723,6 @@ enum Confirm {
         key: String,
         text: String,
     },
-    /// H 里挑了同一家的别的账号:y = 换成它、原地重启接着这段对话;H = 还是交接(handoff 是备好的那个,
-    /// 建不了的话没有)。why:为什么要问(正在跑…)
-    Rehome {
-        t: Target,
-        to: String,
-        label: String,
-        why: String,
-        handoff: Option<Box<Job>>,
-    },
     /// A:接管这个普通 tmux 会话。plan:认出来的、打算怎么登记(给人看的就是它,y 之后照它做)
     Adopt {
         t: Target,
@@ -1817,9 +1855,6 @@ struct Pass {
     note: Option<String>,
     /// 它还在跑 / 在等你选:菜单里提一句,两边会一起动同一处
     busy: bool,
-    /// 它现在登记的工具、账号:菜单里挑了同一家的别的账号,问要不要改成原地换账号(见 `Confirm::Rehome`)
-    tool: String,
-    account: String,
 }
 
 /// `m` 挑分组要的
@@ -1977,6 +2012,8 @@ pub struct App {
     /// 刚按过 v:底栏亮一会儿「布局 分屏 → 预览为主 → 只看列表」
     layout_at: Option<Instant>,
     msg: Option<(String, Instant)>,
+    /// msg 在底栏留多久(一般 3 秒;上次界面怎么没的那句留久一点)
+    msg_ttl: Duration,
     /// 上一帧的屏幕大小,`v` 的提示里说「自动」现在落在哪边
     screen: Rect,
     pins: Pins,
@@ -2096,6 +2133,10 @@ pub struct App {
     handoff: Option<Pass>,
     /// `H` 从哪认出要交接的对话(`with_handoff`);默认认不出,单元测试不碰真实文件
     source_loader: fn(&Session) -> Result<Source, String>,
+    /// `X` 换账号的框:各账号的额度、问登录着没有(`with_rehome`);默认什么都没有、问不出,单元测试不碰真实文件
+    rehome_quotas: fn(Agent) -> Vec<crate::usage::Quota>,
+    rehome_ask: fn(Agent, &str) -> crate::accounts::Login,
+    rehome_background: bool,
     /// 等 y 确认的:删除(`d`)/ 重启(`R`)/ 停止 / 发便签。确认了放进 `job`,由 run 循环放到后台去做
     confirm: Option<Confirm>,
     /// 底栏里正在输入的:`r` 新标题 / `G` 新分组名
@@ -2174,6 +2215,7 @@ impl App {
             preview_narrow: Preview::Auto,
             layout_at: None,
             msg: None,
+            msg_ttl: FLASH,
             screen: Rect::default(),
             pins: Pins::default(),
             notes: Notes::default(),
@@ -2248,6 +2290,9 @@ impl App {
             tool_menu: None,
             handoff: None,
             source_loader: |_| Err(t!("找不到它的对话记录", "can't find its conversation record").into()),
+            rehome_quotas: |_| vec![],
+            rehome_ask: |_, _| crate::accounts::Login::Unknown(String::new()),
+            rehome_background: false,
             group_hints: crate::data::GroupHints::default,
             adopt_planner: |_| Err(t!("这里认不了", "can't recognize it here").into()),
             new_group_dir: || "~/workspace".into(),
@@ -2330,6 +2375,17 @@ impl App {
 
     pub fn with_handoff(mut self, f: fn(&Session) -> Result<Source, String>) -> Self {
         self.source_loader = f;
+        self
+    }
+
+    /// `X` 换账号的框:额度从哪读、登录怎么问、放不放到后台问
+    pub fn with_rehome(
+        mut self,
+        quotas: fn(Agent) -> Vec<crate::usage::Quota>,
+        ask: fn(Agent, &str) -> crate::accounts::Login,
+        background: bool,
+    ) -> Self {
+        (self.rehome_quotas, self.rehome_ask, self.rehome_background) = (quotas, ask, background);
         self
     }
 
@@ -4251,21 +4307,8 @@ impl App {
             let mut d = p.draft;
             (d.tool, d.account) = (t.tool.clone(), t.account.clone());
             d.label = t.name.clone();
-            let handoff = d.finish().map(|req| Job::Handoff { t: p.t.clone(), from: p.from.clone(), req, to: t.agent, note: p.note });
-            // 同一家的别的账号:对话能原样带过去,先问是原地换账号还是交接(登记的会话才换得了)
-            if t.agent == p.from.agent && !p.t.id.is_empty() && (t.tool != p.tool || t.account != p.account) {
-                let to = if t.account.is_empty() { t.tool.clone() } else { format!("{}:{}", t.tool, t.account) };
-                let why = if p.busy {
-                    t!("它还在跑 / 在等你选,换账号会打断它", "it's running or waiting for you; switching interrupts it")
-                } else {
-                    ""
-                };
-                let handoff = handoff.ok().map(Box::new);
-                self.confirm = Some(Confirm::Rehome { t: p.t, to, label: t.name.clone(), why: why.into(), handoff });
-                return;
-            }
-            match handoff {
-                Ok(job) => self.job = Some(job),
+            match d.finish() {
+                Ok(req) => self.job = Some(Job::Handoff { t: p.t, from: p.from, req, to: t.agent, note: p.note }),
                 Err(e) => self.flash(&e),
             }
             return;
@@ -4558,6 +4601,24 @@ impl App {
         self.prompt = Some(Prompt { text: fork_title(&t.title), ask: Ask::Fork(t), hint: String::new() });
     }
 
+    /// X:换个账号接着跑 —— 框里是它现在的账号和额度、能换过去的账号(登录着没有、额度),⏎ 直接换(见 `rehome`)
+    fn ask_rehome(&mut self) {
+        self.digits.clear();
+        let Some(t) = self.deck_target(t!("换账号", "switch accounts of")) else { return };
+        let Some(s) = self.current().cloned() else { return };
+        if !matches!(s.agent, Agent::Claude | Agent::Codex) {
+            return self.flash(t!("只能给 Claude / Codex 会话换账号", "only Claude / Codex sessions can switch accounts"));
+        }
+        let tools = match (self.tools_loader)() {
+            Ok(v) => v,
+            Err(e) => return self.flash(&e),
+        };
+        let env = crate::rehome::Env { ask: self.rehome_ask, background: self.rehome_background, accounts: self.accounts_page };
+        let now = epoch() as i64;
+        let menu = crate::rehome::Menu::new(t, &s, tools, &(self.rehome_quotas)(s.agent), (now, crate::usage::local_offset()), env);
+        self.open(Box::new(menu));
+    }
+
     /// H:交接给新会话 —— 先挑新会话的工具 / 账号(`n` 的菜单,没有 shell),在它的目录、分组里建好,
     /// 把交接说明发过去,让新会话读它的对话接着干(见 `handoff`)。它的便签一起带过去
     fn ask_handoff(&mut self) {
@@ -4594,7 +4655,7 @@ impl App {
         let t = Target { name: s.name.clone(), title: s.title.clone(), profile: s.profile.clone(), id: s.deck_id.clone() };
         let note = from.note.is_some().then_some(key);
         let busy = matches!(s.state, State::Running | State::Ask);
-        self.handoff = Some(Pass { t, from: Box::new(from), draft, note, busy, tool: s.tool.clone(), account: s.account.clone() });
+        self.handoff = Some(Pass { t, from: Box::new(from), draft, note, busy });
         self.tool_menu = Some((menu, 0));
     }
 
@@ -6068,7 +6129,12 @@ impl App {
     }
 
     pub fn flash(&mut self, m: &str) {
+        self.flash_for(m, FLASH);
+    }
+
+    pub fn flash_for(&mut self, m: &str, ttl: Duration) {
         self.msg = Some((m.to_string(), Instant::now()));
+        self.msg_ttl = ttl;
     }
 
     pub fn on_key(&mut self, k: KeyEvent) {
@@ -6152,9 +6218,6 @@ impl App {
                 }
                 Confirm::Send { t, pane, key, text } if yes => self.job = Some(Job::Send { t, pane, text, key }),
                 Confirm::Send { .. } => self.flash(t!("没发", "not sent")),
-                Confirm::Rehome { t, to, label, .. } if yes => self.job = Some(Job::Rehome { t, to, label }),
-                Confirm::Rehome { handoff: Some(j), .. } if matches!(k.code, KeyCode::Char('H' | 'h')) => self.job = Some(*j),
-                Confirm::Rehome { .. } => self.flash(t!("没换账号", "account not switched")),
                 Confirm::Adopt { t, plan } if yes => self.job = Some(Job::Adopt { t, plan }),
                 Confirm::Adopt { .. } => self.flash(t!("没接管", "not adopted")),
             }
@@ -6284,6 +6347,7 @@ impl App {
             // F 是原来的「起名再分叉」,现在 f 就是
             KeyCode::Char('f' | 'F') => self.ask_fork(),
             KeyCode::Char('H') => self.ask_handoff(),
+            KeyCode::Char('X') => self.ask_rehome(),
             KeyCode::Char('A') => self.ask_adopt(),
             KeyCode::Char('M') => self.open_mcp(),
             KeyCode::Char('P') => self.open_plugins(),
@@ -6772,7 +6836,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ),
         // 按了 q / Q:比刚才的提示要紧
         _ if app.pending.is_some() => pending_bar(app, w),
-        Some((m, t)) if t.elapsed() < Duration::from_secs(3) => Line::styled(m.clone(), theme::warn()).centered(),
+        Some((m, t)) if t.elapsed() < app.msg_ttl => Line::styled(m.clone(), theme::warn()).centered(),
         _ if term_area.is_some() => menu_bar(&[vec![("Esc", t!("收起", "hide"), 0), ("exit", t!("关闭", "close"), 0)]], Some(0), w),
         _ if layout_strip.is_some() => layout_strip.unwrap_or_default(),
         _ if doing.is_some() => Line::styled(doing.clone().unwrap_or_default(), theme::warn()).centered(),
@@ -6841,7 +6905,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_tools(f, menu, *sel, app.handoff.as_ref());
     } else if let Some(o) = app.overlays.last() {
         // 底栏的那句话(刚说的,不然是后台在做的)也写在弹窗最下面:手机上弹窗盖着底栏,开着弹窗做的事结果就看不到了
-        let note = app.msg.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(3)).map(|(m, _)| m.clone()).or_else(|| app.doing());
+        let note = app.msg.as_ref().filter(|(_, t)| t.elapsed() < app.msg_ttl).map(|(m, _)| m.clone()).or_else(|| app.doing());
         if o.fill() {
             // 框的大小不变:最底下留一行给那句话(长了两行),没话说空着,页面的行不跟着跳
             modal_fill(f, o.width(), o.fill_rows(), theme::pal().accent, |w, h| {
@@ -7337,15 +7401,7 @@ fn draw_tools(f: &mut Frame, menu: &[Tool], sel: usize, pass: Option<&Pass>) {
                 marks.push(Span::styled(t!("带上便签", "with the note"), dim()));
             }
             if !marks.is_empty() {
-                out.push(Line::from(marks));
-            }
-            // 登记的会话:挑同一家的别的账号时还能原地换(见 `Confirm::Rehome`)
-            if !p.t.id.is_empty() {
-                let hint = t!("挑同一家的别的账号还能原地换、对话整段带过去", "same-kind accounts can also take it over in place");
-                out.push(Line::styled(clip(hint, w).trim_end().to_string(), dim()));
-            }
-            if out.len() > 2 {
-                out.push(Line::raw(""));
+                out.extend([Line::from(marks), Line::raw("")]);
             }
         }
         for (i, t) in menu.iter().enumerate().skip(start).take(TOOL_ROWS) {
@@ -7471,30 +7527,6 @@ fn draw_confirm(f: &mut Frame, c: &Confirm, all: &[Session]) {
             }
             (t.name.as_str(), t.title.as_str(), theme::pal().accent, t!("发送便签？", "Send the note?"), what, vec![], t!("发送", "send"))
         }
-        Confirm::Rehome { t, label, why, .. } => {
-            let what = [
-                tr!(
-                    "换到 {label}：在原地重启，接着这段对话，上下文原样带过去",
-                    "move to {label}: restart in place and resume this conversation with its whole context"
-                ),
-                t!(
-                    "新账号的缓存是空的：头一轮整段上下文要重新写一遍",
-                    "the new account's cache is cold: the first turn writes the whole context again"
-                )
-                .to_string(),
-            ]
-            .join("\n");
-            let notes = if why.is_empty() { vec![] } else { vec![why.clone()] };
-            (
-                t.name.as_str(),
-                t.title.as_str(),
-                theme::pal().accent,
-                t!("换账号接着跑？", "Carry on under another account?"),
-                what,
-                notes,
-                t!("换账号", "switch"),
-            )
-        }
         Confirm::Adopt { t, plan } => (
             t.name.as_str(),
             t.title.as_str(),
@@ -7530,11 +7562,7 @@ fn draw_confirm(f: &mut Frame, c: &Confirm, all: &[Session]) {
         out.extend(what.lines().flat_map(|l| wrap_width(l, w)).map(|l| Line::styled(l, dim())));
         out.extend(notes.iter().map(|n| Line::styled(clip(n, w).trim_end().to_string(), warn)));
         out.push(Line::raw(""));
-        let mut buttons = vec![button(&format!("y {act}"), border)];
-        if let Confirm::Rehome { handoff: Some(_), .. } = c {
-            buttons.extend([Span::raw("  "), Span::styled(t!("H 改成新开一个接手（交接）", "H hand off to a new session instead"), dim())]);
-        }
-        out.push(Line::from(buttons));
+        out.push(Line::from(vec![button(&format!("y {act}"), border)]));
         out
     });
 }
@@ -7852,7 +7880,7 @@ fn draw_reader(f: &mut Frame, app: &mut App) {
         ansi::paint_links(f.buffer_mut(), body, &rows);
     }
     let foot_line = match &app.msg {
-        Some((m, t)) if t.elapsed() < Duration::from_secs(3) => Line::styled(m.clone(), theme::warn()).centered(),
+        Some((m, t)) if t.elapsed() < app.msg_ttl => Line::styled(m.clone(), theme::warn()).centered(),
         _ => match diff {
             Some((mode, _)) => menu_bar(
                 &[
@@ -7923,7 +7951,7 @@ fn draw_trace(f: &mut Frame, app: &mut App) {
     let (w, h) = (area.width as usize, body.height as usize);
     let live = app.trace_live();
     let now = now_ms();
-    let msg = app.msg.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(3)).map(|(m, _)| m.clone());
+    let msg = app.msg.as_ref().filter(|(_, t)| t.elapsed() < app.msg_ttl).map(|(m, _)| m.clone());
     let Some(v) = app.trace.as_mut() else { return };
     // 换了主题(设置页预览、主题文件改了):排好的全重排
     let pal = theme::pal() as *const theme::Pal as usize;
@@ -8359,7 +8387,7 @@ fn draw_bill(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(lines.into_iter().skip(scroll).take(h).collect::<Vec<_>>()), body);
     }
     let foot_line = match &app.msg {
-        Some((m, t)) if t.elapsed() < Duration::from_secs(3) => Line::styled(m.clone(), theme::warn()).centered(),
+        Some((m, t)) if t.elapsed() < app.msg_ttl => Line::styled(m.clone(), theme::warn()).centered(),
         _ => {
             let mut keys = vec![
                 ("←→", t!("时段", "period"), 0),
@@ -8653,6 +8681,14 @@ fn yazi_blocked(dir: &str) -> Option<String> {
     (!found).then(|| t!("没找到 yazi(brew install yazi)", "yazi not found (brew install yazi)").into())
 }
 
+/// 出错时把终端还回去(exitlog 的善后在主线程上调):和正常退出一样关掉键盘增强、焦点事件、鼠标,退出全屏和 raw 模式。
+/// 不碰输入法:它的锁可能正被出错的那段占着(ime::Guard 退出时会切回去)
+fn release_terminal() -> std::io::Result<()> {
+    kbd(false);
+    let _ = execute!(stdout(), DisableFocusChange, DisableMouseCapture);
+    ratatui::try_restore()
+}
+
 /// 让出终端(进会话 / fzf / 编辑器)。扩展键盘协议先关掉,不然里面的程序收到的是它不认识的按键编码
 fn suspend() -> std::io::Result<()> {
     kbd(false);
@@ -8741,7 +8777,8 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
         .with_settings(crate::config::ime_auto, config_bad, crate::config::set, crate::accounts::all)
         .with_mcp(crate::mcp::load)
         .with_groups(crate::groups::load)
-        .with_handoff(crate::handoff::source);
+        .with_handoff(crate::handoff::source)
+        .with_rehome(crate::rehome::quotas, crate::accounts::login, true);
     // 远端任务的 server 在设置页里填;P 是插件页(挂载、远端任务都是插件了,在 : 菜单里)
     app = app.with_plugins(|| Box::new(crate::plugins::Page::new(crate::plugins::load)));
     // 起 Claude 时带不带 aca 的 mod(额度不靠状态栏)
@@ -8764,6 +8801,10 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     app.sync_failed = aca_core::config::problem().into_iter().collect();
     if let Some(state) = &restarted {
         app.resume(state, installed_at());
+    }
+    // 上次的界面是随终端关掉 / 出错退出的:说一次(见 exitlog.rs)
+    if let Some(m) = crate::exitlog::take_notice() {
+        app.flash_for(&m, NOTICE);
     }
     let mut saved = app.view_state();
     let mut lang = i18n::lang();
@@ -8826,7 +8867,10 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     });
 
     let mut quiet_until = Instant::now() + startup_quiet(crate::data::in_popup() || restarted.is_some());
+    // ratatui::init 会装自己的出错善后,先把原来的(std 默认的)拿出来,init 之后换成 exitlog 的
+    let std_hook = std::panic::take_hook();
     let mut terminal = ratatui::init();
+    crate::exitlog::install(std_hook, release_terminal);
     execute!(stdout(), EnableMouseCapture)?;
     focus_events(true);
     // 在 tmux 窗格里 / 直接开在 kitty 里时,切到别的窗格、别的 App 就把输入法还回去(弹窗收不到焦点事件)
@@ -8841,6 +8885,14 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     kbd(true);
     let res = (|| -> anyhow::Result<()> {
         loop {
+            // 终端没了(窗口被关、ssh 断了):不等读写出错,收尾退出(见 exitlog.rs)
+            if crate::exitlog::gone() {
+                return Ok(());
+            }
+            // 后台线程出错了:界面还在,底栏说一声
+            if let Some(m) = crate::exitlog::take_live() {
+                app.flash_for(&m, NOTICE);
+            }
             let mut refreshed = false;
             // 刚挪过就先攒着,停手再换上:滑动途中插进一次整屏重画,手机上就是一顿
             while let Ok(v) = rx.try_recv() {
@@ -9221,10 +9273,19 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     focus_events(false);
     crate::ime::english(false);
     let _ = execute!(stdout(), DisableMouseCapture);
-    ratatui::restore();
-    // 这次删的撤不回了(^L 重启也一样,撤销记录在内存里):真删(另起进程去删,不耽误退出)
+    // 终端没了(窗口被关、ssh 断了)就还不回去,也没处说:记进 exit.log,不打印、错误不往外交。
+    // 以前这里用 ratatui::restore(),还不回去就往没了的终端打印,出错再出错,程序直接中止(见 exitlog.rs)
+    let restored = ratatui::try_restore();
+    let gone = restored.is_err() || crate::exitlog::gone();
+    if gone {
+        crate::exitlog::term_gone(res.as_ref().err(), restored.as_ref().err());
+    }
+    // 这次删的撤不回了(^L 重启也一样,撤销记录在内存里):真删(另起进程去删,不耽误退出;终端没了也照删)
     if app.trash.release(None).unwrap_or(0) > 0 {
         crate::trash::purge_detached();
+    }
+    if gone {
+        return Ok(());
     }
     if app.relaunch && res.is_ok() {
         // 刚挪过的高亮可能还没记(停手才记),换之前补记一次
@@ -9251,7 +9312,8 @@ pub fn snapshot(w: u16, h: u16, keys: &str) -> anyhow::Result<String> {
         .with_tools(|| Ok(crate::tools::load()))
         .with_mcp(crate::mcp::load)
         .with_groups(crate::groups::load)
-        .with_handoff(crate::handoff::source);
+        .with_handoff(crate::handoff::source)
+        .with_rehome(crate::rehome::quotas, crate::accounts::login, true);
     let mut t = Terminal::new(TestBackend::new(w, h))?;
     t.draw(|f| draw(f, &mut app))?;
     for c in keys.chars() {
@@ -9382,6 +9444,8 @@ mod tests {
             subagents: vec![],
             subagent: None,
             tokens: vec![],
+            error: String::new(),
+            error_kind: String::new(),
         }
     }
 
@@ -9965,12 +10029,10 @@ mod tests {
         assert_eq!(app.msg.as_ref().unwrap().0, "已交接");
         assert_eq!(app.notes.get("id-跑"), None);
 
-        // 没发出去:说明留在新会话的便签里。挑的是同一家的别的账号,先问换不换账号,H 还是交接
+        // 没发出去:说明留在新会话的便签里。H 只管交接:挑同一家的别的账号也是新开一个(原地换账号是 X)
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('H'));
         press(&mut app, KeyCode::Enter);
-        assert!(matches!(app.confirm, Some(Confirm::Rehome { .. })));
-        press(&mut app, KeyCode::Char('H'));
         let job = app.take_job().unwrap();
         let Job::Handoff { note, to, .. } = &job else { panic!() };
         assert_eq!((note, *to), (&None, Agent::Claude));
@@ -9980,45 +10042,143 @@ mod tests {
         assert!(app.current().unwrap().noted);
     }
 
-    #[test]
-    fn shift_h_on_another_account_of_the_same_kind_can_switch_accounts_in_place() {
-        let mut app = fixture().with_tools(handoff_tools).with_handoff(fake_source).with_group_hints(hints);
-        app.set_sessions(sessions());
-        select(&mut app, "闲");
-        press(&mut app, KeyCode::Char('H'));
-        shows(&reader_rows(&mut app, 60, 14), &["挑同一家的别的账号还能原地换"]);
-        // 闲是 Claude:挑 cw(Claude 的别的账号)先问
-        press(&mut app, KeyCode::Char('1'));
-        assert!(app.job.is_none() && app.tool_menu.is_none());
-        let rows = reader_rows(&mut app, 70, 16);
-        shows(&rows, &["换账号接着跑？", "换到 cw：在原地重启", "缓存是空的", "y 换账号", "H 改成新开一个接手"]);
-        // 别的键取消
-        press(&mut app, KeyCode::Enter);
-        assert!(app.confirm.is_none() && app.job.is_none());
-        assert_eq!(app.msg.as_ref().unwrap().0, "没换账号");
+    fn rehome_quotas(_: Agent) -> Vec<crate::usage::Quota> {
+        let q = |who: &str, five: f64, week: f64| crate::usage::Quota {
+            agent: Agent::Claude,
+            who: who.into(),
+            plan: String::new(),
+            wins: vec![
+                crate::usage::Win { label: "5h".into(), used: five, resets: None },
+                crate::usage::Win { label: "7d".into(), used: week, resets: None },
+            ],
+            updated: 0,
+            note: String::new(),
+        };
+        vec![q("ding", 98.0, 61.0), q("cw", 12.0, 40.0)]
+    }
 
-        press(&mut app, KeyCode::Char('H'));
-        press(&mut app, KeyCode::Char('1'));
-        press(&mut app, KeyCode::Char('y'));
+    /// cw2 没登录,别的都登录着
+    fn rehome_ask(_: Agent, name: &str) -> crate::accounts::Login {
+        if name == "cw2" { crate::accounts::Login::Out } else { crate::accounts::Login::In("max".into()) }
+    }
+
+    fn rehome_tools() -> Result<Vec<Tool>, String> {
+        Ok(vec![
+            tool("shell", "shell", "", Agent::None),
+            tool("ding", "claude", "ding", Agent::Claude),
+            tool("cw", "claude", "cw", Agent::Claude),
+            tool("cw2", "claude", "cw2", Agent::Claude),
+            tool("cx", "codex", "cx", Agent::Codex),
+        ])
+    }
+
+    /// 都在 ding 上
+    fn on_ding() -> Vec<Session> {
+        sessions()
+            .into_iter()
+            .map(|mut s| {
+                (s.account, s.who) = ("ding".into(), "ding".into());
+                s
+            })
+            .collect()
+    }
+
+    #[test]
+    fn x_lists_the_other_accounts_with_their_quota_and_login_and_enter_switches() {
+        let mut app = fixture().with_tools(rehome_tools).with_rehome(rehome_quotas, rehome_ask, false);
+        app.set_sessions(on_ding());
+        select(&mut app, "闲");
+        press(&mut app, KeyCode::Char('X'));
+        // 顶上是现在的账号和额度;下面只有同一家的别的账号(没有它自己、没有 Codex、没有 shell),登录着没有、额度
+        let rows = reader_rows(&mut app, 80, 24);
+        shows(
+            &rows,
+            &[
+                "「闲」换个账号接着跑",
+                "现在  Claude·ding   5h 98% · 7d 61%",
+                "换到哪个账号 —— 对话整段带过去,在原地重启:",
+                "› 1 cw    ● 登录着      5h 12% · 7d 40%",
+                "  2 cw2   ○ 没登录      额度没记到",
+                "新账号的缓存是空的",
+                "⏎ 换过去",
+            ],
+        );
+        assert!(!rows.iter().any(|r| r.contains(" cx ") || r.contains("会打断")), "{rows:#?}");
+        // 没登录的不让换
+        press(&mut app, KeyCode::Char('2'));
+        assert!(app.job.is_none() && !app.overlays.is_empty());
+        assert_eq!(app.msg.as_ref().unwrap().0, "cw2 没登录 · a 去账号页登录,登好再按 X");
+        // ⏎ 换到高亮的那个,框收起
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.overlays.is_empty());
         assert_eq!(app.job, Some(Job::Rehome { t: target("闲"), to: "claude:cw".into(), label: "cw".into() }));
         let job = app.take_job().unwrap();
         assert_eq!(app.busy.as_deref(), Some("正在把「闲」换到 cw…"));
-        app.job_done(&job, Outcome::Done("已换到 cw,对话接着来".into()), sessions());
-        assert_eq!(app.current().unwrap().title, "闲");
-        assert_eq!(app.msg.as_ref().unwrap().0, "已换到 cw,对话接着来");
+        app.job_done(&job, Outcome::Done("已换到 cw,对话接着来".into()), on_ding());
+        assert_eq!((app.current().unwrap().title.as_str(), app.msg.as_ref().unwrap().0.as_str()), ("闲", "已换到 cw,对话接着来"));
 
         // 在跑的:框里说会打断它
         select(&mut app, "跑");
-        press(&mut app, KeyCode::Char('H'));
-        press(&mut app, KeyCode::Char('1'));
-        shows(&reader_rows(&mut app, 70, 16), &["换账号会打断它"]);
+        press(&mut app, KeyCode::Char('X'));
+        shows(&reader_rows(&mut app, 80, 24), &["⚠ 它正在跑 / 在等你选:换账号会打断这一轮"]);
         press(&mut app, KeyCode::Esc);
+        assert!(app.overlays.is_empty() && app.job.is_none());
+    }
 
-        // 换到别家(Codex):照旧直接交接
+    #[test]
+    fn x_says_why_it_cannot_switch() {
+        // 没有别的账号:说怎么加
+        let mut app =
+            fixture().with_tools(|| Ok(vec![tool("ding", "claude", "ding", Agent::Claude)])).with_rehome(rehome_quotas, rehome_ask, false);
+        app.set_sessions(on_ding());
         select(&mut app, "闲");
-        press(&mut app, KeyCode::Char('H'));
-        press(&mut app, KeyCode::Char('2'));
-        assert!(app.confirm.is_none() && matches!(app.job, Some(Job::Handoff { .. })));
+        press(&mut app, KeyCode::Char('X'));
+        shows(&reader_rows(&mut app, 80, 20), &["没有别的 Claude 账号可以换。", "按 + 加一个,登录好再按 X。", "+ 加账号"]);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.job.is_none());
+        press(&mut app, KeyCode::Esc);
+        // shell 会话、普通 tmux 会话:不开
+        let mut v = on_ding();
+        v[3].agent = Agent::None; // 闲
+        v[0].deck_id.clear(); // 问
+        let mut app = App::new(String::new(), v).with_tools(rehome_tools);
+        select(&mut app, "闲");
+        press(&mut app, KeyCode::Char('X'));
+        assert!(app.overlays.is_empty());
+        assert_eq!(app.msg.as_ref().unwrap().0, "只能给 Claude / Codex 会话换账号");
+        select(&mut app, "问");
+        press(&mut app, KeyCode::Char('X'));
+        assert_eq!(app.msg.as_ref().unwrap().0, "普通 tmux 会话不能换账号(没在 aca 里登记) · A 接管");
+    }
+
+    #[test]
+    fn a_session_stopped_by_its_account_says_so_and_points_to_x() {
+        let fail = |error: &str, kind: &str| {
+            let mut v = on_ding();
+            let s = v.iter_mut().find(|s| s.title == "闲").unwrap();
+            (s.state, s.error, s.error_kind) = (State::Error, error.into(), kind.into());
+            v
+        };
+        let mut app = fixture().with_tools(rehome_tools);
+        app.set_sessions(fail("You've hit your session limit · resets 2:40pm", "account"));
+        select(&mut app, "闲");
+        let rows = reader_rows(&mut app, 100, 30);
+        // 列表那一行下面:原话(放不下截短)、X 能干什么;预览:状态、原话、按钮
+        shows(
+            &rows,
+            &[
+                "You've hit your session li…  X 换账号",
+                "出错 · 额度 / 登录",
+                "✕ You've hit your session limit",
+                "X 换账号  对话整段带到别的账号",
+            ],
+        );
+        // 别的出错(不是账号的):只在预览里写原话,不提 X
+        app.set_sessions(fail("prompt is too long", "fatal"));
+        let rows = reader_rows(&mut app, 100, 30);
+        shows(&rows, &["✕ prompt is too long"]);
+        assert!(!rows.iter().any(|r| r.contains("X 换账号")), "{rows:#?}");
     }
 
     #[test]
@@ -13189,6 +13349,8 @@ mod tests {
             subagents: vec![],
             subagent: None,
             tokens: vec![],
+            error: String::new(),
+            error_kind: String::new(),
         }
     }
 

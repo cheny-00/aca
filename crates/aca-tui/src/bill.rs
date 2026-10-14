@@ -266,7 +266,7 @@ fn local(ts: i64, off: i64) -> (i64, i64, i64) {
 }
 
 /// 几点:今天 14:30 / 明天 09:00 / 周五 09:00 / 10/12 09:00
-fn when(ts: i64, now: i64, off: i64) -> String {
+pub(crate) fn when(ts: i64, now: i64, off: i64) -> String {
     let (d, h, m) = local(ts, off);
     let today = local(now, off).0;
     let day = match d - today {
@@ -282,7 +282,7 @@ fn when(ts: i64, now: i64, off: i64) -> String {
 }
 
 /// 刚刚 / 3 分钟前
-fn ago(ts: i64, now: i64) -> String {
+pub(crate) fn ago(ts: i64, now: i64) -> String {
     match (now - ts).max(0) as u64 {
         0..=59 => t!("刚刚", "just now").into(),
         s => tr!("{}前", "{} ago", crate::data::dur(s)),

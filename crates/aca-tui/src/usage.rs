@@ -1084,6 +1084,54 @@ fn codex_quota(src: &Source, ts: i64, r: &XRate) -> Option<Quota> {
     Some(Quota { agent: Agent::Codex, who: src.who.clone(), plan: r.plan_type.clone().unwrap_or_default(), wins, updated: ts, note })
 }
 
+/// 一个 Codex 账号现在的额度,不扫整个目录(换账号的框里用,要快):最近三天里最近改过的几份对话记录,
+/// 从末尾往前找最后一次记下的 rate_limits。没有(API key 的账号不记、最近没用过)= None
+pub fn codex_now(src: &Source) -> Option<Quota> {
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = vec![];
+    for day in newest_dirs(&src.dir.join("sessions"), 3, 3) {
+        for e in std::fs::read_dir(&day).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+                files.push((e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), e.path()));
+            }
+        }
+    }
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    files.iter().take(8).find_map(|(_, f)| last_rate(f).and_then(|(ts, r)| codex_quota(src, ts, &r)))
+}
+
+/// `dir` 底下 `depth` 层的目录(年 / 月 / 日),名字大的(新的)在前,最多 n 个
+fn newest_dirs(dir: &Path, depth: u32, n: usize) -> Vec<PathBuf> {
+    let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    subs.sort();
+    if depth <= 1 {
+        return subs.into_iter().rev().take(n).collect();
+    }
+    let mut out = vec![];
+    for d in subs.iter().rev() {
+        out.extend(newest_dirs(d, depth - 1, n - out.len()));
+        if out.len() >= n {
+            break;
+        }
+    }
+    out
+}
+
+/// 一份 Codex 记录里最后一次记下的额度和时刻(只读最后 2 MB)
+fn last_rate(path: &Path) -> Option<(i64, XRate)> {
+    let mut f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(2 << 20))).ok()?;
+    let mut buf = vec![];
+    f.read_to_end(&mut buf).ok()?;
+    buf.split(|b| *b == b'\n').rev().filter(|l| Finder::new(b"\"rate_limits\":{").find(l).is_some()).find_map(|l| {
+        let v: serde_json::Value = serde_json::from_slice(l).ok()?;
+        let r: XRate = serde_json::from_value(v["payload"]["rate_limits"].clone()).ok()?;
+        Some((parse_ts(v["timestamp"].as_str()?), r))
+    })
+}
+
 /// 本地时区偏移(秒):借 SQLite 的 localtime,跟着 TZ 走
 pub fn local_offset() -> i64 {
     rusqlite::Connection::open_in_memory()
@@ -1820,6 +1868,35 @@ pub(crate) mod tests {
         assert_eq!((r.ranges[1].days, r.ranges[1].active), (4, 2));
         assert_eq!(r.quotas.len(), 1);
         assert_eq!((r.quotas[0].who.as_str(), r.quotas[0].wins[0].label.as_str()), ("cx", "5h"));
+    }
+
+    #[test]
+    fn a_codex_accounts_quota_now_comes_from_its_latest_rollouts() {
+        let d = std::env::temp_dir().join(format!("aca-codex-now-{}", std::process::id()));
+        let day = d.join("sessions/2026/10/14");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::create_dir_all(d.join("sessions/2026/10/13")).unwrap();
+        let rate = |used: f64, ts: &str| {
+            format!(
+                r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":{used},"window_minutes":300,"resets_at":1791990000}},"secondary":{{"used_percent":40.0,"window_minutes":10080}},"plan_type":"plus"}}}}}}"#
+            )
+        };
+        // 一份记了两次(取后面那次),一份没记过(API key 那种是 null)
+        let a = format!(
+            "{}\n{}\n{{\"type\":\"turn_context\",\"payload\":{{}}}}\n",
+            rate(10.0, "2026-10-14T01:00:00Z"),
+            rate(97.5, "2026-10-14T02:00:00Z")
+        );
+        std::fs::write(day.join("rollout-2026-10-14T01-00-00-a.jsonl"), a).unwrap();
+        std::fs::write(d.join("sessions/2026/10/13/rollout-2026-10-13T01-00-00-b.jsonl"), "{\"payload\":{\"rate_limits\":null}}\n")
+            .unwrap();
+        let src = Source { agent: Agent::Codex, who: "cx".into(), dir: d.clone() };
+        let q = codex_now(&src).unwrap();
+        let wins: Vec<(&str, f64)> = q.wins.iter().map(|w| (w.label.as_str(), w.used)).collect();
+        assert_eq!((q.who.as_str(), q.plan.as_str(), wins), ("cx", "plus", vec![("5h", 97.5), ("7d", 40.0)]));
+        assert_eq!(q.updated, parse_ts("2026-10-14T02:00:00Z"));
+        assert_eq!(codex_now(&Source { dir: d.join("nothing"), ..src }), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

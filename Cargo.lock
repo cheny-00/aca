@@ -37,6 +37,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "signal-hook",
  "syntect",
  "toml",
  "two-face",

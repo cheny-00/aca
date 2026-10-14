@@ -98,11 +98,16 @@ Creating, taking over
             conversation record, an extracted text version (what both sides said, subagent reports, the files it
             changed, in ~/.local/state/aca/ui/handoff/), the directory, the conversation id, and its note; the new
             session reads it all and carries on, asking you first only if the original ended with a question its note
-            doesn't answer. The original is left alone. If it can't be sent it stays in the new session's note (s sends).
-            Picking another account of the same kind (on a registered session) asks first: y switches accounts —
-            no new session: it restarts in place on that account and resumes this conversation, its record copied
-            to the new account's config directory, the context whole (for when one account ran out of quota; same as
-            aca restart <id> --as ACCOUNT); H hands off after all; any other key cancels
+            doesn't answer. The original is left alone. If it can't be sent it stays in the new session's note (s sends)
+  X         carry on under another account (for when one ran out of quota mid-task): no new session — it restarts in
+            place on another account of the same kind and resumes this conversation, its record copied to the new
+            account's config directory, the context whole; row, tmux session, title and note stay. The box shows the
+            current account and its quota on top, then the accounts it can move to: logged in or not, and quota
+            (5h / 7d used; amber past 70%, red past 90%, as on the billing page). ⏎ or a digit switches; a logged-out
+            one can't be picked: a opens the accounts page to log in, + adds an account (then X again). If it's
+            running or waiting for you the box says switching interrupts the turn. The new account's cache is cold:
+            the first turn writes the whole context again. A session stopped by quota or login shows the error and
+            "X switch account" under its row. Same as aca restart <id> --as ACCOUNT
   A         adopt: register an ordinary tmux session (not started by aca: by hand, by agent-deck) as aca's, without
             stopping it. A confirmation shows which agent, which account, which conversation it recognized and what the
             session will be renamed to; only y adopts. Same as aca adopt (what it recognizes and what to watch out for

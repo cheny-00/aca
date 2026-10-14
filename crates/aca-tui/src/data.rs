@@ -125,6 +125,9 @@ pub struct Session {
     pub subagent: Option<Subagent>,
     /// 插件挂在行上的字(`aca meta set`,没过期的):名字 → 值
     pub tokens: Vec<(String, String)>,
+    /// 出错停下的(登记的会话):hook 报的原话和类别(transient / account / fatal,见 `lifecycle::error_kind`);没出错是空的
+    pub error: String,
+    pub error_kind: String,
 }
 
 /// 父子会话(在某个会话里 `aca new` 的、`--parent` 指定的)。
@@ -997,6 +1000,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
                 subagents: vec![],
                 subagent: None,
                 tokens: vec![],
+                error: String::new(),
+                error_kind: String::new(),
             });
             continue;
         };
@@ -1056,6 +1061,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             subagents: vec![],
             subagent: None,
             tokens: r.live_tokens(now).into_iter().collect(),
+            error: if state == State::Error { r.error.clone() } else { String::new() },
+            error_kind: if state == State::Error { r.error_kind.clone() } else { String::new() },
         });
     }
     // 会话里另开的窗口(prefix c)、分出来的窗格(prefix % / "):列在会话下面,自己的状态、自己认 agent。
@@ -1155,6 +1162,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             subagents: vec![],
             subagent: None,
             tokens: vec![],
+            error: String::new(),
+            error_kind: String::new(),
         });
     }
     link_parents(&mut out, &sessions);
@@ -1306,6 +1315,8 @@ pub(crate) mod tests {
             subagents: vec![],
             subagent: None,
             tokens: vec![],
+            error: String::new(),
+            error_kind: String::new(),
         }
     }
 

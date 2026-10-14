@@ -1447,7 +1447,10 @@ fn show(page: &mut Page) -> std::io::Result<()> {
             }
         }
     })();
-    ratatui::restore();
+    // 终端没了(窗口被关)就还不回去,也别再打印:往没了的终端打印会出错(见 exitlog.rs)
+    if ratatui::try_restore().is_err() {
+        return Ok(());
+    }
     out
 }
 

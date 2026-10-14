@@ -26,4 +26,5 @@ too_many_arguments = "allow"
 [profile.release]
 opt-level = 3
 lto = "thin"
-strip = true
+# 只去掉调试信息、留着函数名:崩溃报告(~/Library/Logs/DiagnosticReports/aca-*.ips)和 exit.log 里的调用栈直接看得出在哪个函数
+strip = "debuginfo"

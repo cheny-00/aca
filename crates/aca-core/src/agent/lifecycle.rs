@@ -45,6 +45,18 @@ fn choice(r: &mut Run, input: &Value) {
     r.ask_multi = qs.len() > 1 || first["multiSelect"].as_bool() == Some(true);
 }
 
+/// Claude 的 `StopFailure`:`error` 是错误的类型,屏幕上那句原话在 `last_assistant_message`(官方文档)。
+/// 类型说得清的照类型;订阅额度用完报的也是 `rate_limit`,和真的限流分不开,再看原话
+fn claude_kind(kind: &str, text: &str) -> Option<&'static str> {
+    Some(match kind {
+        "authentication_failed" | "oauth_org_not_allowed" | "account_on_hold" | "billing_error" | "cloud_credential_error" => "account",
+        "rate_limit" if error_kind(text) == "account" => "account",
+        "rate_limit" | "overloaded" | "server_error" => "transient",
+        "invalid_request" | "model_not_found" | "max_output_tokens" => "fatal",
+        _ => return None,
+    })
+}
+
 /// 一轮失败是哪一类,看错误原文(报了类别的那家用它报的,见 Codex 的 `unreported_end`):
 /// - transient:限流、过载、断流、5xx、超时,过一会儿再说一句「继续」多半就好了
 /// - account:额度用完、没登录、欠费,得人去处理
@@ -52,7 +64,9 @@ fn choice(r: &mut Run, input: &Value) {
 pub fn error_kind(text: &str) -> &'static str {
     let t = text.to_lowercase();
     let has = |ws: &[&str]| ws.iter().any(|w| t.contains(w));
-    if has(&["401", "403", "unauthorized", "authentication", "usage limit", "quota", "credit", "billing", "payment", "budget"]) {
+    // 订阅额度用完:Claude 屏幕上是「You've hit your session limit · resets 2:40pm」(2.1.29x),也有 weekly、5-hour 的
+    let plan = has(&["hit your", "session limit", "weekly limit", "-hour limit", "opus limit", "out of extra usage"]);
+    if plan || has(&["401", "403", "unauthorized", "authentication", "usage limit", "quota", "credit", "billing", "payment", "budget"]) {
         "account"
     } else if has(&[
         "429",
@@ -154,9 +168,15 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
         "StopFailure" => {
             r.status = "error".into();
             r.done = now;
-            r.error = clip(v["error"].as_str().or(v["message"].as_str()).unwrap_or(t!("这一轮失败了", "this turn failed")), 400);
+            // 原话在 last_assistant_message 里的(Claude),error 只是类型
+            let said = v["last_assistant_message"].as_str().filter(|t| !t.trim().is_empty());
+            let kind = v["error"].as_str().unwrap_or("");
+            r.error = clip(said.or(v["error"].as_str()).or(v["message"].as_str()).unwrap_or(t!("这一轮失败了", "this turn failed")), 400);
             r.clear_ask();
-            r.error_kind = v["error_kind"].as_str().map(str::to_string).unwrap_or_else(|| error_kind(&r.error).to_string());
+            r.error_kind = match v["error_kind"].as_str() {
+                Some(k) => k.to_string(),
+                None => said.and_then(|t| claude_kind(kind, t)).unwrap_or_else(|| error_kind(&r.error)).to_string(),
+            };
             out.push(("turn.failed", json!({ "error": r.error, "kind": r.error_kind })));
         }
         // 你按 Esc 打断的(Codex 会报,Claude 不报):人就在跟前,不算「跑完没看」
@@ -319,6 +339,9 @@ mod tests {
         assert_eq!(error_kind("API Error: 529 Overloaded"), "transient");
         assert_eq!(error_kind("stream disconnected before completion"), "transient");
         assert_eq!(error_kind("You've hit your usage limit. Upgrade or try later"), "account");
+        assert_eq!(error_kind("You've hit your session limit · resets 2:40pm (Asia/Taipei)"), "account");
+        assert_eq!(error_kind("Weekly limit reached ∙ resets Oct 20"), "account");
+        assert_eq!(error_kind("API Error: Rate limit reached"), "transient");
         assert_eq!(error_kind("401 Unauthorized"), "account");
         assert_eq!(error_kind("prompt is too long"), "fatal");
         // 报了类别的(Codex 那边补的)用它报的;没报的看原文
@@ -327,6 +350,19 @@ mod tests {
         assert_eq!((r.status.as_str(), r.error_kind.as_str(), out[0].1["kind"].as_str()), ("error", "transient", Some("transient")));
         apply(&mut r, &json!({"hook_event_name": "StopFailure", "error": "rate limit reached"}), 6);
         assert_eq!(r.error_kind, "transient");
+        // Claude:error 是类型,原话在 last_assistant_message。订阅额度用完也报 rate_limit,看原话分出来
+        let claude = |kind: &str, said: &str| {
+            let mut r = Run::default();
+            apply(&mut r, &json!({"hook_event_name": "StopFailure", "error": kind, "last_assistant_message": said}), 6);
+            (r.error, r.error_kind)
+        };
+        assert_eq!(
+            claude("rate_limit", "You've hit your session limit · resets 2:40pm (Asia/Taipei)"),
+            ("You've hit your session limit · resets 2:40pm (Asia/Taipei)".to_string(), "account".to_string())
+        );
+        assert_eq!(claude("rate_limit", "API Error: Rate limit reached").1, "transient");
+        assert_eq!(claude("authentication_failed", "API Error: 401").1, "account");
+        assert_eq!(claude("max_output_tokens", "API Error: output too long").1, "fatal");
         // 下一轮开始:原文和类别一起清掉
         apply(&mut r, &json!({"hook_event_name": "UserPromptSubmit", "prompt": "继续"}), 7);
         assert!(r.error.is_empty() && r.error_kind.is_empty());

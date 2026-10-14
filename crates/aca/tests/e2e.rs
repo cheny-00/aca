@@ -3725,3 +3725,61 @@ fn restart_as_another_account_carries_the_conversation_over_and_back() {
     assert_eq!((home.as_str(), after(&args, "-m")), (xa.to_str().unwrap(), None));
     assert_eq!(sb.json(&["show", &cx, "--json"])["args"], serde_json::json!([]));
 }
+
+/// 界面开在一个 shell 底下(sh 不理挂断,和 kitty 里 zsh 底下开的一样),窗格整个关掉 = kitty 关了那个窗口。
+/// 以前:往没了的终端打印出错,出错时的善后再打印、再出错,程序被中止(134),什么也没留下(2026-10-14 那次)。
+/// 现在:正常退出(0),exit.log 记着终端没了;下次打开界面,底栏说一次
+#[test]
+fn closing_the_terminal_under_the_interface_quits_quietly_and_says_so_next_time() {
+    let Some(sb) = Sandbox::new("hangup") else { return };
+    let status = sb.home.join("status");
+    let script = sb.home.join("ui.sh");
+    let q = |p: &Path| format!("'{}'", p.display());
+    write(
+        &script,
+        &format!(
+            "trap '' HUP\n\
+             unset TMUX TMUX_PANE KITTY_WINDOW_ID TERM_PROGRAM SSH_CONNECTION SSH_TTY\n\
+             export HOME={home} ACA_HOME={home} ACA_TMUX_SOCKET={sock} ACA_LANG=zh ACA_IME=0 TERM=xterm-256color\n\
+             {aca} ui\n\
+             echo $? >> {status}\n",
+            home = q(&sb.home),
+            sock = sb.socket,
+            aca = q(Path::new(env!("CARGO_BIN_EXE_aca"))),
+            status = q(&status),
+        ),
+    );
+    // 开一个界面,等屏幕上出现 want
+    let open = |name: &str, want: &str| {
+        sb.tmux(&["new-session", "-d", "-s", name, "-x", "120", "-y", "30", "/bin/sh", script.to_str().unwrap()]);
+        let mut screen = String::new();
+        for _ in 0..100 {
+            screen = sb.tmux(&["capture-pane", "-p", "-t", name]);
+            if screen.contains(want) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("没等到「{want}」:\n{screen}");
+    };
+    // 关掉后 aca 的退出码(一行一次)
+    let codes = |n: usize| {
+        assert!(sb.until(|| std::fs::read_to_string(&status).is_ok_and(|s| s.lines().count() >= n)), "aca 没退出");
+        std::fs::read_to_string(&status).unwrap()
+    };
+    let ui = sb.home.join("state/ui");
+
+    open("first", "快捷键");
+    sb.tmux(&["kill-pane", "-t", "first"]);
+    assert_eq!(codes(1), "0\n");
+    let log = std::fs::read_to_string(ui.join("exit.log")).unwrap();
+    assert!(log.contains("终端没了,界面跟着退出(终端)"), "{log}");
+    assert!(ui.join("last-exit").exists());
+
+    // 下次打开:底栏说一次,说完就删了
+    open("second", "随终端关掉退出了(终端)");
+    assert!(!ui.join("last-exit").exists());
+    sb.tmux(&["kill-pane", "-t", "second"]);
+    assert_eq!(codes(2), "0\n0\n");
+    assert_eq!(std::fs::read_to_string(ui.join("exit.log")).unwrap().matches("终端没了").count(), 2);
+}

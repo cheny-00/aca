@@ -336,7 +336,7 @@ plugins.toml 里不用写它(sync 不装它也不删它);要停着、改它给 a
 | `session.renamed` | `title` `tmux` | 人改的名 |
 | `session.titled` | `title` `tmux` | agent 自己起了 / 换了标题 |
 | `session.moved` | `group` | 挪分组 |
-| `session.rehomed` | `tool` `account` `from`(原来的「工具:账号」) | 换账号接着跑(`aca restart --as`、界面 `H` 里挑同一家的别的账号):对话拷到新账号,在原地重起 |
+| `session.rehomed` | `tool` `account` `from`(原来的「工具:账号」) | 换账号接着跑(`aca restart --as`、界面的 `X`):对话拷到新账号,在原地重起 |
 | `session.archived` / `session.removed` | 删的带 `title`;`aca release` 放手的多一个 `released`(tmux 会话还在) | |
 | `turn.started` | `prompt` | 你发了一句 |
 | `turn.done` | `last`(最后一条回复)`bg`(还挂着的后台任务数)`secs` | 一轮跑完 |
