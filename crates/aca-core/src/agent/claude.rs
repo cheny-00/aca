@@ -302,6 +302,28 @@ impl Agent for Claude {
         Some("CLAUDE_CONFIG_DIR")
     }
 
+    fn default_home(&self) -> Option<&str> {
+        Some("~/.claude")
+    }
+
+    /// 对话记录 `projects/<项目>/<id>.jsonl`,旁边同名的目录(子代理的记录、存出来的大段工具输出),
+    /// 还有 `/rewind` 用的 `file-history/<id>`、任务清单 `tasks/<id>`(有才算)
+    fn conv_files(&self, home: &Path, conv: &str) -> Vec<PathBuf> {
+        if conv.is_empty() || conv.contains('/') {
+            return vec![];
+        }
+        let file = format!("{conv}.jsonl");
+        let Some(dir) = std::fs::read_dir(home.join("projects")).ok().and_then(|d| d.flatten().find(|d| d.path().join(&file).is_file()))
+        else {
+            return vec![];
+        };
+        let project = Path::new("projects").join(dir.file_name());
+        let mut out = vec![project.join(&file)];
+        let extra = [project.join(conv), Path::new("file-history").join(conv), Path::new("tasks").join(conv)];
+        out.extend(extra.into_iter().filter(|p| home.join(p).is_dir()));
+        out
+    }
+
     fn new_conv(&self) -> String {
         paths::uuid4()
     }

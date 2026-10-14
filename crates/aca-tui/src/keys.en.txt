@@ -98,7 +98,11 @@ Creating, taking over
             conversation record, an extracted text version (what both sides said, subagent reports, the files it
             changed, in ~/.local/state/aca/ui/handoff/), the directory, the conversation id, and its note; the new
             session reads it all and carries on, asking you first only if the original ended with a question its note
-            doesn't answer. The original is left alone. If it can't be sent it stays in the new session's note (s sends)
+            doesn't answer. The original is left alone. If it can't be sent it stays in the new session's note (s sends).
+            Picking another account of the same kind (on a registered session) asks first: y switches accounts —
+            no new session: it restarts in place on that account and resumes this conversation, its record copied
+            to the new account's config directory, the context whole (for when one account ran out of quota; same as
+            aca restart <id> --as ACCOUNT); H hands off after all; any other key cancels
   A         adopt: register an ordinary tmux session (not started by aca: by hand, by agent-deck) as aca's, without
             stopping it. A confirmation shows which agent, which account, which conversation it recognized and what the
             session will be renamed to; only y adopts. Same as aca adopt (what it recognizes and what to watch out for
@@ -242,7 +246,11 @@ Panels and settings
               directory, who is logged in, how its status bar is wired, which sessions use it, whether it's a
               default account, its place in the n menu, the commands to type.
               ⏎ logs in (asks first when the account is logged in, y to go: the tool's login replaces the current
-              one, and Codex deletes it the moment login starts) · + adds an account · d unregisters (says what
+              one, and Codex deletes it the moment login starts) · no browser opens by itself: when the link comes,
+              a list offers copying it first, then the installed browsers (the default one marked), Esc leaves it;
+              over SSH only a link you can finish on another device (Claude: paste the page's code back; Codex: a
+              device code) ·
+              + adds an account · d unregisters (says what
               goes and who uses it first, y to confirm; the directory stays) · ⇧↑ ⇧↓ reorder (the n menu's order,
               kept under [ui] menu) · s each account's status bar wiring · r asks about the logins again ·
             n edit the tool menu in an editor · g the default directory for new groups · e edit config.toml in an editor ·

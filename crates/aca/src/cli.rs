@@ -974,6 +974,10 @@ fn unknown(name: &str) -> String {
 fn run(mut a: Args) -> Res<i32> {
     // 什么都不带:界面
     let Some(cmd) = a.maybe() else { return ui(vec![]) };
+    // 登录时工具拿 aca 当浏览器(见 aca_core::agent::quiet_login):链接交给界面或者不开,不开登记表
+    if cmd.starts_with("https://") || cmd.starts_with("http://") {
+        return Ok(agent::login_link(&cmd));
+    }
     // hook 最常跑:排在最前面,不开登记表
     match cmd.as_str() {
         "hook" if !help::asked(&a.0) => return Ok(hook::run(&a.next(Tr::new("哪个工具", "which tool"))?)),
@@ -1068,6 +1072,9 @@ fn run(mut a: Args) -> Res<i32> {
     // 写坏了的配置是当成没写的(hook 不能因为它出错),人敲的命令这里提醒一句
     if let Some(e) = config::problem() {
         eprintln!("{}", tr!("config.toml 写法有问题,当成没写:{e}", "config.toml has a problem and is ignored: {e}"));
+    }
+    if let Some(e) = config::login_problem() {
+        eprintln!("{}", tr!("config.toml 的 [login] 写法有问题,这一节当成没写:{e}", "config.toml's [login] has a problem and is ignored: {e}"));
     }
     let cfg = config::load();
     // 不建会话,带着账号原样跑工具自己的命令:换成它,终端直接是它的
@@ -1165,7 +1172,35 @@ fn run(mut a: Args) -> Res<i32> {
         "stop" => session::stop(&store, &a.next(ID)?)?,
         "restart" => {
             let fresh = a.flag("--fresh");
-            session::restart(&store, &cfg, &a.next(ID)?, fresh)?;
+            let to = a.opt("--as")?;
+            let key = a.next(ID)?;
+            match to {
+                Some(_) if fresh => {
+                    return Err(t!(
+                        "--as 是换账号接着原来的对话,和 --fresh 不能一起用",
+                        "--as carries the conversation over to another account; it doesn't go with --fresh"
+                    )
+                    .into());
+                }
+                Some(to) => {
+                    let r = session::rehome(&store, &cfg, &key, &to)?;
+                    match r.copied {
+                        0 => println!("{}", tr!("换到了 {},在原地重启", "moved to {}, restarted in place", r.to)),
+                        n => println!(
+                            "{}",
+                            tr!(
+                                "换到了 {},接着原来的对话(对话记录拷过去 {n} 个文件)",
+                                "moved to {}, resuming the conversation ({n} files of it copied over)",
+                                r.to
+                            )
+                        ),
+                    }
+                    if !r.note.is_empty() {
+                        println!("{}", r.note);
+                    }
+                }
+                None => session::restart(&store, &cfg, &key, fresh)?,
+            }
         }
         "fork" => {
             let title = a.opt("-t")?.unwrap_or_default();

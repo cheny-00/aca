@@ -204,6 +204,12 @@ impl Store {
         self.set(id, "conv", &conv)
     }
 
+    /// 换账号(连工具一起:同一家的另一个工具也行)
+    pub fn set_account(&self, id: &str, tool: &str, account: &str) -> Res<()> {
+        self.set(id, "tool", &tool)?;
+        self.set(id, "account", &account)
+    }
+
     pub fn set_args(&self, id: &str, args: &[String]) -> Res<()> {
         self.set(id, "args", &serde_json::to_string(args).unwrap())
     }

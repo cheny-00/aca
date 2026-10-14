@@ -1,4 +1,4 @@
-//! 对选中会话的操作:`R` 重启、`r` 改名、`m` 挪分组、`⇧↑` `⇧↓` 组内挪位置(分组上是挪分组的先后)、`f` / `F` 分叉、`H` 交接、`M` 挂 MCP、`d` 删除(分组上是删分组)、`A` 接管,
+//! 对选中会话的操作:`R` 重启、`H` 里挑同一家的别的账号 = 换账号接着跑、`r` 改名、`m` 挪分组、`⇧↑` `⇧↓` 组内挪位置(分组上是挪分组的先后)、`f` / `F` 分叉、`H` 交接、`M` 挂 MCP、`d` 删除(分组上是删分组)、`A` 接管,
 //! 还有 `^Z` 撤回删掉 / 停掉的,都是 aca-core 里的函数(`session::*`、登记表);`s` 发便签走 tmux。
 //! 停、删要等进程退干净(最长几秒),由 run 循环放进后台线程跑,界面不卡。
 
@@ -50,6 +50,9 @@ pub enum Job {
     /// H:照 req 新建一个会话(to 是它哪家),把 from 的交接说明发过去(见 `handoff`)。
     /// note:from 的便签带过去了,新会话建成就删(它的键)
     Handoff { t: Target, from: Box<Source>, req: NewReq, to: Agent, note: Option<String> },
+    /// H 里挑了同一家的别的账号、确认框里按 y:换成那个账号,在原地重启、接着这段对话(见 `session::rehome`)。
+    /// to 是「工具:账号」,label 是菜单里那个名字
+    Rehome { t: Target, to: String, label: String },
     /// A:接管一个普通 tmux 会话(不是 aca 起的),照确认框里给人看过的那份登记(见 `aca_core::adopt`)
     Adopt { t: Target, plan: Box<aca_core::adopt::Plan> },
     /// `^Z`:撤回删掉的(unarchive = 取消归档,见 trash.rs)/ 停掉的;start = 再启动(原来在跑)
@@ -99,6 +102,7 @@ impl Job {
             | Job::Remove { t, .. }
             | Job::Order { t, .. }
             | Job::Handoff { t, .. }
+            | Job::Rehome { t, .. }
             | Job::Adopt { t, .. }
             | Job::Revive { t, .. } => t,
             Job::GroupOrder { .. } | Job::Group(_) | Job::Plugins(_) => return None,
@@ -122,6 +126,7 @@ impl Job {
             Job::Order { t, .. } => tr!("正在挪「{}」…", "moving “{}”…", short(&t.title)),
             Job::GroupOrder { group, .. } => tr!("正在挪分组 {}…", "moving group {}…", short(group)),
             Job::Handoff { t, .. } => tr!("正在交接「{}」…", "handing off “{}”…", short(&t.title)),
+            Job::Rehome { t, label, .. } => tr!("正在把「{}」换到 {label}…", "moving “{}” to {label}…", short(&t.title)),
             Job::Adopt { t, .. } => tr!("正在接管「{}」…", "adopting “{}”…", short(&t.title)),
             Job::Revive { t, .. } => tr!("正在撤回「{}」…", "undoing “{}”…", short(&t.title)),
             Job::Group(a) => a.doing(),
@@ -210,6 +215,22 @@ pub fn run(job: &Job) -> Outcome {
         Job::Order { t, by, after } => order(&store, t, by, *after),
         Job::GroupOrder { group, by, after } => group_order(&store, group, by, *after),
         Job::Handoff { from, req, to, .. } => crate::handoff::run(from, req, *to),
+        Job::Rehome { t, to, label } => match session::rehome(&store, &cfg, &t.id, to) {
+            Ok(r) => {
+                let mut msg = match r.copied {
+                    0 => tr!("已换到 {label},重启了", "moved to {label} and restarted"),
+                    _ => tr!(
+                        "已换到 {label},对话接着来 · 说一句「继续」它就接着干",
+                        "moved to {label}, conversation resumed · say “continue” and it carries on"
+                    ),
+                };
+                if !r.note.is_empty() {
+                    msg = format!("{msg} · {}", r.note);
+                }
+                Outcome::Done(msg)
+            }
+            Err(e) => Outcome::Failed(tr!("换账号失败:{e}", "switching accounts failed: {e}")),
+        },
         Job::Adopt { plan, .. } => match aca_core::adopt::apply(&store, plan) {
             // 进程没动过,还没带 aca 的 hook:重启一次才有「跑完没看」
             Ok((s, _)) => Outcome::Made {

@@ -23,6 +23,25 @@ pub struct Term {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     size: (u16, u16),
+    /// 登录终端:盯着登录链接(见 [`Term::new_link`])
+    pub link: Option<Catch>,
+    /// 已经交出去弹过的那个链接
+    linked: Option<Link>,
+}
+
+/// 登录链接从哪来:Claude 交给 aca 的写在 file 里(见 `aca_core::agent::login_link`);
+/// Codex 不交(macOS 上它不认 BROWSER)、远程时 Claude 也不交,screen = 从屏幕上认
+#[derive(Clone, Debug, PartialEq)]
+pub struct Catch {
+    pub file: std::path::PathBuf,
+    pub screen: bool,
+}
+
+/// 登录链接;code = Codex 设备码登录给的一次性码(打开链接后在网页里输入)
+#[derive(Clone, Debug, PartialEq)]
+pub struct Link {
+    pub url: String,
+    pub code: Option<String>,
 }
 
 /// 程序问终端的话(设备属性、光标在哪)由我们替终端答:vt100 只解析不回话,
@@ -97,7 +116,33 @@ impl Term {
                 DIRTY.store(true, Ordering::Relaxed);
             });
         }
-        Ok(Term { dir: dir.to_string(), title: String::new(), parser, writer, master: pair.master, child, size: (rows, cols) })
+        Ok(Term {
+            dir: dir.to_string(),
+            title: String::new(),
+            parser,
+            writer,
+            master: pair.master,
+            child,
+            size: (rows, cols),
+            link: None,
+            linked: None,
+        })
+    }
+
+    /// 登录链接出来了、还没交出去过:交出来(界面弹出来挑浏览器)。同一个链接只交一次,再登一次换了链接再交
+    pub fn new_link(&mut self) -> Option<Link> {
+        let c = self.link.as_ref()?;
+        let link = std::fs::read_to_string(&c.file)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.starts_with("http"))
+            .map(|url| Link { url, code: None })
+            .or_else(|| if c.screen { link_on(&self.text()) } else { None })?;
+        if self.linked.as_ref() == Some(&link) {
+            return None;
+        }
+        self.linked = Some(link.clone());
+        Some(link)
     }
 
     /// 跟着画它的那块变大小(shell 收到 SIGWINCH 自己重排)
@@ -151,16 +196,38 @@ impl Term {
         Some(Position::new(area.x + c.min(area.width - 1), area.y + r.min(area.height - 1)))
     }
 
-    #[cfg(test)]
     fn text(&self) -> String {
         self.parser.lock().unwrap().screen().contents()
     }
+}
+
+/// 屏幕上的登录链接(折行接起来的整条):授权页那个(`…/oauth/authorize?…`),
+/// 或者 Codex 设备码登录的那个(`…/device`)和后面跟着的一次性码(`ABCD-EFGHI`)
+fn link_on(screen: &str) -> Option<Link> {
+    let words: Vec<&str> = screen.split_whitespace().collect();
+    let at = words.iter().position(|w| w.starts_with("https://") && (w.contains("/oauth/authorize?") || w.ends_with("/device")))?;
+    let url = words[at].to_string();
+    if !url.ends_with("/device") {
+        // 后面还有字了才算打完(Claude 跟着「Paste code here」,Codex 跟着下一行提示),免得认到打了一半的
+        return (at + 1 < words.len()).then_some(Link { url, code: None });
+    }
+    // 码还没打出来就先不交,下一轮再看
+    let code = words[at + 1..].iter().find(|w| one_time_code(w))?;
+    Some(Link { url, code: Some(code.to_string()) })
+}
+
+fn one_time_code(w: &str) -> bool {
+    let Some((a, b)) = w.split_once('-') else { return false };
+    a.len() == 4 && (4..=6).contains(&b.len()) && w.chars().all(|c| c == '-' || c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 impl Drop for Term {
     // shell 是会话首进程:它一死,前台还在跑的命令收到 SIGHUP
     fn drop(&mut self) {
         let _ = self.child.kill();
+        if let Some(c) = &self.link {
+            let _ = std::fs::remove_file(&c.file);
+        }
     }
 }
 
@@ -316,5 +383,48 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(t.exited());
+    }
+
+    #[test]
+    fn a_login_link_is_handed_over_once_from_the_screen_or_the_file() {
+        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        let file = tmp.join(format!("aca-term-link-{}.url", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        // Codex 只打在屏幕上:窄终端里折成好几行,接起来是整条;前面别的地址不算
+        let url = format!("https://auth.openai.com/oauth/authorize?response_type=code&state={}", "s".repeat(70));
+        let say = format!(
+            "echo 'Starting local login server on http://localhost:1455.'; echo 'https://example.com/docs'; echo '{url}'; echo 'On a remote machine?'; sleep 5"
+        );
+        let mut t = Term::spawn_argv(&["/bin/sh", "-c", &say], &tmp.to_string_lossy(), &[], 10, 40).unwrap();
+        t.link = Some(Catch { file: file.clone(), screen: true });
+        wait_for(&t, "ssss");
+        assert_eq!(t.new_link(), Some(Link { url: url.clone(), code: None }));
+        // 交过一次就不再交
+        assert_eq!(t.new_link(), None);
+        // Claude 交给 aca 的写在文件里:先认文件;不认屏幕的(本机时 Claude 屏幕上那条要贴码)只看文件
+        std::fs::write(&file, "https://claude.com/cai/oauth/authorize?code=true&x=1\n").unwrap();
+        t.link = Some(Catch { file: file.clone(), screen: false });
+        assert_eq!(t.new_link().map(|l| l.url).as_deref(), Some("https://claude.com/cai/oauth/authorize?code=true&x=1"));
+        assert_eq!(t.new_link(), None);
+        // 关掉终端,链接文件一起删
+        drop(t);
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_device_code_login_hands_over_the_link_with_its_one_time_code() {
+        // Codex 远程时走 --device-auth:固定链接,下面一行是一次性码;码出来之前不交
+        let half = "Follow these steps to sign in with ChatGPT using device code authorization:\n\
+                    1. Open this link in your browser and sign in to your account\n   https://auth.openai.com/codex/device\n";
+        assert_eq!(link_on(half), None);
+        let whole = format!("{half}2. Enter this one-time code (expires in 15 minutes)\n   AB12-CD3EF\nContinue only if you started this login.");
+        assert_eq!(
+            link_on(&whole),
+            Some(Link { url: "https://auth.openai.com/codex/device".into(), code: Some("AB12-CD3EF".into()) })
+        );
+        // 授权页的链接后面就算有像码的字也不当码;链接是屏幕上最后一个字时还没打完,不交
+        assert_eq!(link_on("visit https://x.ai/oauth/authorize?a=1 then AB12-CD3EF").and_then(|l| l.code), None);
+        assert_eq!(link_on("visit https://x.ai/oauth/authorize?a=1&st"), None);
+        assert!(one_time_code("W2U9-CRA4P") && !one_time_code("2.1-299") && !one_time_code("ab12-cd3e"));
     }
 }

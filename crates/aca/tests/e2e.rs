@@ -3603,3 +3603,123 @@ fn a_typed_opening_message_waits_until_the_screen_has_settled_after_a_startup_ga
     let screen = sb.wait_screen(&pane, "resume");
     assert!(screen.contains("ready") && screen.contains("resume"), "{screen}");
 }
+
+#[test]
+fn restart_as_another_account_carries_the_conversation_over_and_back() {
+    let Some(sb) = Sandbox::new("rehome") else { return };
+    // 假 agent:起来时把配置目录和参数一行一个写进 run-<会话 id>
+    let script = sb.home.join("rec.sh");
+    write(
+        &script,
+        &format!(
+            "#!/bin/sh\n{{ echo \"home=$CLAUDE_CONFIG_DIR$CODEX_HOME\"; printf '%s\\n' \"$@\"; }} > '{}/run-'\"$ACA_SESSION_ID\"\nexec sleep 600\n",
+            sb.home.display()
+        ),
+    );
+    let (ca, cb, xa, xb) = (sb.home.join("ca"), sb.home.join("cb"), sb.home.join("xa"), sb.home.join("xb"));
+    write(&xa.join("config.toml"), "model = \"m-a\"\n");
+    write(&xb.join("config.toml"), "model = \"m-b\"\n");
+    let cfg = sb.home.join("config/config.toml");
+    let text = std::fs::read_to_string(&cfg).unwrap()
+        + &format!(
+            "[tools.rc]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{s}\"]\n[tools.rx]\nkind = \"codex\"\ncmd = [\"/bin/sh\", \"{s}\"]\n\
+             [accounts.claude]\na = \"{}\"\nb = \"{}\"\n[accounts.codex]\nx = \"{}\"\ny = \"{}\"\n",
+            ca.display(),
+            cb.display(),
+            xa.display(),
+            xb.display(),
+            s = script.display()
+        );
+    write(&cfg, &text);
+    // 这次起来时的配置目录、参数;先删掉旧的,等新起的那个写
+    let relaunch = |id: &str, args: &[&str]| -> (String, Vec<String>, String) {
+        let f = sb.home.join(format!("run-{id}"));
+        let _ = std::fs::remove_file(&f);
+        let said = sb.aca(args);
+        for _ in 0..50 {
+            if let Ok(t) = std::fs::read_to_string(&f)
+                && t.ends_with('\n')
+            {
+                let mut lines = t.lines().map(String::from);
+                let home = lines.next().unwrap().trim_start_matches("home=").to_string();
+                return (home, lines.collect(), said);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("{id} 没起来");
+    };
+    let after = |args: &[String], flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+
+    // Claude:对话记录、子代理的记录、/rewind 的检查点都在 a 的配置目录里
+    let id = sb.aca(&["new", "rc:a", &sb.proj()]);
+    let pane = sb.json(&["show", &id, "--json"])["pane"].as_str().unwrap().to_string();
+    let rel = Path::new("projects/-proj/c1.jsonl");
+    write(&ca.join(rel), "{\"type\":\"user\"}\n");
+    write(&ca.join("projects/-proj/c1/subagents/agent-1.jsonl"), "{\"type\":\"user\"}\n");
+    write(&ca.join("file-history/c1/f@v1"), "x");
+    let start =
+        |t: &Path| format!("{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"c1\",\"transcript_path\":\"{}\"}}", t.display());
+    sb.hook(&id, &pane, &start(&ca.join(rel)));
+
+    // 换到 b:三样拷到 b 的同一位置,在原地带着 b 的目录接着 c1 起
+    let (home, args, said) = relaunch(&id, &["restart", &id, "--as", "b"]);
+    assert!(said.contains("换到了 rc:b") && said.contains("3 个文件"), "{said}");
+    assert_eq!((home.as_str(), after(&args, "--resume").as_deref()), (cb.to_str().unwrap(), Some("c1")), "{args:?}");
+    assert_eq!(read(&cb.join(rel)), read(&ca.join(rel)));
+    assert!(cb.join("projects/-proj/c1/subagents/agent-1.jsonl").is_file() && cb.join("file-history/c1/f@v1").is_file());
+    let row = sb.json(&["show", &id, "--json"]);
+    assert_eq!((row["tool"].as_str(), row["account"].as_str(), row["pane"].as_str()), (Some("rc"), Some("b"), Some(pane.as_str())));
+    assert!(sb.event_names().iter().any(|e| e == "session.rehomed"));
+
+    // 在 b 上又聊了一轮,换回 a:a 那份是 b 那份的开头一段,直接盖掉,不留备份
+    write(&cb.join(rel), "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n");
+    sb.hook(&id, &pane, &start(&cb.join(rel)));
+    let (home, _, _) = relaunch(&id, &["restart", &id, "--as", "rc:a"]);
+    assert_eq!(home, ca.to_str().unwrap());
+    assert_eq!(read(&ca.join(rel)), read(&cb.join(rel)));
+    let names =
+        |d: &Path| std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
+    assert!(!names(&ca.join("projects/-proj")).iter().any(|n| n.contains(".bak-")), "{:?}", names(&ca.join("projects/-proj")));
+
+    // b 那份对不上(不是从这边拷过去的):先留一份备份再盖
+    write(&cb.join(rel), "{\"type\":\"别的\"}\n");
+    relaunch(&id, &["restart", &id, "--as", "b"]);
+    assert_eq!(read(&cb.join(rel)), read(&ca.join(rel)));
+    assert!(names(&cb.join("projects/-proj")).iter().any(|n| n.starts_with("c1.jsonl.bak-")), "{:?}", names(&cb.join("projects/-proj")));
+
+    // 换不了的:别家的工具、已经是的、和 --fresh 一起
+    let fails = |args: &[&str]| {
+        let o = sb.run(args);
+        assert!(!o.status.success(), "{args:?}");
+        String::from_utf8_lossy(&o.stderr).into_owned()
+    };
+    assert!(fails(&["restart", &id, "--as", "rx:x"]).contains("H 交接"));
+    assert!(fails(&["restart", &id, "--as", "b"]).contains("已经是 rc:b"));
+    assert!(fails(&["restart", &id, "--as", "a", "--fresh"]).contains("--fresh"));
+
+    // Codex:记录在 sessions/<日期>/ 底下;两个账号默认模型不一样,带上原来用的那个
+    let cx = sb.aca(&["new", "rx:x", &sb.proj()]);
+    let cpane = sb.json(&["show", &cx, "--json"])["pane"].as_str().unwrap().to_string();
+    let rollout = Path::new("sessions/2026/10/14/rollout-2026-10-14T09-00-00-th-1.jsonl");
+    write(
+        &xa.join(rollout),
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"th-1\"}}\n{\"type\":\"turn_context\",\"payload\":{\"model\":\"m-a\"}}\n",
+    );
+    let begin = serde_json::json!({"hook_event_name": "SessionStart", "session_id": "th-1", "transcript_path": xa.join(rollout)});
+    sb.hook_as("codex", &cx, &cpane, &begin.to_string());
+    let (home, args, said) = relaunch(&cx, &["restart", &cx, "--as", "y"]);
+    assert!(said.contains("-m m-a"), "{said}");
+    assert_eq!(home, xb.to_str().unwrap());
+    assert_eq!(
+        (args.first().map(String::as_str), args.get(1).map(String::as_str), after(&args, "-m").as_deref()),
+        (Some("resume"), Some("th-1"), Some("m-a"))
+    );
+    assert_eq!(read(&xb.join(rollout)), read(&xa.join(rollout)));
+    assert_eq!(sb.json(&["show", &cx, "--json"])["args"], serde_json::json!(["-m", "m-a"]));
+
+    // 换回原来的账号:那边默认就是它,-m 拿掉
+    let (home, args, _) = relaunch(&cx, &["restart", &cx, "--as", "x"]);
+    assert_eq!((home.as_str(), after(&args, "-m")), (xa.to_str().unwrap(), None));
+    assert_eq!(sb.json(&["show", &cx, "--json"])["args"], serde_json::json!([]));
+}

@@ -336,11 +336,27 @@ kept as [keys] next in config.toml; to change it: aca tmux key next <key>.
                 names: &["restart"],
                 short: Tr::same("restart <id>"),
                 brief: Tr::new(
-                    "在原地重启,接着原来的对话;--fresh 换一段新对话",
-                    "restart in place, resuming the conversation; --fresh: anew",
+                    "原地重启接着对话;--fresh 换一段新的;--as 换账号接着",
+                    "restart in place, resuming; --fresh anew, --as other account",
                 ),
-                usage: &[Tr::same("restart <id> [--fresh]")],
-                more: Tr::new("  --fresh    不接原来的对话,换一段新的", "  --fresh    don't resume the conversation, start a new one"),
+                usage: &[Tr::new("restart <id> [--fresh] [--as 工具[:账号]]", "restart <id> [--fresh] [--as TOOL[:ACCOUNT]]")],
+                more: Tr::new(
+                    "  --fresh          不接原来的对话,换一段新的
+  --as 工具[:账号] 换个账号接着这段对话(一个账号额度用完了、活还没干完):对话记录从原账号的配置目录拷到
+                   新账号的同一位置,上下文原样带过去,行、tmux 会话、标题都不动;原账号那份留着,之前那几轮
+                   计费还算它的。只写一个词:是这个工具的账号就当账号,不是就当工具名(用它默认的账号)。
+                   只能在同一家里换(Claude 和 Codex 的对话记录不通,换家用界面里的 H 交接)。
+                   Codex 各账号默认模型不一样时带上原来的 -m。新账号的缓存是空的:头一轮整段上下文重新写一遍",
+                    "  --fresh              don't resume the conversation, start a new one
+  --as TOOL[:ACCOUNT]  carry this conversation over to another account (one ran out of quota mid-task): its
+                       record is copied from the old account's config directory to the same place in the new
+                       one, so the context comes along whole and the row, tmux session and title stay; the old
+                       account keeps its copy and the earlier turns still bill to it. A single word is an
+                       account of this tool if there is one, otherwise a tool (with its default account).
+                       Only within one family (Claude and Codex conversations don't mix; to change family, hand
+                       off with H in the UI). Codex accounts with different default models get the old -m
+                       carried. The new account's cache is cold: the first turn writes the whole context again",
+                ),
             },
             Cmd {
                 names: &["fork"],
@@ -777,6 +793,10 @@ ordering (⇧↑ ⇧↓) are all on that page.",
                     "\
 和在终端里敲 CODEX_HOME=~/.codex2 codex login 是一回事,只是不用把目录再敲一遍。
 带的是账号的环境;参数只有你给的(工具、账号里登记的 args 是起会话用的,这里不带)。
+跑的是登录(claude 的 auth login、codex login)时不替你开默认浏览器:
+链接工具自己打在屏幕上,贴到要用的浏览器里;你自己设了 BROWSER 的,Claude 用你的。
+从 SSH 连进来时换成在别的设备上登得完的:Claude 给要把码贴回终端的链接,Codex 加 --device-auth。
+在界面的账号页按 ⏎ 登录,链接出来会弹一张表:复制链接,或者挑一个浏览器开。
 
 例:
   aca run codex:team -- login
@@ -785,6 +805,11 @@ ordering (⇧↑ ⇧↓) are all on that page.",
 Same as typing CODEX_HOME=~/.codex2 codex login in a terminal, without typing the directory again.
 It brings the account's environment; the only arguments are yours (args registered on the tool or account are for
 starting sessions and aren't added here).
+A login (claude's auth login, codex login) doesn't open your default browser: the tool prints the link, paste it
+into the browser you want; if you set BROWSER yourself, Claude uses yours.
+Over SSH it switches to a login you can finish on another device: Claude gives the link whose page shows a code to
+paste back, Codex gets --device-auth.
+⏎ on the accounts page in the interface pops up a list once the link comes: copy it, or pick a browser to open it.
 
 Examples:
   aca run codex:team -- login
@@ -1324,6 +1349,13 @@ aca 绑在 tmux 上的键(不用前缀,只在 aca 的会话里拦;不写进你�
   [keys]
   next = \"C-M-n\"                   # 进下一个在等你的会话(aca help next)。不写就是它;\"\" = 不绑;aca tmux key next <键> 也是改这里
 
+登录(账号页的 ⏎、aca run … login:不替你开默认浏览器,链接弹出来挑;写错了只这一节当没写)
+  [login]
+  browsers = [\"Firefox\", { name = \"Chrome 工作\", cmd = [\"google-chrome\", \"--profile-directory=Profile 1\"] }]
+                                   # 不写:自动找(Mac 看 .app,Linux 看 .desktop);写了就只列这些。
+                                   # 字符串:Mac 上是 App 的名字,Linux 上是命令;表:名字 + 命令,链接接在最后(写 {url} 就换在那)
+  remote = \"auto\"                  # 远程(不列浏览器,换成在别的设备上登得完的):auto 看 SSH、Linux 有没有图形界面;yes / no 定死
+
 界面
   [ui]
   lang = \"zh\"                      # 说哪种话:en(默认)/ zh;环境变量 ACA_LANG 压过它
@@ -1382,6 +1414,15 @@ Keys aca binds in tmux (no prefix, only inside aca's sessions; nothing written t
   [keys]
   next = \"C-M-n\"                   # go to the next session waiting for you (aca help next). Unset: this; \"\" = not bound;
                                    # aca tmux key next <key> edits this
+
+Logins (⏎ on the accounts page, aca run … login: no default browser, the link pops up to pick; a mistake drops only this)
+  [login]
+  browsers = [\"Firefox\", { name = \"Work Chrome\", cmd = [\"google-chrome\", \"--profile-directory=Profile 1\"] }]
+                                   # unset: found by itself (.app on a Mac, .desktop files on Linux); set: only these.
+                                   # A string is an app name on a Mac, a command on Linux; a table is a name + a command,
+                                   # the link goes last ({url} puts it there instead)
+  remote = \"auto\"                  # remote (no browsers, a login you can finish on another device): auto looks at SSH
+                                   # and whether Linux has a display; yes / no fixes it
 
 Interface
   [ui]

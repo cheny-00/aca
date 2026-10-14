@@ -35,6 +35,12 @@
 //! [keys]                       # aca 自己绑在 tmux 上的键(不用前缀,只在 aca 的会话里拦;不写进你的 tmux.conf)
 //! next = "C-M-n"               # 进下一个在等你的会话(`aca next`)。不写就是它;"" = 不绑
 //!
+//! [login]                      # aca 起的登录(账号页的 ⏎、aca run … login):不替你开默认浏览器,链接弹出来挑
+//! browsers = ["Firefox", { name = "Chrome 工作", cmd = ["google-chrome", "--profile-directory=Profile 1"] }]
+//!                              # 不写:自动找(Mac 看 .app,Linux 看 .desktop)。字符串:Mac 上是 App 的名字,Linux 上是命令;
+//!                              # 表:名字 + 命令,链接接在最后(参数里写 {url} 就换在那)
+//! remote = "auto"              # 当不当远程(远程:不列浏览器,换成在别的设备上登得完的):auto 看 SSH、Linux 有没有图形界面;yes / no 定死
+//!
 //! [tools.aider]                # 不写 kind、名字也不是内置的:声明式工具,下面几项告诉 aca 怎么对待它(见 agent/declared.rs)
 //! cmd = ["aider"]              # 不写就是工具名
 //! home_var = "AIDER_HOME"      # 账号的 home 交给哪个环境变量;不写的话账号里只能用 env / args
@@ -138,6 +144,87 @@ pub struct Config {
     pub inbox: Inbox,
     pub trust: Trust,
     pub keys: Keys,
+    #[serde(deserialize_with = "lenient")]
+    pub login: Login,
+}
+
+/// `[login]`:aca 起的登录,链接怎么交给你(见 `agent::quiet_login`、界面的 browser.rs)
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Login {
+    /// 链接弹出来时列哪些浏览器;不写 = 自动找,写了就只列这些
+    pub browsers: Vec<Browser>,
+    pub remote: Remote,
+}
+
+/// 一个浏览器:表上写的名字,和开链接的命令(链接接在最后;参数里写了 `{url}` 就换在那)
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(from = "BrowserDef")]
+pub struct Browser {
+    pub name: String,
+    pub cmd: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BrowserDef {
+    /// 简写:Mac 上是 App 的名字(`open -a`),别处是命令
+    Short(String),
+    Full {
+        #[serde(default)]
+        name: String,
+        cmd: Vec<String>,
+    },
+}
+
+impl From<BrowserDef> for Browser {
+    fn from(d: BrowserDef) -> Browser {
+        // 写的是路径时,表上只写文件名(`/opt/x/firefox` → firefox,`/Applications/Arc.app` → Arc)
+        let base = |s: &str| s.trim_end_matches('/').rsplit('/').next().unwrap_or(s).trim_end_matches(".app").to_string();
+        match d {
+            BrowserDef::Short(s) if cfg!(target_os = "macos") => Browser { name: base(&s), cmd: vec!["open".into(), "-a".into(), s] },
+            BrowserDef::Short(s) => Browser { name: base(&s), cmd: vec![paths::expand(&s)] },
+            BrowserDef::Full { name, mut cmd } => {
+                if let Some(c) = cmd.first_mut() {
+                    *c = paths::expand(c);
+                }
+                let name = if name.trim().is_empty() { cmd.first().map(|c| base(c)).unwrap_or_default() } else { name };
+                Browser { name, cmd }
+            }
+        }
+    }
+}
+
+/// `[login] remote`:当不当远程(见 `agent::remote`)。`"auto"`(不写)/ `"yes"` / `"no"`,也认 true / false
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[serde(try_from = "toml::Value")]
+pub enum Remote {
+    #[default]
+    Auto,
+    Yes,
+    No,
+}
+
+impl TryFrom<toml::Value> for Remote {
+    type Error = String;
+    fn try_from(v: toml::Value) -> Result<Remote, String> {
+        match &v {
+            toml::Value::Boolean(b) => return Ok(if *b { Remote::Yes } else { Remote::No }),
+            toml::Value::String(s) => match s.trim() {
+                "" | "auto" => return Ok(Remote::Auto),
+                "yes" | "true" => return Ok(Remote::Yes),
+                "no" | "false" => return Ok(Remote::No),
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(crate::tr!("remote 认 auto / yes / no,不认 {v}", "remote takes auto / yes / no, not {v}"))
+    }
+}
+
+/// `[login]` 写错了只当它没写,不连累别的(整个文件写坏才当空的);错在哪由 [`problem`] 说
+fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Login, D::Error> {
+    Ok(toml::Value::deserialize(d)?.try_into().unwrap_or_default())
 }
 
 /// 不写 `[keys] next` 时的键:Ctrl+Alt+N
@@ -188,6 +275,16 @@ pub fn load() -> Config {
 pub fn problem() -> Option<String> {
     let text = std::fs::read_to_string(paths::config_dir().join("config.toml")).ok()?;
     toml::from_str::<Config>(&text).err().map(|e| e.to_string())
+}
+
+/// `[login]` 写错了的话错在哪:那一节是单独当成没写的(见 [`lenient`]),别的照用
+pub fn login_problem() -> Option<String> {
+    login_problem_in(&std::fs::read_to_string(paths::config_dir().join("config.toml")).ok()?)
+}
+
+pub fn login_problem_in(text: &str) -> Option<String> {
+    let login = toml::from_str::<toml::Value>(text).ok()?.get("login")?.clone();
+    login.try_into::<Login>().err().map(|e| e.to_string().trim().to_string())
 }
 
 /// 写坏了的配置当成没写:建会话、hook 都不该因为它起不来
@@ -290,5 +387,35 @@ mod tests {
             ("", format!("{home}/k.env").as_str(), "https://x")
         );
         assert_eq!(c.names(), ["claude", "codex", "shell", "codex:api", "codex:corp", "codex:labs"]);
+    }
+
+    #[test]
+    fn login_lists_its_browsers_and_a_mistake_there_only_drops_that_section() {
+        assert_eq!(parse("").login, Login::default());
+        let c = parse(
+            "[accounts.claude]\nsub = \"~/.cs\"\n[login]\nremote = \"no\"\n\
+             browsers = [\"Firefox\", { name = \"Chrome 工作\", cmd = [\"google-chrome\", \"--profile-directory=Profile 1\"] }, { cmd = [\"~/bin/zen\", \"{url}\"] }]\n",
+        );
+        assert_eq!(c.login.remote, Remote::No);
+        let b = &c.login.browsers;
+        // 字符串:Mac 上是 App 的名字,别处是命令
+        let firefox = if cfg!(target_os = "macos") { vec!["open", "-a", "Firefox"] } else { vec!["Firefox"] };
+        assert_eq!((b[0].name.as_str(), b[0].cmd.iter().map(String::as_str).collect::<Vec<_>>()), ("Firefox", firefox));
+        assert_eq!(b[1], Browser { name: "Chrome 工作".into(), cmd: vec!["google-chrome".into(), "--profile-directory=Profile 1".into()] });
+        // 不写名字:命令的文件名;~ 展开
+        assert_eq!(b[2].name, "zen");
+        assert!(b[2].cmd[0].ends_with("/bin/zen") && !b[2].cmd[0].starts_with('~'));
+        // 简写成路径:表上也只写文件名
+        let b = parse("[login]\nbrowsers = [\"/opt/x/work-chrome\", \"/Applications/Arc.app\"]\n").login.browsers;
+        assert_eq!((b[0].name.as_str(), b[1].name.as_str()), ("work-chrome", "Arc"));
+        assert_eq!(parse("[login]\nremote = true\n").login.remote, Remote::Yes);
+        assert_eq!(parse("[login]\nremote = \"auto\"\n").login.remote, Remote::Auto);
+        // 写错了:只有 [login] 当没写,账号照用;错在哪说得出来
+        let c = parse("[accounts.claude]\nsub = \"~/.cs\"\n[login]\nremote = \"maybe\"\nbrowsers = [\"Firefox\"]\n");
+        assert!(c.account("claude", "sub").is_some() && c.login == Login::default());
+        assert!(login_problem_in("[login]\nremote = \"maybe\"\n").is_some_and(|e| e.contains("auto / yes / no")));
+        assert!(login_problem_in("[login]\nbrowsers = \"firefox\"\n").is_some());
+        assert_eq!(login_problem_in("[login]\nremote = \"yes\"\n"), None);
+        assert_eq!(login_problem_in("[ui]\nlang = \"zh\"\n"), None);
     }
 }

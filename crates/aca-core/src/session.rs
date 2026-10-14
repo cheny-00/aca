@@ -318,6 +318,165 @@ pub fn restart(store: &Store, cfg: &Config, key: &str, fresh: bool) -> Res<()> {
     launch(cfg, &Session { conv, ..s }, pane.as_ref(), how)
 }
 
+/// 换账号接着跑([`rehome`])做了什么
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Rehomed {
+    /// 现在的「工具:账号」
+    pub to: String,
+    /// 拷过去几个文件(对话记录、子代理的记录……);0 = 没有要拷的(还没说过话、两个账号用的是同一个目录)
+    pub copied: usize,
+    /// 参数上改了什么(Codex 带上原来的模型),给人看的;空 = 没改
+    pub note: String,
+}
+
+/// `--as` 写的那个换成「工具:账号」:写了冒号的照写的;只写一个词的先当这个会话那个工具的账号(登记过的、写成目录的),
+/// 不是的话当工具名(用它默认的账号)
+fn rehome_spec(cfg: &Config, s: &Session, to: &str) -> String {
+    let kind = agent::of(cfg, s).map(|(a, _)| a.name().to_string()).unwrap_or_default();
+    match to.contains(':') || (cfg.account(&kind, to).is_none() && !agent::is_dir(to)) {
+        true => to.to_string(),
+        false => format!("{}:{to}", s.tool),
+    }
+}
+
+/// 换账号接着跑:换成同一家的另一个账号(`to` 是「工具:账号」,或者只写账号),在原地重启、接着这段对话。
+/// 用在一个账号额度用完了、活还没干完的时候:上下文原样带过去,行、tmux 会话、标题、便签都不动。
+/// 对话记录从原账号的配置目录拷到新账号的同一位置(拷哪些见 [`agent::Agent::conv_files`]),原账号那份留着
+/// (之前那几轮计费还算它的,见 [`Run::moves`])。只能在同一家里换:两家的对话记录不通,要换家用界面的 `H` 交接。
+/// 正在跑的这一轮会被打断(和重启一样);还没说过话的会话只是换个账号重起
+pub fn rehome(store: &Store, cfg: &Config, key: &str, to: &str) -> Res<Rehomed> {
+    let s = store.get(key)?;
+    let (agent, _) = agent::of(cfg, &s)?;
+    let p = agent::pick(cfg, &rehome_spec(cfg, &s, to))?;
+    if p.agent.name() != agent.name() {
+        return Err(tr!(
+            "{} 不是 {} 那一家:换账号只能在同一家里换(两家的对话记录不通),换家用界面里的 H 交接",
+            "{} isn't a {} tool: accounts can only be switched within one family (their conversations don't mix); use H in the UI to hand off",
+            p.tool,
+            agent.name()
+        ));
+    }
+    let label = |tool: &str, account: &str| if account.is_empty() { tool.to_string() } else { format!("{tool}:{account}") };
+    let target = label(&p.tool, &p.account);
+    if p.tool == s.tool && p.account == s.account {
+        return Err(tr!("已经是 {target} 了", "it's already on {target}"));
+    }
+    let (from, dest) = (agent::home(cfg, &s.tool, &s.account)?, agent::home(cfg, &p.tool, &p.account)?);
+    let r = runtime::load(&s.id);
+    let (how, conv) = how_to_resume(cfg, &s, &r);
+    let carry = match &how {
+        How::Resume(c) | How::Fork(c) => c.clone(),
+        How::Fresh => String::new(),
+    };
+    // 要搬的:两个账号的配置目录不一样,这段对话也有记录
+    let moving = match (&from, &dest) {
+        (Some(a), Some(b)) if !carry.is_empty() => (!same_dir(a, b)).then(|| (a.clone(), b.clone())),
+        _ => None,
+    };
+    let files = match &moving {
+        Some((a, _)) => {
+            let f = agent.conv_files(a, &carry);
+            if f.is_empty() {
+                return Err(tr!(
+                    "{} 里找不到对话 {carry} 的记录,接不过去",
+                    "can't find the record of conversation {carry} under {}, so it can't move",
+                    a.display()
+                ));
+            }
+            f
+        }
+        None => vec![],
+    };
+    let fixed: Vec<String> = p.def.args.iter().chain(&agent::account(cfg, &*p.agent, &p.account)?.args).cloned().collect();
+    let (args, note) = match &moving {
+        Some((a, b)) => agent.rehome_args(&s.args, &a.join(&files[0]), a, b, &fixed),
+        None => (s.args.clone(), String::new()),
+    };
+    // 先停(对话记录不再变),再拷;拷不成就停在这,登记还是原来的账号,⏎ 照原样起
+    let pane = tmux::find(&s.id);
+    if let Some(x) = &pane {
+        halt(x);
+    }
+    let mut copied = 0;
+    if let Some((a, b)) = &moving {
+        for rel in &files {
+            copied += copy_over(&a.join(rel), &b.join(rel))
+                .map_err(|e| tr!("对话记录没拷过去({}):{e}", "couldn't copy the conversation ({}): {e}", rel.display()))?;
+        }
+    }
+    store.set_account(&s.id, &p.tool, &p.account)?;
+    if args != s.args {
+        store.set_args(&s.id, &args)?;
+    }
+    if let Some((a, b)) = &moving {
+        let move_ = runtime::Move { at: paths::now(), conv: carry.clone(), from: a.display().to_string(), to: b.display().to_string() };
+        runtime::update(&s.id, |r| {
+            // 记录换成新账号那份(内容一样):hook 报上来之前,界面、交接读的也是它
+            if let Ok(rest) = Path::new(&r.transcript).strip_prefix(a) {
+                r.transcript = b.join(rest).display().to_string();
+            }
+            r.moves.push(move_);
+        });
+    }
+    event::emit("session.rehomed", &s.id, json!({ "tool": p.tool, "account": p.account, "from": label(&s.tool, &s.account) }));
+    launch(cfg, &Session { tool: p.tool.clone(), account: p.account.clone(), args, conv, ..s }, pane.as_ref(), how)?;
+    Ok(Rehomed { to: target, copied, note })
+}
+
+/// 两个目录是不是同一个(换了写法、经过链接的也算)
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    real(a) == real(b)
+}
+
+/// 把 `from`(文件或目录)拷到 `to`,目录整个往里拷,同名的盖掉;返回拷了几个文件。
+/// 对话记录那种只往后加的文件:那边已经有一份、又不是这边的开头一段(不是之前从这边拷过去的),先留一份 `.bak-<时间>` 再盖
+fn copy_over(from: &Path, to: &Path) -> std::io::Result<usize> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        let mut n = 0;
+        for e in std::fs::read_dir(from)?.flatten() {
+            n += copy_over(&e.path(), &to.join(e.file_name()))?;
+        }
+        return Ok(n);
+    }
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if to.is_file() && !is_prefix(to, from)? {
+        let mut bak = to.as_os_str().to_owned();
+        bak.push(format!(".bak-{}", paths::now()));
+        std::fs::rename(to, bak)?;
+    }
+    // 先拷到旁边再换进去:拷到一半不会留下半个文件
+    let mut tmp = to.as_os_str().to_owned();
+    tmp.push(".aca-tmp");
+    std::fs::copy(from, &tmp)?;
+    std::fs::rename(&tmp, to)?;
+    Ok(1)
+}
+
+/// `a` 的内容是不是 `b` 的开头一段(一样也算)
+fn is_prefix(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let (la, lb) = (std::fs::metadata(a)?.len(), std::fs::metadata(b)?.len());
+    if la > lb {
+        return Ok(false);
+    }
+    let (mut fa, mut fb) = (std::io::BufReader::new(std::fs::File::open(a)?), std::io::BufReader::new(std::fs::File::open(b)?).take(la));
+    let (mut x, mut y) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let n = fa.read(&mut x)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut y[..n])?;
+        if x[..n] != y[..n] {
+            return Ok(false);
+        }
+    }
+}
+
 /// 从这个会话现在的对话分出一个新会话。它是你自己接着聊的另一条路,不是原会话派出去的:不记 `parent`
 /// (通知、代答、状态栏都按 `parent` 认 worker),分自谁记在 `fork_of`;和原会话平级,排在它紧后面
 pub fn fork(store: &Store, cfg: &Config, key: &str, title: &str) -> Res<Session> {

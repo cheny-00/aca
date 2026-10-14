@@ -14,6 +14,7 @@
 //! 带着 `-c` 起的(单机模式)窗口也每 10 秒看一次队列,空着就开一轮,在跑就等这一轮结束马上接上,
 //! 你打了一半的草稿不动;按 Esc 打断后排着的不自己开跑,等下一轮正常跑完;退出了,resume 起来马上送。
 
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -24,6 +25,7 @@ use crate::paths::Res;
 use crate::runtime::Run;
 use crate::screen::Seen;
 use crate::store::Session;
+use crate::tr;
 
 pub struct Codex;
 
@@ -93,6 +95,62 @@ fn not_carried(rest: &[String], first: bool) -> usize {
         "-c" | "--config" if rest.get(1).is_some_and(|v| ours(v)) => 2,
         _ => 0,
     }
+}
+
+const MODEL: &[&str] = &["-m", "--model"];
+
+/// `dir` 往下最多 `depth` 层里,名字是 `rollout-…<tail>` 的那个文件
+fn rollout_in(dir: &Path, tail: &str, depth: u32) -> Option<PathBuf> {
+    let mut dirs = vec![];
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let kind = e.file_type().ok()?;
+        if kind.is_file() && name.starts_with("rollout-") && name.ends_with(tail) {
+            return Some(e.path());
+        }
+        if kind.is_dir() && depth > 1 {
+            dirs.push(e.path());
+        }
+    }
+    // 新的日子在后面:倒着找,刚说过话的那段多半在最近的目录里
+    dirs.sort();
+    dirs.iter().rev().find_map(|d| rollout_in(d, tail, depth - 1))
+}
+
+/// 记录里最后一轮用的模型(`turn_context` 里记着)
+fn last_model(log: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(log).ok()?;
+    let mut model = None;
+    for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+        if !line.contains("\"turn_context\"") {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        if v["type"] == "turn_context"
+            && let Some(m) = v["payload"]["model"].as_str().filter(|m| !m.is_empty())
+        {
+            model = Some(m.to_string());
+        }
+    }
+    model
+}
+
+/// 一个账号默认用什么:config.toml 的 `model`、`model_provider`(没写是 openai);
+/// 选了 profile 的(参数里的 `--profile` / `-p`,或者 config.toml 的 `profile`)先看 `[profiles.<它>]` 里的
+struct Defaults {
+    model: Option<String>,
+    provider: String,
+}
+
+fn defaults(home: &Path, args: &[String]) -> Defaults {
+    let t: toml::Table = std::fs::read_to_string(home.join("config.toml")).ok().and_then(|t| t.parse().ok()).unwrap_or_default();
+    let named = args.iter().position(|a| a == "--profile" || a == "-p").and_then(|i| args.get(i + 1)).cloned();
+    let profile = named.or_else(|| t.get("profile").and_then(|v| v.as_str()).map(String::from));
+    let section = profile.and_then(|p| t.get("profiles")?.get(&p)?.as_table().cloned()).unwrap_or_default();
+    let get = |k: &str| section.get(k).or_else(|| t.get(k)).and_then(|v| v.as_str()).map(String::from);
+    Defaults { model: get("model"), provider: get("model_provider").unwrap_or_else(|| "openai".into()) }
 }
 
 /// 文件末尾这么多字节,从下一个整行开始
@@ -177,6 +235,62 @@ impl Agent for Codex {
 
     fn home_var(&self) -> Option<&str> {
         Some("CODEX_HOME")
+    }
+
+    fn default_home(&self) -> Option<&str> {
+        Some("~/.codex")
+    }
+
+    /// 对话记录 `sessions/<年>/<月>/<日>/rollout-<时间>-<id>.jsonl`
+    fn conv_files(&self, home: &Path, conv: &str) -> Vec<PathBuf> {
+        if conv.is_empty() || conv.contains('/') {
+            return vec![];
+        }
+        let tail = format!("-{conv}.jsonl");
+        let found = rollout_in(&home.join("sessions"), &tail, 4);
+        found.and_then(|f| f.strip_prefix(home).ok().map(Path::to_path_buf)).into_iter().collect()
+    }
+
+    /// 各账号 config.toml 里的默认模型不一样(这台机器上就是):原来那段用的模型不是新账号默认的,带上 `-m` 接着用它。
+    /// 会话参数里原来的 `-m` 先拿掉再看要不要带(换回原账号时就不用带了)。工具、新账号里写死了模型的不动;
+    /// 两个账号走的不是同一个服务(`model_provider`)的也不动,模型照新账号的,说一声
+    fn rehome_args(&self, args: &[String], log: &Path, from: &Path, to: &Path, fixed: &[String]) -> (Vec<String>, String) {
+        let keep = || (args.to_vec(), String::new());
+        let Some(was) = last_model(log) else { return keep() };
+        if fixed.iter().enumerate().any(|(i, _)| super::valued(&fixed[i..], MODEL) > 0) {
+            return keep();
+        }
+        let (old, new) = (defaults(from, &[]), defaults(to, fixed));
+        if old.provider != new.provider {
+            let now = new.model.unwrap_or_default();
+            return (
+                args.to_vec(),
+                tr!(
+                    "两个账号走的服务不一样({} → {}),模型照新账号的 {now}(原来是 {was})",
+                    "the accounts use different providers ({} → {}); the model is the new account's {now} (was {was})",
+                    old.provider,
+                    new.provider
+                ),
+            );
+        }
+        let mut out = vec![];
+        let mut rest = args;
+        while let Some(w) = rest.first() {
+            let n = super::valued(rest, MODEL);
+            if n == 0 {
+                out.push(w.clone());
+            }
+            rest = &rest[n.max(1).min(rest.len())..];
+        }
+        if new.model.as_deref() == Some(was.as_str()) {
+            return (out, String::new());
+        }
+        let note = match &new.model {
+            Some(m) => tr!("带上 -m {was}(新账号默认是 {m})", "with -m {was} (the new account defaults to {m})"),
+            None => tr!("带上 -m {was}", "with -m {was}"),
+        };
+        out.extend(["-m".to_string(), was]);
+        (out, note)
     }
 
     fn can_fork(&self) -> bool {
@@ -291,6 +405,53 @@ mod tests {
 
     fn lines(s: &str) -> Vec<String> {
         s.lines().map(String::from).collect()
+    }
+
+    #[test]
+    fn switching_accounts_keeps_the_model_unless_the_new_one_pins_it_or_uses_another_provider() {
+        let d = std::env::temp_dir().join(format!("aca-rehome-{}", std::process::id()));
+        let (a, b, c) = (d.join("a"), d.join("b"), d.join("c"));
+        for (dir, toml) in [
+            (&a, "model = \"m-a\"\n"),
+            (&b, "model = \"m-b\"\nprofile = \"fast\"\n[profiles.fast]\nmodel = \"m-fast\"\n"),
+            (&c, "model = \"m-a\"\nmodel_provider = \"relay\"\n"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("config.toml"), toml).unwrap();
+        }
+        let log = d.join("rollout.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"m-x\"}}\n{\"type\":\"turn_context\",\"payload\":{\"model\":\"m-a\"}}\n",
+        )
+        .unwrap();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // b 选了 profile:默认是 profile 里的 m-fast,和最后一轮的 m-a 不一样,带上;原来的 -m 先拿掉
+        let (args, note) = Codex.rehome_args(&s(&["-m", "old", "--yolo"]), &log, &a, &b, &[]);
+        assert_eq!((args, note.contains("m-fast")), (s(&["--yolo", "-m", "m-a"]), true));
+        // 参数里点名了别的 profile:看它的(没有这个 profile 就是顶上的 m-b)
+        assert_eq!(Codex.rehome_args(&[], &log, &a, &b, &s(&["--profile", "none"])).0, s(&["-m", "m-a"]));
+        // 回到默认就是 m-a 的账号:不用带
+        assert_eq!(Codex.rehome_args(&s(&["--model=m-a"]), &log, &b, &a, &[]), (vec![], String::new()));
+        // 新账号里写死了模型:不动
+        assert_eq!(Codex.rehome_args(&s(&["--yolo"]), &log, &a, &b, &s(&["-m", "pinned"])).0, s(&["--yolo"]));
+        // 走的不是同一个服务:模型照新账号的,说一声
+        let (args, note) = Codex.rehome_args(&s(&["-m", "m-a"]), &log, &a, &c, &[]);
+        assert_eq!(args, s(&["-m", "m-a"]));
+        assert!(note.contains("openai → relay"), "{note}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_rollout_is_found_by_its_thread_id_under_sessions() {
+        let d = std::env::temp_dir().join(format!("aca-rollouts-{}", std::process::id()));
+        let f = d.join("sessions/2026/10/14/rollout-2026-10-14T09-00-00-th-1.jsonl");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, "").unwrap();
+        std::fs::write(f.with_file_name("rollout-2026-10-14T09-00-00-th-10.jsonl"), "").unwrap();
+        assert_eq!(Codex.conv_files(&d, "th-1"), vec![PathBuf::from("sessions/2026/10/14/rollout-2026-10-14T09-00-00-th-1.jsonl")]);
+        assert!(Codex.conv_files(&d, "th-2").is_empty() && Codex.conv_files(&d, "../x").is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

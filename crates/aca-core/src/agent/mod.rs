@@ -25,7 +25,7 @@ pub mod declared;
 pub mod lifecycle;
 mod shell;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -77,6 +77,24 @@ pub trait Agent: Sync {
     /// 账号的 `home`(配置目录)交给它的哪个环境变量;None = 账号里只能写 env / args
     fn home_var(&self) -> Option<&str> {
         None
+    }
+
+    /// 账号没给配置目录、环境里也没有时它用的那个(`~/.claude`);None = 没有配置目录这一说
+    fn default_home(&self) -> Option<&str> {
+        None
+    }
+
+    /// 这段对话在配置目录 `home` 里留下的东西,相对 `home` 的路径,头一个是对话记录本身。
+    /// 换账号接着跑([`crate::session::rehome`])时照原样拷到新账号的配置目录。找不到 / 这一家接不了 = 空
+    fn conv_files(&self, _home: &Path, _conv: &str) -> Vec<PathBuf> {
+        vec![]
+    }
+
+    /// 换账号接着跑时,会话自己的参数 `args` 要改成什么,才和原来用的一样(Codex:各账号 config.toml 的默认模型不一样)。
+    /// `log` 是这段对话在原账号里的记录,`from` / `to` 是两个账号的配置目录,`fixed` 是工具、新账号里写死的参数。
+    /// 返回 (新的参数, 给人看的一句;空 = 没什么要说的)。默认不动
+    fn rehome_args(&self, args: &[String], _log: &Path, _from: &Path, _to: &Path, _fixed: &[String]) -> (Vec<String>, String) {
+        (args.to_vec(), String::new())
     }
 
     /// 程序名(工具没自己写 `cmd` 时用)
@@ -470,6 +488,18 @@ fn layered_env(agent: &dyn Agent, tool: &Tool, a: &Account) -> Res<Vec<(String, 
     Ok(env)
 }
 
+/// 这个工具、账号实际用的配置目录:账号那一层给的(配置目录,或者 env / env_file 里写的那个变量),没有就是环境里的,
+/// 再没有是它默认的([`Agent::default_home`])。None = 这一家没有配置目录这一说
+pub fn home(cfg: &Config, tool: &str, account: &str) -> Res<Option<PathBuf>> {
+    let (agent, def) = resolve(cfg, tool)?;
+    let Some(var) = agent.home_var() else { return Ok(None) };
+    let layer = self::account(cfg, &*agent, account)?;
+    let env = layered_env(&*agent, &def, &layer)?;
+    let set = env.into_iter().rev().find(|(k, _)| k == var).map(|(_, v)| v);
+    let dir = set.or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty())).or_else(|| agent.default_home().map(String::from));
+    Ok(dir.map(|d| PathBuf::from(paths::expand(&d))))
+}
+
 /// 这个 Codex 用哪个配置目录:账号给的 `CODEX_HOME`,没有就是环境里的,再没有是 `~/.codex`
 fn codex_home(env: &[(String, String)]) -> std::path::PathBuf {
     let from_env = env.iter().rev().find(|(k, _)| k == "CODEX_HOME").map(|(_, v)| v.clone());
@@ -565,8 +595,97 @@ pub fn direct(cfg: &Config, spec: &str, args: &[String]) -> Res<Launch> {
     let mut cmd = base(&p.def, &p.agent.program());
     cmd[0] = which(&cmd[0]).ok_or_else(|| tr!("PATH 里没有 {}", "{} isn't on PATH", cmd[0]))?;
     cmd.extend(args.iter().cloned());
-    let env = account_env(cfg, spec)?;
-    Ok(Launch { argv: without(&[FOREIGN, OURS], &env, cmd), env, said: false })
+    let mut env = account_env(cfg, spec)?;
+    let argv = without(&[FOREIGN, OURS], &env, cmd);
+    let asked = std::env::var_os(LOGIN_LINK).is_some();
+    let theirs = std::env::var_os("BROWSER").is_some_and(|b| !b.is_empty());
+    let argv = quiet_login(p.agent.name(), args, Seat { asked, theirs, remote: remote(cfg) }, &mut env, argv);
+    Ok(Launch { argv, env, said: false })
+}
+
+/// 人不在这台机器跟前:`[login] remote` 写了 yes / no 就照它;不写看自己:从 SSH 连进来(和 `aca` 复制时的判断一样),
+/// 或者 Linux 上没有图形界面。这时登录链接要能在别的设备上打开:回调本机的那种登不完(见 [`quiet_login`])
+pub fn remote(cfg: &Config) -> bool {
+    match cfg.login.remote {
+        config::Remote::Yes => true,
+        config::Remote::No => false,
+        config::Remote::Auto => {
+            let has = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+            has("SSH_CONNECTION") || has("SSH_TTY") || (cfg!(target_os = "linux") && !has("DISPLAY") && !has("WAYLAND_DISPLAY"))
+        }
+    }
+}
+
+/// 起登录时的处境:asked = aca 界面起的(带着 [`LOGIN_LINK`]);theirs = 外面设了 BROWSER;remote 见 [`remote`]
+#[derive(Clone, Copy, Default)]
+struct Seat {
+    asked: bool,
+    theirs: bool,
+    remote: bool,
+}
+
+/// aca 界面起登录时带的:指着一个文件,工具要开的登录链接写进去(见 [`login_link`]),界面看到了弹出来挑浏览器
+pub const LOGIN_LINK: &str = "ACA_LOGIN_LINK";
+
+/// Codex 在 macOS 上开链接只走系统的 open、不认 `$BROWSER`:放进沙箱里跑,只拦「打开别的程序」这一样(本机回调照样收得到)
+const SANDBOX: &str = "/usr/bin/sandbox-exec";
+const NO_OPEN: &str = "(version 1) (allow default) (deny lsopen)";
+
+/// 工具自己的浏览器登录:`claude auth login`、`codex login`(带 key / token、设备码、查状态、看帮助的不算)
+fn browser_login(family: &str, args: &[String]) -> bool {
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    let help = |rest: &[&str]| rest.iter().any(|x| matches!(*x, "-h" | "--help" | "help"));
+    match family {
+        "claude" => a.starts_with(&["auth", "login"]) && !help(&a[2..]),
+        "codex" => {
+            a.first() == Some(&"login")
+                && !help(&a[1..])
+                && !a[1..].iter().any(|x| matches!(*x, "status" | "--with-api-key" | "--with-access-token" | "--device-auth"))
+        }
+        _ => false,
+    }
+}
+
+/// 登录不替你开默认浏览器(2026-10-14 他说的:不一定用默认浏览器登这个账号,自己跳过去很麻烦)。
+/// 链接两家都会自己打在屏幕上;Claude 开链接用 `$BROWSER`,指回 aca 自己(见 [`login_link`]);Codex 不认它,放进沙箱里拦住。
+/// aca 界面起的(asked):跑的是什么都这么办(新账号起的是工具本身),外面设的 BROWSER 也盖掉,链接要交给界面;
+/// 自己敲的只管登录命令,外面设了 BROWSER(theirs)就用你的。账号里写了 BROWSER 的一律照账号的。
+/// 远程(他挑的,2026-10-14):换成在别的设备上登得完的 —— Claude 的 BROWSER 设成 `true`,它什么都不开、
+/// 屏幕上给要把码贴回来的那条链接;Codex 加 `--device-auth`(一个固定链接 + 一次性码),不回调本机
+fn quiet_login(family: &str, args: &[String], seat: Seat, env: &mut Vec<(String, String)>, mut argv: Vec<String>) -> Vec<String> {
+    let login = browser_login(family, args);
+    if !seat.asked && !login {
+        return argv;
+    }
+    if !env.iter().any(|(k, _)| k == "BROWSER") && (seat.asked || !seat.theirs) {
+        let opener = if seat.remote { "true".to_string() } else { self_exe() };
+        env.push(("BROWSER".into(), opener));
+    }
+    if family == "codex" && seat.remote && login {
+        argv.push("--device-auth".into());
+    }
+    if family == "codex" && cfg!(target_os = "macos") && std::path::Path::new(SANDBOX).exists() {
+        return [SANDBOX.to_string(), "-p".into(), NO_OPEN.into()].into_iter().chain(argv).collect();
+    }
+    argv
+}
+
+/// `aca <链接>`:登录时工具拿 aca 当浏览器(见 [`quiet_login`])。aca 界面要链接([`LOGIN_LINK`] 指着文件)就写给它;
+/// 不然什么都不开 —— 链接工具自己打在屏幕上了。都退出 0:工具当成开过了,接着等你在浏览器里登完
+pub fn login_link(url: &str) -> i32 {
+    hand_link(std::env::var_os(LOGIN_LINK).map(PathBuf::from), url);
+    0
+}
+
+fn hand_link(to: Option<PathBuf>, url: &str) {
+    let Some(f) = to else {
+        return eprintln!("{}", tr!("aca 不替登录开浏览器,链接:{url}", "aca doesn't open a browser for logins; the link: {url}"));
+    };
+    // 先写到旁边再改名:界面不会读到写了一半的
+    let part = f.with_extension("part");
+    if let Err(e) = std::fs::write(&part, url).and_then(|()| std::fs::rename(&part, &f)) {
+        eprintln!("{}", tr!("登录链接交不给 aca 界面({}):{e}", "couldn't hand the login link to aca's UI ({}): {e}", f.display()));
+    }
 }
 
 /// 「工具:账号」那一层的环境(工具的 env、env_file、账号的 env、配置目录),不带会话的身份。
@@ -731,5 +850,68 @@ mod tests {
         // 外层指名的 profile 也一样:不拿掉,firm 用的是那个 profile 的登录;账号自己指名的留着
         assert!(unset("claude:firm", "ANTHROPIC_PROFILE") && unset("claude", "ANTHROPIC_PROFILE"));
         assert!(!unset("claude:console", "ANTHROPIC_PROFILE") && unset("claude:console", "CLAUDE_SECURESTORAGE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn logins_aca_runs_dont_open_the_default_browser() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // 认得出两家的浏览器登录;带 key、设备码、查状态、看帮助的不算
+        assert!(browser_login("claude", &s(&["auth", "login"])) && browser_login("claude", &s(&["auth", "login", "--console"])));
+        assert!(!browser_login("claude", &s(&["auth", "status"])) && !browser_login("claude", &s(&["auth", "login", "-h"])));
+        assert!(!browser_login("claude", &[]) && !browser_login("toy", &s(&["login"])));
+        assert!(browser_login("codex", &s(&["login"])) && !browser_login("codex", &s(&["login", "status"])));
+        assert!(!browser_login("codex", &s(&["login", "--with-api-key"])) && !browser_login("codex", &s(&["login", "--device-auth"])));
+
+        let login = s(&["auth", "login"]);
+        let argv = s(&["/usr/bin/env", "-u", "CLAUDECODE", "/bin/claude", "auth", "login"]);
+        let here = Seat::default();
+        let run = |args: &[String], seat: Seat, env: &[(&str, &str)]| {
+            let mut env: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            let out = quiet_login("claude", args, seat, &mut env, argv.clone());
+            (out, env.into_iter().find(|(k, _)| k == "BROWSER").map(|(_, v)| v))
+        };
+        // 自己敲的登录:BROWSER 指回 aca,命令不变
+        assert_eq!(run(&login, here, &[]), (argv.clone(), Some(self_exe())));
+        // 外面设了 BROWSER 的用你的;账号里写了的照账号的,界面起的也一样
+        assert_eq!(run(&login, Seat { theirs: true, ..here }, &[]).1, None);
+        assert_eq!(run(&login, Seat { asked: true, ..here }, &[("BROWSER", "/x/ff")]).1.as_deref(), Some("/x/ff"));
+        // 界面起的:不是登录命令也这么办(新账号起的是 claude 本身),外面的 BROWSER 盖掉
+        assert_eq!(run(&[], Seat { asked: true, theirs: true, ..here }, &[]).1, Some(self_exe()));
+        // 别的命令:原样
+        assert_eq!(run(&s(&["-p", "hi"]), here, &[]), (argv.clone(), None));
+        // 远程:Claude 什么都不开(BROWSER=true),屏幕上给要贴码的链接;外面设了的照样用你的
+        let far = Seat { remote: true, ..here };
+        assert_eq!(run(&login, far, &[]), (argv.clone(), Some("true".into())));
+        assert_eq!(run(&[], Seat { asked: true, ..far }, &[]).1.as_deref(), Some("true"));
+        assert_eq!(run(&login, Seat { theirs: true, ..far }, &[]).1, None);
+
+        // Codex 不认 BROWSER:macOS 上放进沙箱,只拦打开别的程序
+        let cx = s(&["/usr/bin/env", "/bin/codex", "login"]);
+        let sandboxed = cfg!(target_os = "macos") && std::path::Path::new(SANDBOX).exists();
+        let strip = |out: Vec<String>| if sandboxed { out[3..].to_vec() } else { out };
+        let out = quiet_login("codex", &s(&["login"]), here, &mut vec![], cx.clone());
+        if sandboxed {
+            assert_eq!(out[..3], s(&[SANDBOX, "-p", NO_OPEN])[..]);
+        }
+        assert_eq!(strip(out), cx);
+        assert_eq!(quiet_login("codex", &s(&["login", "status"]), here, &mut vec![], cx.clone()), cx);
+        // 远程:改走设备码,不回调本机;不是登录的不加
+        assert_eq!(strip(quiet_login("codex", &s(&["login"]), far, &mut vec![], cx.clone())), s(&["/usr/bin/env", "/bin/codex", "login", "--device-auth"]));
+        assert_eq!(quiet_login("codex", &s(&["login", "status"]), far, &mut vec![], cx.clone()), cx);
+    }
+
+    #[test]
+    fn the_link_goes_to_the_file_the_ui_named() {
+        let dir = std::env::temp_dir().join(format!("aca-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("login-claude-work.url");
+        hand_link(Some(f.clone()), "https://claude.com/cai/oauth/authorize?x=1");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "https://claude.com/cai/oauth/authorize?x=1");
+        // 写到旁边再改名,不留半截
+        assert!(!f.with_extension("part").exists());
+        // 第二次登录换了链接:覆盖
+        hand_link(Some(f.clone()), "https://claude.com/cai/oauth/authorize?x=2");
+        assert!(std::fs::read_to_string(&f).unwrap().ends_with("x=2"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

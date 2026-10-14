@@ -87,6 +87,9 @@ fn problems_in(text: &str) -> Vec<String> {
                 .into(),
         );
     }
+    if let Some(e) = aca_core::config::login_problem_in(text) {
+        bad.push(tr!("config.toml [login] 当成没写:{e}", "config.toml [login] is ignored: {e}"));
+    }
     bad
 }
 
@@ -162,6 +165,10 @@ mod tests {
         assert!(ime_auto_in("[ime\nbroken"));
         assert_eq!(problems_in("[ime]\nauto = \"no\"\n[new_group]\ndefault_path = 1\n").len(), 2);
         assert!(problems_in("[ime]\nauto = false\n[new_group]\ndefault_path = \"~/x\"\n").is_empty());
+        // [login] 写错了:那一节当没写,设置页说一句
+        let bad = problems_in("[login]\nremote = \"maybe\"\n");
+        assert!(bad.len() == 1 && bad[0].starts_with("config.toml [login] 当成没写:") && bad[0].contains("maybe"), "{bad:?}");
+        assert!(problems_in("[login]\nremote = \"yes\"\nbrowsers = [\"Firefox\"]\n").is_empty());
     }
 
     #[test]

@@ -1676,6 +1676,15 @@ enum Confirm {
         key: String,
         text: String,
     },
+    /// H 里挑了同一家的别的账号:y = 换成它、原地重启接着这段对话;H = 还是交接(handoff 是备好的那个,
+    /// 建不了的话没有)。why:为什么要问(正在跑…)
+    Rehome {
+        t: Target,
+        to: String,
+        label: String,
+        why: String,
+        handoff: Option<Box<Job>>,
+    },
     /// A:接管这个普通 tmux 会话。plan:认出来的、打算怎么登记(给人看的就是它,y 之后照它做)
     Adopt {
         t: Target,
@@ -1778,6 +1787,8 @@ pub struct TermReq {
     pub env: Vec<(String, String)>,
     /// 不开 shell,直接跑这条命令(新账号登录),它退出终端就关
     pub run: Option<String>,
+    /// 登录终端:登录链接出来了弹出来挑浏览器(见 browser.rs)
+    pub link: Option<crate::term::Catch>,
 }
 
 /// 高亮停在分组上时预览里写的:哪个组、它的路径;路径不是组的默认路径时,是跟着组里哪个会话(标题)
@@ -1806,6 +1817,9 @@ struct Pass {
     note: Option<String>,
     /// 它还在跑 / 在等你选:菜单里提一句,两边会一起动同一处
     busy: bool,
+    /// 它现在登记的工具、账号:菜单里挑了同一家的别的账号,问要不要改成原地换账号(见 `Confirm::Rehome`)
+    tool: String,
+    account: String,
 }
 
 /// `m` 挑分组要的
@@ -4237,8 +4251,21 @@ impl App {
             let mut d = p.draft;
             (d.tool, d.account) = (t.tool.clone(), t.account.clone());
             d.label = t.name.clone();
-            match d.finish() {
-                Ok(req) => self.job = Some(Job::Handoff { t: p.t, from: p.from, req, to: t.agent, note: p.note }),
+            let handoff = d.finish().map(|req| Job::Handoff { t: p.t.clone(), from: p.from.clone(), req, to: t.agent, note: p.note });
+            // 同一家的别的账号:对话能原样带过去,先问是原地换账号还是交接(登记的会话才换得了)
+            if t.agent == p.from.agent && !p.t.id.is_empty() && (t.tool != p.tool || t.account != p.account) {
+                let to = if t.account.is_empty() { t.tool.clone() } else { format!("{}:{}", t.tool, t.account) };
+                let why = if p.busy {
+                    t!("它还在跑 / 在等你选,换账号会打断它", "it's running or waiting for you; switching interrupts it")
+                } else {
+                    ""
+                };
+                let handoff = handoff.ok().map(Box::new);
+                self.confirm = Some(Confirm::Rehome { t: p.t, to, label: t.name.clone(), why: why.into(), handoff });
+                return;
+            }
+            match handoff {
+                Ok(job) => self.job = Some(job),
                 Err(e) => self.flash(&e),
             }
             return;
@@ -4567,7 +4594,7 @@ impl App {
         let t = Target { name: s.name.clone(), title: s.title.clone(), profile: s.profile.clone(), id: s.deck_id.clone() };
         let note = from.note.is_some().then_some(key);
         let busy = matches!(s.state, State::Running | State::Ask);
-        self.handoff = Some(Pass { t, from: Box::new(from), draft, note, busy });
+        self.handoff = Some(Pass { t, from: Box::new(from), draft, note, busy, tool: s.tool.clone(), account: s.account.clone() });
         self.tool_menu = Some((menu, 0));
     }
 
@@ -5166,7 +5193,7 @@ impl App {
                 self.remember(u);
             }
         }
-        if let (Job::Restart { t, .. }, Outcome::Done(_)) = (job, &out) {
+        if let (Job::Restart { t, .. } | Job::Rehome { t, .. }, Outcome::Done(_)) = (job, &out) {
             let new = fresh.iter().find(|s| s.deck_id == t.id && s.profile == t.profile).map(|s| s.name.clone());
             if let Some(new) = new.filter(|n| *n != t.name) {
                 let _ = self.pins.rename(&t.name, &new);
@@ -5774,7 +5801,8 @@ impl App {
                 return self.flash(t!("不知道这个组在哪个目录", "no idea which directory this group is in"));
             };
             let w = Where { dir, ..Where::default() };
-            self.term_req = Some(TermReq { key, family: String::new(), title: group_label(&g).to_string(), w, env: vec![], run: None });
+            self.term_req =
+                Some(TermReq { key, family: String::new(), title: group_label(&g).to_string(), w, env: vec![], run: None, link: None });
             return;
         }
         let Some(s) = self.current() else { return };
@@ -5789,7 +5817,18 @@ impl App {
             w: Where::of(s),
             env: vec![],
             run: None,
+            link: None,
         });
+    }
+
+    /// 登录终端里出了登录链接(收起来了的也算):弹出来挑用哪个浏览器开
+    fn catch_links(&mut self) {
+        let mut got: Vec<(String, crate::term::Link)> =
+            self.terms.values_mut().filter_map(|t| t.new_link().map(|l| (t.title.clone(), l))).collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        for (title, link) in got {
+            self.open(Box::new(crate::browser::Pick::new(&title, link)));
+        }
     }
 
     /// 终端开着:按键都给它(包括 ^C),只有 Esc 收起 —— shell 接着跑,再按 t 回来
@@ -6042,6 +6081,10 @@ impl App {
         {
             return self.back_session();
         }
+        // 终端上面盖着弹窗(登录链接出来时弹的,见 browser.rs):键先给弹窗,关了再回终端
+        if self.term_on.is_some() && !self.overlays.is_empty() {
+            return self.on_overlay_key(k);
+        }
         if let Some(key) = self.term_on.clone() {
             return self.on_term_key(&key, k);
         }
@@ -6109,6 +6152,9 @@ impl App {
                 }
                 Confirm::Send { t, pane, key, text } if yes => self.job = Some(Job::Send { t, pane, text, key }),
                 Confirm::Send { .. } => self.flash(t!("没发", "not sent")),
+                Confirm::Rehome { t, to, label, .. } if yes => self.job = Some(Job::Rehome { t, to, label }),
+                Confirm::Rehome { handoff: Some(j), .. } if matches!(k.code, KeyCode::Char('H' | 'h')) => self.job = Some(*j),
+                Confirm::Rehome { .. } => self.flash(t!("没换账号", "account not switched")),
                 Confirm::Adopt { t, plan } if yes => self.job = Some(Job::Adopt { t, plan }),
                 Confirm::Adopt { .. } => self.flash(t!("没接管", "not adopted")),
             }
@@ -6934,7 +6980,9 @@ fn draw_term(f: &mut Frame, app: &mut App, key: &str, area: Rect) {
     let head_line = Line::from(vec![Span::styled(label, theme::chip()), Span::raw(" "), Span::styled(clip_left(&dir, rest), dim())]);
     f.render_widget(Paragraph::new(head_line), head);
     f.render_widget(ratatui::widgets::Clear, body);
-    if let Some(pos) = t.render(body, f.buffer_mut()) {
+    // 上面盖着弹窗(登录链接的)时不放光标:键在弹窗那
+    let covered = !app.overlays.is_empty();
+    if let Some(pos) = app.terms.get(key).and_then(|t| t.render(body, f.buffer_mut())).filter(|_| !covered) {
         f.set_cursor_position(pos);
     }
 }
@@ -7289,7 +7337,15 @@ fn draw_tools(f: &mut Frame, menu: &[Tool], sel: usize, pass: Option<&Pass>) {
                 marks.push(Span::styled(t!("带上便签", "with the note"), dim()));
             }
             if !marks.is_empty() {
-                out.extend([Line::from(marks), Line::raw("")]);
+                out.push(Line::from(marks));
+            }
+            // 登记的会话:挑同一家的别的账号时还能原地换(见 `Confirm::Rehome`)
+            if !p.t.id.is_empty() {
+                let hint = t!("挑同一家的别的账号还能原地换、对话整段带过去", "same-kind accounts can also take it over in place");
+                out.push(Line::styled(clip(hint, w).trim_end().to_string(), dim()));
+            }
+            if out.len() > 2 {
+                out.push(Line::raw(""));
             }
         }
         for (i, t) in menu.iter().enumerate().skip(start).take(TOOL_ROWS) {
@@ -7415,6 +7471,30 @@ fn draw_confirm(f: &mut Frame, c: &Confirm, all: &[Session]) {
             }
             (t.name.as_str(), t.title.as_str(), theme::pal().accent, t!("发送便签？", "Send the note?"), what, vec![], t!("发送", "send"))
         }
+        Confirm::Rehome { t, label, why, .. } => {
+            let what = [
+                tr!(
+                    "换到 {label}：在原地重启，接着这段对话，上下文原样带过去",
+                    "move to {label}: restart in place and resume this conversation with its whole context"
+                ),
+                t!(
+                    "新账号的缓存是空的：头一轮整段上下文要重新写一遍",
+                    "the new account's cache is cold: the first turn writes the whole context again"
+                )
+                .to_string(),
+            ]
+            .join("\n");
+            let notes = if why.is_empty() { vec![] } else { vec![why.clone()] };
+            (
+                t.name.as_str(),
+                t.title.as_str(),
+                theme::pal().accent,
+                t!("换账号接着跑？", "Carry on under another account?"),
+                what,
+                notes,
+                t!("换账号", "switch"),
+            )
+        }
         Confirm::Adopt { t, plan } => (
             t.name.as_str(),
             t.title.as_str(),
@@ -7450,7 +7530,11 @@ fn draw_confirm(f: &mut Frame, c: &Confirm, all: &[Session]) {
         out.extend(what.lines().flat_map(|l| wrap_width(l, w)).map(|l| Line::styled(l, dim())));
         out.extend(notes.iter().map(|n| Line::styled(clip(n, w).trim_end().to_string(), warn)));
         out.push(Line::raw(""));
-        out.push(Line::from(vec![button(&format!("y {act}"), border)]));
+        let mut buttons = vec![button(&format!("y {act}"), border)];
+        if let Confirm::Rehome { handoff: Some(_), .. } = c {
+            buttons.extend([Span::raw("  "), Span::styled(t!("H 改成新开一个接手（交接）", "H hand off to a new session instead"), dim())]);
+        }
+        out.push(Line::from(buttons));
         out
     });
 }
@@ -9049,6 +9133,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                     match spawned {
                         Ok(mut t) => {
                             t.title = r.title;
+                            t.link = r.link;
                             app.terms.insert(r.key.clone(), t);
                             app.term_on = Some(r.key);
                         }
@@ -9064,6 +9149,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
             }
             // 里面 exit 了的去掉;正看着的那个没了就回列表
             app.terms.retain(|_, t| !t.exited());
+            app.catch_links();
             if app.term_on.as_ref().is_some_and(|k| !app.terms.contains_key(k)) {
                 app.term_on = None;
                 app.flash(t!("终端关了", "terminal closed"));
@@ -9879,10 +9965,12 @@ mod tests {
         assert_eq!(app.msg.as_ref().unwrap().0, "已交接");
         assert_eq!(app.notes.get("id-跑"), None);
 
-        // 没发出去:说明留在新会话的便签里
+        // 没发出去:说明留在新会话的便签里。挑的是同一家的别的账号,先问换不换账号,H 还是交接
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('H'));
         press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.confirm, Some(Confirm::Rehome { .. })));
+        press(&mut app, KeyCode::Char('H'));
         let job = app.take_job().unwrap();
         let Job::Handoff { note, to, .. } = &job else { panic!() };
         assert_eq!((note, *to), (&None, Agent::Claude));
@@ -9890,6 +9978,47 @@ mod tests {
         assert_eq!(app.current().unwrap().title, "接手");
         assert_eq!(app.notes.get("id-接手"), Some("接手「闲」…"));
         assert!(app.current().unwrap().noted);
+    }
+
+    #[test]
+    fn shift_h_on_another_account_of_the_same_kind_can_switch_accounts_in_place() {
+        let mut app = fixture().with_tools(handoff_tools).with_handoff(fake_source).with_group_hints(hints);
+        app.set_sessions(sessions());
+        select(&mut app, "闲");
+        press(&mut app, KeyCode::Char('H'));
+        shows(&reader_rows(&mut app, 60, 14), &["挑同一家的别的账号还能原地换"]);
+        // 闲是 Claude:挑 cw(Claude 的别的账号)先问
+        press(&mut app, KeyCode::Char('1'));
+        assert!(app.job.is_none() && app.tool_menu.is_none());
+        let rows = reader_rows(&mut app, 70, 16);
+        shows(&rows, &["换账号接着跑？", "换到 cw：在原地重启", "缓存是空的", "y 换账号", "H 改成新开一个接手"]);
+        // 别的键取消
+        press(&mut app, KeyCode::Enter);
+        assert!(app.confirm.is_none() && app.job.is_none());
+        assert_eq!(app.msg.as_ref().unwrap().0, "没换账号");
+
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.job, Some(Job::Rehome { t: target("闲"), to: "claude:cw".into(), label: "cw".into() }));
+        let job = app.take_job().unwrap();
+        assert_eq!(app.busy.as_deref(), Some("正在把「闲」换到 cw…"));
+        app.job_done(&job, Outcome::Done("已换到 cw,对话接着来".into()), sessions());
+        assert_eq!(app.current().unwrap().title, "闲");
+        assert_eq!(app.msg.as_ref().unwrap().0, "已换到 cw,对话接着来");
+
+        // 在跑的:框里说会打断它
+        select(&mut app, "跑");
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Char('1'));
+        shows(&reader_rows(&mut app, 70, 16), &["换账号会打断它"]);
+        press(&mut app, KeyCode::Esc);
+
+        // 换到别家(Codex):照旧直接交接
+        select(&mut app, "闲");
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Char('2'));
+        assert!(app.confirm.is_none() && matches!(app.job, Some(Job::Handoff { .. })));
     }
 
     #[test]
@@ -10285,6 +10414,33 @@ mod tests {
         press(&mut app, KeyCode::Char('o'));
         press(&mut app, KeyCode::Char('t'));
         assert_eq!(app.term_req.take().map(|r| r.key).as_deref(), Some("group:work"));
+    }
+
+    #[test]
+    fn a_login_link_pops_up_over_the_terminal_and_takes_the_keys_until_it_closes() {
+        let mut app = with_windows();
+        let file = std::env::temp_dir().join(format!("aca-ui-link-{}.url", std::process::id()));
+        std::fs::write(&file, "https://claude.com/cai/oauth/authorize?x=1").unwrap();
+        let mut t = crate::term::Term::spawn("/", &[], 5, 20).unwrap();
+        t.title = "登录 Claude Code · ding".into();
+        t.link = Some(crate::term::Catch { file: file.clone(), screen: false });
+        app.terms.insert("account:ding".into(), t);
+        app.term_on = Some("account:ding".into());
+        app.catch_links();
+        assert_eq!(app.overlays.len(), 1);
+        // 同一个链接不再弹
+        app.catch_links();
+        assert_eq!(app.overlays.len(), 1);
+        // 键先给弹窗:Esc 关的是它,终端还开着
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlays.is_empty() && app.term_on.as_deref() == Some("account:ding"));
+        assert!(app.msg.as_ref().is_some_and(|(m, _)| m.contains("链接还在登录终端里")), "{:?}", app.msg);
+        // 再 Esc:收起终端
+        press(&mut app, KeyCode::Esc);
+        assert!(app.term_on.is_none());
+        // 终端关了,链接文件一起删
+        app.terms.clear();
+        assert!(!file.exists());
     }
 
     #[test]

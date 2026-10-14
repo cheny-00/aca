@@ -195,6 +195,10 @@ pub struct Env {
     pub ask: fn(Agent, &str) -> Login,
     /// 放到后台问、问到了下一帧就显示(界面里);测试里当场问
     pub background: bool,
+    /// 登录链接交到这个目录里的文件(见 `aca_core::agent::LOGIN_LINK`)
+    pub links: PathBuf,
+    /// 人不在这台机器跟前(`aca_core::agent::remote`):Claude 也不交链接,从屏幕上认
+    pub remote: bool,
 }
 
 /// 登记着的一个会话:哪一家、用的账号、标题
@@ -256,8 +260,14 @@ pub struct Page {
 impl Page {
     /// `adding`:一开就进加账号(`n` 菜单里按 `+`)
     pub fn real(adding: bool) -> Page {
-        let env =
-            Env { config: crate::config::path(), home: std::env::var("HOME").unwrap_or_default(), ask: accounts::login, background: true };
+        let env = Env {
+            config: crate::config::path(),
+            home: std::env::var("HOME").unwrap_or_default(),
+            ask: accounts::login,
+            background: true,
+            links: aca_core::paths::state_dir(),
+            remote: aca_core::agent::remote(&aca_core::config::load()),
+        };
         Page::load(env, crate::setup::session_accounts(), adding)
     }
 
@@ -476,7 +486,11 @@ impl Page {
                 )
                 .to_string(),
                 (_, "…") => tr!("正在问 {me}", "asking {me}"),
-                (_, "○") => t!("没登录:按 ⏎ 在下面开个终端登录", "not logged in: ⏎ opens a terminal below to log in").to_string(),
+                (_, "○") => t!(
+                    "没登录:按 ⏎ 在下面开个终端登录;不自己开浏览器,链接出来你挑用哪个",
+                    "not logged in: ⏎ opens a terminal below to log in; no browser opens by itself, you pick one for the link"
+                )
+                .to_string(),
                 (_, "?") => tr!("问不出登录着没有:{said}", "can't tell whether it's logged in: {said}"),
                 _ => said,
             };
@@ -621,14 +635,21 @@ impl Page {
         fx.term = Some(self.term(&r.a.name, r.a.agent, accounts::relogin_cmd(r.a.agent, &r.a.name)));
     }
 
+    /// 登录不让工具自己开默认浏览器:链接交给界面(文件),弹出来挑用哪个开(见 browser.rs)。
+    /// Codex 不交、远程时 Claude 也不交(给的是要贴码的那条),界面从屏幕上认;上次留下的文件先删掉,免得一开就弹旧的
     fn term(&self, name: &str, a: Agent, run: String) -> TermReq {
+        let tool = if a == Agent::Codex { "codex" } else { "claude" };
+        let file = self.env.links.join(format!("login-{tool}-{name}.url"));
+        let _ = std::fs::create_dir_all(&self.env.links);
+        let _ = std::fs::remove_file(&file);
         TermReq {
             key: format!("account:{name}"),
             family: String::new(),
             title: tr!("登录 {} · {name}", "log in {} · {name}", accounts::who(a)),
             w: crate::workdir::Where { dir: self.env.home.clone(), ..Default::default() },
-            env: vec![],
+            env: vec![(aca_core::agent::LOGIN_LINK.to_string(), file.to_string_lossy().into_owned())],
             run: Some(run),
+            link: Some(crate::term::Catch { file, screen: a == Agent::Codex || self.env.remote }),
         }
     }
 
@@ -827,6 +848,8 @@ mod tests {
                 _ => Login::Out,
             },
             background: false,
+            links: root.join("state"),
+            remote: false,
         };
         std::fs::write(&env.config, config).unwrap();
         (root, env)
@@ -1090,7 +1113,11 @@ mod tests {
         let fx = press(&mut p, &[KeyCode::Down, KeyCode::Enter]);
         let term = fx.term.unwrap();
         assert_eq!(term.title, "登录 Claude Code · firm");
-        assert!(term.run.as_deref().is_some_and(|c| c.ends_with("' run claude:firm -- auth login")) && term.env.is_empty());
+        assert!(term.run.as_deref().is_some_and(|c| c.ends_with("' run claude:firm -- auth login")));
+        // 不让 Claude 自己开浏览器:链接交到这个文件,界面弹出来挑(Codex 的从屏幕上认)
+        let file = root.join("state/login-claude-firm.url");
+        assert_eq!(term.env, [("ACA_LOGIN_LINK".to_string(), file.to_string_lossy().into_owned())]);
+        assert_eq!(term.link, Some(crate::term::Catch { file, screen: false }));
         // 登录着的(往上绕到最后一行,Codex 的):⏎ 不直接去登录 —— Codex 的登录一开始就把原来那份删了,先问
         let fx = press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Enter]);
         assert!(fx.term.is_none() && p.asking == Some(Asking::Relogin));
@@ -1106,7 +1133,9 @@ mod tests {
         shows(&shown(&p, 110), &["重新登录  ⏎(会先问);命令 aca run codex:cx -- login"]);
         assert!(shown(&p, 110).last().unwrap().starts_with("⏎ 重新登录 • + 加账号"));
         let fx = press(&mut p, &[KeyCode::Enter, KeyCode::Char('y')]);
-        assert!(fx.term.unwrap().run.as_deref().is_some_and(|c| c.ends_with("' run codex:cx -- login")));
+        let term = fx.term.unwrap();
+        assert!(term.run.as_deref().is_some_and(|c| c.ends_with("' run codex:cx -- login")));
+        assert!(term.link.is_some_and(|c| c.screen && c.file.ends_with("login-codex-cx.url")));
         // Claude 登录着的也先问;还没问到的、问不出的当它登录着
         let fx = press(&mut p, &[KeyCode::Up, KeyCode::Enter]);
         assert!(fx.term.is_none() && names(&p)[p.sel] == "sub");

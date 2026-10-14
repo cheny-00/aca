@@ -8,6 +8,7 @@ mod acctpage;
 mod ansi;
 mod bar;
 mod bill;
+mod browser;
 mod caps;
 mod clip;
 mod config;

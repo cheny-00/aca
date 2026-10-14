@@ -571,7 +571,7 @@ mod tests {
         };
         let codex = make(".cx", &["auth.json", "config.toml", "version.json", "history.jsonl"]);
         let claude = make(".cc", &[".claude.json", "settings.json", "history.jsonl"]);
-        let who = |a, dir: &str| foreign(a, dir, &home).map(|(other, why)| (other, why));
+        let who = |a, dir: &str| foreign(a, dir, &home);
         assert_eq!(who(Agent::Claude, &codex), Some((Agent::Codex, "里面有 auth.json、config.toml…".into())));
         assert_eq!(who(Agent::Codex, &claude), Some((Agent::Claude, "里面有 .claude.json、settings.json".into())));
         assert_eq!((who(Agent::Codex, &codex), who(Agent::Claude, &claude)), (None, None));

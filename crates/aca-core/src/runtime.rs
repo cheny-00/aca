@@ -76,6 +76,19 @@ pub struct Run {
     /// 这次 agent 是什么时候起的(`session::launch`):刚起的那一会儿,启动时的关有人替你答(见 [`crate::trust`])
     #[serde(skip_serializing_if = "is_zero")]
     pub started: u64,
+    /// 换过账号接着跑的([`crate::session::rehome`]),一次一条。换之前的那几轮两个账号目录里都有,计费靠它归回原来那个
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub moves: Vec<Move>,
+}
+
+/// 一次换账号:什么时候、哪段对话、从哪个配置目录拷到哪个
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct Move {
+    pub at: u64,
+    pub conv: String,
+    pub from: String,
+    pub to: String,
 }
 
 impl Run {

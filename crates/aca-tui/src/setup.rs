@@ -193,6 +193,9 @@ fn config_warning() {
     if let Some(e) = aca_core::config::problem() {
         eprintln!("{}", tr!("config.toml 写法有问题,当成没写:{e}", "config.toml has a problem and is ignored: {e}"));
     }
+    if let Some(e) = aca_core::config::login_problem() {
+        eprintln!("{}", tr!("config.toml 的 [login] 写法有问题,这一节当成没写:{e}", "config.toml's [login] has a problem and is ignored: {e}"));
+    }
 }
 
 fn setup(mut args: Vec<String>) -> Res<i32> {

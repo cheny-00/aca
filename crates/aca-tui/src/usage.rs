@@ -1020,6 +1020,22 @@ pub fn picked(only: &[String], agent: Agent, who: &str) -> bool {
 #[derive(Default)]
 pub struct Deck {
     by_conv: HashMap<String, (String, String)>,
+    /// 换过账号接着跑的对话(`aca restart --as`):从什么时候起在哪个配置目录,头一个是换之前的(从最早算起)。
+    /// 换之前那几轮两个账号目录里都有一份,一模一样,归当时用的那个
+    homes: HashMap<String, Vec<(i64, PathBuf)>>,
+}
+
+impl Deck {
+    /// 这段对话在 ts 那一刻在哪个配置目录;没换过账号 = None
+    fn home_at(&self, conv: &str, ts: i64) -> Option<&Path> {
+        let line = self.homes.get(conv)?;
+        line.iter().take_while(|(since, _)| *since <= ts).last().map(|(_, h)| h.as_path())
+    }
+}
+
+/// 比目录用:换了写法、经过链接的也对得上
+fn real(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// 读登记表里的会话(归档的也要:对话记录还在)。现在这段对话记在表里,换过的每一段在 hook 写的状态里
@@ -1031,6 +1047,13 @@ pub fn deck() -> Deck {
         let title = aca_core::status::title(&s, &run);
         for c in std::iter::once(&s.conv).chain(&run.convs).chain(std::iter::once(&run.conv)).filter(|c| !c.is_empty()) {
             d.by_conv.entry(c.clone()).or_insert_with(|| (s.id.clone(), title.clone()));
+        }
+        for m in &run.moves {
+            let line = d.homes.entry(m.conv.clone()).or_default();
+            if line.is_empty() {
+                line.push((i64::MIN, real(Path::new(&m.from))));
+            }
+            line.push((m.at as i64, real(Path::new(&m.to))));
         }
     }
     d
@@ -1103,9 +1126,12 @@ impl Scanner {
             }
         }
         quotas.retain(|q| picked(only, q.agent, &q.who));
-        // 重复的留输出最多的;一样多的留先有的那个文件(分叉出来的文件晚,归到原来的对话上)
+        // 重复的留输出最多的;一样多的留先有的那个文件(分叉出来的文件晚,归到原来的对话上)。
+        // 换过账号的对话是例外:两个账号目录里一模一样的那几轮,归当时用的那个账号(见 `Deck::homes`)
         let mut files: Vec<&Seen> = self.files.values().filter(|s| !s.recs.is_empty()).collect();
         files.sort_by_cached_key(|s| (s.first_ts(), s.conv.clone(), s.off));
+        let src_dirs: Vec<PathBuf> = if deck.homes.is_empty() { vec![] } else { self.srcs.iter().map(|s| real(&s.dir)).collect() };
+        let owns = |s: &Seen, ts: i64| deck.home_at(&s.conv, ts).is_some_and(|h| src_dirs.get(s.src).is_some_and(|d| d == h));
         let mut best: HashMap<u64, (usize, usize), Fast> =
             HashMap::with_capacity_and_hasher(files.iter().map(|s| s.recs.len()).sum(), Fast::default());
         for (fi, s) in files.iter().enumerate() {
@@ -1116,7 +1142,8 @@ impl Scanner {
                     }
                     Entry::Occupied(mut e) => {
                         let (f0, r0) = *e.get();
-                        if r.tok[4] > files[f0].recs[r0].tok[4] {
+                        let (had, got) = (files[f0].recs[r0].tok[4], r.tok[4]);
+                        if got > had || (got == had && !src_dirs.is_empty() && owns(s, r.ts) && !owns(files[f0], r.ts)) {
                             e.insert((fi, ri));
                         }
                     }
@@ -1793,6 +1820,32 @@ pub(crate) mod tests {
         assert_eq!((r.ranges[1].days, r.ranges[1].active), (4, 2));
         assert_eq!(r.quotas.len(), 1);
         assert_eq!((r.quotas[0].who.as_str(), r.quotas[0].wins[0].label.as_str()), ("cx", "5h"));
+    }
+
+    #[test]
+    fn turns_copied_to_another_account_stay_with_the_account_they_ran_on() {
+        let t = parse_ts("2026-09-30T01:00:00Z");
+        let rec = |key: u64, ts: i64| Rec { key, ts, model: 0, tok: [0, 0, 0, 0, 1_000_000], ..Default::default() };
+        let seen = |src: usize, path: &str, recs: Vec<Rec>| {
+            let mut s = Seen::new(src, Agent::Claude, Path::new(path));
+            (s.models, s.recs) = (vec!["claude-opus-5".into()], recs);
+            s
+        };
+        // 在 a 上跑了 1、2;换到 b 跑了 3;又换回 a 跑了 4。a 那份最后被 b 那份盖过,四轮都在,b 那份有前三轮
+        let a = seen(0, "/ca/projects/p/c1.jsonl", vec![rec(1, t), rec(2, t + 60), rec(3, t + 3600), rec(4, t + 7200)]);
+        let b = seen(1, "/cb/projects/p/c1.jsonl", vec![rec(1, t), rec(2, t + 60), rec(3, t + 3600)]);
+        let srcs = vec![
+            Source { agent: Agent::Claude, who: "a".into(), dir: PathBuf::from("/ca") },
+            Source { agent: Agent::Claude, who: "b".into(), dir: PathBuf::from("/cb") },
+        ];
+        let files = [("/ca/projects/p/c1.jsonl", a), ("/cb/projects/p/c1.jsonl", b)];
+        let sc = Scanner { srcs, files: files.into_iter().map(|(p, s)| (PathBuf::from(p), s)).collect(), ..Default::default() };
+        let mut deck = Deck::default();
+        deck.homes.insert("c1".into(), vec![(i64::MIN, "/ca".into()), (t + 1800, "/cb".into()), (t + 5400, "/ca".into())]);
+        let r = sc.report(t + 7200, 0, &deck, vec![], &[]);
+        let by: Vec<(&str, f64)> = r.ranges[3].by_src.iter().map(|x| (x.name.as_str(), x.cost)).collect();
+        assert_eq!(by, vec![("Claude a", 75.0), ("Claude b", 25.0)]);
+        assert_eq!(r.ranges[3].calls, 4);
     }
 
     #[test]
