@@ -119,6 +119,10 @@ On sessions
             only has a conversation id once it has talked; one that never did starts fresh).
             Sessions gone from tmux entirely (after a reboot) and restored archived ones are listed the same way, ⏎
             recreates them; one whose last turn ended in an error shows ✕.
+            One aca stopped for idling shows ☾ and "auto-stopped, idle" on its row; ⏎ resumes it the same way. Put
+            [idle] stop_after = "3h" in config.toml and while the interface is open, every 5 minutes it stops the
+            sessions idle that long; never one mid-turn, attached, with background tasks, with unsent text in its
+            input box or with a schedule of its own not yet due (CronCreate, /loop) (see aca help stop)
             D on a window / pane opened inside a session, or on an ordinary tmux session: stops only that pane (the
             program stops, the pane stays, shows ■), ⏎ starts its original command again in place
   R         restart (in place, the conversation continues, other windows untouched): asks first if it's running / waiting for you
@@ -327,7 +331,11 @@ Reading the list
             hooks can't be matched to its conversation and shows none. Teammates split off by Claude's agent
             teams are real panes and are listed as panes
   State     ● running (the last column is how long)  ◐ waiting for you: red = a choice / confirmation, yellow = finished, not seen yet
-            ○ idle  ✕ error  ■ not running (the agent exited / stopped with D / gone from tmux)  ✎ has a note  ★ pinned  ⇄ open elsewhere too
+            ○ idle  ✕ error  ■ not running (the agent exited / stopped with D / gone from tmux)  ☾ stopped by aca for idling
+            ✎ has a note  ★ pinned  ⇄ open elsewhere too
+            ◷ 08:57 after a title: it scheduled something of its own not yet due (Claude's CronCreate, /loop's next
+            wakeup), with when the first one runs and +N for more; the preview lists them. They live only in its
+            process: stopping or restarting drops them, and it isn't auto-stopped while idle
             Registered sessions: what the screen shows (asking, running) wins, what it can't show (finished unread,
             error) comes from the hooks; other sessions go by the screen only.
             Open = ● ◐ ○ ✕ (everything but not running), no matter how long ago

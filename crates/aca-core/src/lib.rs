@@ -25,6 +25,7 @@ pub mod paths;
 pub mod plugin;
 pub mod proc;
 pub mod runtime;
+pub mod schedule;
 pub mod screen;
 pub mod session;
 pub mod status;

@@ -332,7 +332,7 @@ plugins.toml 里不用写它(sync 不装它也不删它);要停着、改它给 a
 |---|---|---|
 | `session.created` | `title` `tool` `account` `dir` `group` `parent` | 建了(分叉出来的多 `fork` 和分自哪个会话 `fork_of`,`parent` 是空的:没人派它;`aca adopt` 接管来的多 `adopted` 和现在的会话名 `tmux`) |
 | `session.started` | `how`:fresh / resume / fork | agent 起来了 |
-| `session.stopped` | | `aca stop` |
+| `session.stopped` | `idle`(闲着被 aca 停掉时:停之前空闲了几秒,见 config.toml 的 `[idle] stop_after`) | `aca stop`、界面里 D;闲着被 aca 停掉 |
 | `session.renamed` | `title` `tmux` | 人改的名 |
 | `session.titled` | `title` `tmux` | agent 自己起了 / 换了标题 |
 | `session.moved` | `group` | 挪分组 |
@@ -439,7 +439,8 @@ aca 点名是哪个插件:
   unread 跑完了没看 / idle / error / exited agent 退出了 / stopped 没在跑)`tool` `account` `group` `dir` `parent`(谁派的)
   `fork_of`(分叉出来的:分自哪个会话;它没有 `parent`)
   `tmux`(tmux 会话名)`pane`(agent 那一格)`attached`(几个终端连着)`conv`(对话 id)`ask`(在等你时问的那句)
-  `ran`(这一轮跑了几秒)`active`(最近有动静的时刻)`bg`(后台任务数)`locked` `created` `order` `tokens`(`meta set` 挂的字)。
+  `ran`(这一轮跑了几秒)`active`(最近有动静的时刻)`bg`(后台任务数)`locked` `created` `order` `tokens`(`meta set` 挂的字)
+  `idle_stopped`(闲着被 aca 停掉的时刻,列表里画 ☾;别的是 0)。
 - `aca show --json` 里的 `run` 是 aca 自己记的状态,**不是接口**,里面的字段随时会变。
 - `aca plugin actions --json`:一行一个能力,`{"id", "title", "contexts", "args", "expose"}`。
 - 时间:事件的 `ts` 是毫秒,别处是秒。JSON 是紧凑的一行,用 `jq` 读,别拿 sed 去拆(怎么排版不算接口)。

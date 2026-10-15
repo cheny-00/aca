@@ -40,7 +40,7 @@ pub const KNOWN: &[&str] = &[
 pub const FIELDS: &[(&str, &[&str])] = &[
     ("session.created", &["title", "tool", "account", "dir", "group", "parent", "fork", "fork_of", "adopted", "tmux"]),
     ("session.started", &["how"]),
-    ("session.stopped", &[]),
+    ("session.stopped", &["idle"]),
     ("session.removed", &["title", "released"]),
     ("session.archived", &[]),
     ("session.renamed", &["title", "tmux"]),

@@ -292,16 +292,29 @@ const DECK_BOUND: &str =
 /// agent-deck 也绑这个键,只认它自己起名的会话(`agentdeck_*`),别的会话里把键吞掉 —— 接管过来的会话改了名,它就不管了。
 /// 所以它绑的换成两边都认的;你自己绑了别的不动。
 /// 绑定不在 tmux.conf 里:服务重启、agent-deck 再起一个会话都会把它冲掉,所以建会话后、进会话前都来一遍。
-/// 你人已经在会话里时 agent-deck 起会话(它每起一个就绑一次),这几处都轮不到:挂一个钩子,它一绑 tmux 当场换回来
+/// 你人已经在会话里时 agent-deck 起会话(它每起一个就绑一次),这几处都轮不到:挂一个钩子,它一绑 tmux 当场换回来。
+/// 进会话前要等它做完:一次 list-keys 看现状,要改的一次 tmux 调用做完
 pub fn bind_detach() {
-    let keys = run(&["list-keys", "-T", "root"]).unwrap_or_default();
-    if rebind(bound(&keys, DETACH_KEY)) {
-        let _ = run(&["bind-key", "-n", DETACH_KEY, "if-shell", "-F", DETACH_IN, "detach-client", &format!("send-keys {DETACH_KEY}")]);
-    }
-    let again = format!("bind-key -n {DETACH_KEY} if-shell -F '{DETACH_IN}' detach-client 'send-keys {DETACH_KEY}'");
-    let _ = run(&["set-hook", "-g", DETACH_HOOK, &format!("if-shell -F \"{DECK_BOUND}\" \"{again}\"")]);
+    let Ok(keys) = run(&["list-keys"]) else { return };
+    let mut cmds = detach_changes(&keys);
     // 插件要的热键一样不在 tmux.conf 里:跟着一起补
-    crate::plugin::bind_hotkeys();
+    if let Some(want) = crate::plugin::hotkey_binds() {
+        cmds.extend(hotkey_changes(&keys, &want).0);
+    }
+    let _ = run(&cmds.join(&";".to_string()));
+}
+
+/// Ctrl+Q 要跑的命令。钩子每次都挂(看一眼它在不在和挂一次一样贵),键上不是这一版的才绑。
+/// 钩子在最前:一串命令里有一条出错,tmux 就不跑后面的了
+fn detach_changes(keys: &str) -> Vec<Vec<String>> {
+    let s = |x: &str| x.to_string();
+    let again = format!("bind-key -n {DETACH_KEY} if-shell -F '{DETACH_IN}' detach-client 'send-keys {DETACH_KEY}'");
+    let mut cmds = vec![vec![s("set-hook"), s("-g"), s(DETACH_HOOK), format!("if-shell -F \"{DECK_BOUND}\" \"{again}\"")]];
+    if rebind(bound(keys, DETACH_KEY)) {
+        let bind = ["bind-key", "-n", DETACH_KEY, "if-shell", "-F", DETACH_IN, "detach-client"];
+        cmds.push(bind.into_iter().map(s).chain([format!("send-keys {DETACH_KEY}")]).collect());
+    }
+    cmds
 }
 
 /// 热键绑的命令里都带着它:「这是 aca 绑的」靠它认。你自己在 tmux.conf 里绑的 `aca plugin pane …` 没有它,不会被当成 aca 的解掉
@@ -383,13 +396,9 @@ fn plain(s: &str) -> String {
     s.chars().filter(|c| !matches!(c, '\\' | '"' | '\'')).collect()
 }
 
-/// `list-keys` 里这个键现在绑的命令(`bind-key [-r] -T root C-q 命令 …` 的命令那一段)
+/// `list-keys` 里这个键在平常那张键表上绑的命令(`bind-key [-r] -T root C-q 命令 …` 的命令那一段)
 fn bound<'a>(keys: &'a str, key: &str) -> Option<&'a str> {
-    keys.lines().find_map(|l| {
-        let table = l.split_once("-T")?.1.trim_start();
-        let (k, cmd) = table.split_once(char::is_whitespace)?.1.trim_start().split_once(char::is_whitespace)?;
-        (k == key).then(|| cmd.trim_start())
-    })
+    bindings(keys, "root").find(|(k, _)| *k == key).map(|(_, cmd)| cmd)
 }
 
 /// 没绑、agent-deck 绑的、aca 以前绑的(条件改过)→ 绑;已经是这一版、别人绑的 → 不动
@@ -473,6 +482,13 @@ mod tests {
         assert!(rebind(bound(&line("if-shell -F \"#{@aca_id}\" detach-client"), "C-q")));
         // 你自己绑的
         assert!(!rebind(bound(&line("display-popup -E htop"), "C-q")));
+        // 读的是全部键表:别的表上的 C-q 不算
+        assert_eq!(bound("bind-key -T copy-mode C-q send-keys -X cancel\n", "C-q"), None);
+        // 钩子每次都挂、挂在最前;键已经是这一版的就不再绑
+        let first = |cmds: &[Vec<String>]| cmds.iter().map(|c| c[0].clone()).collect::<Vec<_>>();
+        assert_eq!(first(&detach_changes(&ours)), ["set-hook"]);
+        assert_eq!(first(&detach_changes(&deck)), ["set-hook", "bind-key"]);
+        assert_eq!(detach_changes(&deck)[1].last().map(String::as_str), Some("send-keys C-q"));
     }
 
     #[test]

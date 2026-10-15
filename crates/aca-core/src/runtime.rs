@@ -76,6 +76,13 @@ pub struct Run {
     /// 这次 agent 是什么时候起的(`session::launch`):刚起的那一会儿,启动时的关有人替你答(见 [`crate::trust`])
     #[serde(skip_serializing_if = "is_zero")]
     pub started: u64,
+    /// 闲着被 aca 停掉的时刻([`crate::session::stop_idle`]):列表里画 ☾,和人停的 ■ 分开。再起、人再停一次就清掉
+    #[serde(skip_serializing_if = "is_zero")]
+    pub idle_stopped: u64,
+    /// 开始压缩对话的时刻(Claude 的 PreCompact;手动 /compact、上下文满了、闲着快一小时它自己压的都报),压完就清掉。
+    /// 闲着自己压的那种 hook 状态一直是「跑完」,靠它才知道正在压,不在这时停([`crate::session::stop_idle`])
+    #[serde(skip_serializing_if = "is_zero")]
+    pub compacting: u64,
     /// 换过账号接着跑的([`crate::session::rehome`]),一次一条。换之前的那几轮两个账号目录里都有,计费靠它归回原来那个
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub moves: Vec<Move>,

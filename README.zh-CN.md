@@ -16,7 +16,7 @@ aca 是参考 [agent-deck](https://github.com/asheshgoplani/agent-deck) 做的,�
 
 ## 它能做什么
 
-- **一个列表,状态一眼看清。** `●` 正在干活 · `◐` 在等你,或者做完了你还没看 · `○` 空闲 · `✕` 出错 · `■` 没在运行。
+- **一个列表,状态一眼看清。** `●` 正在干活 · `◐` 在等你,或者做完了你还没看 · `○` 空闲 · `✕` 出错 · `■` 没在运行 · `☾` 闲太久被 aca 自动停的(见下面的 `[idle]`)。
 - **多个账号放在一起用。** 个人订阅、公司订阅、API key、Bedrock:所有账号的会话都在同一个列表里,
   而且 aca 保证一个账号的登录不会被另一个账号的会话用到。
 - **不改动你的 agent 配置。** aca 不会往 `~/.claude` 或 `~/.codex` 里写 hook 或者别的东西。
@@ -144,6 +144,10 @@ hook_trust = "bypass"                     # 不再询问「Hooks need review」(
 
 [trust]
 folder = true                             # 替你回答「是否信任这个目录」
+
+[idle]
+stop_after = "3h"                         # 界面开着时,把空闲这么久的会话停掉(⏎ 接着原来的对话再起);
+                                          # 闲着的 agent 也一直占着 CPU
 
 [ui]
 lang = "zh"                               # "en" 或 "zh"

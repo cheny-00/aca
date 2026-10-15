@@ -75,7 +75,19 @@ pub struct Row {
     pub order: i64,
     /// 插件挂上来的小段字
     pub tokens: BTreeMap<String, String>,
+    /// 闲着被 aca 停掉的时刻(见 [`crate::session::stop_idle`]);别的(在跑、人停的)是 0
+    pub idle_stopped: u64,
 }
+
+impl Row {
+    /// 状态图标:闲着被 aca 停掉的画 ☾,别的照状态
+    pub fn glyph(&self) -> &'static str {
+        if self.idle_stopped > 0 { IDLE_STOPPED } else { self.state.glyph() }
+    }
+}
+
+/// 闲着被 aca 停掉的会话的图标(人停的、agent 自己退的是 ■)
+pub const IDLE_STOPPED: &str = "☾";
 
 /// 显示的标题:人改过名听人的,否则 agent 自己起的,还没有就用登记时的
 pub fn title(s: &Session, r: &Run) -> String {
@@ -157,7 +169,9 @@ pub fn merge(pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64) -> (St
     let state = match r.status.as_str() {
         // 读了屏幕却没看到框:要么框还没画出来(刚报的),要么已经按 Esc 打断了(打断不发事件)
         "waiting" if seen.is_none() || now.saturating_sub(r.ts) < 5 => State::Ask,
-        "running" if seen.is_none() => State::Running,
+        // 一轮刚报开始、屏幕还没转起来:事件触发的那次重读常常赶在屏幕前面,不信 hook 就要等下一轮 2 秒的重读。
+        // 过了这几秒屏幕上还安静,当是按 Esc 打断了
+        "running" if seen.is_none() || now.saturating_sub(r.turn) < 3 => State::Running,
         "error" => State::Error,
         // 看过:手动标的 / 跑完那一刻正连着(hook 记的)、跑完之后连进去过、跑完之后在里面按过键(一直连着看它跑完再切走的)。
         // 按键和跑完在同一秒的不算:分不出先后,会话刚建时 tmux 也记一次「有人动过」
@@ -195,6 +209,7 @@ fn row(s: &Session, pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64)
         created: s.created,
         order: s.order,
         tokens: r.live_tokens(now),
+        idle_stopped: if matches!(state, State::Exited | State::Stopped) { r.idle_stopped } else { 0 },
     }
 }
 
@@ -318,6 +333,7 @@ mod tests {
             created: 0,
             order: 0,
             tokens: BTreeMap::new(),
+            idle_stopped: 0,
         };
         for (file, docs, from, to) in [
             ("plugins.md", include_str!("../../../docs/plugins.md"), "**JSON that aca prints**", "**Names**"),
@@ -352,6 +368,9 @@ mod tests {
         assert_eq!(merge(Some(&p), &Run { turn: 91, ..run("running") }, Some(&Seen::Running(0)), 100).2, 9);
         // 按 Esc 打断不发事件:hook 还说在跑,屏幕上已经安静了
         assert_eq!(st(&run("running"), Some(Seen::Quiet)), State::Idle);
+        // 一轮刚报开始,屏幕还没转起来:先信 hook;几秒了还安静的才当是打断了
+        assert_eq!(merge(Some(&p), &Run { turn: 99, ..run("running") }, Some(&Seen::Quiet), 100), (State::Running, String::new(), 1));
+        assert_eq!(st(&Run { turn: 97, ..run("running") }, Some(Seen::Quiet)), State::Idle);
         // 没读屏幕:信 hook
         assert_eq!(merge(Some(&p), &Run { turn: 40, ..run("running") }, None, 100), (State::Running, String::new(), 60));
         assert_eq!(merge(Some(&p), &Run { ask: "Bash:ls".into(), ..run("waiting") }, None, 100), (State::Ask, "Bash:ls".into(), 0));

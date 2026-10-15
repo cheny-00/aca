@@ -72,6 +72,7 @@ pub use groups::rename_all as rename_group;
 /// 进这个 tmux 会话(`tmux` 是会话号):已经在 tmux 里就把这台客户端切过去
 fn attach_now(tmux: &str) -> bool {
     if std::env::var_os("TMUX").is_some() {
+        aca_core::tmux::bind_detach();
         let _ = crate::data::switch_to(tmux);
         std::process::exit(0);
     }

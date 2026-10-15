@@ -215,6 +215,7 @@ mod tests {
             created: 0,
             order: 0,
             tokens: BTreeMap::new(),
+            idle_stopped: 0,
         }
     }
 

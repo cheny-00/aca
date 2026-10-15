@@ -1183,14 +1183,11 @@ pub fn bind_hotkeys() -> Vec<(String, String)> {
     }
     // 照登记表现在的样子,不去看你自己的那份清单变没变([`registry`] 会看:变了它要重新登记、存登记表,又绕回这里)
     let (items, _) = hotkeys_in(read_registry());
-    let exe = crate::agent::self_exe();
     let (next, mut notes) = match crate::config::load().keys.next_key() {
         Ok(k) => (k, vec![]),
         Err(e) => (None, vec![(OWN_KEYS.to_string(), tr!("config.toml [keys] next:{e}", "config.toml [keys] next: {e}"))]),
     };
-    let mut want: Vec<(String, String)> = next.iter().map(|k| (k.clone(), next_command(&exe, k))).collect();
-    want.extend(items.iter().filter(|h| next.as_ref() != Some(&h.key)).map(|h| (h.key.clone(), hotkey_command(&exe, h))));
-    let held = crate::tmux::bind_hotkeys(&want);
+    let held = crate::tmux::bind_hotkeys(&want_keys(&items, next.as_ref()));
     if let Some(k) = next.as_ref().filter(|k| held.contains(k)) {
         notes.push((
             OWN_KEYS.to_string(),
@@ -1233,6 +1230,25 @@ pub fn bind_hotkeys() -> Vec<(String, String)> {
         });
     notes.extend(plugins);
     notes
+}
+
+/// tmux 上该绑的热键,和 [`bind_hotkeys`] 绑的同一份:(键, 按了跑的命令)。不说哪些没绑上 ——
+/// 进会话前补绑定(见 [`crate::tmux::bind_detach`])只要这一份。单元测试里是 None:不去碰真的那个 tmux 服务
+pub fn hotkey_binds() -> Option<Vec<(String, String)>> {
+    if cfg!(test) {
+        return None;
+    }
+    let (items, _) = hotkeys_in(read_registry());
+    let next = crate::config::load().keys.next_key().ok().flatten();
+    Some(want_keys(&items, next.as_ref()))
+}
+
+/// aca 自己的那个键,和开着的插件的热键;两边要同一个键,给 aca 的
+fn want_keys(items: &[HotkeyItem], next: Option<&String>) -> Vec<(String, String)> {
+    let exe = crate::agent::self_exe();
+    let mut want: Vec<(String, String)> = next.iter().map(|k| (k.to_string(), next_command(&exe, k))).collect();
+    want.extend(items.iter().filter(|h| next != Some(&h.key)).map(|h| (h.key.clone(), hotkey_command(&exe, h))));
+    want
 }
 
 fn menu_and_notes() -> (Vec<MenuItem>, Vec<(String, String)>) {

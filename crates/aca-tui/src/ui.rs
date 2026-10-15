@@ -16,7 +16,7 @@ use ratatui::crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -60,6 +60,9 @@ const REFRESH: Duration = Duration::from_secs(2);
 const FLASH: Duration = Duration::from_secs(3);
 /// 上次的界面怎么没的、后台出了错:开界面那一下人可能还没看过来,留久一点
 const NOTICE: Duration = Duration::from_secs(12);
+/// 多久照 `[idle] stop_after` 看一次闲着的会话;界面刚开时先等 IDLE_FIRST(见 `idle_watch`)
+const IDLE_EVERY: Duration = Duration::from_secs(300);
+const IDLE_FIRST: Duration = Duration::from_secs(30);
 /// 多久看一眼事件流的文件变没变(一次 stat);变了就不等 REFRESH,马上重读
 const EVENT_TICK: Duration = Duration::from_millis(150);
 /// 事件触发的刷新最密隔这么久
@@ -313,6 +316,14 @@ pub fn icon(s: State) -> (&'static str, Style) {
     }
 }
 
+/// 一个会话的图标:闲着被 aca 停掉的画 ☾(灰的,和 ■ 一样不抢眼;`[idle] stop_after`),别的照状态
+pub fn session_icon(s: &Session) -> (&'static str, Style) {
+    if s.idle_stopped > 0 && matches!(s.state, State::Dead | State::Stopped) {
+        return (aca_core::status::IDLE_STOPPED, Style::new().fg(theme::pal().muted));
+    }
+    icon(s.state)
+}
+
 /// 子代理那一行的图标:在跑和会话一个样;跑完的打勾(会话没有这个),出错、被停的照会话的画
 fn agent_icon(p: Phase) -> (&'static str, Style) {
     let pal = theme::pal();
@@ -352,6 +363,7 @@ fn agent_row(parent: &Session, k: usize, a: &Subagent) -> Session {
         sub: Some(Sub { parent: parent.name.clone(), parent_title: parent.title.clone(), win: 0, pane: k as u32, split: false }),
         subagents: vec![],
         subagent: Some(a.clone()),
+        due: vec![],
         ..parent.clone()
     }
 }
@@ -492,10 +504,13 @@ pub fn list_rows(view: &[&Session], sections: bool, width: usize, jump: Option<&
     let nums = desk || width >= NUM_MIN_W;
     let trees = tree_marks(view, sections);
     // 桌面上标题那一栏按最长的标题定宽,账号和时间紧跟着,不被推到列表最右边
+    let now = epoch();
     let fit = if desk {
         view.iter()
             .zip(&trees)
-            .map(|(s, (t, _))| t.width() + row_loc(s).width() + s.title.width() + agents_badge(s).width() + marks(s).width())
+            .map(|(s, (t, _))| {
+                t.width() + row_loc(s).width() + s.title.width() + agents_badge(s).width() + due_badge(s, now).width() + marks(s).width()
+            })
             .max()
             .unwrap_or(0)
     } else {
@@ -725,7 +740,7 @@ fn row_segments(
     fit: usize,
 ) -> Vec<Vec<(String, Style)>> {
     let lead_w: usize = lead.iter().map(|(t, _)| t.width()).sum();
-    let (ic, ic_style) = s.subagent.as_ref().map_or_else(|| icon(s.state), |a| agent_icon(a.phase));
+    let (ic, ic_style) = s.subagent.as_ref().map_or_else(|| session_icon(s), |a| agent_icon(a.phase));
     // 子代理那一行:不是会话,没有便签、账号,字写灰的
     let own = s.subagent.is_none();
     let flags: String = [(s.noted, '✎'), (s.attached, '⇄')].iter().filter(|f| f.0 && own).map(|f| f.1).collect();
@@ -737,6 +752,7 @@ fn row_segments(
     let pre = tree;
     let loc = row_loc(s);
     let badge = agents_badge(s);
+    let due = due_badge(s, epoch());
     // 至少 8 格只管屏幕太窄;按最长标题定的宽度不再各行各自撑开,不然窗口号长的那行时间会错开
     let title_w =
         width.saturating_sub(lead_w + pre.width() + 2 + tail_w + loc.width()).max(8).min(fit.saturating_sub(pre.width() + loc.width()));
@@ -745,9 +761,9 @@ fn row_segments(
         first.push((pre.into(), theme::faint()));
     }
     first.extend([(ic.to_string(), ic_style), (" ".into(), Style::new()), (loc, dim())]);
-    // 标题后面紧跟两样:子代理的 +N(绿)、插件挂的字(灰);标题先占,至少留它三分之二
+    // 标题后面紧跟三样:子代理的 +N(绿)、定时的 ◷(强调色)、插件挂的字(灰);标题先占,至少留它三分之二
     let marks = marks(s);
-    let tail = badge.width() + marks.width();
+    let tail = badge.width() + due.width() + marks.width();
     if tail == 0 {
         first.push((clip(&s.title, title_w), if own { Style::new() } else { dim() }));
     } else {
@@ -755,11 +771,19 @@ fn row_segments(
         let shown = clip(&s.title, tw).trim_end().to_string();
         let room = title_w.saturating_sub(shown.width());
         let badge = clip(&badge, room).trim_end().to_string();
+        // 放不下整个「◷ 08:57」就只留 ◷:截一半的时间会看错
+        let left = room.saturating_sub(badge.width());
+        let due = match due.width() {
+            w if w <= left => due,
+            _ if left >= 2 => format!(" {DUE}"),
+            _ => String::new(),
+        };
         // 插件的字补满这一栏(没有就是空格),后面的时间才对得齐
-        let marks = clip(&marks, room.saturating_sub(badge.width()));
+        let marks = clip(&marks, room.saturating_sub(badge.width() + due.width()));
         first.extend([
             (shown, if own { Style::new() } else { dim() }),
             (badge, Style::new().fg(theme::pal().green)),
+            (due, Style::new().fg(theme::pal().accent)),
             (marks, theme::faint()),
         ]);
     }
@@ -816,6 +840,36 @@ fn agents_badge(s: &Session) -> String {
     }
 }
 
+/// 标题后面的 ◷:它给自己定了还没到点的(见 `Session::due`),写最先到点的那个几点;几样的再写 +N
+fn due_badge(s: &Session, now: u64) -> String {
+    let Some(first) = s.due.first() else { return String::new() };
+    let when = first.next.map_or_else(|| t!("定时", "scheduled").to_string(), |t| local_when(t, now));
+    let more = if s.due.len() > 1 { format!(" +{}", s.due.len() - 1) } else { String::new() };
+    format!(" {DUE} {when}{more}")
+}
+
+/// 给自己定了还没到点的(列表的标题后面、预览里、图例)
+const DUE: &str = "◷";
+
+/// 本地时间:今天的写「08:57」,别的日子写「10/16 08:57」
+fn local_when(t: u64, now: u64) -> String {
+    let (a, b) = (aca_core::schedule::local(t), aca_core::schedule::local(now));
+    let hm = format!("{:02}:{:02}", a.h, a.mi);
+    if (a.y, a.m, a.d) == (b.y, b.m, b.d) { hm } else { format!("{}/{} {hm}", a.m, a.d) }
+}
+
+/// 预览里一样一行:哪种、cron、下次几点、到点交给它的那句话
+fn due_line(d: &aca_core::schedule::Due, now: u64) -> String {
+    let when = d.next.map_or_else(|| t!("认不出几点", "time unknown").to_string(), |t| local_when(t, now));
+    let what = match (d.cron.is_empty(), d.recurring) {
+        (true, _) => tr!("/loop 下一次 {when}", "/loop next at {when}"),
+        (false, true) => tr!("循环定时 {} · 下次 {when}", "recurring {} · next {when}", d.cron),
+        (false, false) => tr!("一次性定时 {} · {when}", "one-shot {} · at {when}", d.cron),
+    };
+    let prompt = d.prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if prompt.is_empty() { format!("{DUE} {what}") } else { format!("{DUE} {what} · {prompt}") }
+}
+
 /// 标题后面灰色的字:分叉出来的先写「 分自 X」,再是插件挂的(`aca meta set`):" [pr #12] [ci ✓]"。
 /// 标题里已经带着原会话的名字(默认起的「X (分叉)」)就不再写一遍
 fn marks(s: &Session) -> String {
@@ -866,6 +920,9 @@ fn state_word(s: &Session) -> String {
         State::Error if s.error_kind == "account" => t!("出错 · 额度 / 登录", "error · quota / login").into(),
         State::Error => t!("出错", "error").into(),
         State::Exited => tr!("已退出 · {}", "exited · {}", ago(s.idle_for)),
+        State::Dead | State::Stopped if s.idle_stopped > 0 => {
+            tr!("闲置自动停 · {}", "auto-stopped, idle · {}", ago(epoch().saturating_sub(s.idle_stopped)))
+        }
         State::Stopped => t!("已停止", "stopped").into(),
         State::Dead => tr!("停着 · {}", "stopped · {}", ago(s.idle_for)),
         State::Crashed => t!("出错 · 没在跑", "error · not running").into(),
@@ -1001,7 +1058,7 @@ fn preview_head(s: &Session, g: Option<&Glance>, note: Option<&str>, editing: bo
             ),
         ];
     }
-    let (_, sty) = icon(s.state);
+    let (_, sty) = session_icon(s);
     let word = state_word(s);
     let used = word.width();
     let dir = create::tilde(g.map(|g| g.work.dir.as_str()).filter(|d| !d.is_empty()).unwrap_or(&s.dir));
@@ -1043,6 +1100,32 @@ fn preview_head(s: &Session, g: Option<&Glance>, note: Option<&str>, editing: bo
             Fork::Gone => out.push(Line::styled(t!("分叉出来的 · 原会话已删", "a fork · original deleted"), dim())),
             Fork::No => {}
         }
+    }
+    // 给自己定了还没到点的:一样一行(最多三行),再说一句停了会怎样 —— D、R 之前看得见
+    if !s.due.is_empty() {
+        let now = epoch();
+        for d in s.due.iter().take(3) {
+            let l = clip(&due_line(d, now), w).trim_end().to_string();
+            out.push(match l.strip_prefix(DUE) {
+                Some(rest) => Line::from(vec![Span::styled(DUE, Style::new().fg(theme::pal().accent)), Span::raw(rest.to_string())]),
+                None => Line::raw(l),
+            });
+        }
+        if s.due.len() > 3 {
+            out.push(Line::styled(tr!("  还有 {} 样", "  and {} more", s.due.len() - 3), dim()));
+        }
+        out.push(Line::styled(
+            clip(
+                t!(
+                    "  只在它进程里:停掉、重启就没了;闲着也不会被自动停",
+                    "  these live only in its process: stopping or restarting drops them; it isn't auto-stopped while idle"
+                ),
+                w,
+            )
+            .trim_end()
+            .to_string(),
+            dim(),
+        ));
     }
     // 出错停下的:原话(最多两行);因为账号停下的,写上 X 能干什么
     if s.state == State::Error && !s.error.is_empty() {
@@ -4227,7 +4310,7 @@ impl App {
                 };
                 DirRow {
                     group: d.group_at(&dir),
-                    sessions: here.iter().map(|s| (icon(s.state).0.to_string(), s.title.clone())).collect(),
+                    sessions: here.iter().map(|s| (session_icon(s).0.to_string(), s.title.clone())).collect(),
                     dir,
                     mark,
                 }
@@ -6738,7 +6821,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 let label = if label.is_empty() { vec![] } else { vec![Span::styled(label, agent_style(s.agent))] };
                 match &s.subagent {
                     Some(a) => (agent_icon(a.phase), s.title.clone(), vec![Span::styled(t!("子代理", "subagent"), dim())]),
-                    None => (icon(s.state), s.title.clone(), label),
+                    None => (session_icon(s), s.title.clone(), label),
                 }
             }
             None => (("▸", dim()), app.current().map(|s| group_label(&s.group).to_string()).unwrap_or_default(), vec![]),
@@ -7540,7 +7623,7 @@ fn draw_confirm(f: &mut Frame, c: &Confirm, all: &[Session]) {
     let s = all.iter().find(|s| s.name == name);
     let head_style = if border == danger { red } else { theme::accent() };
     modal(f, 60, border, |w| {
-        let (ic, sty) = s.map_or(("·", dim()), |s| icon(s.state));
+        let (ic, sty) = s.map_or(("·", dim()), session_icon);
         let label = s.map(|s| s.agent_label()).unwrap_or_default();
         let who = s.map_or(Style::new(), |s| agent_style(s.agent));
         let mut out = vec![
@@ -7859,7 +7942,7 @@ fn draw_reader(f: &mut Frame, app: &mut App) {
     });
 
     let s = app.all.iter().find(|s| s.name == name);
-    let ic = s.map_or(("·", dim()), |s| icon(s.state));
+    let ic = s.map_or(("·", dim()), session_icon);
     let where_ = if scroll == 0 { t!("最新", "latest").to_string() } else { tr!("↑{scroll} 行", "↑{scroll} lines") };
     let title = s.map_or(name.as_str(), |s| s.title.as_str());
     let plugin = r.plugin.is_some();
@@ -7969,7 +8052,7 @@ fn draw_trace(f: &mut Frame, app: &mut App) {
         }
     }
     let s = app.all.iter().find(|s| s.name == v.name);
-    let ic = s.map_or(("·", dim()), |s| icon(s.state));
+    let ic = s.map_or(("·", dim()), session_icon);
     let mut title = s.map_or(v.name.as_str(), |s| s.title.as_str()).to_string();
     // 在子代理里:标题写它是谁,在不在跑按它自己的
     let live = v.live(live, now);
@@ -8698,19 +8781,23 @@ fn suspend() -> std::io::Result<()> {
     disable_raw_mode()
 }
 
+/// 接回终端,当场画好一帧(拿手上现有的数据:要重读的交给后台,读完再换上)。
 /// 先补一个「同步结束」:tmux 画一帧前后夹着同步开始 / 结束,detach 正赶上画到一半(会话在刷屏)时,
 /// 没写出去的后半帧连同「结束」被它扔掉,kitty 停在「同步中」不刷新,aca 画好了也看不见,最多卡 2 秒
 /// (实测刷屏的会话里 100 次 detach 有 7 次)。没停在同步中的终端收到它什么也不做。
+/// 进全屏、清屏、画这一帧再夹在一次同步里:终端等画完一起换上,中间不露出空屏(以前先清屏再读列表,空着几十毫秒,看着是一闪)。
 /// 清屏用 resize 不用 clear:clear 为了把光标放回原处,先问终端光标在哪、等它答,ssh 连着的手机线路一卡
 /// (2 秒没答)就报错,aca 跟着退出。resize 一样清屏、下一帧整屏重画,但不问
-fn resume(t: &mut DefaultTerminal) -> std::io::Result<()> {
+fn resume(t: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     enable_raw_mode()?;
-    execute!(stdout(), EndSynchronizedUpdate, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout(), EndSynchronizedUpdate, BeginSynchronizedUpdate, EnterAlternateScreen, EnableMouseCapture)?;
     kbd(true);
     focus_events(true);
     t.hide_cursor()?;
     let area = t.size()?.into();
-    t.resize(area)
+    t.resize(area)?;
+    t.draw(|f| draw(f, app))?;
+    execute!(stdout(), EndSynchronizedUpdate)
 }
 
 /// 是不是 Ctrl+\。终端发的是 0x1C,crossterm 读成 ^4;开了键盘增强的终端里是 ^\ 本身
@@ -8744,19 +8831,45 @@ fn installed_at() -> Option<String> {
     let secs = |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64);
     let t = secs(std::fs::metadata(std::env::current_exe().ok()?).ok()?.modified().ok()?)?;
     let now = secs(std::time::SystemTime::now())?;
-    let off = crate::usage::local_offset();
-    let (day, hm) = ((t + off).div_euclid(86400), (t + off).rem_euclid(86400));
-    let clock = format!("{:02}:{:02}", hm / 3600, hm % 3600 / 60);
-    if day == (now + off).div_euclid(86400) {
-        return Some(clock);
+    Some(local_when(t.max(0) as u64, now.max(0) as u64))
+}
+
+/// 照 config.toml 的 `[idle] stop_after` 定时停闲着的会话(见 `session::stop_idle`),停了的送回界面。
+/// 配置每次现读,改了不用重开界面;没写、写错了(设置页里列着)就不停。按 u 标成未读的留着:核心那份「看过」不知道这个
+fn idle_watch(tx: mpsc::Sender<Vec<aca_core::session::Idled>>) {
+    let mut wait = IDLE_FIRST;
+    loop {
+        thread::sleep(wait);
+        wait = IDLE_EVERY;
+        let cfg = aca_core::config::load();
+        let Ok(Some(after)) = cfg.idle.stop_after() else { continue };
+        let Ok(store) = aca_core::store::Store::open() else { continue };
+        let reads = Reads::open(Reads::default_path());
+        let stopped = aca_core::session::stop_idle(&store, &cfg, after, &|id| reads.unread(id)).unwrap_or_default();
+        if !stopped.is_empty() && tx.send(stopped).is_err() {
+            return;
+        }
     }
-    let (_, m, d) = crate::usage::civil_from_days(day);
-    Some(format!("{m}/{d} {clock}"))
+}
+
+/// 自动停了几个闲着的会话之后,底栏说的那句:几个、哪几个(多了只列前三个)、怎么再起
+fn idle_note(v: &[aca_core::session::Idled]) -> String {
+    let mut names: Vec<String> = v.iter().take(3).map(|s| tr!("「{}」", "“{}”", clip(&s.title, 16).trim_end())).collect();
+    if v.len() > 3 {
+        names.push(tr!("等 {} 个", "and {} more", v.len() - 3));
+    }
+    tr!(
+        "{} 自动停了 {} 个闲着的会话:{} · ⏎ 接着原来的对话再起",
+        "{} stopped {} idle sessions: {} · ⏎ resumes one",
+        aca_core::status::IDLE_STOPPED,
+        v.len(),
+        names.join(t!("", ", "))
+    )
 }
 
 pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     // 首屏等读完再画(~20ms),免得先闪一下空列表;在后台读,同时在这边切输入法(第一次要 ~40ms)
-    let first = thread::spawn(collect);
+    let first = thread::spawn(crate::data::collect_first);
     // 先切输入法:弹窗一出来就按的键不被拼音吃掉。和之后的切来切去一样在主线程
     crate::ime::start();
     let _ime = crate::ime::Guard;
@@ -8843,6 +8956,10 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
         });
     }
 
+    // 闲着的会话到点停掉:单独一个线程,不跟着刷新暂停 —— 你连进哪个会话里了也照看
+    let (idle_tx, idle_rx) = mpsc::channel::<Vec<aca_core::session::Idled>>();
+    thread::spawn(move || idle_watch(idle_tx));
+
     // 重启 / 改名 / 挪分组 / 删除在后台跑,做完连同重读的会话一起送回来(重读也要几十毫秒,不占界面)
     let (job_tx, job_rx) = mpsc::channel::<(Job, Outcome, Vec<Session>)>();
     // 滑动途中攒着的后台刷新
@@ -8908,6 +9025,10 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
             while let Ok((job, out, fresh)) = job_rx.try_recv() {
                 app.job_done(&job, out, fresh);
                 refreshed = true;
+            }
+            while let Ok(v) = idle_rx.try_recv() {
+                app.flash_for(&idle_note(&v), NOTICE);
+                let _ = req_tx.send(());
             }
             // 全屏阅读:刚打开 / 换了会话 / 每次定时刷新,重抓历史(3000 行也只要几毫秒)
             if let Some(target) = app.reader_target().filter(|_| std::mem::take(&mut app.reader_load) || refreshed) {
@@ -9088,9 +9209,9 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                     paused.store(true, Ordering::Relaxed);
                     suspend()?;
                     let got = create::pick_dir(&p);
-                    resume(&mut terminal)?;
-                    paused.store(false, Ordering::Relaxed);
                     app.picked(got);
+                    resume(&mut terminal, &mut app)?;
+                    paused.store(false, Ordering::Relaxed);
                 }
             }
             if let Some(req) = app.create.take() {
@@ -9138,9 +9259,9 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 paused.store(true, Ordering::Relaxed);
                 suspend()?;
                 let got = notes::edit_in_editor(&ed.text);
-                resume(&mut terminal)?;
-                paused.store(false, Ordering::Relaxed);
                 app.note_editor_done(ed, got);
+                resume(&mut terminal, &mut app)?;
+                paused.store(false, Ordering::Relaxed);
             }
             // tmux 弹窗里的 yazi:它认出 tmux 后会穿透出去问外面的终端,弹窗不转发,退出时每次干等 5 秒(图也出不来)
             // → 改在会话里分一格放大的跑它,q 退出这格就关了,人留在会话里(弹窗本来就是切过去用的)
@@ -9153,18 +9274,18 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 paused.store(true, Ordering::Relaxed);
                 suspend()?;
                 let err = run_external(&x);
-                resume(&mut terminal)?;
-                paused.store(false, Ordering::Relaxed);
                 app.external_done(err);
+                resume(&mut terminal, &mut app)?;
+                paused.store(false, Ordering::Relaxed);
                 let _ = req_tx.send(());
             }
             if let Some(p) = app.pick_group.take() {
                 paused.store(true, Ordering::Relaxed);
                 suspend()?;
                 let got = ops::pick_group(&p.cands, &p.t.title);
-                resume(&mut terminal)?;
-                paused.store(false, Ordering::Relaxed);
                 app.group_picked(p, got);
+                resume(&mut terminal, &mut app)?;
+                paused.store(false, Ordering::Relaxed);
             }
             if let Some(r) = app.term_req.take() {
                 let dir = crate::workdir::find(&r.w).dir;
@@ -9245,26 +9366,35 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                     app.note_filled(&key);
                 }
                 if std::env::var_os("TMUX").is_some() {
-                    // 已经在 tmux 里(桌面上开在 tmux 里、手机上的弹窗):直接切过去,不嵌套。切走界面就退了,进去就算看过
+                    // 已经在 tmux 里(桌面上开在 tmux 里、手机上的弹窗):直接切过去,不嵌套。切走界面就退了,进去就算看过。
+                    // 先切再让出终端:界面已经不在眼前了才退全屏,看不到底下的 shell
                     app.mark_seen(&name);
-                    suspend()?;
+                    aca_core::tmux::bind_detach();
                     crate::data::switch_to(&target)?;
+                    suspend()?;
                     return Ok(());
                 }
+                // 让出终端之前备好(界面还在屏上),tmux 一起来就是它的画面
+                let entry = crate::data::prepare(&target);
                 paused.store(true, Ordering::Relaxed);
                 suspend()?;
-                let ok = crate::data::attach(&target);
-                resume(&mut terminal)?;
+                let left = crate::data::go_in(&entry);
                 app.mark_seen(&name);
-                quiet_until = Instant::now() + BACK_QUIET;
-                paused.store(false, Ordering::Relaxed);
-                // 回来时高亮停在刚进去的那个(新建的、交接出来的还没被选中过);本来就停在它或它的窗口上的不动
+                // 回来时高亮停在刚进去的那个(新建的、交接出来的还没被选中过);本来就停在它或它的窗口上的不动。
+                // 还没读进列表的,后台重读的送到了才挪过去
                 if !name.starts_with('$') && app.current().is_none_or(|s| s.family() != name) {
                     app.selected = Some(name.clone());
                 }
-                app.set_sessions(collect());
-                if !ok {
+                if left.is_none() {
                     app.flash(t!("进不去:会话可能刚结束", "can't go in: the session may have just ended"));
+                }
+                // 先拿进去之前的列表画出回来的第一帧,新的交给后台读(几十毫秒),读完再换上
+                resume(&mut terminal, &mut app)?;
+                quiet_until = Instant::now() + BACK_QUIET;
+                paused.store(false, Ordering::Relaxed);
+                let _ = req_tx.send(());
+                if let Some(left) = left {
+                    crate::data::remember_left(&entry, &left);
                 }
             }
         }
@@ -9446,6 +9576,8 @@ mod tests {
             tokens: vec![],
             error: String::new(),
             error_kind: String::new(),
+            idle_stopped: 0,
+            due: vec![],
         }
     }
 
@@ -10150,6 +10282,93 @@ mod tests {
         select(&mut app, "问");
         press(&mut app, KeyCode::Char('X'));
         assert_eq!(app.msg.as_ref().unwrap().0, "普通 tmux 会话不能换账号(没在 aca 里登记) · A 接管");
+    }
+
+    #[test]
+    fn a_session_aca_stopped_for_idling_is_drawn_apart_from_one_stopped_by_hand() {
+        let mut v = sessions();
+        for (title, at) in [("闲", epoch() - 7300), ("错", 0)] {
+            let s = v.iter_mut().find(|s| s.title == title).unwrap();
+            (s.state, s.idle_stopped, s.idle_for) = (State::Dead, at, 7300);
+        }
+        let mut app = fixture();
+        app.set_sessions(v);
+        let by = |t: &str| app.all.iter().find(|s| s.title == t).unwrap().clone();
+        // 闲着被 aca 停的:☾、灰的,写明是自动停的、停了多久;人停的照旧 ■「停着」
+        assert_eq!(session_icon(&by("闲")), ("☾", Style::new().fg(theme::pal().muted)));
+        assert_eq!(state_word(&by("闲")), "闲置自动停 · 2 小时前");
+        assert_eq!((session_icon(&by("错")).0, state_word(&by("错")).as_str()), ("■", "停着 · 2 小时前"));
+        // 又起来了(记号还没清的那一下):照状态画
+        let mut up = by("闲");
+        up.state = State::Idle;
+        assert_eq!(session_icon(&up).0, "○");
+        select(&mut app, "闲");
+        let rows = reader_rows(&mut app, 100, 30);
+        shows(&rows, &["☾", "闲置自动停 · 2 小时前"]);
+    }
+
+    #[test]
+    fn a_session_with_its_own_schedule_shows_when_next_and_the_preview_lists_them() {
+        use aca_core::schedule::Due;
+        let now = epoch();
+        let hm = |t: u64| {
+            let d = aca_core::schedule::local(t);
+            format!("{:02}:{:02}", d.h, d.mi)
+        };
+        let (soon, later) = (now + 1200, now + 3 * 86400);
+        let loop_ = Due { cron: String::new(), recurring: false, prompt: "接着看\n部署".into(), next: Some(soon) };
+        let daily = Due { cron: "57 8 * * *".into(), recurring: true, prompt: "看一眼".into(), next: Some(later) };
+        let mut v = sessions();
+        v.iter_mut().find(|s| s.title == "闲").unwrap().due = vec![loop_.clone(), daily.clone()];
+        let mut app = fixture();
+        app.set_sessions(v);
+        let by = |t: &str| app.all.iter().find(|s| s.title == t).unwrap().clone();
+        // 标题后面:最先到点的那个几点(今天的只写时分,别的日子带上几月几号),几样的写 +N;没定的什么也没有
+        assert_eq!(due_badge(&by("闲"), now), format!(" ◷ {} +1", hm(soon)));
+        assert_eq!(due_badge(&by("跑"), now), "");
+        let day = aca_core::schedule::local(later);
+        assert_eq!(local_when(later, now), format!("{}/{} {}", day.m, day.d, hm(later)));
+        // 一样一行:哪种、cron、几点、那句话(换行并成一行);认不出几点的照说
+        assert_eq!(due_line(&loop_, now), format!("◷ /loop 下一次 {} · 接着看 部署", hm(soon)));
+        assert_eq!(due_line(&daily, now), format!("◷ 循环定时 57 8 * * * · 下次 {} · 看一眼", local_when(later, now)));
+        let odd = Due { cron: "@daily".into(), recurring: false, prompt: String::new(), next: None };
+        assert_eq!(due_line(&odd, now), "◷ 一次性定时 @daily · 认不出几点");
+        // 它派的子代理那一行不跟着标
+        let mut parent = by("闲");
+        parent.subagents = vec![];
+        let a = Subagent {
+            id: "a1".into(),
+            kind: "Explore".into(),
+            desc: "找".into(),
+            phase: Phase::Running,
+            t0: 0,
+            dur: 0,
+            tools: 0,
+            depth: 0,
+            screen: vec![],
+            reported: false,
+        };
+        assert!(agent_row(&parent, 0, &a).due.is_empty());
+        select(&mut app, "闲");
+        let rows = reader_rows(&mut app, 100, 30);
+        shows(
+            &rows,
+            &[
+                &format!("闲 ◷ {} +1", hm(soon)),
+                &format!("◷ /loop 下一次 {} · 接着看 部署", hm(soon)),
+                "◷ 循环定时 57 8 * * *",
+                // 预览窄了后半句截掉
+                "只在它进程里:停掉、重启就没了",
+            ],
+        );
+    }
+
+    #[test]
+    fn idle_stopping_says_how_many_which_and_how_to_resume() {
+        let one = |t: &str| aca_core::session::Idled { id: t.into(), title: t.into(), idle: 0 };
+        assert_eq!(idle_note(&[one("甲"), one("乙")]), "☾ 自动停了 2 个闲着的会话:「甲」「乙」 · ⏎ 接着原来的对话再起");
+        let many: Vec<_> = ["a", "b", "c", "d", "e"].map(one).into_iter().collect();
+        assert_eq!(idle_note(&many), "☾ 自动停了 5 个闲着的会话:「a」「b」「c」等 2 个 · ⏎ 接着原来的对话再起");
     }
 
     #[test]
@@ -13351,6 +13570,8 @@ mod tests {
             tokens: vec![],
             error: String::new(),
             error_kind: String::new(),
+            idle_stopped: 0,
+            due: vec![],
         }
     }
 

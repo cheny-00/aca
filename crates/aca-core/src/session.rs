@@ -4,6 +4,7 @@
 //! 那个窗口开着 remain-on-exit:agent 退出后窗格连最后的画面留着,**停和重启都在原地**,
 //! 你在这个 tmux 会话里另开的窗口不受影响。tmux 里整个没了(重启过电脑)也没事,登记还在,`start` 重新建、接上对话。
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -207,6 +208,7 @@ fn launch_saying(cfg: &Config, s: &Session, pane: Option<&Pane>, how: How, say: 
         // 门铃等这次起来的 agent 自己接上(Claude 的 SessionStart)
         r.bell = false;
         r.started = paths::now();
+        r.idle_stopped = 0;
         if r.status == "ended" {
             r.status = "idle".into();
         }
@@ -294,9 +296,114 @@ pub fn stop(store: &Store, key: &str) -> Res<()> {
     let p = tmux::find(&s.id).ok_or(t!("没在跑", "not running"))?;
     halt(&p);
     sync_conv(store, &s);
-    runtime::update(&s.id, |r| r.status = "ended".into());
+    runtime::update(&s.id, |r| {
+        r.status = "ended".into();
+        r.idle_stopped = 0;
+    });
     event::emit("session.stopped", &s.id, json!({}));
     Ok(())
+}
+
+/// 闲着被停掉的一个
+#[derive(Clone, Debug, PartialEq)]
+pub struct Idled {
+    pub id: String,
+    pub title: String,
+    /// 停之前空闲了几秒
+    pub idle: u64,
+}
+
+/// 空闲了 `after` 秒以上的会话停掉(`[idle] stop_after`:界面开着时定时跑;`aca stop --idle`)。和 [`stop`] 一样 agent 退出、
+/// 窗格和登记留着,另外记下是闲着被停的(列表里画 ☾,人停的画 ■),再起照常接着原来的对话。
+/// 宁可不停,不能停在半路上:跑完没看的、在等你的、出错的、有人连着的、有后台任务的、派出去的会话还开着的(停了它就收不到
+/// 它们的通知)、正在压缩对话的、再起接不上原来对话的(shell、接不上对话的工具、还没说过话的)都不停;停之前把它自己从头再看一遍(见 [`idle_for`])。
+/// `spare`:调用的一方另外要留着的
+pub fn stop_idle(store: &Store, cfg: &Config, after: u64, spare: &dyn Fn(&str) -> bool) -> Res<Vec<Idled>> {
+    let rows = status::collect(store, cfg, true)?;
+    let mut out = vec![];
+    for row in candidates(&rows, paths::now(), after).into_iter().filter(|r| !spare(&r.id)) {
+        let Ok(s) = store.get(&row.id) else { continue };
+        let Some(idle) = idle_for(cfg, &s, after) else { continue };
+        if how_to_resume(cfg, &s, &runtime::load(&s.id)).0 == How::Fresh {
+            continue;
+        }
+        let Some(p) = tmux::find(&s.id).filter(|p| !p.dead) else { continue };
+        halt(&p);
+        sync_conv(store, &s);
+        runtime::update(&s.id, |r| {
+            r.status = "ended".into();
+            r.idle_stopped = paths::now();
+        });
+        event::emit("session.stopped", &s.id, json!({ "idle": idle }));
+        out.push(Idled { id: s.id.clone(), title: row.title.clone(), idle });
+    }
+    Ok(out)
+}
+
+/// 列表里看着能停的(还要过 [`idle_for`]):空闲、没人连着、没有后台任务、派出去的会话都没开着,
+/// 有人动过 / hook 报过事是 `after` 秒以前(真正的「多久没动静」还要算上屏幕输出、对话记录,在 [`idle_for`] 里)
+fn candidates(rows: &[status::Row], now: u64, after: u64) -> Vec<&status::Row> {
+    let open_kids: HashSet<&str> =
+        rows.iter().filter(|r| !matches!(r.state, State::Exited | State::Stopped)).map(|r| r.parent.as_str()).collect();
+    rows.iter().filter(|r| quiet(r) && now.saturating_sub(r.active) >= after && !open_kids.contains(r.id.as_str())).collect()
+}
+
+/// 读了屏幕的状态是空闲(没在跑、没在问、没出错),没人连着,没有后台任务
+fn quiet(r: &status::Row) -> bool {
+    r.state == State::Idle && r.attached == 0 && r.bg == 0
+}
+
+/// 它空闲了几秒;不到 `after`,或者有一样说不准它真闲着,就是 None。停之前现读它自己,几样都要对:
+/// - 读了屏幕的状态是空闲([`quiet`])
+/// - hook 也说这一轮跑完了。只报了开头(在跑)、在等确认的都不算 —— 屏幕万一认错了,也不会停在半路上。
+///   代价:按 Esc 打断的 Claude 不报事件,一直算在跑,要等它下一轮跑完才会被停
+/// - 认得出输入框,里面没有你没发的字
+/// - 最后一次有动静(见 [`stirred`])是 `after` 秒以前
+/// - 它没给自己定着还没到点的(Claude 的 CronCreate、`/loop` 的下一次,见 [`crate::schedule`]):那些只在它进程里,停了就没了
+/// - 没在压缩对话([`compacting`])。Claude 闲着快一小时会自己压一次(提示缓存过期之前),那时 hook 状态还是「跑完」
+fn idle_for(cfg: &Config, s: &Session, after: u64) -> Option<u64> {
+    let p = tmux::find(&s.id).filter(|p| !p.dead)?;
+    let r = runtime::load(&s.id);
+    if !matches!(r.status.as_str(), "" | "idle" | "done") || compacting(&r, paths::now()) || !quiet(&status::one(cfg, s, true)) {
+        return None;
+    }
+    let (agent, _) = agent::of(cfg, s).ok()?;
+    if let Some(m) = agent.prompt_mark()
+        && crate::inbox::draft(m, &tmux::capture_ansi(&p.pane)) != Some(false)
+    {
+        return None;
+    }
+    let now = paths::now();
+    let idle = now.saturating_sub(stirred(&p, &r, s.created, written(&r)));
+    (idle >= after && !crate::schedule::pending(&r, now)).then_some(idle)
+}
+
+/// PreCompact 之后一直没等到压完的(压缩失败、进程没了),过了这么久就不再当它在压。真的压一次多是一到四分钟
+const COMPACT_LONGEST: u64 = 30 * 60;
+
+/// 在压缩对话:报了开始(PreCompact),还没报压完,开始不到 [`COMPACT_LONGEST`]
+fn compacting(r: &Run, now: u64) -> bool {
+    r.compacting != 0 && now.saturating_sub(r.compacting) < COMPACT_LONGEST
+}
+
+/// 最后一次有动静的时刻,几样里最晚的:屏幕有输出(干活时转圈、计时每秒都在刷)、有人连进去 / 按过键、hook 报事、
+/// 这一轮开始 / 跑完、这次起来、登记,还有对话记录最后写入(`written`)。hook 一轮只报开头和结尾,
+/// 中间几个小时的「还在干活」全靠屏幕输出和记录写入
+fn stirred(p: &Pane, r: &Run, created: u64, written: u64) -> u64 {
+    [p.win_activity, p.activity, p.last_attached, r.ts, r.turn, r.done, r.started, created, written].into_iter().max().unwrap_or(0)
+}
+
+/// 对话记录、它旁边 `subagents/` 里子代理的记录(Claude;后台的子代理在主线程跑完之后还在写)最后写入的时刻;没有是 0
+fn written(r: &Run) -> u64 {
+    if r.transcript.is_empty() {
+        return 0;
+    }
+    let t = Path::new(&r.transcript);
+    let at = |p: &Path| {
+        p.metadata().and_then(|m| m.modified()).ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())
+    };
+    let subs = std::fs::read_dir(t.with_extension("").join("subagents")).into_iter().flatten().flatten().map(|e| at(&e.path()));
+    subs.chain([at(t)]).max().unwrap_or(0)
 }
 
 /// 在原地重启,接着原来的对话;`fresh` = 换一段新的
@@ -718,5 +825,98 @@ mod tests {
         // 工具从配置里删了:只能新开
         let gone = Session { tool: "ccx".into(), conv: "c1".into(), ..Default::default() };
         assert_eq!(how_to_resume(&cfg, &gone, &Run::default()), (How::Fresh, "c1".into()));
+    }
+
+    #[test]
+    fn only_quiet_sessions_nobody_watches_and_nothing_waits_on_are_candidates() {
+        let row = |id: &str, state: State, active: u64| status::Row {
+            id: id.into(),
+            title: id.into(),
+            state,
+            tool: "claude".into(),
+            account: String::new(),
+            group: String::new(),
+            dir: String::new(),
+            parent: String::new(),
+            fork_of: String::new(),
+            tmux: id.into(),
+            pane: String::new(),
+            attached: 0,
+            conv: String::new(),
+            ask: String::new(),
+            ran: 0,
+            active,
+            bg: 0,
+            locked: false,
+            created: 0,
+            order: 0,
+            tokens: Default::default(),
+            idle_stopped: 0,
+        };
+        let now = 100_000;
+        let mut rows = vec![
+            row("old", State::Idle, now - 4000),
+            row("new", State::Idle, now - 100),
+            row("unread", State::Unread, now - 9000),
+            row("asks", State::Ask, now - 9000),
+            row("runs", State::Running, now - 9000),
+            row("err", State::Error, now - 9000),
+            row("off", State::Exited, now - 9000),
+            row("watched", State::Idle, now - 9000),
+            row("bg", State::Idle, now - 9000),
+            // 派了一个还在跑的、一个停了的
+            row("boss", State::Idle, now - 9000),
+            row("worker", State::Running, now),
+            row("boss2", State::Idle, now - 9000),
+            row("done", State::Exited, now - 9000),
+        ];
+        rows[7].attached = 1;
+        rows[8].bg = 2;
+        rows[10].parent = "boss".into();
+        rows[12].parent = "boss2".into();
+        let ids = |after| candidates(&rows, now, after).iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(3600), ["old", "boss2"]);
+        assert_eq!(ids(60), ["old", "new", "boss2"]);
+    }
+
+    #[test]
+    fn the_last_stir_counts_screen_output_and_transcript_writes_not_only_hooks_and_keys() {
+        // 一轮跑了 4 小时:hook 只报了开头(1000),没人按过键(900);屏幕一直在刷(15000)、记录一直在写(15200)
+        let p = Pane { activity: 900, last_attached: 800, win_activity: 15_000, ..Default::default() };
+        let r = Run { ts: 1000, turn: 1000, ..Default::default() };
+        assert_eq!(stirred(&p, &r, 500, 15_200), 15_200);
+        assert_eq!(stirred(&p, &r, 500, 0), 15_000);
+        // 都不动了:最晚的那样
+        let p = Pane { activity: 900, win_activity: 1200, ..Default::default() };
+        assert_eq!(stirred(&p, &Run { ts: 1000, done: 1300, started: 100, ..Default::default() }, 500, 1100), 1300);
+    }
+
+    #[test]
+    fn a_compaction_counts_until_it_reports_done_or_half_an_hour_has_gone() {
+        let at = |compacting| Run { compacting, ..Default::default() };
+        assert!(!compacting(&at(0), 10_000));
+        assert!(compacting(&at(10_000), 10_000));
+        assert!(compacting(&at(10_000), 10_000 + 29 * 60));
+        // 没等到压完的(压缩失败、进程没了):半小时之后不再算
+        assert!(!compacting(&at(10_000), 10_000 + 30 * 60));
+    }
+
+    #[test]
+    fn a_transcript_and_its_subagents_tell_when_it_last_wrote() {
+        let dir = std::env::temp_dir().join(format!("aca-written-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("c1/subagents")).unwrap();
+        let t = dir.join("c1.jsonl");
+        std::fs::write(&t, "{}\n").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(7200);
+        std::fs::File::options().write(true).open(&t).unwrap().set_modified(old).unwrap();
+        let r = Run { transcript: t.to_string_lossy().into_owned(), ..Default::default() };
+        let now = paths::now();
+        assert!((now - 7201..=now - 7199).contains(&written(&r)));
+        // 后台的子代理还在写
+        std::fs::write(dir.join("c1/subagents/agent-a1.jsonl"), "{}\n").unwrap();
+        assert!(written(&r) >= now);
+        assert_eq!(written(&Run::default()), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

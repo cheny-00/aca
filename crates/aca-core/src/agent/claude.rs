@@ -27,6 +27,7 @@ const EVENTS: &[(&str, Option<&str>)] = &[
     ("StopFailure", None),
     ("Notification", None),
     ("PermissionRequest", None),
+    ("PreCompact", None),
     ("PostCompact", None),
     ("SessionEnd", None),
     ("PreToolUse", Some("AskUserQuestion")),

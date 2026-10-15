@@ -178,7 +178,7 @@ fn list(cfg: &Config, rows: &[Row], all: &[String], w: usize, now: u64) -> Vec<S
         }
         // 没在跑的整行淡一档
         let off = matches!(r.state, State::Exited | State::Stopped);
-        let mut line = vec![spaces(2), seg(r.state.glyph(), state(r.state).0), spaces(1)];
+        let mut line = vec![spaces(2), seg(r.glyph(), state(r.state).0), spaces(1)];
         line.extend(id_cell(&ids[i], idw));
         line.push(spaces(2));
         line.push(seg(ui::clip(&trace::clean(&r.title), titlew), if off { theme::minor() } else { Style::new() }));
@@ -232,7 +232,8 @@ fn markdown(reply: &str, w: usize, color: bool) -> Vec<Styled> {
 /// `aca show <id>`:第一行状态和标题,下面一项一行,最后是排好的最后一条回复
 fn card(cfg: &Config, row: &Row, run: &Run, all: &[String], w: usize, now: u64, color: bool) -> Vec<Styled> {
     let (st, word) = state(row.state);
-    let mut out = vec![vec![seg(row.state.glyph(), st), spaces(1), seg(trace::clean(&row.title), bold())]];
+    let word = if row.idle_stopped > 0 { t!("闲着被 aca 停了", "stopped by aca for idling") } else { word };
+    let mut out = vec![vec![seg(row.glyph(), st), spaces(1), seg(trace::clean(&row.title), bold())]];
     // 名字那一栏:中文两个字(4 格)空两格;英文最长的 account 也空两格
     let col: usize = if lang() == Lang::En { 9 } else { 6 };
     let mut field = |name: &str, value: Styled| {
@@ -243,6 +244,7 @@ fn card(cfg: &Config, row: &Row, run: &Run, all: &[String], w: usize, now: u64, 
     let none = |s: &str| vec![seg(s, theme::minor())];
     let since = match row.state {
         State::Running if row.ran > 0 => tr!(" · 跑了 {}", " · running for {}", age(row.ran)),
+        _ if row.idle_stopped > 0 => tr!(" · {}前停的", " · {} ago", age(now.saturating_sub(row.idle_stopped))),
         _ => tr!(" · {} 没动", " · quiet for {}", age(now.saturating_sub(row.active))),
     };
     field(t!("状态", "state"), vec![seg(word, Style::new().fg(st.fg.unwrap_or_default())), seg(since, theme::minor())]);
@@ -533,6 +535,7 @@ mod tests {
             created: 0,
             order: 0,
             tokens: Default::default(),
+            idle_stopped: 0,
         }
     }
 
@@ -575,8 +578,11 @@ mod tests {
             row("11111111-1790000000", "修登录", State::Running, "work/app", "claude:sub", 5),
             row("22222222", "a much longer title here", State::Ask, "work/app", "codex", 90),
             row("33333333", "停着的", State::Stopped, "", "claude:~/.claude-x", 86400 * 3),
+            row("44444444", "闲着停的", State::Exited, "", "claude:~/.claude-x", 86400 * 3),
         ];
         rows[1].ask = "Allow Bash(rm -rf)?".into();
+        // 闲着被 aca 停掉的画 ☾,和人停的 ■ 分开
+        rows[3].idle_stopped = NOW - 3600;
         rows[1].tokens.insert("pr".into(), "#12".into());
         let out = list(&Config::default(), &rows, &ids(&rows), 100, NOW);
         assert_eq!(
@@ -585,10 +591,11 @@ mod tests {
              \x20 ● 11111111  修登录                    claude:sub        5秒\n\
              \x20 ◐ 22222222  a much longer title here  codex             1分 [pr #12]\n\
              \x20             └ Allow Bash(rm -rf)?\n\
-             (没分组)  1\n\
+             (没分组)  2\n\
              \x20 ■ 33333333  停着的                    claude:.claude-x  3天\n\
+             \x20 ☾ 44444444  闲着停的                  claude:.claude-x  3天\n\
              \n\
-             3 个会话 · ◐ 1 在等你 · ● 1 在跑"
+             4 个会话 · ◐ 1 在等你 · ● 1 在跑"
         );
         let p = theme::pal();
         // 状态、账号的颜色和界面的列表一套;没在跑的标题淡一档
@@ -598,6 +605,7 @@ mod tests {
         assert_eq!(style_of(&out[2], "codex").fg, Some(p.codex));
         assert_eq!(style_of(&out[3], "Allow").fg, Some(p.red));
         assert_eq!(style_of(&out[5], "停着的"), theme::minor());
+        assert_eq!((style_of(&out[6], "闲着停的"), style_of(&out[6], "☾").fg), (theme::minor(), Some(p.muted)));
         assert_eq!(style_of(&out[1], "修登录"), Style::new());
         assert_eq!(style_of(&out[0], "work/app"), bold());
     }

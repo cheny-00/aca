@@ -18,7 +18,7 @@ aca is modeled on [agent-deck](https://github.com/asheshgoplani/agent-deck); see
 ## What you get
 
 - **One list with clear states.** `●` working · `◐` waiting for you, or finished and not read yet ·
-  `○` idle · `✕` error · `■` not running.
+  `○` idle · `✕` error · `■` not running · `☾` stopped by aca after sitting idle (see `[idle]` below).
 - **Several accounts side by side.** Personal and work subscriptions, an API key, Bedrock: sessions from
   all of them sit in the same list, and aca makes sure one account's login never leaks into another.
 - **Your agent setup stays yours.** aca does not write hooks or anything else into `~/.claude` or
@@ -152,6 +152,10 @@ hook_trust = "bypass"                     # don't ask "Hooks need review" (see G
 
 [trust]
 folder = true                             # answer "do you trust this folder?" for you
+
+[idle]
+stop_after = "3h"                         # while the interface is open, stop sessions idle this long (they
+                                          # resume their conversation with ⏎); idle agents still use CPU
 
 [ui]
 lang = "en"                               # "en" or "zh"

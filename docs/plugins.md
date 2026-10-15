@@ -376,7 +376,7 @@ One JSON object per line. Common fields: `ts` (milliseconds), `event`, `session`
 |---|---|---|
 | `session.created` | `title` `tool` `account` `dir` `group` `parent` | created (a fork adds `fork` and `fork_of`, the session it was forked from, and its `parent` is empty: nobody dispatched it; a session taken over with `aca adopt` adds `adopted` and its current session name `tmux`) |
 | `session.started` | `how`: fresh / resume / fork | the agent started |
-| `session.stopped` | | `aca stop` |
+| `session.stopped` | `idle` (when aca stopped it for idling: how many seconds it had been idle; see `[idle] stop_after` in config.toml) | `aca stop`, D in the interface; aca stopping an idle session |
 | `session.renamed` | `title` `tmux` | you renamed it |
 | `session.titled` | `title` `tmux` | the agent set or changed its own title |
 | `session.moved` | `group` | moved to another group |
@@ -504,7 +504,7 @@ load, and linking says to upgrade aca first). Within one version aca only adds t
   from; a fork has no `parent`) `tmux` (the tmux session name) `pane` (the agent's pane) `attached` (how many terminals
   are attached) `conv` (the conversation id) `ask` (the question while it waits for you) `ran` (seconds this turn has
   run) `active` (the last time something happened) `bg` (background tasks) `locked` `created` `order` `tokens` (text set
-  with `meta set`).
+  with `meta set`) `idle_stopped` (when aca stopped it for idling, drawn ☾ in the list; 0 otherwise).
 - `run` in `aca show --json` is aca's own bookkeeping, **not part of the interface**; its fields can change at any time.
 - `aca plugin actions --json`: one command per line, `{"id", "title", "contexts", "args", "expose"}`.
 - Times: an event's `ts` is in milliseconds, everything else in seconds. JSON is printed compactly on one line; read it

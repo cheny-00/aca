@@ -257,6 +257,124 @@ fn a_session_is_a_tmux_session_named_by_its_title_and_stops_and_restarts_in_plac
 }
 
 #[test]
+fn stop_idle_stops_only_sessions_really_idle_long_enough_and_marks_them_apart() {
+    let Some(sb) = Sandbox::new("idle") else { return };
+    // 假 agent 按 Claude 那一家起,屏幕上画一个输入框;draft 的输入框里有没发的字,ticker 底下一直在刷(像干活时转圈、计时)
+    let mut cfg = std::fs::read_to_string(sb.home.join("config/config.toml")).unwrap();
+    for (tool, script) in [
+        ("box", "printf '────\\n❯ \\n────\\n'; exec sleep 600"),
+        ("draft", "printf '────\\n❯ 写了一半的话\\n────\\n'; exec sleep 600"),
+        ("ticker", "printf '────\\n❯ \\n────\\n'; while :; do printf '\\r%s' \"$(date +%s%N)\"; sleep 0.3; done"),
+    ] {
+        let path = sb.home.join(format!("{tool}.sh"));
+        write(&path, &format!("#!/bin/sh\n{script}\n"));
+        cfg.push_str(&format!("[tools.{tool}]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{}\"]\n", path.display()));
+    }
+    write(&sb.home.join("config/config.toml"), &cfg);
+    // 都说过话(有对话记录,再起接得上)。finish:这一轮跑完了(Stop),没跑完的只报了开头;seen:看过了;
+    // record:对话记录里另外写的几行(Claude 给自己定的到点再来;会话起来之后才写,早于这次起来的那一秒的不算);then:跑完之后又报的 hook
+    let now_iso = || {
+        let o = Command::new("date").args(["-u", "+%Y-%m-%dT%H:%M:%S.000Z"]).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let call = |name: &str, id: &str, input: &str| {
+        format!(
+            "{{\"timestamp\":\"{}\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"{name}\",\"input\":{input}}}]}}}}\n",
+            now_iso()
+        )
+    };
+    let reply = |id: &str, text: &str| {
+        format!(
+            "{{\"timestamp\":\"{}\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{id}\",\"content\":\"{text}\"}}]}}}}\n",
+            now_iso()
+        )
+    };
+    let cron = |job: &str| {
+        call("CronCreate", &format!("u-{job}"), "{\"cron\":\"57 8 * * *\",\"prompt\":\"看一眼\",\"recurring\":true}")
+            + &reply(&format!("u-{job}"), &format!("Scheduled recurring task {job} (57 8 * * *). Next run: Oct 16 8:57am."))
+    };
+    let talk_with =
+        |tool: &str, title: &str, conv: &str, finish: Option<&str>, seen: bool, record: &dyn Fn() -> String, then: &[(&str, &str)]| {
+            let id = sb.aca(&["new", tool, &sb.proj(), "-t", title]);
+            let pane = sb.json(&["show", &id, "--json"])["pane"].as_str().unwrap().to_string();
+            sb.wait_screen(&pane, "❯");
+            let t = sb.home.join(format!("{conv}.jsonl"));
+            write(&t, &format!("{{\"type\":\"user\"}}\n{}", record()));
+            let common = format!("\"session_id\":\"{conv}\",\"transcript_path\":\"{}\"", t.display());
+            let hook = |ev: &str, more: &str| sb.hook(&id, &pane, &format!("{{\"hook_event_name\":\"{ev}\",{common}{more}}}"));
+            hook("SessionStart", ",\"source\":\"startup\"");
+            hook("UserPromptSubmit", ",\"prompt\":\"在吗\"");
+            if let Some(bg) = finish {
+                hook("Stop", &format!(",\"last_assistant_message\":\"在\",\"background_tasks\":{bg}"));
+            }
+            for (ev, more) in then {
+                hook(ev, more);
+            }
+            if seen {
+                sb.aca(&["seen", &id]);
+            }
+            id
+        };
+    let talk = |tool: &str, title: &str, conv: &str, finish: Option<&str>, seen: bool| {
+        talk_with(tool, title, conv, finish, seen, &String::new, &[])
+    };
+    let idle = talk("box", "甲", "c1", Some("[]"), true);
+    let unread = talk("box", "跑完没看", "c2", Some("[]"), false);
+    let bg = talk("box", "有后台任务", "c3", Some("[{\"id\":1}]"), true);
+    // 跑到一半:hook 只报了开头。假 agent 的屏幕上没有转圈,读屏幕会当它空闲 —— 屏幕认错了也不能停
+    let half = talk("box", "跑到一半", "c4", None, false);
+    let half_at = std::time::Instant::now();
+    let draft = talk("draft", "有草稿", "c5", Some("[]"), true);
+    let ticking = talk("ticker", "屏幕在刷", "c6", Some("[]"), true);
+    let subs = talk("box", "子代理在写", "c7", Some("[]"), true);
+    // 给自己定了每天的定时、/loop 的下一次还没到:只在它进程里,停了就没了;定了又删掉的照常停
+    let cron_on = talk_with("box", "有定时", "c8", Some("[]"), true, &|| cron("aa11"), &[]);
+    let looping = talk_with("box", "loop 在等", "c9", Some("[]"), true, &|| call("ScheduleWakeup", "u-w", "{\"delaySeconds\":3600}"), &[]);
+    let cron_off =
+        talk_with("box", "定时删掉了", "c10", Some("[]"), true, &|| cron("bb22") + &call("CronDelete", "u-d", "{\"id\":\"bb22\"}"), &[]);
+    // 闲着快一小时 Claude 自己压缩对话:没有一轮,hook 状态一直是跑完,只报了开始压;压完了的照常停
+    let auto = ",\"trigger\":\"auto\"";
+    let compacting = talk_with("box", "在压缩", "c11", Some("[]"), true, &String::new, &[("PreCompact", auto)]);
+    let compacted = talk_with("box", "压完了", "c12", Some("[]"), true, &String::new, &[("PreCompact", auto), ("PostCompact", auto)]);
+    let show = |id: &str| sb.json(&["show", id, "--json"]);
+    let state = |id: &str| show(id)["state"].as_str().unwrap().to_string();
+
+    // 还没闲够:不停
+    assert_eq!(sb.aca(&["stop", "--idle", "1h"]), "没有空闲了 1h 以上、能停的会话");
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    // 一轮刚报开始的头 3 秒列表先信 hook(在跑);过了这几秒,跑到一半的那个屏幕上看着是闲的
+    std::thread::sleep(std::time::Duration::from_millis(3200).saturating_sub(half_at.elapsed()));
+    assert_eq!([state(&idle), state(&unread), state(&half), state(&draft)], ["idle", "unread", "idle", "idle"]);
+    // 主线程跑完了,后台的子代理还在往它的记录里写
+    write(&sb.home.join("c7/subagents/agent-a1.jsonl"), "{}\n");
+    let out = sb.aca(&["stop", "--idle", "2s"]);
+    let mut titles: Vec<&str> = out.lines().map(|l| l.split("  ").nth(1).unwrap_or("").split('(').next().unwrap()).collect();
+    titles.sort();
+    assert_eq!(titles, ["压完了", "定时删掉了", "甲"], "{out}");
+    assert!(out.contains(&format!("☾ {idle}  甲(空闲了 ")) && out.contains(&format!("☾ {cron_off}  ")), "{out}");
+    assert_eq!(state(&idle), "exited");
+    assert_eq!(state(&compacted), "exited");
+    for id in [&unread, &bg, &half, &draft, &ticking, &subs, &cron_on, &looping, &compacting] {
+        assert_ne!(state(id), "exited", "{}", show(id));
+        assert_eq!(show(id)["idle_stopped"], 0);
+    }
+    assert!(show(&idle)["idle_stopped"].as_u64().unwrap() > 0);
+    // 列表里画 ☾;事件里带着停之前空闲了几秒
+    assert!(sb.aca(&["ls"]).contains(&format!("☾ {idle}")));
+    let ev = sb.aca(&["events", "-n", "200"]).lines().find(|l| l.contains("session.stopped")).unwrap().to_string();
+    assert!(serde_json::from_str::<Value>(&ev).unwrap()["idle"].as_u64().unwrap() >= 2, "{ev}");
+
+    // 再起:接着原来的对话,记号清掉;人再停一次就是 ■
+    assert_eq!(sb.aca(&["start", &idle]), "启动了,接着原来的对话");
+    assert_eq!(show(&idle)["idle_stopped"], 0);
+    sb.aca(&["stop", &idle]);
+    assert!(sb.aca(&["ls"]).contains(&format!("■ {idle}")));
+    // 写不对的时长
+    let o = sb.run(&["stop", "--idle", "3"]);
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("30m、3h、1d、1h30m"));
+}
+
+#[test]
 fn hooks_move_the_status_and_the_agents_own_title_becomes_the_session_name() {
     let Some(sb) = Sandbox::new("hooks") else { return };
     let id = sb.aca(&["new", "fake", &sb.proj()]);
@@ -1472,7 +1590,8 @@ fn a_codex_turn_that_finishes_without_its_stop_hook_is_found_in_its_rollout() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"th-1","prompt":"再改注册页"}"#);
     let v = show();
-    assert_eq!((v["state"].as_str(), v["run"]["status"].as_str()), (Some("idle"), Some("running")), "{v}");
+    // 刚报开始的头 3 秒,屏幕还安静也先信 hook:在跑
+    assert_eq!((v["state"].as_str(), v["run"]["status"].as_str()), (Some("running"), Some("running")), "{v}");
     let all = sb.aca(&["events", "-n", "100"]);
     assert_eq!(all.lines().filter(is_done).count(), 1, "{all}");
 }

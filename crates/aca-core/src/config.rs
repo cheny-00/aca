@@ -32,6 +32,11 @@
 //! [trust]
 //! folder = true                # 起会话时替你答「信不信任这个目录」(Claude、Codex 头一回进一个目录都问);不写 = 不替你答
 //!
+//! [idle]                       # 闲着的会话
+//! stop_after = "3h"            # 空闲这么久就停掉(agent 退出,窗格留着,列表里标 ☾;⏎ / aca start 接着原来的对话再起)。
+//!                              # 写成 30m、3h、1d、1h30m;不写 = 不自动停。aca 界面开着时每 5 分钟看一次;
+//!                              # 这一轮没跑完的、有人连着的、有后台任务的等等不停(见 session::stop_idle)
+//!
 //! [keys]                       # aca 自己绑在 tmux 上的键(不用前缀,只在 aca 的会话里拦;不写进你的 tmux.conf)
 //! next = "C-M-n"               # 进下一个在等你的会话(`aca next`)。不写就是它;"" = 不绑
 //!
@@ -146,6 +151,57 @@ pub struct Config {
     pub keys: Keys,
     #[serde(deserialize_with = "lenient")]
     pub login: Login,
+    #[serde(deserialize_with = "lenient")]
+    pub idle: Idle,
+}
+
+/// `[idle]`:闲着的会话(见 [`crate::session::stop_idle`])
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Idle {
+    /// 空闲这么久就停掉;原样留着,用的时候由 [`Idle::stop_after`] 认
+    pub stop_after: Option<toml::Value>,
+}
+
+impl Idle {
+    /// 空闲几秒就停;不自动停 = `Ok(None)`,写得认不出来 = Err 说为什么(这时也不停)
+    pub fn stop_after(&self) -> Result<Option<u64>, String> {
+        match &self.stop_after {
+            None => Ok(None),
+            Some(toml::Value::String(s)) => span(s).map(|n| (n > 0).then_some(n)).ok_or_else(|| {
+                crate::tr!(
+                    "stop_after 写成 30m、3h、1d、1h30m 这样,不认 \"{s}\"",
+                    "write stop_after like 30m, 3h, 1d or 1h30m, not \"{s}\""
+                )
+            }),
+            Some(v) => Err(crate::tr!(
+                "stop_after 要写成带单位的字符串,比如 \"3h\",不认 {v}",
+                "stop_after takes a string with a unit, like \"3h\", not {v}"
+            )),
+        }
+    }
+}
+
+/// 时长:一个或几个「数 + 单位」连着写,单位 s / m / h / d(`90m`、`1h30m`)。空的 = 0;认不出来 = None
+pub fn span(text: &str) -> Option<u64> {
+    let (mut total, mut num) = (0u64, None::<u64>);
+    for c in text.trim().to_ascii_lowercase().chars() {
+        match c {
+            '0'..='9' => num = Some(num.unwrap_or(0).checked_mul(10)?.checked_add(c as u64 - '0' as u64)?),
+            's' | 'm' | 'h' | 'd' => {
+                let unit = match c {
+                    's' => 1,
+                    'm' => 60,
+                    'h' => 3600,
+                    _ => 86400,
+                };
+                total = total.checked_add(num.take()?.checked_mul(unit)?)?;
+            }
+            _ => return None,
+        }
+    }
+    // 最后一个数没写单位
+    num.is_none().then_some(total)
 }
 
 /// `[login]`:aca 起的登录,链接怎么交给你(见 `agent::quiet_login`、界面的 browser.rs)
@@ -222,8 +278,8 @@ impl TryFrom<toml::Value> for Remote {
     }
 }
 
-/// `[login]` 写错了只当它没写,不连累别的(整个文件写坏才当空的);错在哪由 [`problem`] 说
-fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Login, D::Error> {
+/// `[login]`、`[idle]` 写错了只当它没写,不连累别的(整个文件写坏才当空的);错在哪由 [`login_problem`]、[`idle_problem_in`] 说
+fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned + Default>(d: D) -> Result<T, D::Error> {
     Ok(toml::Value::deserialize(d)?.try_into().unwrap_or_default())
 }
 
@@ -285,6 +341,19 @@ pub fn login_problem() -> Option<String> {
 pub fn login_problem_in(text: &str) -> Option<String> {
     let login = toml::from_str::<toml::Value>(text).ok()?.get("login")?.clone();
     login.try_into::<Login>().err().map(|e| e.to_string().trim().to_string())
+}
+
+/// `[idle]` 写错了的话错在哪(这时不自动停)
+pub fn idle_problem() -> Option<String> {
+    idle_problem_in(&std::fs::read_to_string(paths::config_dir().join("config.toml")).ok()?)
+}
+
+pub fn idle_problem_in(text: &str) -> Option<String> {
+    let idle = toml::from_str::<toml::Value>(text).ok()?.get("idle")?.clone();
+    match idle.try_into::<Idle>() {
+        Ok(i) => i.stop_after().err(),
+        Err(e) => Some(e.to_string().trim().to_string()),
+    }
 }
 
 /// 写坏了的配置当成没写:建会话、hook 都不该因为它起不来
@@ -417,5 +486,25 @@ mod tests {
         assert!(login_problem_in("[login]\nbrowsers = \"firefox\"\n").is_some());
         assert_eq!(login_problem_in("[login]\nremote = \"yes\"\n"), None);
         assert_eq!(login_problem_in("[ui]\nlang = \"zh\"\n"), None);
+    }
+
+    #[test]
+    fn idle_stop_after_is_a_span_with_units_and_a_mistake_there_only_turns_it_off() {
+        assert_eq!(parse("").idle.stop_after(), Ok(None));
+        assert_eq!(parse("[idle]\nstop_after = \"3h\"\n").idle.stop_after(), Ok(Some(3 * 3600)));
+        assert_eq!(parse("[idle]\nstop_after = \" 1H30m \"\n").idle.stop_after(), Ok(Some(5400)));
+        assert_eq!(parse("[idle]\nstop_after = \"\"\n").idle.stop_after(), Ok(None));
+        assert_eq!(parse("[idle]\nstop_after = \"0m\"\n").idle.stop_after(), Ok(None));
+        assert_eq!((span("2d"), span("45s"), span("90m")), (Some(172800), Some(45), Some(5400)));
+        // 最后一个数没单位、别的字、单位前没数:都不认
+        assert_eq!((span("3"), span("3h20"), span("3 小时"), span("h"), span("99999999999999999999d")), (None, None, None, None, None));
+        // 写错了:不自动停,说得出错在哪;别的照用
+        let c = parse("[accounts.claude]\nsub = \"~/.cs\"\n[idle]\nstop_after = 180\n");
+        assert!(c.account("claude", "sub").is_some() && c.idle.stop_after().is_err());
+        assert!(idle_problem_in("[idle]\nstop_after = 180\n").is_some_and(|e| e.contains("\"3h\"")));
+        assert!(idle_problem_in("[idle]\nstop_after = \"3 hours\"\n").is_some_and(|e| e.contains("3 hours")));
+        assert!(idle_problem_in("idle = 3\n").is_some());
+        assert_eq!(idle_problem_in("[idle]\nstop_after = \"3h\"\n"), None);
+        assert_eq!(idle_problem_in("[keys]\nnext = \"\"\n"), None);
     }
 }

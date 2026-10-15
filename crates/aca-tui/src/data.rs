@@ -128,6 +128,11 @@ pub struct Session {
     /// 出错停下的(登记的会话):hook 报的原话和类别(transient / account / fatal,见 `lifecycle::error_kind`);没出错是空的
     pub error: String,
     pub error_kind: String,
+    /// 闲着被 aca 停掉的时刻(`[idle] stop_after`,见 `session::stop_idle`):画 ☾、写「闲置自动停」,和 D 停的 ■ 分开。别的是 0
+    pub idle_stopped: u64,
+    /// 它给自己定了、还没到点的(Claude 的 CronCreate、`/loop` 的下一次,见 `aca_core::schedule`):标题后面标 ◷ 和下次几点。
+    /// 只在它进程里,所以闲着也不会被自动停。登记的、agent 还开着的会话才有,开界面的第一屏不读
+    pub due: Vec<aca_core::schedule::Due>,
 }
 
 /// 父子会话(在某个会话里 `aca new` 的、`--parent` 指定的)。
@@ -255,30 +260,59 @@ fn sh(args: &[&str]) -> String {
 /// 所以先连上刚离开的那个、马上切到要进的(两个命令跑完才画第一帧,看不到那一个),tmux 就记下了「上一个会话」。
 /// stdout 不往终端上打:detach 时 tmux 客户端往 stdout 打一行「[detached (from session …)]」,落在终端主屏上,
 /// 进出几次、界面退出后就露出一串;这里读它,知道最后停在哪个会话(里面可能切过)。
-/// 画面是 tmux 服务端往 stdin 那个终端 fd 写的,不受影响;出错信息走 stderr,照留
+/// 画面是 tmux 服务端往 stdin 那个终端 fd 写的,不受影响;出错信息走 stderr,照留。
+/// 界面里分三步走(见 [`prepare`]、[`go_in`]、[`remember_left`]),中间让出、接回终端
 pub fn attach(name: &str) -> bool {
-    aca_core::tmux::bind_detach();
-    let been = been();
-    let back = been.iter().find(|s| *s != name && has_session(s)).filter(|_| has_session(name));
+    let e = prepare(name);
+    let Some(left) = go_in(&e) else { return false };
+    remember_left(&e, &left);
+    true
+}
+
+/// 进一个会话之前备好的:要进的、刚离开的那个(还在的话)、这个终端待过的
+pub struct Entry {
+    name: String,
+    back: Option<String>,
+    been: Vec<String>,
+}
+
+/// 进会话前要做的都不用终端:补 Ctrl+Q、热键的绑定,找出刚离开的那个。界面在让出终端之前调它 ——
+/// 这时列表还在屏上,做完 tmux 马上接着画,中间不露出底下的 shell。三件事各是 tmux 命令,同时做
+pub fn prepare(name: &str) -> Entry {
+    let (been, live) = thread::scope(|s| {
+        s.spawn(aca_core::tmux::bind_detach);
+        let live = s.spawn(live_sessions);
+        (been(), live.join().unwrap_or_default())
+    });
+    let back = been.iter().find(|s| *s != name && live.contains(*s)).filter(|_| live.contains(name)).cloned();
+    Entry { name: name.to_string(), back, been }
+}
+
+/// attach 进去,detach 回来时返回 tmux 说最后停在哪个会话(会话名,里面可能切过;没说是空的)。None = 没进去
+pub fn go_in(e: &Entry) -> Option<String> {
     let run = |back: Option<&String>| {
         let mut c = tmux_cmd();
         match back {
-            Some(b) => c.args(["attach-session", "-t", b, ";", "switch-client", "-t", name]),
-            None => c.args(["attach-session", "-t", name]),
+            Some(b) => c.args(["attach-session", "-t", b, ";", "switch-client", "-t", &e.name]),
+            None => c.args(["attach-session", "-t", &e.name]),
         };
         c.stdin(Stdio::inherit()).stdout(Stdio::piped()).stderr(Stdio::inherit()).output().ok()
     };
-    let mut out = run(back);
+    let mut out = run(e.back.as_ref());
     // 刚离开的那个恰好这一下没了:没连上(什么都没打),不带它再来一次
-    if back.is_some() && out.as_ref().is_none_or(|o| !o.status.success() && o.stdout.is_empty()) {
+    if e.back.is_some() && out.as_ref().is_none_or(|o| !o.status.success() && o.stdout.is_empty()) {
         out = run(None);
     }
-    let Some(o) = out.filter(|o| o.status.success()) else { return false };
+    let o = out.filter(|o| o.status.success())?;
     let text = String::from_utf8_lossy(&o.stdout);
+    Some(text.lines().find_map(|l| l.strip_prefix("[detached (from session ")?.strip_suffix(")]")).unwrap_or_default().to_string())
+}
+
+/// 回来之后记下这个终端先后待过的会话(两条 tmux 命令):界面画完回来的第一帧再调
+pub fn remember_left(e: &Entry, left: &str) {
     // tmux 说的是会话名(= 标题,会变);记的是会话号
-    let left = text.lines().find_map(|l| l.strip_prefix("[detached (from session ")?.strip_suffix(")]")).and_then(session_id);
-    remember(left.as_deref().unwrap_or(name), name, &been);
-    true
+    let left = (!left.is_empty()).then(|| session_id(left)).flatten();
+    remember(left.as_deref().unwrap_or(&e.name), &e.name, &e.been);
 }
 
 /// 会话名 → 会话号(`$3`)
@@ -324,8 +358,9 @@ fn been_after<'a>(left: &'a str, name: &'a str, been: &'a [String]) -> Vec<&'a s
     v
 }
 
-fn has_session(name: &str) -> bool {
-    !name.is_empty() && tmux_cmd().args(["has-session", "-t", name]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+/// tmux 里现在有的会话:会话号和会话名都在里面(一条命令,不用一个个 has-session)
+fn live_sessions() -> HashSet<String> {
+    tmux(&["list-sessions", "-F", "#{session_id}\t#{session_name}"]).lines().flat_map(|l| l.split('\t')).map(String::from).collect()
 }
 
 /// 把文字粘进会话的输入框:括号粘贴(程序开了这个模式的话,Claude / Codex 都开),不按回车,多行也不会被当成发送
@@ -366,8 +401,7 @@ pub fn send_into(target: &str, text: &str) -> Result<(), &'static str> {
 
 /// 进会话前先切到那一格(那个窗口、那个窗格),进去就落在它上面
 pub fn focus_pane(pane: &str) {
-    let _ = tmux_cmd().args(["select-window", "-t", pane]).status();
-    let _ = tmux_cmd().args(["select-pane", "-t", pane]).status();
+    let _ = tmux_cmd().args(["select-window", "-t", pane, ";", "select-pane", "-t", pane]).stderr(Stdio::null()).status();
 }
 
 /// `--client`:界面开在 tmux 弹窗里时,是哪台客户端按的键。弹窗里裸 switch-client 切的是最近有按键的那台,
@@ -398,9 +432,8 @@ pub fn client_term() -> String {
     tmux(&args).trim().to_string()
 }
 
-/// 已经在 tmux 里:把这台客户端切到那个会话(不嵌套 attach)
+/// 已经在 tmux 里:把这台客户端切到那个会话(不嵌套 attach)。Ctrl+Q 的绑定调用的人先补(`tmux::bind_detach`)
 pub fn switch_to(name: &str) -> std::io::Result<std::process::ExitStatus> {
-    aca_core::tmux::bind_detach();
     let mut c = tmux_cmd();
     c.arg("switch-client");
     if let Some(cl) = CLIENT.get() {
@@ -860,6 +893,15 @@ pub struct Inputs {
 }
 
 pub fn collect() -> Vec<Session> {
+    gather(true)
+}
+
+/// 开界面时的第一屏:不读定时(第一次要把各会话的记录读一遍,几百 MB 要零点几秒),两秒后的那次刷新补上
+pub fn collect_first() -> Vec<Session> {
+    gather(false)
+}
+
+fn gather(schedules: bool) -> Vec<Session> {
     let now = paths::now();
     let cfg = aca_core::config::load();
     let (sessions, groups) = match Store::open() {
@@ -887,6 +929,13 @@ pub fn collect() -> Vec<Session> {
     let mut out = build(Inputs { now, cfg, sessions, groups, panes, screens, attached, kids }, &status::load, &home_of);
     // 各家自己派出去的子代理:读它们的记录(见 subagent.rs),后台的还在跑的会话算在跑
     crate::subagent::attach(&mut out, &status::load);
+    // 给自己定了还没到点的:agent 还开着才有(进程一退就没了)。读过的记录只读后面新写的
+    if schedules {
+        let open = |s: &Session| !matches!(s.state, State::Dead | State::Stopped | State::Crashed | State::Exited);
+        for s in out.iter_mut().filter(|s| s.sub.is_none() && !s.deck_id.is_empty() && open(s)) {
+            s.due = aca_core::schedule::due(&status::load(&s.deck_id), now);
+        }
+    }
     out
 }
 
@@ -1002,6 +1051,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
                 tokens: vec![],
                 error: String::new(),
                 error_kind: String::new(),
+                idle_stopped: 0,
+                due: vec![],
             });
             continue;
         };
@@ -1063,6 +1114,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             tokens: r.live_tokens(now).into_iter().collect(),
             error: if state == State::Error { r.error.clone() } else { String::new() },
             error_kind: if state == State::Error { r.error_kind.clone() } else { String::new() },
+            idle_stopped: if p.dead { r.idle_stopped } else { 0 },
+            due: vec![],
         });
     }
     // 会话里另开的窗口(prefix c)、分出来的窗格(prefix % / "):列在会话下面,自己的状态、自己认 agent。
@@ -1117,6 +1170,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             pid: running.map_or(0, |r| r.1),
             pane: p.pane.clone(),
             sub: Some(Sub { parent: parent.name.clone(), parent_title: parent.title.clone(), win: p.window, pane: p.index, split }),
+            idle_stopped: 0,
+            due: vec![],
             ..parent.clone()
         });
     }
@@ -1164,6 +1219,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             tokens: vec![],
             error: String::new(),
             error_kind: String::new(),
+            idle_stopped: r.idle_stopped,
+            due: vec![],
         });
     }
     link_parents(&mut out, &sessions);
@@ -1317,6 +1374,8 @@ pub(crate) mod tests {
             tokens: vec![],
             error: String::new(),
             error_kind: String::new(),
+            idle_stopped: 0,
+            due: vec![],
         }
     }
 

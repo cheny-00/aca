@@ -304,6 +304,8 @@ fn legend(w: usize) -> Vec<Line<'static>> {
         (Span::styled(ic, sty), what)
     })
     .chain([
+        (Span::styled(aca_core::status::IDLE_STOPPED, Style::new().fg(theme::pal().muted)), t!("自动停", "auto-stopped")),
+        (Span::styled("◷", Style::new().fg(theme::pal().accent)), t!("有定时", "scheduled")),
         (Span::styled("✎", theme::warn()), t!("有便签", "has a note")),
         (Span::styled("★", theme::warn()), t!("置顶", "pinned")),
         (Span::styled("⇄", dim()), t!("别处打开", "open elsewhere")),

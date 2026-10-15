@@ -104,7 +104,7 @@ fn print_rows_zh(rows: &[Row]) {
         }
         let who = if r.account.is_empty() { r.tool.clone() } else { format!("{}:{}", r.tool, agent::account_label(&r.account)) };
         let tokens: String = r.tokens.iter().map(|(k, v)| format!(" [{k} {v}]")).collect();
-        println!("  {} {}  {}  {}  {}{}", r.state.glyph(), r.id, r.title, who, print::age(now.saturating_sub(r.active)), tokens);
+        println!("  {} {}  {}  {}  {}{}", r.glyph(), r.id, r.title, who, print::age(now.saturating_sub(r.active)), tokens);
         if !r.ask.is_empty() {
             println!("      └ {}", r.ask);
         }
@@ -1076,6 +1076,12 @@ fn run(mut a: Args) -> Res<i32> {
     if let Some(e) = config::login_problem() {
         eprintln!("{}", tr!("config.toml 的 [login] 写法有问题,这一节当成没写:{e}", "config.toml's [login] has a problem and is ignored: {e}"));
     }
+    if let Some(e) = config::idle_problem() {
+        eprintln!(
+            "{}",
+            tr!("config.toml 的 [idle] 写法有问题,不自动停:{e}", "config.toml's [idle] has a problem; nothing is auto-stopped: {e}")
+        );
+    }
     let cfg = config::load();
     // 不建会话,带着账号原样跑工具自己的命令:换成它,终端直接是它的
     if cmd == "run" {
@@ -1169,7 +1175,21 @@ fn run(mut a: Args) -> Res<i32> {
             ));
         }
         "start" => println!("{}", session::start(&store, &cfg, &a.next(ID)?)?),
-        "stop" => session::stop(&store, &a.next(ID)?)?,
+        "stop" => match a.opt("--idle")? {
+            Some(span) => {
+                let after = config::span(&span).filter(|n| *n > 0).ok_or_else(|| {
+                    tr!("--idle 写成 30m、3h、1d、1h30m 这样,不认 {span}", "write --idle like 30m, 3h, 1d or 1h30m, not {span}")
+                })?;
+                let stopped = session::stop_idle(&store, &cfg, after, &|_| false)?;
+                if stopped.is_empty() {
+                    println!("{}", tr!("没有空闲了 {span} 以上、能停的会话", "no session idle for {span} or more to stop"));
+                }
+                for s in stopped {
+                    println!("{} {}  {}", status::IDLE_STOPPED, s.id, tr!("{}(空闲了 {})", "{} (idle {})", s.title, print::age(s.idle)));
+                }
+            }
+            None => session::stop(&store, &a.next(ID)?)?,
+        },
         "restart" => {
             let fresh = a.flag("--fresh");
             let to = a.opt("--as")?;

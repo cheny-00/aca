@@ -238,14 +238,14 @@ agent-deck's are the exception: its own hooks still report, and \"finished, unre
                     "  --json         打成 JSON(给脚本读)
   --no-screen    不读屏幕,只用 hook 报的状态(几毫秒;按 Esc 打断这类 hook 不报的事看不出来)
 
-状态:● 在跑  ◐ 在等你 / 跑完没看  ○ 空闲  ✕ 出错  ■ 没在跑。在等你的下面多一行它问的。
+状态:● 在跑  ◐ 在等你 / 跑完没看  ○ 空闲  ✕ 出错  ■ 没在跑  ☾ 闲着被停的。在等你的下面多一行它问的。
 在终端里是排好、上了色的:id 只打前 8 位,加粗的那几位就够敲(aca attach 3f);最底下一行是总数。
 接到管道、文件里是不带颜色的原样,id 是完整的。",
                     "  --json         print as JSON (for scripts)
   --no-screen    don't read screens, only the state hooks report (milliseconds; misses what hooks don't report,
                  like an Esc interrupt)
 
-States: ● running  ◐ waiting for you / finished, unread  ○ idle  ✕ error  ■ not running. One waiting for you
+States: ● running  ◐ waiting for you / finished, unread  ○ idle  ✕ error  ■ not running  ☾ stopped for idling. One waiting for you
 gets an extra line with what it asked.
 In a terminal it's laid out and colored: ids show their first 8 characters, the bold ones are enough to type
 (aca attach 3f); the last line is the total. Piped or redirected it's plain, with full ids.",
@@ -322,14 +322,39 @@ kept as [keys] next in config.toml; to change it: aca tmux key next <key>.
                     "启动(接着原来的对话)/ 停下(agent 退出,窗格和登记留着)",
                     "start, resuming the conversation / stop: the agent exits",
                 ),
-                usage: &[Tr::same("start <id>"), Tr::same("stop <id>")],
+                usage: &[Tr::same("start <id>"), Tr::same("stop <id>"), Tr::new("stop --idle <时长>", "stop --idle <DURATION>")],
                 more: Tr::new(
-                    "  stop    让 agent 自己退出(3 秒不走再强制)。它那一格连最后的画面留着,同一个 tmux 会话里另开的窗口不动。
-  start   没在跑就在原地再起,接着原来的对话(起了没说过话的是新的一段);tmux 里整个没了(重启过电脑)就重新建。",
-                    "  stop    ask the agent to exit (forced after 3 seconds). Its pane stays with the last screen; other windows
-          in the same tmux session are left alone.
-  start   not running: start it again in place, resuming the conversation (one that never talked starts fresh);
-          gone from tmux entirely (after a reboot): create it again.",
+                    "  stop           让 agent 自己退出(3 秒不走再强制)。它那一格连最后的画面留着,同一个 tmux 会话里另开的窗口不动。
+                 列表里标 ■
+  --idle 时长    不写 id:停掉空闲了这么久的会话(30m、3h、1d、1h30m),列表里标 ☾,和一个个停的 ■ 分开。
+                 空闲从最后一次有动静算起:屏幕有输出(干活时转圈、计时一直在刷)、有人进去过、hook 报事、对话记录
+                 (连同子代理的)有写入。不停:这一轮没跑完的(hook 只报了开头,屏幕看着再闲也不停)、跑完没看的、
+                 在等你的、出错的、有人连着的、有后台任务的、输入框里有没发的字的、派出去的会话还开着的、
+                 给自己定了还没到点的(Claude 的 CronCreate、/loop 的下一次:只在它进程里,停了就没了)、
+                 再起接不上原来对话的。打出停了哪些
+  start          没在跑就在原地再起,接着原来的对话(起了没说过话的是新的一段);tmux 里整个没了(重启过电脑)就重新建
+
+自动停:config.toml 里写
+  [idle]
+  stop_after = \"3h\"
+aca 界面开着时每 5 分钟照 stop --idle 3h 停一次(你连进哪个会话里了也照看)。",
+                    "  stop           ask the agent to exit (forced after 3 seconds). Its pane stays with the last screen; other
+                 windows in the same tmux session are left alone. Drawn ■ in the list
+  --idle DURATION  without an id: stop the sessions idle this long (30m, 3h, 1d, 1h30m), drawn ☾ in the list,
+                 apart from the ■ of ones stopped one by one. Idle counts from the last sign of life: output on screen
+                 (a working agent's spinner and timer keep redrawing), someone attaching, a hook, a write to its
+                 conversation record (or a subagent's). Never stopped: a turn that hasn't finished (the hook reported
+                 only its start, however idle the screen looks), finished-unread, waiting for you, failed, attached,
+                 background tasks, unsent text in its input box, dispatched sessions still open, a schedule of its own
+                 not yet due (Claude's CronCreate, /loop's next wakeup: they live only in its process), or one that
+                 can't resume its conversation. Prints the ones it stopped
+  start          not running: start it again in place, resuming the conversation (one that never talked starts fresh);
+                 gone from tmux entirely (after a reboot): create it again
+
+To stop them automatically, put in config.toml
+  [idle]
+  stop_after = \"3h\"
+and while the aca interface is open it does a stop --idle 3h every 5 minutes (also while you're inside a session).",
                 ),
             },
             Cmd {
@@ -1345,6 +1370,12 @@ const CONFIG: &str = "\
   folder = true                    # 替你答「信不信任这个目录」(Claude、Codex 头一回进一个目录都问;不写:不替你答,
                                    # 会话停在那等你;界面 ^S 的 f 也能开关)。那个目录自带的配置从此不问就能跑
 
+闲着的会话(aca help stop;写错了只这一节当没写)
+  [idle]
+  stop_after = \"3h\"                # 空闲这么久就停掉,列表里标 ☾(30m、3h、1d、1h30m;不写 = 不自动停)。aca 界面开着时每 5 分钟看一次;
+                                   # 这一轮没跑完的、跑完没看的、在等你的、有人连着的、有后台任务的、输入框里有没发的字的、
+                                   # 派出去的会话还开着的、给自己定了还没到点的定时的不停(aca help stop)。⏎ 接着原来的对话再起
+
 aca 绑在 tmux 上的键(不用前缀,只在 aca 的会话里拦;不写进你的 tmux.conf)
   [keys]
   next = \"C-M-n\"                   # 进下一个在等你的会话(aca help next)。不写就是它;\"\" = 不绑;aca tmux key next <键> 也是改这里
@@ -1409,6 +1440,13 @@ Startup gates
   folder = true                    # answer \"trust this folder?\" for you (Claude and Codex ask the first time they enter
                                    # a folder; unset: not answered, the session waits for you; f in ^S toggles it).
                                    # The folder's own config then runs without asking
+
+Idle sessions (aca help stop; a mistake drops only this)
+  [idle]
+  stop_after = \"3h\"                # stop sessions idle this long, drawn ☾ in the list (30m, 3h, 1d, 1h30m; unset = never).
+                                   # Checked every 5 minutes while the aca interface is open; never mid-turn, finished-unread,
+                                   # waiting for you, attached, with background tasks or unsent text, with dispatched
+                                   # sessions still open, or with a schedule of its own not yet due (aca help stop). ⏎ resumes
 
 Keys aca binds in tmux (no prefix, only inside aca's sessions; nothing written to your tmux.conf)
   [keys]
@@ -1605,7 +1643,7 @@ mod tests {
         assert!(new.starts_with("aca new <工具[:账号]> [目录]") && new.contains("--say 话") && new.contains("例:"), "{new}");
         // 共用一项的两个名字都找得到同一页;用法只打自己的那一行
         assert_eq!(of("stop"), of("start"));
-        assert_eq!(usage("stop").as_deref(), Some("aca stop <id>"));
+        assert_eq!(usage("stop").as_deref(), Some("aca stop <id>\n     aca stop --idle <时长>"));
         assert_eq!(usage("rename").as_deref(), Some("aca rename <id> <标题>\n     aca rename <id> --auto"));
         let output = of("output").unwrap();
         assert!(output.contains("最长 4000 字)") && output.ends_with("就是那个会话"), "{output}");

@@ -90,6 +90,9 @@ fn problems_in(text: &str) -> Vec<String> {
     if let Some(e) = aca_core::config::login_problem_in(text) {
         bad.push(tr!("config.toml [login] 当成没写:{e}", "config.toml [login] is ignored: {e}"));
     }
+    if let Some(e) = aca_core::config::idle_problem_in(text) {
+        bad.push(tr!("config.toml [idle] 当成没写,不自动停:{e}", "config.toml [idle] is ignored, nothing is auto-stopped: {e}"));
+    }
     bad
 }
 
@@ -169,6 +172,10 @@ mod tests {
         let bad = problems_in("[login]\nremote = \"maybe\"\n");
         assert!(bad.len() == 1 && bad[0].starts_with("config.toml [login] 当成没写:") && bad[0].contains("maybe"), "{bad:?}");
         assert!(problems_in("[login]\nremote = \"yes\"\nbrowsers = [\"Firefox\"]\n").is_empty());
+        // [idle] 写错了:不自动停,设置页说一句
+        let bad = problems_in("[idle]\nstop_after = \"三小时\"\n");
+        assert!(bad.len() == 1 && bad[0].starts_with("config.toml [idle] 当成没写,不自动停:") && bad[0].contains("三小时"), "{bad:?}");
+        assert!(problems_in("[idle]\nstop_after = \"3h\"\n").is_empty());
     }
 
     #[test]

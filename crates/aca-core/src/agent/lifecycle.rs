@@ -121,6 +121,10 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
     if r.conv != from && !from.is_empty() {
         out.push(("conversation.changed", json!({ "conv": r.conv, "from": from })));
     }
+    // 压完(压完接着干的 SessionStart 也算)、这一轮结束、退出:不在压了。状态照下面各自的规矩走
+    if matches!(ev, "PostCompact" | "SessionStart" | "Stop" | "StopFailure" | "SessionEnd") {
+        r.compacting = 0;
+    }
     match ev {
         // 压缩完接着干的那次 SessionStart 不是「空下来了」
         "SessionStart" if s("source") != "compact" => {
@@ -185,6 +189,8 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
             r.clear_ask();
             out.push(("turn.interrupted", json!({})));
         }
+        // 开始压缩:状态不动(闲着自己压的那种前后都没有一轮,一直是「跑完」),只记下正在压
+        "PreCompact" => r.compacting = now,
         // 手动 /compact 结束时不发 Stop
         "PostCompact" if s("trigger") == "manual" && r.status == "running" => {
             r.status = "done".into();
@@ -314,8 +320,18 @@ mod tests {
         assert_eq!((r.status.as_str(), r.conv.as_str(), r.convs.len()), ("idle", "c2", 2));
         // 手动压缩结束没有 Stop
         r.status = "running".into();
+        ev(&mut r, r#"{"hook_event_name":"PreCompact","trigger":"manual","session_id":"c2"}"#, 3);
+        assert_eq!((r.status.as_str(), r.compacting), ("running", 3));
         ev(&mut r, r#"{"hook_event_name":"PostCompact","trigger":"manual","session_id":"c2"}"#, 3);
-        assert_eq!((r.status.as_str(), r.done), ("done", 3));
+        assert_eq!((r.status.as_str(), r.done, r.compacting), ("done", 3, 0));
+        // 闲着快一小时它自己压(trigger 是 auto):前后都没有一轮,一直是跑完,只是记着正在压;压完接着的 SessionStart 也清掉
+        ev(&mut r, r#"{"hook_event_name":"PreCompact","trigger":"auto","session_id":"c2"}"#, 5);
+        assert_eq!((r.status.as_str(), r.compacting), ("done", 5));
+        ev(&mut r, r#"{"hook_event_name":"PostCompact","trigger":"auto","session_id":"c2"}"#, 6);
+        assert_eq!((r.status.as_str(), r.done, r.compacting), ("done", 3, 0));
+        ev(&mut r, r#"{"hook_event_name":"PreCompact","trigger":"auto","session_id":"c2"}"#, 7);
+        ev(&mut r, r#"{"hook_event_name":"SessionStart","source":"compact","session_id":"c2"}"#, 8);
+        assert_eq!((r.status.as_str(), r.compacting), ("done", 0));
         assert!(ev(&mut r, r#"{"hook_event_name":"SessionEnd","reason":"clear","session_id":"c2"}"#, 4).is_empty());
         assert_eq!(ev(&mut r, r#"{"hook_event_name":"SessionEnd","reason":"prompt_input_exit","session_id":"c2"}"#, 4), ["agent.exited"]);
         assert_eq!(r.status, "ended");
