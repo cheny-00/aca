@@ -74,14 +74,39 @@ curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | sh -
 如果 `~/.local/bin` 不在你的 `PATH` 里,脚本会提醒你;请在 shell 的启动文件里把它加上。
 
 编译好的版本支持 macOS(Apple 芯片和 Intel)和 Linux(x86_64 和 arm64,glibc 2.35 以上)。
-其他环境请从源码编译:
-
-```sh
-git clone https://github.com/cheny-00/aca && cd aca
-./install.sh              # 需要 Rust 1.89 以上;编译后安装到 ~/.local/bin/aca
-```
+其他环境,或者想用最新的代码,请[从源码编译](#从源码编译)。
 
 **升级:** 把安装命令再运行一遍。你的设置和会话都不会变。
+
+### 从源码编译
+
+需要:
+
+- **Rust 1.89 或更新的版本。** 用 [rustup](https://rustup.rs) 安装;Linux 发行版自带的 Rust 往往比这个旧。
+  `cargo --version` 可以看现在的版本。
+- **C 编译器。** aca 把 SQLite 一起编进程序里。macOS 上运行 `xcode-select --install`(Rust 在 macOS 上本来也要它);
+  Debian / Ubuntu 上 `sudo apt install build-essential`;Fedora 上 `sudo dnf install gcc`;Arch 上 `sudo pacman -S base-devel`。
+- **git**,以及第一次编译时能上网(cargo 要下载依赖)。
+
+然后:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # 还没有 Rust 时才需要;装完开一个新终端
+git clone https://github.com/cheny-00/aca && cd aca
+./install.sh
+```
+
+`./install.sh` 编译出发布版(第一次要几分钟),安装到 `~/.local/bin/aca`,和下载安装的效果一样:同样的参数都能用
+(`--prefix`、`--statusline`、`--no-setup`),也不会安装别的东西。第一次在终端里运行时,装完会打开 `aca setup`,按 Esc 可以跳过。
+
+升级:拉取最新代码,再运行一遍。
+
+```sh
+cd aca && git pull && ./install.sh
+```
+
+想编某个发布的版本而不是最新代码,先切到它的 tag(例如 `git checkout v0.1.0`)。
+不想留一份源码的话,在最上面那条安装命令后面加上 `--from-source`:它会用 `cargo install` 在临时目录里编译出同样的程序。
 
 ## 快速上手
 

@@ -14010,6 +14010,8 @@ mod tests {
     fn shift_z_shows_the_chat_on_the_left_and_the_turns_steps_on_the_right() {
         let (mut app, _) = trace_app("shows");
         let (left, right) = trace_panes(&mut app, 120, 30);
+        // 记录里那一轮在 UTC 01:00 那一分钟,画的是本地时刻(东八区是 09:00)
+        let numbers = format!("{} · 20.0s · 4 调用 · 3 工具 · $0.03", crate::trace::clock(3_600_000, crate::usage::local_offset(), false));
         // 左边是对话:你说的、Claude 最后说的(Markdown 排过)、一行数字;中间说的话不在这
         shows(
             &left,
@@ -14018,7 +14020,7 @@ mod tests {
                 "你  看看两栏为什么对不齐",
                 "Claude  改好了:len() 数的是字节",
                 "• 换成按显示宽度算的 width()",
-                "09:00 · 20.0s · 4 调用 · 3 工具 · $0.03",
+                &numbers,
                 "── 压缩 97k → 12k · 21.0s",
                 "你  再试一次",
                 "✕ 出错",

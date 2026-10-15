@@ -79,14 +79,42 @@ curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | sh -
 If `~/.local/bin` is not on your `PATH`, the script says so; add it in your shell's startup file.
 
 Prebuilt binaries exist for macOS (Apple silicon and Intel) and Linux (x86_64 and arm64, glibc 2.35 or
-newer). Anywhere else, build from source:
-
-```sh
-git clone https://github.com/cheny-00/aca && cd aca
-./install.sh              # needs Rust 1.89+; builds, then installs to ~/.local/bin/aca
-```
+newer). Anywhere else, or to run the latest code, [build from source](#build-from-source).
 
 **Upgrade:** run the same install command again. Your settings and sessions are untouched.
+
+### Build from source
+
+You need:
+
+- **Rust 1.89 or newer.** Install it with [rustup](https://rustup.rs); the Rust that Linux distributions
+  ship is often older. `cargo --version` shows what you have.
+- **A C compiler.** aca builds SQLite into itself. On macOS run `xcode-select --install` (Rust needs it there
+  anyway); on Debian / Ubuntu `sudo apt install build-essential`; on Fedora `sudo dnf install gcc`;
+  on Arch `sudo pacman -S base-devel`.
+- **git**, and an internet connection for the first build (cargo downloads the dependencies).
+
+Then:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # only without Rust; open a new terminal after
+git clone https://github.com/cheny-00/aca && cd aca
+./install.sh
+```
+
+`./install.sh` builds a release binary (the first build takes a few minutes) and installs it at
+`~/.local/bin/aca`, just like the download: the same options work (`--prefix`, `--statusline`, `--no-setup`),
+and it installs nothing else. The first time, run in a terminal, it opens `aca setup` at the end; Esc skips it.
+
+To upgrade, pull and run it again:
+
+```sh
+cd aca && git pull && ./install.sh
+```
+
+To build a release instead of the latest code, check out its tag first (for example `git checkout v0.1.0`).
+If you would rather not keep a clone, add `--from-source` to the install command at the top: it builds the
+same thing with `cargo install` in a temporary directory.
 
 ## Quick start
 
