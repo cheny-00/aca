@@ -41,15 +41,40 @@ aca is modeled on [agent-deck](https://github.com/asheshgoplani/agent-deck); see
 - **No background service.** State is a handful of small files written by the agents' hooks. Nothing runs
   when you are not using it.
 
-## Requirements
-
-- macOS or Linux. aca is developed and used every day on macOS. On Linux it builds and the basics work,
-  but it has had much less testing, and plugin timers currently work on macOS only.
-- [tmux](https://github.com/tmux/tmux) 3.3 or newer
-- [Claude Code](https://github.com/anthropics/claude-code) and/or [Codex CLI](https://github.com/openai/codex),
-  installed and logged in the way you normally use them
-
 ## Install
+
+aca is a single program, `aca`. There are three ways to get it. All three put it at `~/.local/bin/aca`
+(change that with `--prefix`) and install nothing else.
+
+| Way | When | It needs |
+|---|---|---|
+| [Install script](#install-script) | macOS or Linux on x86_64 / arm64: most people | `curl` or `wget` |
+| [Download by hand](#download-by-hand) | You want to do each step yourself | `tar`, `shasum` or `sha256sum` |
+| [Build from source](#build-from-source) | No prebuilt binary for your machine, or you want the latest code | Rust 1.89+, a C compiler, git |
+
+### Before you install
+
+aca needs these to run, whichever way you install it. The install script checks them and tells you what
+is missing, but never installs them for you.
+
+- **macOS or Linux.** aca is developed and used every day on macOS. On Linux it builds and the basics work,
+  but it has had much less testing, and plugin timers currently work on macOS only. Prebuilt binaries cover
+  macOS (Apple silicon and Intel) and Linux (x86_64 and arm64) with glibc 2.35 or newer, which means
+  Ubuntu 22.04, Debian 12 or later. `uname -sm` shows which machine you have.
+- **[tmux](https://github.com/tmux/tmux) 3.3 or newer.** Every session aca starts is a tmux session; you do
+  not need to know tmux to use aca. Check with `tmux -V`. On macOS, `brew install tmux`. On Linux, use your
+  package manager, but note that Ubuntu 22.04 ships tmux 3.2a, which is too old; Ubuntu 24.04 and Debian 12
+  are new enough.
+- **[Claude Code](https://github.com/anthropics/claude-code) and/or [Codex CLI](https://github.com/openai/codex),**
+  installed and logged in the way you normally use them. Run `claude` or `codex` once to make sure it
+  answers. aca starts them, but it does not install them or log in for you.
+- **`~/.local/bin` on your `PATH`** (or whichever directory you install to). If it is not, add
+  `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` or `~/.bashrc` and open a new terminal.
+
+Tools such as git, fzf and jq are optional: each one switches on one feature. See
+[Optional tools](#optional-tools).
+
+### Install script
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | sh
@@ -72,16 +97,52 @@ curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | sh -
 |---|---|
 | `--prefix <dir>` | Install to `<dir>/bin/aca` (default `~/.local`) |
 | `--version <tag>` | Install a specific release, for example `v0.1.0` (default: the latest) |
-| `--from-source` | Build with cargo instead of downloading (needs Rust 1.89+) |
+| `--from-source` | Build with cargo instead of downloading (see [Build from source](#build-from-source) for what it needs) |
 | `--statusline <how>` | Also connect Claude's status bar right away: `aca`, `wrap` or `off` (see [below](#claudes-subscription-limits-and-status-bar)) |
 | `--no-setup` | Only install the binary and print nothing about next steps |
 
-If `~/.local/bin` is not on your `PATH`, the script says so; add it in your shell's startup file.
+### Download by hand
 
-Prebuilt binaries exist for macOS (Apple silicon and Intel) and Linux (x86_64 and arm64, glibc 2.35 or
-newer). Anywhere else, or to run the latest code, [build from source](#build-from-source).
+Every [release](https://github.com/cheny-00/aca/releases) has one file per machine, each with a `.sha256`
+checksum file next to it:
 
-**Upgrade:** run the same install command again. Your settings and sessions are untouched.
+| Machine | File |
+|---|---|
+| Mac with Apple silicon | `aca-aarch64-apple-darwin.tar.gz` |
+| Mac with Intel | `aca-x86_64-apple-darwin.tar.gz` |
+| Linux, x86_64 | `aca-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux, arm64 | `aca-aarch64-unknown-linux-gnu.tar.gz` |
+
+1. Download your file and its checksum, from the releases page or with curl:
+
+   ```sh
+   f=aca-aarch64-apple-darwin.tar.gz       # yours, from the table above
+   curl -fLO https://github.com/cheny-00/aca/releases/latest/download/$f
+   curl -fLO https://github.com/cheny-00/aca/releases/latest/download/$f.sha256
+   ```
+
+2. Check it and unpack it. The archive holds one file, `aca`.
+
+   ```sh
+   shasum -a 256 -c $f.sha256              # on Linux: sha256sum -c $f.sha256
+   tar -xzf $f
+   ```
+
+3. Put it on your `PATH`:
+
+   ```sh
+   mkdir -p ~/.local/bin && mv aca ~/.local/bin/
+   ```
+
+4. **Only on a Mac, and only if a browser downloaded it:** remove the mark the browser put on it.
+   aca is not signed with an Apple developer ID, so macOS refuses to run a browser download until you do.
+   Files fetched with curl do not get this mark.
+
+   ```sh
+   xattr -d com.apple.quarantine ~/.local/bin/aca
+   ```
+
+Then go on with the [Quick start](#quick-start).
 
 ### Build from source
 
@@ -106,15 +167,23 @@ git clone https://github.com/cheny-00/aca && cd aca
 `~/.local/bin/aca`, just like the download: the same options work (`--prefix`, `--statusline`, `--no-setup`),
 and it installs nothing else. The first time, run in a terminal, it opens `aca setup` at the end; Esc skips it.
 
-To upgrade, pull and run it again:
-
-```sh
-cd aca && git pull && ./install.sh
-```
-
 To build a release instead of the latest code, check out its tag first (for example `git checkout v0.1.0`).
-If you would rather not keep a clone, add `--from-source` to the install command at the top: it builds the
+If you would rather not keep a clone, add `--from-source` to the install script's command: it builds the
 same thing with `cargo install` in a temporary directory.
+
+### Upgrade
+
+Your settings and sessions are untouched by an upgrade.
+
+- **Install script:** run the same command again.
+- **By hand:** repeat the steps above to replace the file. If you ran `aca tmux install`, run it once more
+  afterwards so those settings match the new version (the install script does this for you).
+- **From source:** `cd aca && git pull && ./install.sh`
+
+Running agents carry on as they are. An interface that is already open keeps running the old version
+until you press `Ctrl+L` in it, which restarts it in place on the new one.
+
+To remove aca, see [Uninstall](#uninstall).
 
 ## Quick start
 

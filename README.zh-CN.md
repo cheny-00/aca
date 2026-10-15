@@ -34,15 +34,34 @@ aca 是参考 [agent-deck](https://github.com/asheshgoplani/agent-deck) 做的,�
   把耗时长的任务放到另一台机器上跑,等等。
 - **没有后台常驻进程。** 状态就是 agent 的 hook 写下的几个小文件。你不用它的时候,什么都不在运行。
 
-## 需要什么
-
-- macOS 或 Linux。aca 是在 macOS 上开发和日常使用的。Linux 上能编译、基本功能可用,
-  但测试少得多,插件的定时任务目前只支持 macOS。
-- [tmux](https://github.com/tmux/tmux) 3.3 或更新的版本
-- [Claude Code](https://github.com/anthropics/claude-code) 和 / 或 [Codex CLI](https://github.com/openai/codex),
-  已经按你平时的方式装好并登录
-
 ## 安装
+
+aca 就是一个程序 `aca`。有三种装法,都是把它放到 `~/.local/bin/aca`(可以用 `--prefix` 换位置),不安装任何别的东西。
+
+| 装法 | 适合 | 需要 |
+|---|---|---|
+| [安装脚本](#安装脚本) | x86_64 / arm64 的 macOS 或 Linux:大多数人用这个 | `curl` 或 `wget` |
+| [手动下载](#手动下载) | 想每一步自己来 | `tar`、`shasum` 或 `sha256sum` |
+| [从源码编译](#从源码编译) | 你的机器没有编译好的版本,或者想用最新的代码 | Rust 1.89 以上、C 编译器、git |
+
+### 安装之前
+
+不管用哪种装法,aca 运行都需要下面这些。安装脚本会检查它们、告诉你缺了什么,但不会替你安装。
+
+- **macOS 或 Linux。** aca 是在 macOS 上开发和日常使用的。Linux 上能编译、基本功能可用,但测试少得多,
+  插件的定时任务目前只支持 macOS。编译好的版本支持 macOS(Apple 芯片和 Intel)和 Linux(x86_64 和 arm64),
+  Linux 要求 glibc 2.35 以上,也就是 Ubuntu 22.04、Debian 12 或更新的版本。`uname -sm` 可以看你的机器是哪种。
+- **[tmux](https://github.com/tmux/tmux) 3.3 或更新的版本。** aca 启动的每个会话都是一个 tmux 会话;用 aca 不需要会用 tmux。
+  用 `tmux -V` 查看版本。macOS 上 `brew install tmux`;Linux 上用包管理器安装,但要注意 Ubuntu 22.04 自带的
+  tmux 是 3.2a,版本不够;Ubuntu 24.04、Debian 12 的就够了。
+- **[Claude Code](https://github.com/anthropics/claude-code) 和 / 或 [Codex CLI](https://github.com/openai/codex),**
+  已经按你平时的方式装好并登录。运行一次 `claude` 或 `codex`,确认它能正常回答。aca 会启动它们,但不会替你安装,也不会替你登录。
+- **`~/.local/bin` 在你的 `PATH` 里**(或者你安装到的那个目录)。不在的话,把
+  `export PATH="$HOME/.local/bin:$PATH"` 加到 `~/.zshrc` 或 `~/.bashrc`,再开一个新终端。
+
+git、fzf、jq 这些工具是可选的,每个只开启一项功能,见[可选的工具](#可选的工具)。
+
+### 安装脚本
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | sh
@@ -67,16 +86,50 @@ curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | sh -
 |---|---|
 | `--prefix <目录>` | 安装到 `<目录>/bin/aca`(默认是 `~/.local`) |
 | `--version <tag>` | 安装指定的版本,例如 `v0.1.0`(默认是最新版) |
-| `--from-source` | 不下载,用 cargo 从源码编译(需要 Rust 1.89 以上) |
+| `--from-source` | 不下载,用 cargo 从源码编译(需要什么见[从源码编译](#从源码编译)) |
 | `--statusline <方式>` | 安装后顺便把 Claude 的状态栏接上:`aca`、`wrap` 或 `off`(含义见[下文](#claude-的订阅额度和状态栏)) |
 | `--no-setup` | 只安装程序,不提示后续步骤 |
 
-如果 `~/.local/bin` 不在你的 `PATH` 里,脚本会提醒你;请在 shell 的启动文件里把它加上。
+### 手动下载
 
-编译好的版本支持 macOS(Apple 芯片和 Intel)和 Linux(x86_64 和 arm64,glibc 2.35 以上)。
-其他环境,或者想用最新的代码,请[从源码编译](#从源码编译)。
+每个[发布版本](https://github.com/cheny-00/aca/releases)里,每种机器有一个文件,旁边各有一个 `.sha256` 校验和文件:
 
-**升级:** 把安装命令再运行一遍。你的设置和会话都不会变。
+| 机器 | 文件 |
+|---|---|
+| Apple 芯片的 Mac | `aca-aarch64-apple-darwin.tar.gz` |
+| Intel 的 Mac | `aca-x86_64-apple-darwin.tar.gz` |
+| Linux,x86_64 | `aca-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux,arm64 | `aca-aarch64-unknown-linux-gnu.tar.gz` |
+
+1. 下载你的文件和它的校验和,在发布页面上点,或者用 curl:
+
+   ```sh
+   f=aca-aarch64-apple-darwin.tar.gz       # 换成上表里你的那个
+   curl -fLO https://github.com/cheny-00/aca/releases/latest/download/$f
+   curl -fLO https://github.com/cheny-00/aca/releases/latest/download/$f.sha256
+   ```
+
+2. 核对、解压。压缩包里只有一个文件 `aca`。
+
+   ```sh
+   shasum -a 256 -c $f.sha256              # Linux 上用 sha256sum -c $f.sha256
+   tar -xzf $f
+   ```
+
+3. 放进 `PATH` 里的目录:
+
+   ```sh
+   mkdir -p ~/.local/bin && mv aca ~/.local/bin/
+   ```
+
+4. **只有 Mac、而且是用浏览器下载的才需要:** 去掉浏览器给它打的标记。aca 没有用苹果开发者证书签名,
+   不去掉的话 macOS 不让运行浏览器下载的文件。用 curl 下载的没有这个标记。
+
+   ```sh
+   xattr -d com.apple.quarantine ~/.local/bin/aca
+   ```
+
+然后接着看[快速上手](#快速上手)。
 
 ### 从源码编译
 
@@ -99,14 +152,21 @@ git clone https://github.com/cheny-00/aca && cd aca
 `./install.sh` 编译出发布版(第一次要几分钟),安装到 `~/.local/bin/aca`,和下载安装的效果一样:同样的参数都能用
 (`--prefix`、`--statusline`、`--no-setup`),也不会安装别的东西。第一次在终端里运行时,装完会打开 `aca setup`,按 Esc 可以跳过。
 
-升级:拉取最新代码,再运行一遍。
-
-```sh
-cd aca && git pull && ./install.sh
-```
-
 想编某个发布的版本而不是最新代码,先切到它的 tag(例如 `git checkout v0.1.0`)。
-不想留一份源码的话,在最上面那条安装命令后面加上 `--from-source`:它会用 `cargo install` 在临时目录里编译出同样的程序。
+不想留一份源码的话,在安装脚本那条命令后面加上 `--from-source`:它会用 `cargo install` 在临时目录里编译出同样的程序。
+
+### 升级
+
+升级不会动你的设置和会话。
+
+- **安装脚本:** 把同一条命令再运行一遍。
+- **手动下载:** 照上面的步骤再做一遍,替换掉原来的文件。如果你运行过 `aca tmux install`,换完再运行一次,
+  让那份设置跟上新版本(安装脚本会替你做这一步)。
+- **从源码编译:** `cd aca && git pull && ./install.sh`
+
+正在跑的 agent 照常跑。已经开着的界面还是旧版本,在里面按 `Ctrl+L`,它会在原地重启成新版本。
+
+要删掉 aca,见[卸载](#卸载)。
 
 ## 快速上手
 

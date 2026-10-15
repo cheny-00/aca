@@ -23,7 +23,9 @@ You do not need Rust, and you do not need to know tmux. aca drives tmux for you.
 curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | sh
 ```
 
-This puts a single file at `~/.local/bin/aca` and installs nothing else. When it finishes you should see:
+This puts a single file at `~/.local/bin/aca` and installs nothing else. (No prebuilt binary for your machine,
+or you would rather download it yourself? [Install](../README.md#install) in the README has the other two ways.)
+When it finishes you should see:
 
 ```
 Installed: /Users/you/.local/bin/aca (aca 0.1.0)

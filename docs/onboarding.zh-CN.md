@@ -24,7 +24,8 @@ curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | ACA_
 ```
 
 这条命令只会在 `~/.local/bin/aca` 放一个文件,不安装任何别的东西。
-(`ACA_LANG=zh` 是让安装脚本用中文提示,去掉就是英文。)完成后你应该看到:
+(`ACA_LANG=zh` 是让安装脚本用中文提示,去掉就是英文。你的机器没有编译好的版本,或者想自己下载,
+README 的[安装](../README.zh-CN.md#安装)一章里有另外两种装法。)完成后你应该看到:
 
 ```
 装好了:/Users/you/.local/bin/aca(aca 0.1.0)
