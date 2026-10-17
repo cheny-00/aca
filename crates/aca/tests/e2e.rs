@@ -3052,6 +3052,91 @@ fn aca_tmux_install_adds_two_lines_and_uninstall_puts_everything_back() {
     assert!(sb.aca(&["tmux", "uninstall"]).contains("没有 source aca 那份的行"));
 }
 
+/// 升级了 aca、没跑 install.sh(brew 之类):界面一打开,aca 那份 tmux 设置照这一版重写,开着的 tmux 也用上。
+/// 那份写的是别的 aca(工作树里编的、另一种装法装的)就不动
+#[test]
+fn opening_the_interface_brings_aca_s_tmux_settings_up_to_this_version() {
+    let Some(sb) = Sandbox::new("tmuxfresh") else { return };
+    sb.aca(&["new", "fake", &sb.proj(), "-t", "x"]);
+    sb.aca(&["tmux", "install"]);
+    let ours = sb.home.join("config/tmux.conf");
+    let now = std::fs::read_to_string(&ours).unwrap();
+    // 「旧版」写的:还没有 prefix + a 那个键,开着的 tmux 里也没有
+    let old: String = now.lines().filter(|l| !l.starts_with("bind a ")).map(|l| format!("{l}\n")).collect();
+    assert_ne!(old, now);
+    sb.tmux(&["unbind-key", "-T", "prefix", "a"]);
+    let bound = || sb.tmux(&["list-keys", "-T", "prefix"]).lines().any(|l| l.contains(" ui --client"));
+    assert!(!bound());
+    let script = sb.home.join("ui.sh");
+    let q = |p: &Path| format!("'{}'", p.display());
+    write(
+        &script,
+        &format!(
+            "unset TMUX TMUX_PANE KITTY_WINDOW_ID TERM_PROGRAM SSH_CONNECTION SSH_TTY\n\
+             export HOME={home} ACA_HOME={home} ACA_TMUX_SOCKET={sock} ACA_LANG=zh ACA_IME=0 TERM=xterm-256color\n\
+             exec {aca} ui\n",
+            home = q(&sb.home),
+            sock = sb.socket,
+            aca = q(Path::new(env!("CARGO_BIN_EXE_aca"))),
+        ),
+    );
+    let open = |name: &str| {
+        sb.tmux(&["new-session", "-d", "-s", name, "-x", "120", "-y", "30", "/bin/sh", script.to_str().unwrap()]);
+        assert!(sb.until(|| sb.tmux(&["capture-pane", "-p", "-t", name]).contains("快捷键")), "界面没打开");
+    };
+
+    // 别的 aca 写的:不动
+    let elsewhere = old.replace(env!("CARGO_BIN_EXE_aca"), "/elsewhere/aca");
+    assert_ne!(elsewhere, old);
+    write(&ours, &elsewhere);
+    open("first");
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert_eq!(std::fs::read_to_string(&ours).unwrap(), elsewhere);
+    assert!(!bound());
+
+    // 这个 aca 写的旧版:重写成这一版的,开着的 tmux 里键也有了
+    write(&ours, &old);
+    open("second");
+    assert!(sb.until(|| std::fs::read_to_string(&ours).unwrap() == now), "没重写");
+    assert!(sb.until(bound), "开着的 tmux 没换上");
+}
+
+/// Claude 的状态栏(aca statusline):闲着又没人连着看的会话,照上次画的原样打(别的会话一干活额度就变,跟着重画的话
+/// 屏幕一直有输出,自动停等不到它闲下来);在说话的、不在 tmux 里的照常重算
+#[test]
+fn an_idle_unwatched_session_prints_its_last_status_bar() {
+    use std::io::Write as _;
+    let Some(sb) = Sandbox::new("bar") else { return };
+    let id = sb.aca(&["new", "fake", &sb.proj(), "-t", "x"]);
+    let pane = sb.pane(&id);
+    let transcript = sb.home.join("t.jsonl");
+    write(&transcript, "{}\n");
+    let bar = |model: &str, in_tmux: bool| {
+        let payload = serde_json::json!({
+            "session_id": "0f6c1d2e-aaaa-bbbb-cccc-000000000001",
+            "transcript_path": transcript,
+            "model": {"display_name": model},
+        });
+        let mut c = sb.cmd();
+        c.arg("statusline").env("TMPDIR", &sb.home).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+        if in_tmux {
+            c.env("TMUX_PANE", &pane);
+        }
+        let mut child = c.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+        String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned()
+    };
+    // 刚说过话:照常画
+    assert!(bar("Opus", true).contains("Opus"));
+    // 闲了一分钟、没人连着:模型换了也还是上次那条
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&transcript).unwrap().set_modified(old).unwrap();
+    let kept = bar("Sonnet", true);
+    assert!(kept.contains("Opus") && !kept.contains("Sonnet"), "{kept}");
+    // 不在 tmux 里(问不到有没有人看):照常重算
+    assert!(bar("Sonnet", false).contains("Sonnet"));
+}
+
 /// 根本起不来的(程序不在 PATH 里):报错说缺什么,登记撤回,列表里不留一条停着的
 #[test]
 fn a_session_whose_program_isnt_there_leaves_nothing_behind() {
@@ -3406,6 +3491,48 @@ fn the_next_key_takes_the_client_to_what_waits_and_the_status_bar_only_counts() 
     assert!(out.contains("没绑键"), "{out}");
     assert_eq!(sb.tmux(&["list-keys"]).lines().filter(|l| l.contains(" next --hotkey ")).count(), 0);
     assert!(sb.aca(&["tmux"]).contains("没绑键"));
+}
+
+/// 从界面进一个会话,先路过刚离开的那个(进去之后 ^` 回得去):tmux 把路过记成连进去过,
+/// 跑完没看的那个不能因此变成看过。之后真的切回去看了,才算看过
+#[test]
+fn passing_through_the_session_just_left_on_the_way_in_does_not_count_as_seeing_it() {
+    let Some(sb) = Sandbox::new("passby") else { return };
+    let left = sb.aca(&["new", "fake", &sb.proj(), "-t", "刚离开的"]);
+    let to = sb.aca(&["new", "fake", &sb.proj(), "-t", "要进的"]);
+    let (left_pane, to_pane) = (sb.pane(&left), sb.pane(&to));
+    sb.hook(&left, &left_pane, "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"c1\",\"prompt\":\"跑\"}");
+    sb.hook(&left, &left_pane, "{\"hook_event_name\":\"Stop\",\"session_id\":\"c1\",\"last_assistant_message\":\"好\"}");
+    let state = |id: &str| {
+        let rows = sb.json(&["ls", "--json", "--no-screen"]);
+        rows.as_array().unwrap().iter().find(|r| r["id"] == id).map(|r| r["state"].as_str().unwrap().to_string()).unwrap()
+    };
+    assert_eq!(state(&left), "unread");
+
+    // 一台真的客户端(另一个 tmux 服务的窗格),照界面进会话的那条命令连进来
+    let outer = format!("{}-outer", sb.socket);
+    let out = |args: &[&str]| {
+        let mut c = Command::new("tmux");
+        let o = scrub(&mut c).args(["-L", &outer, "-f", "/dev/null"]).args(args).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let sid = |pane: &str| sb.tmux(&["display-message", "-p", "-t", pane, "#{session_id}"]);
+    let words: Vec<String> = aca_core::tmux::attach_via(&sid(&left_pane), &sid(&to_pane)).iter().map(|a| format!("'{a}'")).collect();
+    out(&["new-session", "-d", "-x", "160", "-y", "40", &format!("tmux -L {} {}", sb.socket, words.join(" "))]);
+    let at = || sb.tmux(&["list-clients", "-F", "#{@aca_id} #{client_last_session}"]);
+    assert!(sb.until(|| at() == format!("{to} 刚离开的")), "客户端没落在要进的那个上、上一个不是路过的:{}", at());
+    // tmux 记了它连进去过;aca 认得那是路过
+    assert!(!sb.tmux(&["display-message", "-p", "-t", &left_pane, "#{session_last_attached}"]).is_empty());
+    assert_eq!(state(&left), "unread");
+
+    // 真的回去看了(^` 就是这个),再走开:看过了。tmux 的时刻按秒记,和路过错开一秒
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    sb.tmux(&["switch-client", "-l"]);
+    assert!(sb.until(|| at().starts_with(&format!("{left} "))), "没切回去:{}", at());
+    sb.tmux(&["switch-client", "-l"]);
+    assert!(sb.until(|| at().starts_with(&format!("{to} "))), "没切走:{}", at());
+    assert_eq!(state(&left), "idle");
+    out(&["kill-server"]);
 }
 
 /// Ctrl+Q:你人在会话里时 agent-deck 又起一个会话,它那一版(不认 aca 的会话,键被吞掉)一绑上来,tmux 当场换回 aca 的 ——

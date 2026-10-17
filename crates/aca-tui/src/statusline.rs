@@ -9,6 +9,7 @@
 //! - Python 的版本读 .venv/pyvenv.cfg;node 的版本按 node 程序的路径和修改时间记着,换了才重问
 //!
 //! 额度那段写的是这个账号所有会话里最新的那份,不是这个会话自己手里的(闲着的会话手里是旧数)。
+//! 闲着又没人连着看的会话不重算,照上次画的原样打(见 `still`):不然它们跟着别的会话一起重画,自动停也等不到它们闲下来。
 //! 出什么错都只是少画一段:状态栏命令一报错,Claude Code 就把整条画成空的。
 //! 配色是 Catppuccin Latte,图标要 Nerd Font。
 
@@ -89,6 +90,15 @@ pub fn run() -> i32 {
     let home = std::env::var("HOME").unwrap_or_default();
     let cache = std::env::temp_dir().join("aca-statusline");
     let transcript = path("/transcript_path");
+    // 闲着又没人在看:照上次画的原样打(见 `still`)
+    let last = v.pointer("/session_id").and_then(Value::as_str).filter(|id| plain(id)).map(|id| cache.join(format!("last-{id}")));
+    if let Some(last) = &last
+        && still(transcript.as_deref().and_then(idle_secs), watched)
+        && let Ok(text) = std::fs::read_to_string(last)
+    {
+        let _ = std::io::stdout().write_all(text.as_bytes());
+        return 0;
+    }
     let found = dir.as_deref().and_then(repo);
     let branch = found.as_ref().and_then(|(_, head)| branch(head));
     let git = match (&found, &branch) {
@@ -115,9 +125,32 @@ pub fn run() -> i32 {
         home,
         now,
     };
+    let out = render(&v, &facts);
+    if let Some(last) = &last {
+        let _ = crate::state::write_atomic(last, &out);
+    }
     // Claude Code 等不及会把管道关掉:写不进去不算错
-    let _ = std::io::stdout().write_all(render(&v, &facts).as_bytes());
+    let _ = std::io::stdout().write_all(out.as_bytes());
     0
+}
+
+/// 照上次画的原样打、不重算:对话记录 ACTIVE 秒没动了(闲着),又没人在看(`watched`)。
+/// 状态栏里有几样闲着也会变:总时长按分钟走,额度跟着同账号别的会话变,git 的数跟着同目录别的会话变。一变 Claude 就重画,
+/// 屏幕上有了输出,自动停(`[idle] stop_after`)就一直认它没闲下来;几十个闲着的会话也一起陪着重画,白费电。
+/// 原样打 Claude 就不重画。有人连进去看,下一次刷新(refreshInterval 的 10 秒内)就是新的;在说话的会话照常每次重算
+fn still(idle: Option<u64>, watched: impl FnOnce() -> bool) -> bool {
+    idle.is_some_and(|s| s >= ACTIVE) && !watched()
+}
+
+/// 有没有人在看这个会话:它在的 tmux 会话连着客户端(aca 的弹窗开在它上面也算)。不在 tmux 里、问不到的都当有人在看,照常画
+fn watched() -> bool {
+    let Some(pane) = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty()) else { return true };
+    !aca_core::tmux::run(&["display-message", "-p", "-t", &pane, "#{session_attached}"]).is_ok_and(|n| n.trim() == "0")
+}
+
+/// 会话号拿来起文件名:只认字母、数字和 -
+fn plain(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// 一段带颜色的字;`attr` 是颜色前面的属性(`1;` 粗、`2;` 淡、`3;` 斜)
@@ -645,5 +678,17 @@ mod tests {
         assert_eq!(venv(None, Some("base".into()), Some(&sub), Some(&proj)), Some((".venv".into(), "3.13.0".into())));
         assert_eq!(venv(None, None, Some(&sub), None), None);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_idle_session_nobody_watches_keeps_its_last_bar() {
+        // 在说话的:照常重算,不去问有没有人在看
+        assert!(!still(Some(ACTIVE - 1), || panic!("不该问")));
+        assert!(!still(None, || panic!("不该问")));
+        // 闲着的:没人看才原样打
+        assert!(still(Some(ACTIVE), || false));
+        assert!(!still(Some(3600), || true));
+        assert!(plain("78c6b838-1895-4f3b-b41f-d9308d892247"));
+        assert!(!plain("") && !plain("../x") && !plain("a/b"));
     }
 }

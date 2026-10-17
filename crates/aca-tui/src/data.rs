@@ -288,12 +288,13 @@ pub fn prepare(name: &str) -> Entry {
     Entry { name: name.to_string(), back, been }
 }
 
-/// attach 进去,detach 回来时返回 tmux 说最后停在哪个会话(会话名,里面可能切过;没说是空的)。None = 没进去
+/// attach 进去,detach 回来时返回 tmux 说最后停在哪个会话(会话名,里面可能切过;没说是空的)。None = 没进去。
+/// 有刚离开的那个就先路过它(进去之后 ^` 回得去),路过不算看过(见 `tmux::attach_via`)
 pub fn go_in(e: &Entry) -> Option<String> {
     let run = |back: Option<&String>| {
         let mut c = tmux_cmd();
         match back {
-            Some(b) => c.args(["attach-session", "-t", b, ";", "switch-client", "-t", &e.name]),
+            Some(b) => c.args(aca_core::tmux::attach_via(b, &e.name)),
             None => c.args(["attach-session", "-t", &e.name]),
         };
         c.stdin(Stdio::inherit()).stdout(Stdio::piped()).stderr(Stdio::inherit()).output().ok()
@@ -969,7 +970,7 @@ fn seen_state(tool: Option<&str>, plain: &[String]) -> (Option<State>, String, u
         Some(agent) => match agent.screen(plain) {
             Seen::Ask(q) => (Some(State::Ask), q, 0),
             Seen::Running(n) => (Some(State::Running), String::new(), n),
-            Seen::Quiet | Seen::Unsure => (None, String::new(), 0),
+            Seen::Quiet | Seen::Moving | Seen::Unsure => (None, String::new(), 0),
         },
         None => screen_state(plain),
     }
@@ -1058,7 +1059,7 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
         };
         let r = run(&s.id);
         let handle = aca_core::agent::of(&cfg, s).ok().map(|x| x.0);
-        let seen = handle.as_ref().filter(|_| !p.dead).map(|h| h.screen(&plain));
+        let seen = handle.as_ref().filter(|_| !p.dead).map(|h| status::look(&s.id, &**h, &plain));
         let (st, question, ran) = status::merge(Some(p), &r, seen.as_ref(), now);
         let (mut state, mut question, mut ran) = (state_of(st), question, ran);
         let shell = agent_of_tool(&cfg, &s.tool) == Agent::None;

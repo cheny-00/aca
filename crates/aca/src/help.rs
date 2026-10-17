@@ -970,12 +970,17 @@ Open Claude sessions switch over immediately, no restart needed.",
                 more: Tr::new(
                     "\
 在 Claude 的 settings.json 里把 statusLine 的命令写成「aca statusline」(想让闲着的会话也跟着变,加上 \"refreshInterval\": 秒数)。
+闲着(对话记录 30 秒没动)又没人连着看的会话照上次画的原样打:不然它跟着别的会话一起重画,屏幕一直有输出,自动停等不到它闲下来。
+连进去看,下一次刷新就是新的。
 两行:上下文 │ 模型 │ 分支和改动 │ 目录;额度 │ 花费和时长 │ Python │ node。没有的那段不画。
 额度照 aca limits 一样记下,不用再套一层;写的是这个账号所有会话里最新的那份,用到八成以上的带上还有多久重置。
 分支每次直接读仓库的 HEAD;改了几个文件、几行、领先落后按目录缓存 5 秒。配色是 Catppuccin Latte,图标要 Nerd Font。",
                     "\
 In Claude's settings.json make the statusLine command \"aca statusline\" (to keep idle sessions updating too, add
 \"refreshInterval\": seconds).
+A session that is idle (no transcript write for 30 seconds) and that nobody is attached to prints its last bar as it was:
+otherwise it redraws along with the other sessions, its screen never goes quiet, and idle stop never sees it idle.
+Attach to it and the next refresh is current.
 Two lines: context │ model │ branch and changes │ directory; quota │ cost and duration │ Python │ node. Parts that
 don't apply aren't drawn.
 Quotas are recorded the way aca limits does, no extra wrapping; it shows the newest across all of this account's
@@ -1015,8 +1020,9 @@ directory for 5 seconds. Colors are Catppuccin Latte; the icons need a Nerd Font
                哪一处见 aca plugin ls)。id 是你正看着的会话(#{@aca_id}),不算它;都没有就什么都不打。
                tmux 每隔 status-interval 秒跑一次,所以只读状态文件和一条 tmux list-panes,不读屏幕:偶尔比列表慢一拍
 
-aca 那份归 aca:每次 install(./install.sh 升级时也会)照新的重写,别在里面改;要换键,在你的 tmux.conf 里 source 它的
-那一行后面自己 unbind / bind。你的 tmux.conf 只加、只删那两行,别的不动;是链接的写到它指着的文件。
+aca 那份归 aca:每次 install 照新的重写,升级以后打开界面(^L 重启也算)时也会,./install.sh 升级时当场就重写。
+别在里面改;要换键,在你的 tmux.conf 里 source 它的那一行后面自己 unbind / bind。
+你的 tmux.conf 只加、只删那两行,别的不动;是链接的写到它指着的文件。
 -q:aca 删了、那份没了,tmux 也不报错。不想装、自己接状态栏:set -ag status-right \"#(aca tmux-status #{@aca_id})\"",
                     "\
   (none)       installed or not; whether your tmux.conf still has aca lines you wrote yourself
@@ -1038,9 +1044,10 @@ aca 那份归 aca:每次 install(./install.sh 升级时也会)照新的重写,�
                tmux runs it every status-interval seconds, so it only reads state files and one tmux list-panes, not
                screens: now and then it's a beat behind the list
 
-aca's file belongs to aca: every install (./install.sh upgrades too) rewrites it, so don't edit it; to change a key,
-unbind / bind after the line in your tmux.conf that sources it. Your tmux.conf only gains / loses those two lines,
-nothing else changes; a symlink is written through to its target.
+aca's file belongs to aca: every install rewrites it, so does opening the interface (or Ctrl+L) after an upgrade, and
+./install.sh rewrites it as it upgrades. Don't edit it; to change a key, unbind / bind after the line in your tmux.conf
+that sources it. Your tmux.conf only gains / loses those two lines, nothing else changes; a symlink is written
+through to its target.
 -q: with aca removed and its file gone, tmux doesn't complain. Without installing, the status segment by hand:
 set -ag status-right \"#(aca tmux-status #{@aca_id})\"",
                 ),

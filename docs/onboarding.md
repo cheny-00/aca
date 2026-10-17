@@ -133,6 +133,9 @@ Press `?` in the interface for the full list. These cover most days:
 | `Ctrl+S` | Settings: theme, language, accounts |
 | `q` `q` or `Esc` | Quit aca. Sessions keep running |
 
+The README's [Keys](../README.md#keys) section lists a few more, the keys that work inside a session, and
+which keys you can change.
+
 ## 7. More than one account
 
 Skip this if you use one Claude login and one Codex login.

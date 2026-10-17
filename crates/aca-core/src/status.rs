@@ -4,6 +4,7 @@
 //! 一起抓回来(`tmux::capture_many`)。不读屏幕(`--no-screen`)就只剩前三样,几毫秒。
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{LazyLock, Mutex};
 
 use serde::Serialize;
 
@@ -170,8 +171,8 @@ pub fn merge(pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64) -> (St
         // 读了屏幕却没看到框:要么框还没画出来(刚报的),要么已经按 Esc 打断了(打断不发事件)
         "waiting" if seen.is_none() || now.saturating_sub(r.ts) < 5 => State::Ask,
         // 一轮刚报开始、屏幕还没转起来:事件触发的那次重读常常赶在屏幕前面,不信 hook 就要等下一轮 2 秒的重读。
-        // 过了这几秒屏幕上还安静,当是按 Esc 打断了
-        "running" if seen.is_none() || now.saturating_sub(r.turn) < 3 => State::Running,
+        // 过了这几秒屏幕上还安静,当是按 Esc 打断了。正文还在往外吐的(屏幕上只有那几行在变)不算安静
+        "running" if seen.is_none() || now.saturating_sub(r.turn) < 3 || seen == Some(&Seen::Moving) => State::Running,
         "error" => State::Error,
         // 看过:手动标的 / 跑完那一刻正连着(hook 记的)、跑完之后连进去过、跑完之后在里面按过键(一直连着看它跑完再切走的)。
         // 按键和跑完在同一秒的不算:分不出先后,会话刚建时 tmux 也记一次「有人动过」
@@ -213,6 +214,33 @@ fn row(s: &Session, pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64)
     }
 }
 
+/// 正文的尾巴(见 [`Agent::body`])上一次看是什么样、最后一次变是什么时候(毫秒):会话 id → (指纹, 时刻)。
+/// 只记在这个进程里:界面、`aca wait` 这种一直在看的记得住;`aca ls` 只看一次,没得比,当它没在动
+static BODIES: LazyLock<Mutex<HashMap<String, (u64, u64)>>> = LazyLock::new(Default::default);
+/// 正文最后一次变之后这么久(毫秒)还算在动。按 Esc 打断之后 ● 多留这么久
+const MOVING_MS: u64 = 3000;
+
+/// 读屏幕:这一家的读法;读出来安静的,再看正文还在不在动([`Seen::Moving`])。每次看都记下正文的样子
+pub fn look(id: &str, agent: &dyn Agent, lines: &[String]) -> Seen {
+    let seen = agent.screen(lines);
+    let Some(fp) = agent.body(lines) else { return seen };
+    let mut bodies = BODIES.lock().unwrap_or_else(|e| e.into_inner());
+    let (next, moving) = moved(bodies.get(id).copied(), fp, paths::now_ms());
+    bodies.insert(id.to_string(), next);
+    if seen == Seen::Quiet && moving { Seen::Moving } else { seen }
+}
+
+/// 这次看到的指纹 `fp` 和上一次记下的(指纹, 最后一次变的时刻)比:返回要记下的、这会儿算不算在动。
+/// 头一回看(没有上一次)不算在动
+fn moved(last: Option<(u64, u64)>, fp: u64, now: u64) -> ((u64, u64), bool) {
+    let at = match last {
+        Some((was, at)) if was == fp => at,
+        Some(_) => now,
+        None => 0,
+    };
+    ((fp, at), at > 0 && now.saturating_sub(at) < MOVING_MS)
+}
+
 /// 这个会话是哪一家(屏幕怎么读看它);工具从配置里删了的认不出来,就不读屏幕
 fn agent_of(cfg: &Config, s: &Session) -> Option<Handle> {
     agent::of(cfg, s).ok().map(|x| x.0)
@@ -233,12 +261,13 @@ pub fn collect(store: &Store, cfg: &Config, read_screen: bool) -> Res<Vec<Row>> 
     let want: Vec<Option<&Pane>> = agents.iter().zip(&picked).map(|(a, p)| a.as_ref().and_then(|_| p.filter(|p| !p.dead))).collect();
     let ids: Vec<&str> = want.iter().flatten().map(|p| p.pane.as_str()).collect();
     let mut screens = tmux::capture_many(&ids, false).into_iter();
-    let seen: Vec<Option<Seen>> = agents
+    let seen: Vec<Option<Seen>> = sessions
         .iter()
+        .zip(&agents)
         .zip(&want)
-        .map(|(a, w)| {
+        .map(|((s, a), w)| {
             let agent: &dyn Agent = a.as_deref()?;
-            w.and_then(|_| screens.next()).map(|out| agent.screen(&tmux::plain_lines(&out)))
+            w.and_then(|_| screens.next()).map(|out| look(&s.id, agent, &tmux::plain_lines(&out)))
         })
         .collect();
     let rank: HashMap<String, i64> = store.groups()?.into_iter().map(|g| (g.path, g.order)).collect();
@@ -268,7 +297,7 @@ pub fn peek(store: &Store) -> Res<Vec<Row>> {
 pub fn one(cfg: &Config, s: &Session, read_screen: bool) -> Row {
     let pane = tmux::find(&s.id);
     let agent = agent_of(cfg, s);
-    let seen = pane.as_ref().filter(|p| read_screen && !p.dead).and_then(|p| Some(agent.as_deref()?.screen(&tmux::capture(&p.pane))));
+    let seen = pane.as_ref().filter(|p| read_screen && !p.dead).and_then(|p| Some(look(&s.id, agent.as_deref()?, &tmux::capture(&p.pane))));
     row(s, pane.as_ref(), &settled(cfg, s, agent.as_deref(), seen.as_ref()), seen.as_ref(), paths::now())
 }
 
@@ -299,7 +328,7 @@ pub fn settle(cfg: &Config, sessions: &[Session], panes: &[Pane], screen: &dyn F
         }
         let Some(p) = tmux::agent_pane(panes, &s.id).filter(|p| !p.dead) else { continue };
         let Some(agent) = agent_of(cfg, s) else { continue };
-        settled(cfg, s, Some(&*agent), Some(&agent.screen(&screen(p))));
+        settled(cfg, s, Some(&*agent), Some(&look(&s.id, &*agent, &screen(p))));
     }
 }
 
@@ -384,6 +413,43 @@ mod tests {
         assert_eq!(st(&run("idle"), Some(Seen::Unsure)), State::Idle);
         // 窗格标题在转圈也算在跑
         assert_eq!(merge(Some(&Pane { title: "⠋ 修登录".into(), ..pane() }), &run("idle"), Some(&Seen::Quiet), 100).0, State::Running);
+        // 正文还在往外吐(屏幕上只有那几行在变):hook 说在跑就是在跑。跑完那一下最后几行也在重画,hook 说跑完了就不算
+        assert_eq!(merge(Some(&p), &Run { turn: 40, ..run("running") }, Some(&Seen::Moving), 100), (State::Running, String::new(), 60));
+        assert_eq!(st(&Run { done: 99, ..run("done") }, Some(Seen::Moving)), State::Unread);
+        assert_eq!(st(&run("idle"), Some(Seen::Moving)), State::Idle);
+    }
+
+    #[test]
+    fn the_body_counts_as_moving_for_a_few_seconds_after_it_last_changed() {
+        // 头一回看:没得比
+        assert_eq!(moved(None, 7, 10_000), ((7, 0), false));
+        assert_eq!(moved(Some((7, 0)), 7, 12_000), ((7, 0), false));
+        // 变了:从这一刻算
+        assert_eq!(moved(Some((7, 0)), 8, 14_000), ((8, 14_000), true));
+        // 之后没再变(吐完了、按 Esc 打断了):3 秒内还算,过了就不算
+        assert_eq!(moved(Some((8, 14_000)), 8, 16_999), ((8, 14_000), true));
+        assert_eq!(moved(Some((8, 14_000)), 8, 17_000), ((8, 14_000), false));
+    }
+
+    #[test]
+    fn looking_again_tells_text_still_coming_out_from_a_quiet_screen() {
+        let claude = agent::builtin("claude").unwrap();
+        let bar = "─".repeat(40);
+        let frame = |text: &str| -> Vec<String> {
+            format!("⏺ 两条路的差别在于:\n{text}\n{bar}\n❯ \n{bar}\n  ⏵⏵ bypass permissions on (shift+tab to cycle)")
+                .lines()
+                .map(String::from)
+                .collect()
+        };
+        let (a, b) = (frame("  - 第一条"), frame("  - 第一条\n  - 第二条"));
+        // 头一回看是安静的;再看正文长了,算在动,紧接着再看一眼没变也还算
+        assert_eq!(look("look-1", claude, &a), Seen::Quiet);
+        assert_eq!(look("look-1", claude, &b), Seen::Moving);
+        assert_eq!(look("look-1", claude, &b), Seen::Moving);
+        // 各会话分开记
+        assert_eq!(look("look-2", claude, &b), Seen::Quiet);
+        // 屏幕上自己认得出的照旧
+        assert_eq!(look("look-1", claude, &frame("✻ Pondering… (12s)")), Seen::Running(12));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! `aca tmux install | uninstall`:aca 在 tmux 里要的几样 —— 会话切换器的两个键、状态栏上谁在等你 —— 写在 aca 自己的一份
 //! 配置里(`~/.config/aca/tmux.conf`),你的 tmux.conf 里只多两行:一行注释、一行 `source-file -q`。
 //!
-//! - aca 那份归 aca:每次 install 照新的重写(install.sh 升级时也重写一遍),别在里面改。要换键,在你的 tmux.conf 里
+//! - aca 那份归 aca:每次 install 照新的重写(install.sh 升级时也重写一遍;没跑 install.sh 的升级,打开界面时重写,见 `refresh`),别在里面改。要换键,在你的 tmux.conf 里
 //!   source 它的那一行后面自己 unbind / bind
 //! - 你的 tmux.conf 只加、只删那两行,别的一个字节不动;放在 TPM 那一段前面(它照规矩在最后),没有 TPM 就接在最后 ——
 //!   状态栏那一段是接在你的 status-right 后面的,要排在你设 status-right 的那几行后面
@@ -271,6 +271,23 @@ fn install() -> Res<String> {
     Ok(say.join("\n"))
 }
 
+/// 界面打开时(^L 重启成新版也是):aca 那份装过、写的就是这个程序,内容却和这一版要写的不一样(升级了、换了界面语言)
+/// → 照这一版重写,开着的 tmux 也 source 一遍。brew 之类的升级不跑 install.sh,靠它跟上。
+/// 写的是别的 aca(工作树里编的、另一种装法装的)就不动:免得开一下临时编的程序,tmux 的键就指到它上面
+pub fn refresh() {
+    let (aca, file) = (aca_core::agent::self_exe(), ours());
+    let Ok(old) = std::fs::read_to_string(&file) else { return };
+    let new = content(&aca);
+    if old != new && stale(&old, &aca) && paths::write_atomic(&file, &new).is_ok() && live() {
+        let _ = aca_core::tmux::run(&["source-file", &file.display().to_string()]);
+    }
+}
+
+/// aca 那份里用的就是这个程序(`"<aca> ui --client`、`#(<aca> tmux-status`):前面带着引号、括号,别的路径以它结尾的不算
+fn stale(old: &str, aca: &str) -> bool {
+    old.contains(&format!("\"{aca} ")) || old.contains(&format!("#({aca} "))
+}
+
 fn uninstall() -> Res<String> {
     let (file, conf) = (ours(), theirs());
     let mut say = vec![];
@@ -442,6 +459,14 @@ mod tests {
         let text = "# bind a run-shell 'aca ui --client x'\nbind a run-shell 'tmux display-popup \"aca ui --client #{client_name}\"'\nset -g mouse on\n\
                     set -ag status-right \"#(aca tmux-status)\"\nsource-file -q \"/x/aca conf/tmux.conf\"\n";
         assert_eq!(handwritten(text, &p()), [2, 4]);
+    }
+
+    #[test]
+    fn only_the_program_that_wrote_aca_s_file_rewrites_it() {
+        let old = content("/opt/homebrew/bin/aca");
+        assert!(stale(&old, "/opt/homebrew/bin/aca"));
+        // 工作树里编的、路径是它结尾的别的程序:不动
+        assert!(!stale(&old, "/x/target/debug/aca") && !stale(&old, "/homebrew/bin/aca") && !stale(&old, "aca"));
     }
 
     #[test]

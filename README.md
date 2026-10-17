@@ -176,8 +176,8 @@ same thing with `cargo install` in a temporary directory.
 Your settings and sessions are untouched by an upgrade.
 
 - **Install script:** run the same command again.
-- **By hand:** repeat the steps above to replace the file. If you ran `aca tmux install`, run it once more
-  afterwards so those settings match the new version (the install script does this for you).
+- **By hand:** repeat the steps above to replace the file. If you ran `aca tmux install`, those settings catch up
+  with the new version the next time you open aca or press `Ctrl+L` in it (the install script rewrites them at once).
 - **From source:** `cd aca && git pull && ./install.sh`
 
 Running agents carry on as they are. An interface that is already open keeps running the old version
@@ -196,7 +196,7 @@ aca                       # open the interface
 2. Press `Enter` to go into it and talk to the agent as usual.
 3. Press `Ctrl+Q` to come back to the list. The agent keeps working.
 4. Start a few more. Watch the marks in the list; `i` jumps to the next session that needs you.
-5. Press `?` any time for the keys.
+5. Press `?` any time for the keys (the common ones are listed under [Keys](#keys)).
 
 `aca setup` is one screen where you can register extra accounts and choose whether aca shows Claude's
 subscription limits. Nothing is changed until you press Enter, and Esc leaves everything as it was. If you
@@ -207,6 +207,65 @@ The interface is in English by default. For Chinese, press `Ctrl+S` then `l` in 
 
 **New here? [Getting started](docs/onboarding.md) walks through the first fifteen minutes**, including the
 two prompts each agent shows the first time and how to make them go away.
+
+## Keys
+
+Press `?` in the interface for a one-screen cheat sheet: press any key in it to see what that key does
+without doing it. `aca help keys` describes every key in detail.
+
+**In the list**
+
+| Key | What it does |
+|---|---|
+| `↑` `↓` or `j` `k` | Move. A number jumps to that row |
+| `Enter` | Go into the session. A stopped one (`■`) starts again first and resumes its conversation |
+| `n` / `N` | New session: pick the tool and account first / the same tool and directory as the selected one |
+| `i` | Go to the next session waiting for you |
+| `Space` | Each row gets a letter; press one to go into that session |
+| `/` | Filter the list |
+| `z` | Read its output full screen, without going in |
+| `x` | What it changed: the git diff of the directory it is working in |
+| `Z` | The conversation record, turn by turn: what it ran, what it changed, what each turn cost |
+| `e` / `s` | Write a note, the next thing to say to it / send the note |
+| `f` | Fork: a new session that continues from this conversation |
+| `H` | Hand off: a new session, with any tool or account, picks up where this one is |
+| `X` | Carry on under another account, for when this one runs out of quota |
+| `r` / `R` / `D` | Rename / restart / stop |
+| `d` | Delete (`Ctrl+Z` undoes it until you quit) |
+| `m` / `p` | Move to another group / pin to the top |
+| `Tab` | Pick a group to show, or all of them |
+| `$` | Usage and cost |
+| `P` / `:` | Plugins / the menu of what your plugins can do for the selected row |
+| `Ctrl+S` | Settings: theme, language, accounts and logins |
+| `Ctrl+L` | Restart the interface in place, for example on a newly installed aca |
+| `q` `q` or `Esc` | Quit aca. The sessions keep running |
+
+**Inside a session**
+
+| Key | What it does |
+|---|---|
+| `Ctrl+Q` | Back to the list. The agent keeps working |
+| `Ctrl+Alt+N` | Go straight to the next session waiting for you |
+
+Both only apply in sessions that aca started; anywhere else they go to the program as usual. In other tmux
+sessions, come back with the tmux prefix and `d`.
+
+**From any tmux session, after `aca tmux install`** (optional, see [Optional tools](#optional-tools))
+
+| Key | What it does |
+|---|---|
+| `Ctrl+\` | Open aca on the right as a switcher; the session beside it follows the highlight |
+| prefix, then `a` | Open aca full screen |
+
+**Changing keys.** The keys in the interface itself are fixed. These can be changed:
+
+- `Ctrl+Alt+N`: `aca tmux key next <key>` with a tmux key name such as `M-n` or `F7`. It is saved as
+  `[keys] next` in `config.toml`, and `""` turns it off.
+- `Ctrl+\` and prefix + `a` are in `~/.config/aca/tmux.conf`, which aca rewrites when it is upgraded. To use
+  other keys, unbind and bind them in your own `tmux.conf` after the line that loads that file.
+- `Ctrl+Q`: if you already bound it in tmux yourself, aca leaves your binding alone; use prefix + `d` instead.
+- Plugin keys, in the `:` menu and inside sessions: on the plugins page (`P`) or with `aca plugin hotkey`. See
+  [docs/plugins.md](docs/plugins.md).
 
 ## Everyday commands
 
@@ -237,7 +296,12 @@ In a terminal the output is laid out and colored; piped into another program it 
 
 Everything is optional. aca works with no configuration file at all.
 
-`~/.config/aca/config.toml`:
+Settings live in `~/.config/aca/config.toml`. Changes take effect at once, with nothing to restart. If the
+file is not valid TOML, aca says so and carries on as if it were empty. You rarely need to edit it by
+hand: the settings page (`Ctrl+S`) changes most things and writes this file for you, and `e` on that page
+opens the file in your editor.
+
+An example with the settings people change most:
 
 ```toml
 [tools.claude]
@@ -254,19 +318,42 @@ folder = true                             # answer "do you trust this folder?" f
 stop_after = "3h"                         # while the interface is open, stop sessions idle this long (they
                                           # resume their conversation with ⏎); idle agents still use CPU
 
+[keys]
+next = "M-n"                              # Alt+N instead of Ctrl+Alt+N for "next session waiting for you"
+
+[login]
+browsers = ["Firefox", "Safari"]          # the browsers offered for a login link (default: the ones installed)
+
 [ui]
 lang = "en"                               # "en" or "zh"
+menu = ["work", "personal"]               # who comes first in the menu that n opens
 
 [tools.aider]                             # another agent, declared without writing code
 resume = ["--session", "{conv}"]
 busy = ['Working\.\.\.']
 ```
 
-`aca help config` lists every setting. Most interface settings (theme, language, and so on) are changed on
-the settings page (`Ctrl+S`) and saved to this file for you.
+Every section, and where to read more:
 
-Claude, Codex and a plain shell are built in. Another agent can be declared right in this file, without
-writing code, as `[tools.aider]` above shows.
+| Section | What it is for | More |
+|---|---|---|
+| `[accounts.claude]` `[accounts.codex]` | Extra accounts | [Accounts](#accounts) |
+| `[tools.<name>]` | Defaults for the built-in Claude, Codex and shell (account, arguments, environment, a wrapper command); variants you name yourself; other agents declared without writing code | `aca help config` |
+| `[trust]` | Answer "do you trust this folder?" for you | [Getting started](docs/onboarding.md#two-questions-you-will-be-asked-the-first-time) |
+| `[idle]` | Stop sessions that have been idle for a while | `aca help stop` |
+| `[inbox]` | What a session that was handed work tells the session that handed it over: done, failed, and so on | `aca help msg` |
+| `[keys]` | The key aca binds in tmux to go to the next session waiting for you | [Keys](#keys) |
+| `[login]` | Which browsers a login link can open in; logging in on another device when you are on SSH | `aca help config` |
+| `[ui]` | Language; order of the `n` menu, and entries hidden from it | `aca help config` |
+| `[mcps.<name>]` | Your catalog of MCP servers: attach one to a project with `M`, or serve it to every agent through the gateway plugin | [docs/plugins.md](docs/plugins.md) |
+| `[theme]` `[ime]` `[new_group]` | Theme, input method switching, default directory for new groups | Set on the settings page (`Ctrl+S`) |
+
+- `aca help config` shows every setting with an example, and `aca names` the account and tool names you can
+  use right now.
+- Plugin settings are kept apart, in `~/.config/aca/plugins.toml`, and changed on the plugins page (`P`). See
+  [docs/plugins.md](docs/plugins.md).
+- Environment variables win over the file for one terminal: `ACA_LANG` (`en` / `zh`), `ACA_THEME`, `ACA_IME`.
+  `ACA_HOME` moves all of aca's files to another directory, which is handy for trying things out.
 
 ## Accounts
 

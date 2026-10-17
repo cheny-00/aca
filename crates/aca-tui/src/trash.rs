@@ -129,7 +129,7 @@ pub fn purge() {
 /// 界面退出时:起一个 `aca ui --purge` 去真删。放进自己的进程组、不接终端,弹窗关了 / 终端断了也照样删完
 pub fn purge_detached() {
     use std::os::unix::process::CommandExt;
-    let Ok(me) = std::env::current_exe() else { return };
+    let Some(me) = aca_core::agent::self_path() else { return };
     let _ =
         Command::new(me).args(["ui", "--purge"]).process_group(0).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }

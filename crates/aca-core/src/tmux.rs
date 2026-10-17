@@ -53,6 +53,7 @@ pub struct Pane {
     pub cmd: String,
     pub dead: bool,
     pub attached: u32,
+    /// 最后连进去、最后有人动的时刻(只是路过的那一下不算,见 [`attach_via`])
     pub last_attached: u64,
     pub activity: u64,
     pub window: u32,
@@ -67,34 +68,61 @@ pub struct Pane {
     pub title: String,
 }
 
-const FMT: &str = "#{@aca_id}\t#{@aca_agent}\t#{session_id}\t#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{session_attached}\t#{session_last_attached}\t#{session_activity}\t#{window_index}\t#{pane_index}\t#{pane_current_path}\t#{window_activity}\t#{window_panes}\t#{window_name}\t#{pane_title}";
+const FMT: &str = "#{@aca_id}\t#{@aca_agent}\t#{session_id}\t#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{session_attached}\t#{session_last_attached}\t#{session_activity}\t#{window_index}\t#{pane_index}\t#{pane_current_path}\t#{window_activity}\t#{window_panes}\t#{window_name}\t#{@aca_pass}\t#{pane_title}";
 
 pub fn parse_panes(out: &str) -> Vec<Pane> {
     out.lines()
         .filter_map(|l| {
-            let f: Vec<&str> = l.splitn(18, '\t').collect();
-            (f.len() == 18).then(|| Pane {
-                id: f[0].into(),
-                agent: f[1] == "1",
-                sid: f[2].into(),
-                session: f[3].into(),
-                pane: f[4].into(),
-                pid: f[5].parse().unwrap_or(0),
-                cmd: f[6].into(),
-                dead: f[7] == "1",
-                attached: f[8].parse().unwrap_or(0),
-                last_attached: f[9].parse().unwrap_or(0),
-                activity: f[10].parse().unwrap_or(0),
-                window: f[11].parse().unwrap_or(0),
-                index: f[12].parse().unwrap_or(0),
-                path: f[13].into(),
-                win_activity: f[14].parse().unwrap_or(0),
-                win_panes: f[15].parse().unwrap_or(1),
-                win_name: f[16].into(),
-                title: f[17].into(),
+            let f: Vec<&str> = l.splitn(19, '\t').collect();
+            (f.len() == 19).then(|| {
+                let (last_attached, activity) = unpass(f[9].parse().unwrap_or(0), f[10].parse().unwrap_or(0), f[17]);
+                Pane {
+                    id: f[0].into(),
+                    agent: f[1] == "1",
+                    sid: f[2].into(),
+                    session: f[3].into(),
+                    pane: f[4].into(),
+                    pid: f[5].parse().unwrap_or(0),
+                    cmd: f[6].into(),
+                    dead: f[7] == "1",
+                    attached: f[8].parse().unwrap_or(0),
+                    last_attached,
+                    activity,
+                    window: f[11].parse().unwrap_or(0),
+                    index: f[12].parse().unwrap_or(0),
+                    path: f[13].into(),
+                    win_activity: f[14].parse().unwrap_or(0),
+                    win_panes: f[15].parse().unwrap_or(1),
+                    win_name: f[16].into(),
+                    title: f[18].into(),
+                }
             })
         })
         .collect()
+}
+
+/// 从外面连进 `to`,先路过 `via`(这个终端刚离开的那个):tmux 这样才记得 `via` 是这台客户端的上一个会话,
+/// 进去之后 `switch-client -l`(你绑的 ^`)回得去。可 tmux 把路过也记成连进去过、有人动过,
+/// 「跑完没看」(◐)就没了,自动停的钟也重新走。所以同一条命令里把路过之前的两个时刻和路过那一刻记在 `via` 的
+/// `@aca_pass` 上(`连进去/有人动/路过`),读窗格时最后一次连进去就是这次路过的,照路过之前的算(见 [`unpass`])
+pub fn attach_via(via: &str, to: &str) -> Vec<String> {
+    let before = ["set-option", "-F", "-t", via, "@aca_pass", "#{session_last_attached}/#{session_activity}"];
+    let after = ["set-option", "-aF", "-t", via, "@aca_pass", "/#{session_last_attached}"];
+    [&before[..], &[";", "attach-session", "-t", via, ";"], &after, &[";", "switch-client", "-t", to]]
+        .concat()
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// 会话上记着路过(`@aca_pass`),之后再没人连进去过:连进去、有人动的时刻换回路过之前的。
+/// 只记了前半截的(连 `via` 没成)、之后又有人连进去的,照 tmux 说的
+fn unpass(last_attached: u64, activity: u64, pass: &str) -> (u64, u64) {
+    let f: Vec<u64> = pass.split('/').map(|x| x.parse().unwrap_or(0)).collect();
+    match f[..] {
+        [attached, active, at] if at > 0 && at == last_attached && activity <= at => (attached, active),
+        _ => (last_attached, activity),
+    }
 }
 
 /// 全部窗格;tmux 服务没起来 = 空
@@ -493,9 +521,9 @@ mod tests {
 
     #[test]
     fn a_pane_title_may_contain_tabs_and_the_agent_pane_wins() {
-        let out = "ab12\t\t$1\t标题\t%3\t100\tzsh\t0\t0\t\t5\t1\t0\t/p\t6\t2\tzsh\tshell\n\
-                   ab12\t1\t$1\t标题\t%2\t99\tnode\t0\t1\t7\t5\t0\t0\t/p\t6\t2\tzsh\t✳ 带\t制表符\n\
-                   \t\t$2\t别的\t%9\t1\tzsh\t1\t0\t\t5\t0\t0\t/\t\t1\tzsh\t\n";
+        let out = "ab12\t\t$1\t标题\t%3\t100\tzsh\t0\t0\t\t5\t1\t0\t/p\t6\t2\tzsh\t\tshell\n\
+                   ab12\t1\t$1\t标题\t%2\t99\tnode\t0\t1\t7\t5\t0\t0\t/p\t6\t2\tzsh\t\t✳ 带\t制表符\n\
+                   \t\t$2\t别的\t%9\t1\tzsh\t1\t0\t\t5\t0\t0\t/\t\t1\tzsh\t\t\n";
         let v = parse_panes(out);
         assert_eq!(v.len(), 3);
         let a = agent_pane(&v, "ab12").unwrap();
@@ -506,6 +534,26 @@ mod tests {
         w[1].agent = false;
         assert_eq!(agent_pane(&w, "ab12").unwrap().pane, "%2");
         assert!(agent_pane(&v, "nope").is_none());
+    }
+
+    #[test]
+    fn a_pass_on_the_way_to_another_session_is_not_an_attach() {
+        let row = |last: u64, active: u64, pass: &str| {
+            let v = parse_panes(&format!("ab12\t1\t$1\t标题\t%2\t99\tnode\t0\t0\t{last}\t{active}\t0\t0\t/p\t6\t1\tzsh\t{pass}\t✳ 标题\n"));
+            (v[0].last_attached, v[0].activity)
+        };
+        // 路过之前 40 连进去过、45 有人动过;50 路过,之后没人来过:还是 40、45
+        assert_eq!(row(50, 50, "40/45/50"), (40, 45));
+        // 从没连进去过的(tmux 给的是空)
+        assert_eq!(row(50, 50, "/45/50"), (0, 45));
+        // 路过之后又连进去了(60):照 tmux 说的
+        assert_eq!(row(60, 61, "40/45/50"), (60, 61));
+        // 连 via 没成,只记了前半截;没记过的
+        assert_eq!(row(50, 50, "40/45"), (50, 50));
+        assert_eq!(row(50, 50, ""), (50, 50));
+        // 先路过、后要进的那个,同一条命令
+        let a = attach_via("$3", "$7").join(" ");
+        assert!(a.contains("attach-session -t $3 ;") && a.ends_with("switch-client -t $7"), "{a}");
     }
 
     #[test]

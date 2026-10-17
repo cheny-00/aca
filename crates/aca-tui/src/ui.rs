@@ -3434,7 +3434,7 @@ impl App {
             let m = tr!("还在忙:{b}", "still busy: {b}");
             return self.flash(&m);
         }
-        if !std::env::current_exe().is_ok_and(|p| p.exists()) {
+        if !aca_core::agent::self_path().is_some_and(|p| p.exists()) {
             return self.flash(t!("找不到 aca 程序,没重启", "can't find the aca program; not restarted"));
         }
         self.relaunch = true;
@@ -8421,7 +8421,7 @@ fn draw_steps(f: &mut Frame, v: &mut TraceView, area: Rect, live: bool, now: i64
 
 /// 起 `aca ui --cost-json` 读计费(同一个程序,环境原样带过去);only = 只看哪些账号
 fn read_bill(only: &[String]) -> Result<crate::usage::Report, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = aca_core::agent::self_path().ok_or(t!("找不到 aca 程序", "can't find the aca program"))?;
     let out = std::process::Command::new(exe)
         .args(["ui", "--cost-json"])
         .args(only.iter().flat_map(|o| ["--only", o.as_str()]))
@@ -8810,9 +8810,8 @@ fn closes_popup(k: KeyEvent) -> bool {
 /// 视图(分组、范围、布局、高亮的会话)本来就记着,新的照样恢复
 fn relaunch(state: &str) -> anyhow::Error {
     use std::os::unix::process::CommandExt;
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => return e.into(),
+    let Some(exe) = aca_core::agent::self_path() else {
+        return anyhow::anyhow!("{}", t!("找不到 aca 程序,没重启", "can't find the aca program; not restarted"));
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("ui");
@@ -8829,7 +8828,7 @@ fn relaunch(state: &str) -> anyhow::Error {
 /// 这个 aca 程序什么时候装的(文件的修改时间):今天的写 11:28,别的天写 9/29 11:28
 fn installed_at() -> Option<String> {
     let secs = |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64);
-    let t = secs(std::fs::metadata(std::env::current_exe().ok()?).ok()?.modified().ok()?)?;
+    let t = secs(std::fs::metadata(aca_core::agent::self_path()?).ok()?.modified().ok()?)?;
     let now = secs(std::time::SystemTime::now())?;
     Some(local_when(t.max(0) as u64, now.max(0) as u64))
 }
@@ -8899,6 +8898,8 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     app = app.with_setting(Box::new(crate::trust::TrustRow::real()));
     // 上次被杀掉 / 崩了的界面删了没来得及真删的
     thread::spawn(crate::trash::purge);
+    // 升级了没跑 install.sh 的(brew 之类):aca 的 tmux 设置照这一版重写
+    thread::spawn(crate::tmuxconf::refresh);
     if let (true, Some(p)) = (restore, &view_file) {
         app = app.restore(View::load(p));
     }

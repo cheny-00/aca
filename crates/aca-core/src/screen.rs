@@ -13,6 +13,9 @@ pub enum Seen {
     Running(u64),
     /// 看得懂这家的屏幕,上面既没在问也没在跑
     Quiet,
+    /// 同 Quiet,只是正文的尾巴这几秒还在变(见 [`crate::status::look`]):Claude 2.1.300 往外吐正文时屏幕上没有别的记号。
+    /// hook 说在跑时才算在跑 —— 跑完那一下最后几行也会重画
+    Moving,
     /// 这家的屏幕看不出在不在跑(没有读法、声明式工具没写 `busy`):状态听 hook 的
     Unsure,
 }

@@ -42,6 +42,8 @@ static STARTING: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*[·✢✳✶✻✽]\s+\S.*?…(?:\s+\((?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?.*)?\s*$").unwrap());
 /// 输入框上面看几行:「在跑」那一行和输入框之间只夹着一两行提示(`⎿  Tip: …`)
 const NEAR: usize = 6;
+/// 正文的尾巴:输入框上面这么多行(见 `body`)
+const BODY: usize = 8;
 
 /// 输入框在第几行:屏幕上最下面那个 `❯` 开头的行,头上、脚下各有一条横线。上面那些 `❯` 是你说过的话;
 /// 确认框 / 选择框弹出来时输入框会收起来,里面的 `❯` 是选项前的光标,不会两头都是横线
@@ -476,6 +478,17 @@ impl Agent for Claude {
             _ => Seen::Quiet,
         }
     }
+
+    /// 输入框头上那条横线往上 [`BODY`] 行。2.1.300 往外吐正文时没有转圈那一行,状态栏里也没有 esc to interrupt,
+    /// 只有这几行在变。行尾空格去掉:界面带颜色抓的屏幕去掉颜色之后,和不带颜色抓的行尾会差几个空格
+    fn body(&self, lines: &[String]) -> Option<u64> {
+        let nonempty: Vec<&str> = lines.iter().map(|l| l.trim_end()).filter(|l| !l.trim().is_empty()).collect();
+        let tail = &nonempty[nonempty.len().saturating_sub(25)..];
+        let at = input_at(tail)?;
+        let mut h = DefaultHasher::new();
+        tail[(at - 1).saturating_sub(BODY)..at - 1].hash(&mut h);
+        Some(h.finish())
+    }
 }
 
 #[cfg(test)]
@@ -839,6 +852,34 @@ mod tests {
         assert_eq!(Claude.screen(&lines(&after)), Seen::Quiet);
         // 正文里出现这几个字不算:只看输入框下面
         assert_eq!(Claude.screen(&with_input("⏺ 按 esc to interrupt 可以停", "")), Seen::Quiet);
+    }
+
+    /// 2.1.300 往外吐正文时的样子(2026-10-16 本机抓的,字换了):没有转圈那一行,状态栏里没有 esc to interrupt,
+    /// 窗格标题也是 ✳。`text` 是正文的尾巴,`cost` 是状态栏里会自己刷新的那一段,`input` 是输入框里打着的字
+    fn streaming(text: &str, cost: &str, input: &str) -> Vec<String> {
+        let bar = "─".repeat(40);
+        lines(&format!(
+            "⏺ 两条路的差别在于:\n{text}\n{bar} 修登录 ─\n❯ {input}\n{bar}\n  ━╌╌╌╌ 11% │ Opus 5.5 │ aca\n  {cost} 40m41s\n  \
+             ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent"
+        ))
+    }
+
+    #[test]
+    fn on_2_1_300_text_coming_out_shows_only_as_the_lines_above_the_input_changing() {
+        let a = streaming("  - 第一条", "$1.841", "");
+        let b = streaming("  - 第一条\n  - 第二条", "$1.841", "");
+        // 屏幕本身看不出在跑
+        assert_eq!((Claude.screen(&a), Claude.screen(&b)), (Seen::Quiet, Seen::Quiet));
+        // 正文长了一行:指纹变了
+        assert!(Claude.body(&a).is_some() && Claude.body(&a) != Claude.body(&b));
+        // 输入框底下的状态栏刷新(闲着也隔 10 / 60 秒一次)、输入框里打字、行尾多了空格:都不算
+        for same in
+            [streaming("  - 第一条", "$1.902", ""), streaming("  - 第一条", "$1.841", "接着改"), streaming("  - 第一条   ", "$1.841", "")]
+        {
+            assert_eq!(Claude.body(&same), Claude.body(&a));
+        }
+        // 弹了框、输入框收起来了:认不出,不看
+        assert_eq!(Claude.body(&lines("Do you want to proceed?\n❯ 1. Yes\n  2. No")), None);
     }
 
     #[test]

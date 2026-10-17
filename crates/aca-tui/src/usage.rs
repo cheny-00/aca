@@ -724,7 +724,7 @@ fn cache_file() -> Option<PathBuf> {
 
 /// 这个 aca 程序文件的(大小, 修改时间)
 fn exe_stamp() -> Option<(u64, u64)> {
-    let m = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
+    let m = std::fs::metadata(aca_core::agent::self_path()?).ok()?;
     let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some((m.len(), t.as_nanos() as u64))
 }

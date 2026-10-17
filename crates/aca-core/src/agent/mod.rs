@@ -152,6 +152,12 @@ pub trait Agent: Sync {
         Seen::Unsure
     }
 
+    /// 正文的尾巴(输入框头上那几行)的指纹:和上一次看的比变没变,认「还在往外吐正文」(见 [`crate::status::look`])。
+    /// 输入框底下的状态栏不算在里面:它闲着也隔一会儿刷一次。None = 认不出(默认),不看
+    fn body(&self, _lines: &[String]) -> Option<u64> {
+        None
+    }
+
     /// 别的会话发来的消息怎么送。默认打字进去
     fn delivery(&self) -> Delivery {
         Delivery::Type
@@ -368,7 +374,26 @@ fn which(cmd: &str) -> Option<String> {
 }
 
 pub fn self_exe() -> String {
-    std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "aca".into())
+    self_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "aca".into())
+}
+
+/// 自己这个程序的路径。写进 hook、状态栏、tmux 设置,^L 重启也 exec 它:升级以后要指得到新装的那个
+pub fn self_path() -> Option<PathBuf> {
+    std::env::current_exe().ok().map(|p| stable_exe(&p))
+}
+
+/// - Linux 读的是 /proc/self/exe:程序文件被换掉(升级)以后,后面多出 " (deleted)"。去掉,就是原地装上的新版
+/// - Homebrew 装的:Linux 上读到的是带版本号的 <前缀>/Cellar/aca/<版本>/bin/aca(macOS 读到的是 bin/aca 那个链接),
+///   升级时旧版会被清掉。换成不带版本号、brew 一直指着现在那版的 <前缀>/opt/aca/bin/aca
+fn stable_exe(p: &Path) -> PathBuf {
+    let p = match p.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(s) if !p.exists() => PathBuf::from(s),
+        _ => p.to_path_buf(),
+    };
+    let parts: Vec<_> = p.components().collect();
+    let Some(i) = parts.iter().rposition(|c| c.as_os_str() == "Cellar").filter(|i| parts.len() > i + 3) else { return p };
+    let opt = parts[..i].iter().collect::<PathBuf>().join("opt").join(parts[i + 1]).join(parts[i + 3..].iter().collect::<PathBuf>());
+    if opt.exists() { opt } else { p }
 }
 
 /// 工具名 → (agent, 工具的定义)。hook 入口拿到的是内置那家的名字(`aca hook claude`)或者工具名,也走这里
@@ -912,6 +937,29 @@ mod tests {
         // 第二次登录换了链接:覆盖
         hand_link(Some(f.clone()), "https://claude.com/cai/oauth/authorize?x=2");
         assert!(std::fs::read_to_string(&f).unwrap().ends_with("x=2"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_recorded_path_outlives_an_upgrade() {
+        let dir = std::env::temp_dir().join(format!("aca-exe-{}", std::process::id()));
+        let keg = dir.join("Cellar/aca/0.1.0");
+        std::fs::create_dir_all(keg.join("bin")).unwrap();
+        std::fs::write(keg.join("bin/aca"), "").unwrap();
+        let cellar = keg.join("bin/aca");
+        // brew 的 opt/aca 还没指过来(装到一半):先用着 Cellar 里的
+        assert_eq!(stable_exe(&cellar), cellar);
+        std::fs::create_dir_all(dir.join("opt")).unwrap();
+        std::os::unix::fs::symlink("../Cellar/aca/0.1.0", dir.join("opt/aca")).unwrap();
+        assert_eq!(stable_exe(&cellar), dir.join("opt/aca/bin/aca"));
+        // Linux 上被升级换掉的:同一个路径上现在是新版
+        let local = dir.join("bin/aca");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(&local, "").unwrap();
+        assert_eq!(stable_exe(&dir.join("bin/aca (deleted)")), local);
+        // 别的照原样:不在 Cellar 里的,Cellar 下面层数不够的
+        assert_eq!(stable_exe(&local), local);
+        assert_eq!(stable_exe(Path::new("/x/Cellar/aca")), Path::new("/x/Cellar/aca"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

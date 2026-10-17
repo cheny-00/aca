@@ -159,7 +159,8 @@ On sessions
   p         pin / unpin. Pinned ones sit in their own block at the top (earliest pinned first), listed even after a
             day without activity
   u         read / unread: on a yellow ◐ marks it read, on ○ marks it unread (◐ until you go in); going in counts as
-            read too, and finishing another turn brings back ◐
+            read too (passing through the one you just left on the way into another, so ^` gets you back, does not),
+            and finishing another turn brings back ◐
 
   Windows opened inside a session / split panes: d closes only that pane, D stops only that pane; R / r / m don't apply.
   Ordinary tmux sessions (unregistered): you can enter, look, D / d; renaming, restarting, forking, moving need A first.
