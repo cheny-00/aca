@@ -422,8 +422,8 @@ impl Agent for Claude {
     }
 
     /// 在跑时按一下 Esc 就停(不发任何 hook,连 Stop 都没有)
-    fn interrupt_key(&self) -> Option<&'static str> {
-        Some("Escape")
+    fn interrupt_keys(&self) -> Option<&'static [&'static str]> {
+        Some(&["Escape"])
     }
 
     fn opening(&self, text: &str) -> Option<Vec<String>> {

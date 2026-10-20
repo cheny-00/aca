@@ -49,13 +49,15 @@ impl State {
 }
 
 /// 会话里跑的是哪家的 agent。列表里的账号名按它上色
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum Agent {
     /// 普通 tmux 会话,或者本来就开成 shell 的
     #[default]
     None,
     Claude,
     Codex,
+    Pi,
+    Opencode,
     /// 声明式的工具(config.toml 里没写 kind 的 `[tools.<名>]`)
     Other,
 }
@@ -74,7 +76,7 @@ pub struct Session {
     /// Ask 状态下它在问什么(找不到就空)
     pub question: String,
     pub idle_for: u64,
-    /// 最后一次有输出的时刻(tmux session_activity,epoch 秒)
+    /// 最后有动静的时刻(epoch 秒):登记的 agent 不在跑时是 hook 报的(见 `Run::hook_at`),别的是窗口最后有输出的时刻
     pub active_at: u64,
     /// Running 状态下已经跑了多少秒(读屏幕得来,0 = 不知道)
     pub ran: u64,
@@ -133,6 +135,8 @@ pub struct Session {
     /// 它给自己定了、还没到点的(Claude 的 CronCreate、`/loop` 的下一次,见 `aca_core::schedule`):标题后面标 ◷ 和下次几点。
     /// 只在它进程里,所以闲着也不会被自动停。登记的、agent 还开着的会话才有,开界面的第一屏不读
     pub due: Vec<aca_core::schedule::Due>,
+    /// 这一项不是会话,是登记表里的空分组(连子分组都没有会话,见 `blank_row`):列表里只画它的标题,高亮停在标题上
+    pub blank: bool,
 }
 
 /// 父子会话(在某个会话里 `aca new` 的、`--parent` 指定的)。
@@ -215,6 +219,8 @@ impl Session {
         let name = match self.agent {
             Agent::Claude => "Claude",
             Agent::Codex => "Codex",
+            Agent::Pi => "Pi",
+            Agent::Opencode => "OpenCode",
             Agent::None | Agent::Other => "",
         };
         match (name, self.who.as_str()) {
@@ -528,21 +534,32 @@ pub fn session_id_var(k: &str) -> bool {
     k.starts_with("AGENTDECK_") || k.ends_with("_SESSION_ID")
 }
 
-/// 临时终端要带上的账号:登记的账号那一层(`shell_env`)里的 CLAUDE_CONFIG_DIR / CODEX_HOME;agent 在跑就以它进程里的为准。
-/// s 是登记的那个会话(会话里另开的窗口用它所在的会话),pid / agent 是这一行自己的
+/// 临时终端要带上的账号:登记的账号那一层(`shell_env`)里各家的配置目录(CLAUDE_CONFIG_DIR / CODEX_HOME / PI_CODING_AGENT_DIR);
+/// agent 在跑就以它进程里的为准。s 是登记的那个会话(会话里另开的窗口用它所在的会话),pid / agent 是这一行自己的
 pub fn account_env(s: Option<&Session>, pid: u32, agent: Agent) -> Vec<(String, String)> {
-    const KEEP: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+    let keep: Vec<&str> = aca_core::agent::kinds().filter_map(|k| aca_core::agent::builtin(k)?.home_var()).collect();
     let mut out: Vec<(String, String)> =
-        s.map(shell_env).unwrap_or_default().into_iter().filter(|(k, _)| KEEP.contains(&k.as_str())).collect();
+        s.map(shell_env).unwrap_or_default().into_iter().filter(|(k, _)| keep.contains(&k.as_str())).collect();
     if pid > 0
-        && matches!(agent, Agent::Claude | Agent::Codex)
+        && let Some(k) = home_var(agent)
         && let Some(d) = config_home(pid, agent)
     {
-        let k = if agent == Agent::Codex { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
         out.retain(|(x, _)| x != k);
         out.push((k.into(), d));
     }
     out
+}
+
+/// 这一家的配置目录交给哪个环境变量;没有这一说(shell、声明式的、opencode)= None
+fn home_var(agent: Agent) -> Option<&'static str> {
+    let kind = match agent {
+        Agent::Claude => "claude",
+        Agent::Codex => "codex",
+        Agent::Pi => "pi",
+        Agent::Opencode => "opencode",
+        Agent::None | Agent::Other => return None,
+    };
+    aca_core::agent::builtin(kind)?.home_var()
 }
 
 /// show-environment 里要去掉的:各家的会话 id。拼成 ` -u A -u B`
@@ -577,10 +594,9 @@ pub fn age(sec: u64) -> String {
     }
 }
 
-/// agent 进程用的配置目录(它环境里的 CLAUDE_CONFIG_DIR / CODEX_HOME);没设 = None(用默认的)
+/// agent 进程用的配置目录(它环境里的 CLAUDE_CONFIG_DIR / CODEX_HOME / PI_CODING_AGENT_DIR);没设、没有这一说 = None(用默认的)
 pub(crate) fn config_home(pid: u32, agent: Agent) -> Option<String> {
-    let want = if agent == Agent::Codex { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
-    let d = aca_core::proc::env_var(pid, want)?;
+    let d = aca_core::proc::env_var(pid, home_var(agent)?)?;
     Some(expand(&d).trim_end_matches('/').to_string())
 }
 
@@ -692,6 +708,8 @@ fn kind_of(name: &str) -> Agent {
         "" | "shell" => Agent::None,
         "claude" => Agent::Claude,
         "codex" => Agent::Codex,
+        "pi" => Agent::Pi,
+        "opencode" => Agent::Opencode,
         _ => Agent::Other,
     }
 }
@@ -926,7 +944,7 @@ fn gather(schedules: bool) -> Vec<Session> {
         at.map(|i| screens[i].iter().map(|l| crate::ansi::strip(l)).collect()).unwrap_or_default()
     });
     let homes = homes_of(&panes, &kids);
-    let home_of = |pid: u32, a: Agent| homes.get(&(pid, a == Agent::Codex)).cloned().flatten();
+    let home_of = |pid: u32, a: Agent| homes.get(&(pid, a)).cloned().flatten();
     let mut out = build(Inputs { now, cfg, sessions, groups, panes, screens, attached, kids }, &status::load, &home_of);
     // 各家自己派出去的子代理:读它们的记录(见 subagent.rs),后台的还在跑的会话算在跑
     crate::subagent::attach(&mut out, &status::load);
@@ -940,23 +958,20 @@ fn gather(schedules: bool) -> Vec<Session> {
     out
 }
 
-type Homes = HashMap<(u32, bool), Option<String>>;
+type Homes = HashMap<(u32, Agent), Option<String>>;
 
-/// 窗格里在跑的 agent 各自用的配置目录:(pid, 是不是 Codex) → 目录。
+/// 窗格里在跑的 agent 各自用的配置目录:(pid, 哪一家) → 目录。
 /// 要看进程的环境(一个进程起一次 `ps`,2–3 毫秒),进程的环境不会变,所以问过的记着;没问过的并行问
 fn homes_of(panes: &[Pane], kids: &Kids) -> Homes {
     static HOMES: LazyLock<std::sync::Mutex<Homes>> = LazyLock::new(Default::default);
-    let want: HashSet<(u32, bool)> =
-        panes.iter().filter(|p| !p.dead).filter_map(|p| agent_in(kids, p)).map(|(tool, pid)| (pid, tool == "codex")).collect();
+    let want: HashSet<(u32, Agent)> =
+        panes.iter().filter(|p| !p.dead).filter_map(|p| agent_in(kids, p)).map(|(tool, pid)| (pid, kind_of(tool))).collect();
     let mut known = HOMES.lock().unwrap_or_else(|e| e.into_inner());
     // 进程没了的不留(pid 以后会被别的进程用)
     known.retain(|k, _| want.contains(k));
-    let missing: Vec<(u32, bool)> = want.into_iter().filter(|k| !known.contains_key(k)).collect();
+    let missing: Vec<(u32, Agent)> = want.into_iter().filter(|k| !known.contains_key(k)).collect();
     let got: Vec<Option<String>> = thread::scope(|s| {
-        let hs: Vec<_> = missing
-            .iter()
-            .map(|&(pid, codex)| s.spawn(move || config_home(pid, if codex { Agent::Codex } else { Agent::Claude })))
-            .collect();
+        let hs: Vec<_> = missing.iter().map(|&(pid, agent)| s.spawn(move || config_home(pid, agent))).collect();
         hs.into_iter().map(|h| h.join().unwrap_or(None)).collect()
     });
     known.extend(missing.into_iter().zip(got));
@@ -986,7 +1001,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
     // 没分组的排在所有分组后面
     order.insert(UNGROUPED.into(), i64::MAX);
     let names: Vec<String> = sessions.iter().map(|s| group_name(&s.group)).collect();
-    let ranks = group_ranks(names.iter().map(String::as_str), &order);
+    // 空分组也排上位置(列表里照样有它的标题)
+    let ranks = group_ranks(names.iter().map(String::as_str).chain(groups.iter().map(|g| g.path.as_str())), &order);
     let mains = main_panes(&panes, &|id| by_id.contains_key(id));
     // 同一个登记 id 记在了两个 tmux 会话上(不该有):只认先遇到的那个,别的当普通会话
     let mut claimed: HashSet<&str> = HashSet::new();
@@ -1054,6 +1070,7 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
                 error_kind: String::new(),
                 idle_stopped: 0,
                 due: vec![],
+                blank: false,
             });
             continue;
         };
@@ -1071,6 +1088,11 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
                 None => {}
             }
         }
+        // 不在跑、还开着的 agent 照 hook 报的算多久没动(见 `Run::hook_at`):不然几天没用的一重画就成了几分钟前
+        let act = match r.hook_at() {
+            at if at > 0 && !shell && matches!(state, State::Idle | State::Unread | State::Ask | State::Error) => at,
+            _ => act,
+        };
         let (agent, who) = match running.filter(|_| shell) {
             Some((tool, pid)) => identify(tool, home_of(pid, kind_of(tool)), &cfg),
             None => registered(&cfg, s),
@@ -1117,6 +1139,7 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             error_kind: if state == State::Error { r.error_kind.clone() } else { String::new() },
             idle_stopped: if p.dead { r.idle_stopped } else { 0 },
             due: vec![],
+            blank: false,
         });
     }
     // 会话里另开的窗口(prefix c)、分出来的窗格(prefix % / "):列在会话下面,自己的状态、自己认 agent。
@@ -1181,7 +1204,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
     for s in sessions.iter().filter(|s| !live.contains(&s.id)) {
         let r = run(&s.id);
         let (agent, who) = registered(&cfg, s);
-        let at = r.ts.max(s.created);
+        // 拿回来(取消归档)也算动过:不然从回收站拿回来的,下一轮又被自动删(`[idle] remove_after`)
+        let at = r.ts.max(r.restored).max(s.created);
         let conv = if r.conv.is_empty() { s.conv.clone() } else { r.conv.clone() };
         let group = group_name(&s.group);
         out.push(Session {
@@ -1222,12 +1246,66 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             error_kind: String::new(),
             idle_stopped: r.idle_stopped,
             due: vec![],
+            blank: false,
         });
+    }
+    // 组里(连子分组)一个会话都没有的:各占一项,列表里照样有它的标题,停在上面 N 就开在这个组里。都沉在列表最底下
+    let within = |g: &str, top: &str| g == top || g.strip_prefix(top).is_some_and(|r| r.starts_with('/'));
+    for g in groups.iter().filter(|g| !sessions.iter().any(|s| within(&s.group, &g.path))) {
+        out.push(blank_row(&g.path, ranks[&g.path]));
     }
     link_parents(&mut out, &sessions);
     link_forks(&mut out, &sessions);
     sort_sessions(&mut out);
     out
+}
+
+/// 空分组那一项的键:这个字开头,后面是分组(会话的键里不会有)
+const BLANK: char = '\u{3}';
+
+/// 空分组 group 在列表里占的那一项(`Session::blank`):不是会话,没有窗格、目录、登记 id。
+/// 排在所有会话后面(连普通 tmux 会话),空组之间照分组的先后(rank)
+pub fn blank_row(group: &str, rank: usize) -> Session {
+    Session {
+        name: format!("{BLANK}{group}"),
+        tmux: String::new(),
+        title: String::new(),
+        locked: false,
+        group: group.to_string(),
+        state: State::Idle,
+        question: String::new(),
+        idle_for: 0,
+        active_at: 0,
+        ran: 0,
+        attached: false,
+        screen: vec![],
+        pinned: false,
+        noted: false,
+        space: crate::spaces::HOME,
+        dir: String::new(),
+        profile: REGISTERED.into(),
+        tool: String::new(),
+        account: String::new(),
+        agent: Agent::None,
+        who: String::new(),
+        pid: 0,
+        deck_id: String::new(),
+        info: String::new(),
+        worktree: false,
+        slot: (usize::MAX, 1, rank as i64),
+        pane: String::new(),
+        sub: None,
+        up: Up::Top,
+        fork: Fork::No,
+        subagents: vec![],
+        subagent: None,
+        tokens: vec![],
+        error: String::new(),
+        error_kind: String::new(),
+        idle_stopped: 0,
+        due: vec![],
+        blank: true,
+    }
 }
 
 #[cfg(test)]
@@ -1377,6 +1455,7 @@ pub(crate) mod tests {
             error_kind: String::new(),
             idle_stopped: 0,
             due: vec![],
+            blank: false,
         }
     }
 
@@ -1760,6 +1839,27 @@ account = \"alt\"
     }
 
     #[test]
+    fn groups_without_sessions_get_a_blank_in_their_place() {
+        let cfg = aca_core::config::parse(CONFIG);
+        let g = |path: &str, order: i64| store::Group { path: path.into(), order, default_path: String::new() };
+        // 空的 empty 排在 work 前面;fun 自己没有会话、子分组 fun/app 有:不算空;一个会话都没有的 fun/lab 算
+        let groups = vec![g("empty", 1), g("work", 2), g("fun", 3), g("fun/app", 1), g("fun/lab", 2)];
+        let sessions = vec![reg("aa11", "claude", "work", 1, 10), reg("bb22", "claude", "fun/app", 1, 20)];
+        let panes =
+            vec![Pane { pid: 300, cmd: "zsh".into(), path: "/tmp".into(), session: "scratch".into(), ..pane("$3", "", false, "%4", 0, 0) }];
+        let inp = Inputs { now: 1000, cfg, sessions, groups, panes, screens: vec![vec![]], attached: HashSet::new(), kids: Kids::new() };
+        let out = build(inp, &|_| Run::default(), &|_, _| None);
+        let rows: Vec<(&str, bool)> = out.iter().map(|s| (s.group.as_str(), s.blank)).collect();
+        // 空组沉在最底下(连普通 tmux 会话也在它们上面),之间照分组的先后
+        assert_eq!(rows, [("work", false), ("fun/app", false), ("-", false), ("empty", true), ("fun/lab", true)]);
+        let b = out.iter().find(|s| s.blank).unwrap();
+        assert_eq!((b.profile.as_str(), b.deck_id.as_str(), b.dir.as_str(), b.sub.is_none()), (REGISTERED, "", "", true));
+        // 键和会话的不会撞,各组各一个
+        assert_ne!(out[3].name, out[4].name);
+        assert!(!out.iter().filter(|s| s.blank).any(|s| s.name == s.group));
+    }
+
+    #[test]
     fn the_list_merges_the_registry_tmux_and_what_the_hooks_said() {
         let out = scene();
         let names: Vec<String> = out.iter().map(|s| s.name.replace('\u{1}', "#")).collect();
@@ -1798,5 +1898,60 @@ account = \"alt\"
         let p = s("scratch");
         assert_eq!((p.tmux.as_str(), p.group.as_str(), p.profile.as_str(), p.deck_id.as_str(), p.idle_for), ("$3", "-", "", "", 400));
         assert_eq!((p.title.as_str(), p.slot.0), ("scratch", usize::MAX));
+    }
+
+    #[test]
+    fn a_stopped_one_counts_from_when_it_was_brought_back() {
+        // 两个都停着、tmux 里没有;后一个是刚从回收站拿回来的
+        let cfg = aca_core::config::parse(CONFIG);
+        let sessions = vec![reg("aa11", "claude", "", 1, 10), reg("bb22", "claude", "", 2, 20)];
+        let run = |id: &str| match id {
+            "aa11" => Run { status: "ended".into(), ts: 300, ..Default::default() },
+            _ => Run { status: "ended".into(), ts: 300, restored: 990, ..Default::default() },
+        };
+        let inp = Inputs { now: 1000, cfg, sessions, groups: vec![], panes: vec![], screens: vec![], attached: HashSet::new(), kids: Kids::new() };
+        let out = build(inp, &run, &|_, _| None);
+        let got: Vec<(&str, State, u64)> = out.iter().map(|s| (s.name.as_str(), s.state, s.active_at)).collect();
+        assert_eq!(got, [("aa11", State::Stopped, 300), ("bb22", State::Stopped, 990)]);
+    }
+
+    #[test]
+    fn an_idle_agent_counts_from_its_last_turn_not_from_a_redraw() {
+        // 四个都在 995 重画过一下(换了设置、窗口变了大小);hook 报的是很早以前
+        let cfg = aca_core::config::parse(CONFIG);
+        let sessions = vec![
+            reg("aa11", "claude", "", 1, 10),
+            reg("bb22", "claude", "", 2, 20),
+            reg("cc33", "shell", "", 3, 30),
+            reg("dd44", "claude", "", 4, 40),
+        ];
+        let at = |sid: &str, id: &str| Pane { pid: 0, cmd: "2.1.300".into(), win_activity: 995, ..pane(sid, id, true, sid, 1, 0) };
+        let panes = vec![at("$1", "aa11"), at("$2", "bb22"), Pane { cmd: "zsh".into(), ..at("$3", "cc33") }, at("$4", "dd44")];
+        let run = |id: &str| match id {
+            // 800 开始、900 跑完、960 那次是闲了一分钟的提醒,不算动静
+            "aa11" => {
+                Run { status: "done".into(), event: "Notification".into(), ts: 960, turn: 800, done: 900, seen: 950, ..Default::default() }
+            }
+            // 940 开始问你
+            "bb22" => Run { status: "waiting".into(), ts: 940, turn: 930, ..Default::default() },
+            // shell 会话没有 hook,只能看窗口
+            "cc33" => Run { started: 100, ..Default::default() },
+            // 在跑:窗口一直在刷,照窗口算
+            _ => Run { status: "running".into(), ts: 700, turn: 700, ..Default::default() },
+        };
+        let ask = v(&[" Do you want to proceed?", " ❯ 1. Yes", "   2. No", "", " Esc to cancel · Tab to amend"]);
+        let screens = vec![vec![], ask, vec![], v(&["✻ Pondering… (5m 0s · esc to interrupt)"])];
+        let inp = Inputs { now: 1000, cfg, sessions, groups: vec![], panes, screens, attached: HashSet::new(), kids: Kids::new() };
+        let out = build(inp, &run, &|_, _| None);
+        let got: Vec<(&str, State, u64, u64)> = out.iter().map(|s| (s.name.as_str(), s.state, s.idle_for, s.active_at)).collect();
+        assert_eq!(
+            got,
+            [
+                ("aa11", State::Idle, 100, 900),
+                ("bb22", State::Ask, 60, 940),
+                ("cc33", State::Idle, 5, 995),
+                ("dd44", State::Running, 5, 995)
+            ]
+        );
     }
 }

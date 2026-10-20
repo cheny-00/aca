@@ -372,11 +372,11 @@ fn hotkey_changes(keys: &str, want: &[(String, String)]) -> (Vec<Vec<String>>, V
     let (mut cmds, mut held) = (vec![], vec![]);
     for table in HOTKEY_TABLES {
         let now: Vec<(&str, &str)> = bindings(keys, table).collect();
-        for (k, _) in now.iter().filter(|(k, c)| c.contains(HOTKEY_MARK) && !want.iter().any(|(w, _)| w == k)) {
+        for (k, _) in now.iter().filter(|(k, c)| c.contains(HOTKEY_MARK) && !want.iter().any(|(w, _)| same_key(w, k))) {
             cmds.push(vec![s("unbind-key"), s("-T"), s(table), s(k)]);
         }
         for (k, sh) in want {
-            match now.iter().find(|(b, _)| b == k) {
+            match now.iter().find(|(b, _)| same_key(b, k)) {
                 Some((_, c)) if !c.contains(HOTKEY_MARK) => {
                     if table == "root" {
                         held.push(k.clone());
@@ -407,6 +407,29 @@ fn bindings<'a>(keys: &'a str, table: &'a str) -> impl Iterator<Item = (&'a str,
     })
 }
 
+/// 是不是同一个键:修饰键的先后不算。Debian 12 的 tmux 3.3a、Ubuntu 24.04 的 3.4 在 `list-keys` 里把
+/// `C-M-y` 打成 `M-C-y`(Mac 上新的 tmux 照写的打),按字面比就认不出 aca 自己绑过的,也认不出你绑的
+fn same_key(a: &str, b: &str) -> bool {
+    key_parts(a) == key_parts(b)
+}
+
+/// (按着哪几个修饰键 C / M / S, 剩下的那个键)。`M--` 是 Alt 加减号:最后剩的一段不再拆
+fn key_parts(k: &str) -> ([bool; 3], &str) {
+    let mut mods = [false; 3];
+    let mut rest = k;
+    while rest.len() > 2 {
+        let i = match rest.get(..2) {
+            Some("C-") => 0,
+            Some("M-") => 1,
+            Some("S-") => 2,
+            _ => break,
+        };
+        mods[i] = true;
+        rest = &rest[2..];
+    }
+    (mods, rest)
+}
+
 /// 一段字写成 tmux 命令里的一个参数(双引号里 `\` `"` `$` 要转义)
 fn quote(s: &str) -> String {
     let mut out = String::from("\"");
@@ -426,7 +449,7 @@ fn plain(s: &str) -> String {
 
 /// `list-keys` 里这个键在平常那张键表上绑的命令(`bind-key [-r] -T root C-q 命令 …` 的命令那一段)
 fn bound<'a>(keys: &'a str, key: &str) -> Option<&'a str> {
-    bindings(keys, "root").find(|(k, _)| *k == key).map(|(_, cmd)| cmd)
+    bindings(keys, "root").find(|(k, _)| same_key(k, key)).map(|(_, cmd)| cmd)
 }
 
 /// 没绑、agent-deck 绑的、aca 以前绑的(条件改过)→ 绑;已经是这一版、别人绑的 → 不动
@@ -490,6 +513,23 @@ mod tests {
         assert_eq!(cmds[0][2], "copy-mode");
         assert!(hotkey_changes(yours, &[]).0.is_empty());
         assert_eq!(quote("a \"b\" $c \\"), "\"a \\\"b\\\" \\$c \\\\\"");
+    }
+
+    #[test]
+    fn an_older_tmux_listing_the_modifiers_the_other_way_round_still_names_the_same_key() {
+        assert!(same_key("C-M-y", "M-C-y") && same_key("C-q", "C-q") && same_key("M--", "M--"));
+        assert!(!same_key("C-y", "M-y") && !same_key("C-M-y", "C-y") && !same_key("M--", "M-"));
+        let sh = format!("'/bin/aca' next {HOTKEY_MARK} C-M-n --session '#{{@aca_id}}' --client '#{{client_name}}'");
+        let want = vec![("C-M-n".to_string(), sh.clone())];
+        // tmux 3.4 把 aca 绑的 C-M-n 打成 M-C-n:认得是它,不解也不重绑
+        let ours = HOTKEY_TABLES
+            .map(|t| format!("bind-key -T {t} M-C-n if-shell -F \"#{{?@aca_id,1,0}}\" \"run-shell -b \\\"{sh}\\\"\" \"send-keys C-M-n\"\n"))
+            .concat();
+        assert_eq!(hotkey_changes(&ours, &want), (vec![], vec![]));
+        // 你绑在 C-M-n 上的,一样打成 M-C-n:不动它,报出来;翻着看的两张表空着,照绑
+        let (cmds, held) = hotkey_changes("bind-key -T root M-C-n display-message mine\n", &want);
+        assert_eq!(held, ["C-M-n"]);
+        assert_eq!(cmds.iter().map(|c| c[2].as_str()).collect::<Vec<_>>(), ["copy-mode", "copy-mode-vi"]);
     }
 
     #[test]

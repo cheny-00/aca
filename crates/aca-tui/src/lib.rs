@@ -129,7 +129,7 @@ fn print_list(kw: &str) {
     }
 }
 
-/// aca cost:把计费面板的内容打印出来
+/// aca cost:把计费面板的内容打印出来(面板上 m 才摆出来的那几块也打)
 fn print_cost(range: Option<&str>, only: &[String]) {
     let sel = match range {
         Some("1" | "today") => 0,
@@ -161,7 +161,7 @@ fn print_cost(range: Option<&str>, only: &[String]) {
         };
         let _ = writeln!(out, "{head}\n");
     }
-    for l in bill::lines(&r, sel, width) {
+    for l in bill::lines(&r, sel, true, width) {
         let s: String = l.spans.iter().map(|sp| if color { ansi(&sp.content, sp.style) } else { sp.content.to_string() }).collect();
         if writeln!(out, "{}", s.trim_end()).is_err() {
             return;
@@ -281,7 +281,7 @@ pub fn main(mut args: Vec<String>) -> anyhow::Result<()> {
     // 界面里 ^L 重启时 exec 自己带上的:开到哪(list / bill:时段),不给人用
     let restarted = take_opt(&mut args, "--restarted");
     let only = take_only(&mut args);
-    // 退出的界面起这个子进程去真删它删掉的会话(见 trash.rs)
+    // 界面退出时起这个子进程去真删回收站里到期的(见 trash.rs)
     if args.iter().any(|a| a == "--purge") {
         trash::purge();
         return Ok(());

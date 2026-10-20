@@ -9,7 +9,9 @@
 //!   `codex-plugins`(只建一次,不改 config.toml),起的时候 `-c plugins.<名字>@aca.enabled=true` 只对这一次打开。
 //!   这靠的是 Codex 内部的缓存目录布局,不是公开的接口:那里已经有别的东西、建不了链接时只挂 MCP,原因记在
 //!   `plugin-logs/mount.log`。MCP 是 `-c mcp_servers.<名字>={…}`;它给 MCP 子进程的环境只有白名单,会话 id 得写在 `env` 里
-//! - 两家的插件 MCP 都是 `aca plugin mcp <插件 id>`:aca 切到插件目录、带上插件的环境(设置、会话)再换成它的命令
+//! - **pi / opencode**:只带 MCP,插件目录不带(skill、命令的格式还没对过)。pi 是 aca 的扩展起来时一个个 `registerMcpServer`
+//!   (那份清单的路径在 `ACA_PI_MCP` 里,见 agent/pi.rs);opencode 写进启动时叠上去的那份配置的 `mcp`(见 agent/opencode.rs)
+//! - 几家的插件 MCP 都是 `aca plugin mcp <插件 id>`:aca 切到插件目录、带上插件的环境(设置、会话)再换成它的命令
 //! - 露给 agent 的能力(`expose = ["agent"]`)由 aca 自带的 `aca plugin tools` 包成工具,这个 MCP 服务叫 `aca`
 //! - gateway 开着([`crate::gateway`]):插件的 MCP(via 不是 direct 的)和能力都归 gateway,agent 身上只挂一个 `aca`,
 //!   是到 gateway 的转接(`aca plugin gateway connect`);via = direct 的照旧直接挂
@@ -98,7 +100,7 @@ pub fn plan(kind: &str, tool: &str, account: &str, codex_home: Option<&Path>) ->
 /// 不一样就是开着的会话要重启才带上。只算给 agent 的(目录、它的命令 agent 自己能不能用、MCP、工具、gateway 开没开),
 /// 只有事件钩子的插件不算
 pub fn signature(kind: &str, tool: &str, account: &str) -> String {
-    if !super::AGENTS.contains(&kind) {
+    if !super::MCP_AGENTS.contains(&kind) {
         return String::new();
     }
     let wants = decl::wants().unwrap_or_default();
@@ -365,6 +367,26 @@ pub fn codex_mcp_flag(name: &str, aca: &str, args: &[String], env: &[(String, St
     format!("mcp_servers.{name}={}", toml::Value::Table(t))
 }
 
+/// pi 那边的:`{ 名字: { command, args } }`,aca 的扩展起来时一个个交给 `pi.registerMcpServer`。
+/// pi 默认把 MCP 工具藏在 codemode 后面(模型写脚本才调得到);aca 给的就几个,直接声明给模型,和 Claude、Codex 一样
+pub fn pi_mcp_config(aca: &str, mcp: &[(String, Vec<String>)]) -> String {
+    let servers: serde_json::Map<String, serde_json::Value> = mcp
+        .iter()
+        .map(|(name, args)| (name.clone(), serde_json::json!({ "command": aca, "args": args, "exposure": "direct" })))
+        .collect();
+    serde_json::to_string_pretty(&servers).unwrap()
+}
+
+/// opencode 那边的:叠上去的那份配置里 `mcp` 下的几项(本机起的,命令连参数写成一个数组)
+pub fn opencode_mcp(aca: &str, mcp: &[(String, Vec<String>)]) -> serde_json::Map<String, serde_json::Value> {
+    mcp.iter()
+        .map(|(name, args)| {
+            let cmd: Vec<&str> = std::iter::once(aca).chain(args.iter().map(String::as_str)).collect();
+            (name.clone(), serde_json::json!({ "type": "local", "command": cmd, "enabled": true }))
+        })
+        .collect()
+}
+
 /// Claude 那边的 `--mcp-config` 内容
 pub fn claude_mcp_config(aca: &str, mcp: &[(String, Vec<String>)]) -> String {
     let servers: serde_json::Map<String, serde_json::Value> =
@@ -375,6 +397,17 @@ pub fn claude_mcp_config(aca: &str, mcp: &[(String, Vec<String>)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_and_opencode_get_the_same_servers_in_their_own_shapes() {
+        let mcp = vec![("aca".to_string(), vec!["plugin".to_string(), "tools".to_string()])];
+        let pi: serde_json::Value = serde_json::from_str(&pi_mcp_config("/bin/aca", &mcp)).unwrap();
+        assert_eq!(pi, serde_json::json!({ "aca": { "command": "/bin/aca", "args": ["plugin", "tools"], "exposure": "direct" } }));
+        assert_eq!(
+            serde_json::Value::Object(opencode_mcp("/bin/aca", &mcp)),
+            serde_json::json!({ "aca": { "type": "local", "command": ["/bin/aca", "plugin", "tools"], "enabled": true } })
+        );
+    }
 
     #[test]
     fn ids_become_names_codex_and_mcp_accept() {

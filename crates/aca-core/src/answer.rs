@@ -161,14 +161,19 @@ pub fn interrupt(store: &Store, cfg: &Config, key: &str) -> Res<String> {
     let s = store.get(key)?;
     let me = caller(store, &s, "中止")?;
     let (agent, _) = agent::of(cfg, &s)?;
-    let esc = agent.interrupt_key().ok_or("这一家还没试过怎么中止:去它的界面里按")?;
+    let keys = agent.interrupt_keys().ok_or("这一家还没试过怎么中止:去它的界面里按")?;
     let pane = tmux::find(&s.id).filter(|p| !p.dead).ok_or("会话没在跑")?;
     match status::one(cfg, &s, true).state {
         State::Running => {}
         State::Ask => return Err("它在等确认,不是在跑:要拒绝用 aca answer <会话> no".into()),
         _ => return Err("它没在跑一轮,不用中止".into()),
     }
-    tmux::keys(&pane.pane, &[esc])?;
+    for (i, k) in keys.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        tmux::keys(&pane.pane, &[k])?;
+    }
     if !agent.reports_interrupt() {
         // Claude 被 Esc 停下不发 hook:自己记成空着
         runtime::update(&s.id, |r| {
@@ -202,6 +207,7 @@ pub fn answer(store: &Store, cfg: &Config, key: &str, reply: &str) -> Res<String
         return Err("它问的已经变了,没按:再看一眼 aca answer <会话>".into());
     }
     tmux::keys(&pane.pane, &[key])?;
+    box_gone(&*agent, &pane.pane);
     let refused = r.ask_kind == "permission" && reply.starts_with('n');
     runtime::update(&s.id, |r| {
         // 拒绝了的,Claude 停下来等你说别的,不发 hook;别的接着跑,它自己的 hook 会再报
@@ -211,6 +217,16 @@ pub fn answer(store: &Store, cfg: &Config, key: &str, reply: &str) -> Res<String
     let by = me.unwrap_or_else(|| "you".into());
     event::emit("ask.answered", &s.id, json!({ "by": by, "answer": said, "ask": r.ask, "kind": r.ask_kind }));
     Ok(format!("替 {} 答了:{said}", s.id))
+}
+
+/// 按完之后等屏幕上那个框收起来,最多 1.5 秒:列表、`aca wait` 以屏幕为准,框还没重画掉的那一下还当它在问
+/// (opencode 重画得慢,答完马上 `aca wait` 会读成又在等确认)。屏幕上认不出框的那几家不等
+fn box_gone(agent: &dyn Agent, pane: &str) {
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_millis(1500) && matches!(agent.screen(&tmux::capture(pane)), crate::screen::Seen::Ask(_))
+    {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// 启动时的关卡:状态看屏幕(没有 hook 报),按完不改 runtime,它过了关自己会变
@@ -244,12 +260,12 @@ mod tests {
         assert!(keys_for(claude, &q, "3").unwrap_err().contains("只有 2 个"));
         assert!(keys_for(claude, &q, "B").is_err() && keys_for(claude, &q, "0").is_err());
         assert!(keys_for(claude, &Run { ask_multi: true, ..q.clone() }, "1").unwrap_err().contains("界面里答"));
-        // 权限框:Claude 同意按 1、拒绝按 Esc;Codex 的还没试过
+        // 权限框:Claude 同意按 1、拒绝按 Esc;Codex 同意按 y、拒绝按 Esc(0.163 上实测)
         let p = Run { ask: "Bash:touch x".into(), ask_kind: "permission".into(), ..Default::default() };
         assert_eq!(keys_for(claude, &p, "yes").unwrap().0, "1");
         assert_eq!(keys_for(claude, &p, "no").unwrap().0, "Escape");
         assert!(keys_for(claude, &p, "2").is_err());
-        assert!(keys_for(codex, &p, "yes").unwrap_err().contains("没试过"));
+        assert_eq!((keys_for(codex, &p, "yes").unwrap().0, keys_for(codex, &p, "no").unwrap().0), ("y", "Escape"));
         // 只在屏幕上认出来的:不归这里(走 gate)
         assert!(keys_for(claude, &Run { ask: "Hooks need review".into(), ..Default::default() }, "1").is_err());
     }

@@ -5,9 +5,10 @@
 //! 状态栏是余光扫的地方,所以只打种类和个数、用颜色分轻重,不打名字:名字截到十几格认不出来,看到了也点不了。
 //! 是谁、在问什么,列表里写得全。
 //!
-//! tmux 每隔 `status-interval` 秒跑一次,所以只读:登记表、一条 `tmux list-panes`、每个会话一个小状态文件、界面记的已读。
+//! 状态栏 tmux 每隔 `status-interval` 秒跑一次,所以只读:登记表、一条 `tmux list-panes`、每个会话一个小状态文件、界面记的已读。
 //! 不读屏幕、不替没报 hook 的那一轮补事件、不跟改名(这些留给列表刷新),所以偶尔比列表慢一拍
 //! (比如 Codex 漏了 Stop hook 的那一轮,列表刷新时才补上)。
+//! `aca next` 是按一下才跑一次:和列表一样读屏幕,只在屏幕上看得出在等你的(没信任 hook 的 Codex、启动时的确认框)也去得了。
 //!
 //! `aca tmux install` 替你接上(见 tmuxconf.rs);自己接:`set -ag status-right "#($HOME/.local/bin/aca tmux-status #{@aca_id})"`。
 //! 后面那个是你正看着的会话,不算它;没有在等你的、插件也都好好的,就什么都不打,这一段就没了。
@@ -82,7 +83,7 @@ fn waiting<'a>(rows: &'a [Row], reads: &Reads, here: &str) -> Vec<(u8, &'a Row)>
     waiting
 }
 
-/// ` ! 2  ● 3`:各有几个。`!` 是 agent 停着等你,红底的一块;`●` 放着也不丢,次要的字色。没有的那一样不打。
+/// ` ◆ 2  ◐ 3`:各有几个,符号同列表。`◆` 要你答:agent 停着等你,红底的一块;`◐` 没看:放着也不丢,次要的字色。没有的那一样不打。
 /// 颜色用终端调色板里的名字:底色是你的 tmux 主题定的,跟着它走
 fn text(rows: &[Row], reads: &Reads, here: &str) -> String {
     let w = waiting(rows, reads, here);
@@ -90,10 +91,10 @@ fn text(rows: &[Row], reads: &Reads, here: &str) -> String {
     let done = w.len() - asks;
     let mut parts = vec![];
     if asks > 0 {
-        parts.push(format!("#[fg=red reverse bold] ! {asks} #[default]"));
+        parts.push(format!("#[fg=red reverse bold] ◆ {asks} #[default]"));
     }
     if done > 0 {
-        parts.push(format!("#[fg=brightblack]● {done}#[default]"));
+        parts.push(format!("#[fg=brightblack]◐ {done}#[default]"));
     }
     parts.join(" ")
 }
@@ -120,7 +121,9 @@ pub fn next(args: &[String]) -> i32 {
         (None, true) => drop(tmux(&["display-message", m])),
         (None, false) => println!("{m}"),
     };
-    let rows = match aca_core::store::Store::open().and_then(|s| Ok((status::peek(&s)?, s))) {
+    // 读屏幕(同列表):只靠 peek 的话,列表里 ◐ 的、hook 没报的那些按了去不了
+    let cfg = aca_core::config::load();
+    let rows = match aca_core::store::Store::open().and_then(|s| Ok((status::collect(&s, &cfg, true)?, s))) {
         Ok(v) => v,
         Err(e) => {
             say(&e);
@@ -219,8 +222,8 @@ mod tests {
         }
     }
 
-    const ASKS: &str = "#[fg=red reverse bold] ! ";
-    const DONES: &str = "#[fg=brightblack]● ";
+    const ASKS: &str = "#[fg=red reverse bold] ◆ ";
+    const DONES: &str = "#[fg=brightblack]◐ ";
 
     #[test]
     fn the_bar_counts_what_waits_asks_loud_finished_quiet_and_not_the_one_you_are_in() {

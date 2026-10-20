@@ -3,6 +3,7 @@ name = "Remote tasks"
 version = "0.3.1"
 api = 1
 description = "把长任务派到别的机器上后台跑(ssh),结束时结果作为一条消息发回派它的会话。你在界面 : 菜单里派,agent 用工具派"
+description_en = "Send long tasks to run in the background on another machine (ssh); when one ends, its result comes back as a message to the session that sent it. You send them from the : menu in the interface, agents with a tool."
 needs = ["jq", "curl", "ssh"]
 
 # 整个功能就是 remote.sh(sh + jq + curl + ssh),aca 里没有远端任务的代码,用的只是插件接口。
@@ -11,15 +12,18 @@ needs = ["jq", "curl", "ssh"]
 [settings.url]
 default = ""
 desc = "server 的地址(https://…):远端回调、去取结果都用它"
+desc_en = "The server's address (https://…): the remote side calls back to it and results are fetched from it."
 
 [settings.token]
 default = ""
 secret = true
 desc = "server 的管理口令,和它的 JOBHOOK_TOKEN 一样"
+desc_en = "The server's admin token, the same as its JOBHOOK_TOKEN."
 
 [[commands]]
 id = "run"
 title = "派到别的机器上跑"
+title_en = "Run on another machine"
 desc = "Run a long command in the background on another machine (over ssh) and return at once. When it ends, its exit code and the last lines of its log come back to you as a message, so don't wait, poll or ssh in to watch. host: an ssh host. command: the shell command. note: what to call the task in the message. within: time limit like 90m / 6h / 2d (default 24h, 0 = none)."
 contexts = ["session"]
 args = { host = "string", command = "string", note = "string?", within = "string?" }
@@ -29,6 +33,7 @@ command = ["sh", "remote.sh", "run"]
 [[commands]]
 id = "new"
 title = "只登记(自己接回调)"
+title_en = "Register only (call back yourself)"
 desc = "Register a task without starting it: prints an id and a curl line to run when your own task ends."
 args = { note = "string?", host = "string?", within = "string?" }
 expose = ["cli"]
@@ -37,6 +42,7 @@ command = ["sh", "remote.sh", "new"]
 [[commands]]
 id = "list"
 title = "列出远端任务"
+title_en = "List remote tasks"
 desc = "List remote tasks: the ones still running and the ones that settled recently, with how they ended."
 expose = ["cli", "agent"]
 command = ["sh", "remote.sh", "list"]
@@ -44,6 +50,7 @@ command = ["sh", "remote.sh", "list"]
 [[commands]]
 id = "rm"
 title = "撤掉一个远端任务"
+title_en = "Drop a remote task"
 args = { id = "string" }
 expose = ["cli"]
 command = ["sh", "remote.sh", "rm"]
@@ -51,13 +58,16 @@ command = ["sh", "remote.sh", "rm"]
 [[commands]]
 id = "collect"
 title = "现在去 server 取一次"
+title_en = "Fetch from the server now"
 expose = ["cli"]
 command = ["sh", "remote.sh", "collect"]
 
 [[commands]]
 id = "check"
 title = "测一下 server(连不连得上、口令对不对)"
-expose = ["menu", "cli"]
+title_en = "Test the server (reachable, token right)"
+# 诊断用的,不进 : 菜单(那里是对着高亮那一行做事的);aca plugin run aca.remote.check
+expose = ["cli"]
 command = ["sh", "remote.sh", "check"]
 
 # 每 5 分钟去取一次:派任务时开上,都了结了 collect 自己关掉 —— 没派任务的日子里什么都不跑
@@ -70,17 +80,20 @@ manual = true
 [[views]]
 id = "tasks"
 title = "远端任务"
+title_en = "Remote tasks"
 rows = true
 command = ["sh", "remote.sh", "rows"]
 
 [[views.keys]]
 key = "enter"
 title = "复制看日志的命令"
+title_en = "Copy the command that shows the log"
 copy = "{log_cmd}"
 
 [[views.keys]]
 key = "x"
 title = "撤掉(远端的任务不会停,只是不再等它)"
+title_en = "Drop it (the remote task keeps running; it's just no longer waited for)"
 run = "rm"
 args = { id = "{id}" }
 confirm = true
@@ -88,6 +101,7 @@ confirm = true
 [[views.keys]]
 key = "r"
 title = "现在去取"
+title_en = "Fetch now"
 run = "collect"
 row = false
 

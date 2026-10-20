@@ -1,6 +1,6 @@
 # aca
 
-**One screen for all your AI coding agent sessions** — Claude Code, Codex, and any other agent you plug in.
+**One screen for all your AI coding agent sessions** — Claude Code, Codex, pi, opencode, and any other agent you plug in.
 
 English | [简体中文](README.zh-CN.md)
 
@@ -17,8 +17,8 @@ aca is modeled on [agent-deck](https://github.com/asheshgoplani/agent-deck); see
 
 ## What you get
 
-- **One list with clear states.** `●` working · `◐` waiting for you, or finished and not read yet ·
-  `○` idle · `✕` error · `■` not running · `☾` stopped by aca after sitting idle (see `[idle]` below).
+- **One list with clear states.** `●` working · `◆` needs you · `◐` finished and not read yet ·
+  `○` idle · `✕` error · `■` stopped · `☾` stopped by aca after sitting idle (see `[idle]` below).
 - **Several accounts side by side.** Personal and work subscriptions, an API key, Bedrock: sessions from
   all of them sit in the same list, and aca makes sure one account's login never leaks into another.
 - **Your agent setup stays yours.** aca does not write hooks or anything else into `~/.claude` or
@@ -65,9 +65,10 @@ is missing, but never installs them for you.
   not need to know tmux to use aca. Check with `tmux -V`. On macOS, `brew install tmux`. On Linux, use your
   package manager, but note that Ubuntu 22.04 ships tmux 3.2a, which is too old; Ubuntu 24.04 and Debian 12
   are new enough.
-- **[Claude Code](https://github.com/anthropics/claude-code) and/or [Codex CLI](https://github.com/openai/codex),**
-  installed and logged in the way you normally use them. Run `claude` or `codex` once to make sure it
-  answers. aca starts them, but it does not install them or log in for you.
+- **[Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex),
+  [pi](https://pi.dev) or [opencode](https://opencode.ai)** (any of them), installed and logged in the way you
+  normally use them. Run `claude`, `codex`, `pi` or `opencode` once to make sure it answers. aca starts them, but it
+  does not install them or log in for you. pi and opencode show up in the new-session menu once they are on your `PATH`.
 - **`~/.local/bin` on your `PATH`** (or whichever directory you install to). If it is not, add
   `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` or `~/.bashrc` and open a new terminal.
 
@@ -193,8 +194,8 @@ aca                       # open the interface
 ```
 
 1. In the interface, press `n`, pick Claude or Codex, and confirm the directory. A session starts.
-2. Press `Enter` to go into it and talk to the agent as usual.
-3. Press `Ctrl+Q` to come back to the list. The agent keeps working.
+2. aca takes you straight into it: talk to the agent as usual.
+3. Press `Ctrl+Q` to come back to the list. The agent keeps working. `Enter` on a session goes back in.
 4. Start a few more. Watch the marks in the list; `i` jumps to the next session that needs you.
 5. Press `?` any time for the keys (the common ones are listed under [Keys](#keys)).
 
@@ -231,8 +232,10 @@ without doing it. `aca help keys` describes every key in detail.
 | `H` | Hand off: a new session, with any tool or account, picks up where this one is |
 | `X` | Carry on under another account, for when this one runs out of quota |
 | `r` / `R` / `D` | Rename / restart / stop |
-| `d` | Delete (`Ctrl+Z` undoes it until you quit) |
+| `d` | Delete; on a group, the group with its sessions. Deleted things stay in the trash for a day; `Ctrl+Z` undoes |
+| `b` | Trash: what you deleted in the last day, `⏎` brings it back; `v` selects several to bring back or delete together |
 | `m` / `p` | Move to another group / pin to the top |
+| `v` `V` | Select several (as in yazi): `v` then move to stretch a range (`Esc` keeps it), `V` stretches one that unselects, `Space` selects one; then `d` `D` `R` `m` `u` `p` `Q` act on all of them, `Ctrl+Z` undoes the batch in one step |
 | `Tab` | Pick a group to show, or all of them |
 | `$` | Usage and cost |
 | `P` / `:` | Plugins / the menu of what your plugins can do for the selected row |
@@ -306,7 +309,7 @@ An example with the settings people change most:
 ```toml
 [tools.claude]
 account = "work"                          # the account `aca new claude` uses when you don't name one
-args = ["--model", "opus"]                # arguments added every time it starts
+args = ["--model", "opus"]                # arguments added every time it starts (also p on the accounts page)
 
 [tools.codex]
 hook_trust = "bypass"                     # don't ask "Hooks need review" (see Getting started)
@@ -317,6 +320,8 @@ folder = true                             # answer "do you trust this folder?" f
 [idle]
 stop_after = "3h"                         # while the interface is open, stop sessions idle this long (they
                                           # resume their conversation with ⏎); idle agents still use CPU
+remove_after = "30d"                      # delete sessions stopped this long (into the trash, ^Z / b brings
+                                          # them back within a day); "never" or unset keeps them
 
 [keys]
 next = "M-n"                              # Alt+N instead of Ctrl+Alt+N for "next session waiting for you"
@@ -346,7 +351,7 @@ Every section, and where to read more:
 | `[login]` | Which browsers a login link can open in; logging in on another device when you are on SSH | `aca help config` |
 | `[ui]` | Language; order of the `n` menu, and entries hidden from it | `aca help config` |
 | `[mcps.<name>]` | Your catalog of MCP servers: attach one to a project with `M`, or serve it to every agent through the gateway plugin | [docs/plugins.md](docs/plugins.md) |
-| `[theme]` `[ime]` `[new_group]` | Theme, input method switching, default directory for new groups | Set on the settings page (`Ctrl+S`) |
+| `[theme]` `[ime]` `[new_group]` | Theme, input method switching (macOS only), default directory for new groups | Set on the settings page (`Ctrl+S`) |
 
 - `aca help config` shows every setting with an example, and `aca names` the account and tool names you can
   use right now.
@@ -439,6 +444,10 @@ aca setup --statusline off     # undo: restore what you had before
 - **aca** draws a two-line status bar: context usage, model, git branch and changes, directory; then the
   account's limits, cost and duration. (It uses Nerd Font icons.)
 - **wrap** leaves your status bar as it is and puts `aca limits --` in front of your command.
+
+Per-model weekly limits (such as Fable) never reach the status bar. For an account with sessions in use,
+aca asks Claude itself in the background every few minutes (the same source as `/usage`) and adds them.
+Only registered accounts are asked.
 
 This changes one thing: the `statusLine` entry in that account's `settings.json`. Nothing else in the file
 is touched, your original entry is remembered, and `off` puts it back. Running Claude sessions pick the

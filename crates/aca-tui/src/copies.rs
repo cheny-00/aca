@@ -31,12 +31,7 @@ impl Menu {
     pub fn new(title: &str, id: &str, info: &str) -> Menu {
         let line = |k: &str| info.lines().find_map(|l| l.strip_prefix(k)).unwrap_or("").trim().to_string();
         let rows = vec![
-            Row {
-                key: 'i',
-                name: "aca id",
-                value: id.to_string(),
-                none: t!("没登记(A 接管之后才有)", "not registered (only after adopting with A)"),
-            },
+            Row { key: 'i', name: "aca id", value: id.to_string(), none: t!("A 接管后才有", "only after adopting with A") },
             Row { key: 's', name: "session id", value: line("Session: "), none: t!("还没有对话", "no conversation yet") },
             Row { key: 'p', name: "path", value: line("Path: "), none: t!("不知道目录", "directory unknown") },
         ];
@@ -88,7 +83,7 @@ impl Overlay for Menu {
             out.push(kit::picked(line, w, i == self.sel && !r.value.is_empty()));
         }
         out.push(Line::raw(""));
-        out.push(kit::keys_line(&[("i s p", t!("直接复制", "copy directly")), ("⏎", t!("复制选中的", "copy selected"))], vec![], w));
+        out.push(kit::keys_line(&[("⏎", t!("复制", "copy"))], vec![], w));
         out
     }
 
@@ -131,8 +126,7 @@ mod tests {
     fn each_row_copies_its_own_value_by_key_or_enter() {
         let mut m = Menu::new("修登录", "3f2a9c1e", "Path: /w/app\nSession: 5f0c-uuid");
         let rows = text(&m, 66);
-        for want in ["复制 · 修登录", "i  aca id      3f2a9c1e", "s  session id  5f0c-uuid", "p  path        /w/app", "直接复制"]
-        {
+        for want in ["复制 · 修登录", "i  aca id      3f2a9c1e", "s  session id  5f0c-uuid", "p  path        /w/app", "⏎ 复制"] {
             assert!(rows.iter().any(|r| r.contains(want)), "缺「{want}」:{rows:#?}");
         }
         let (f, fx) = press(&mut m, KeyCode::Char('s'));
@@ -151,9 +145,9 @@ mod tests {
         let mut m = Menu::new("裸", "", "Path: /w/x");
         assert_eq!(m.sel, 2);
         let rows = text(&m, 66);
-        assert!(rows.iter().any(|r| r.contains("没登记(A 接管之后才有)")) && rows.iter().any(|r| r.contains("还没有对话")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("A 接管后才有")) && rows.iter().any(|r| r.contains("还没有对话")), "{rows:#?}");
         let (f, fx) = press(&mut m, KeyCode::Char('i'));
-        assert_eq!((f, fx.copy, fx.flash.as_deref()), (Flow::Stay, None, Some("没有 aca id:没登记(A 接管之后才有)")));
+        assert_eq!((f, fx.copy, fx.flash.as_deref()), (Flow::Stay, None, Some("没有 aca id:A 接管后才有")));
         press(&mut m, KeyCode::Up);
         assert_eq!(m.sel, 2);
         // 手机宽度:一行不超宽

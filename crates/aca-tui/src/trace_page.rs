@@ -262,7 +262,7 @@ fn sub_reply(t: &Trace) -> String {
     t.last_turn().and_then(|r| last_said(t, r)).map(|c| said(t, c).1.join("\n\n")).unwrap_or_default()
 }
 
-/// 子代理的数字:在跑 / 出错 / 被停、几次调用、钱、从头到尾多久(后台跑的 Agent 工具早就返回了,真正的耗时在这)
+/// 子代理的数字:在跑 / 出错 / 被打断、几次调用、钱、从头到尾多久(后台跑的 Agent 工具早就返回了,真正的耗时在这)
 fn sub_numbers(t: &Trace, i: usize, live: bool, now: i64) -> Styled {
     let Some(s) = t.sub_of(i) else { return vec![] };
     let p = theme::pal();
@@ -271,7 +271,7 @@ fn sub_numbers(t: &Trace, i: usize, live: bool, now: i64) -> Styled {
     match (t.sub_live(i, live, now), t.sub_state(i)) {
         (true, _) => parts.push(seg(t!("在跑", "running"), Style::new().fg(p.green).add_modifier(Modifier::BOLD))),
         (_, St::Err) => parts.push(seg(t!("出错", "error"), Style::new().fg(p.red))),
-        (_, St::Stopped) => parts.push(seg(t!("被停", "stopped"), dim())),
+        (_, St::Stopped) => parts.push(seg(t!("被打断", "interrupted"), dim())),
         _ => {}
     }
     if sum.calls > 0 {
@@ -330,27 +330,23 @@ fn sub_item(t: &Trace, i: usize, live: bool, now: i64, open: bool) -> (Vec<Para>
     (ps, open || hidden)
 }
 
-/// 一次调用开头一条分隔线,线上写数字:── 4.5s · 上下文 1.1k · 出 640 · $0.01 ───(不是常用的模型时写上模型)
-fn call_rule(t: &Trace, i: usize, main: usize) -> Para {
+/// 一次调用开头一条分隔线,线上写数字:── 4.5s · 1.1k · $0.01 ───(模型换了写上模型)
+fn call_rule(t: &Trace, i: usize) -> Para {
     Para {
-        body: vec![seg("── ", theme::faint()), seg(call_numbers(t, i, main), dim()), seg(" ", Style::new())],
+        body: vec![seg("── ", theme::faint()), seg(call_numbers(t, i), dim()), seg(" ", Style::new())],
         fill: Some(seg("─", theme::faint())),
         ..Para::default()
     }
 }
 
-/// 一次调用的数字:4.5s · 上下文 1.1k · 出 640 · $0.01(不是常用的模型时写上模型)
-fn call_numbers(t: &Trace, i: usize, main: usize) -> String {
+/// 一次调用的数字:多久 · 上下文 · 钱,4.5s · 1.1k · $0.01。模型和上一次调用的不一样时写上模型
+/// (头一次调用跟出现最多的那个比)
+fn call_numbers(t: &Trace, i: usize) -> String {
     let n = &t.nodes[i];
     let cost = if n.copied { t!("不计", "not counted").to_string() } else { t.cost(i).map_or("–".into(), fmt_cost) };
-    let mut s = tr!(
-        "{} · 上下文 {} · 出 {} · {cost}",
-        "{} · context {} · out {} · {cost}",
-        fmt_dur(t.dur(i, false, 0)),
-        fmt_tok(n.context()),
-        fmt_tok(n.tok[4])
-    );
-    if n.model != main {
+    let mut s = format!("{} · {} · {cost}", fmt_dur(t.dur(i, false, 0)), fmt_tok(n.context()));
+    let prev = t.nodes[..i].iter().rev().find(|x| x.kind == Kind::Call).map_or_else(|| t.main_model(), |x| x.model);
+    if n.model != prev {
         s += &format!(" · {}", short_model(&t.models[n.model]));
     }
     s
@@ -363,9 +359,9 @@ pub(crate) fn last_said(t: &Trace, turn: usize) -> Option<usize> {
 
 /// 右边的一次调用:分隔线、想的(收着摊成一段,最多 PEEK_THOUGHT 行)、说的(全文;brief = 这是回复,左边有全文,收着只写第一句)。
 /// 第二个值:能不能 o(想的截没截到,要折好才知道,见 `wrap_clipped`)
-fn call_item(t: &Trace, i: usize, main: usize, brief: bool, open: bool) -> (Vec<Para>, bool) {
+fn call_item(t: &Trace, i: usize, brief: bool, open: bool) -> (Vec<Para>, bool) {
     let n = &t.nodes[i];
-    let mut out = vec![call_rule(t, i, main)];
+    let mut out = vec![call_rule(t, i)];
     let (thought, text) = said(t, i);
     let label = |s: &str| vec![seg(s.to_string(), theme::faint())];
     let pad = vec![seg("     ", Style::new())];
@@ -445,7 +441,7 @@ fn flow_item(t: &Trace, turn: usize, list: &[usize], k: usize, live: bool, now: 
         }
         Kind::Call => {
             let reply = if brief && !t.running(turn, live) { last_said(t, turn) } else { None };
-            call_item(t, i, t.main_model(), reply == Some(i), open(i))
+            call_item(t, i, reply == Some(i), open(i))
         }
         Kind::Tool => tool_item(t, i, live, now, open(i)),
         _ => {
@@ -475,8 +471,62 @@ fn flow_item(t: &Trace, turn: usize, list: &[usize], k: usize, live: bool, now: 
     Step { node: i, paras, fold }
 }
 
-/// 一轮的头:几点到几点、多久、出错 / 被打断;几次调用、几个工具、上下文最多多少、输出、钱
+/// 一轮的头(整屏看一轮、e 写的那份):几点到几点、多久、出错 / 被打断;几次调用、几个工具、上下文最多多少、输出、钱
 fn turn_head(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
+    let n = &t.nodes[i];
+    let mut out = vec![minor(turn_span(t, i, live, now))];
+    let s = t.sum(i);
+    if s.calls > 0 {
+        let mut nums = tr!("{} · 输出 {} · {}", "{} · output {} · {}", turn_counts(&s), fmt_tok(s.out), fmt_cost(s.cost));
+        if s.subs > 0 {
+            nums += &tr!(" · 子代理 {}", " · subagents {}", fmt_cost(s.sub_cost));
+        }
+        if s.unpriced {
+            nums += t!(" · 有模型没算钱", " · some models not priced");
+        }
+        out.push(minor(nums));
+    }
+    if n.copied {
+        out.push(minor(t!("上一段 · 不计", "earlier · not counted")));
+    }
+    out
+}
+
+/// 右栏顶上一轮的头:时刻、时长、钱、出错 / 被打断左栏那一轮底下写了,这里只写几次调用、几个工具、上下文最多多少
+fn side_head(t: &Trace, i: usize) -> Vec<Para> {
+    let s = t.sum(i);
+    let mut out = vec![];
+    if s.calls > 0 {
+        let mut nums = turn_counts(&s);
+        if s.unpriced {
+            nums += t!(" · 有模型没算钱", " · some models not priced");
+        }
+        out.push(minor(nums));
+    }
+    if t.nodes[i].copied {
+        out.push(minor(t!("上一段 · 不计", "earlier · not counted")));
+    }
+    out
+}
+
+/// 2 调用 · 1 工具 · 3 子代理 · 上下文最多 309k
+fn turn_counts(s: &crate::trace::Sum) -> String {
+    let (k, w) = (s.calls, noun(s.calls as u64, "call", "calls"));
+    let mut parts = vec![tr!("{k} 调用", "{k} {w}")];
+    if s.tools > 0 {
+        let (k, w) = (s.tools, noun(s.tools as u64, "tool", "tools"));
+        parts.push(tr!("{k} 工具", "{k} {w}"));
+    }
+    if s.subs > 0 {
+        let (k, w) = (s.subs, noun(s.subs as u64, "subagent", "subagents"));
+        parts.push(tr!("{k} 子代理", "{k} {w}"));
+    }
+    parts.push(tr!("上下文最多 {}", "context up to {}", fmt_tok(s.ctx)));
+    parts.join(" · ")
+}
+
+/// 几点到几点、多久、出错 / 被打断 / 回退掉了
+fn turn_span(t: &Trace, i: usize, live: bool, now: i64) -> String {
     let n = &t.nodes[i];
     let running = t.running(i, live);
     let dur = t.dur(i, running, now);
@@ -498,26 +548,7 @@ fn turn_head(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
     if n.rolled {
         first += t!(" · 回退掉了", " · rolled back");
     }
-    let mut out = vec![minor(first)];
-    let s = t.sum(i);
-    if s.calls > 0 {
-        let subs =
-            if s.subs > 0 { tr!("(子代理 {} 个 {})", " (subagents: {}, {})", s.subs, fmt_cost(s.sub_cost)) } else { String::new() };
-        out.push(minor(tr!(
-            "{} 调用 · {} 工具 · 上下文最多 {} · 输出 {} · {}{subs}{}",
-            "{} calls · {} tools · context up to {} · output {} · {}{subs}{}",
-            s.calls,
-            s.tools,
-            fmt_tok(s.ctx),
-            fmt_tok(s.out),
-            fmt_cost(s.cost),
-            if s.unpriced { t!("(有模型不在价目表里)", " (some models aren't in the price list)") } else { "" }
-        )));
-    }
-    if n.copied {
-        out.push(minor(t!("接续过来的,不计", "carried over, not counted")));
-    }
-    out
+    first
 }
 
 /// 左边对话里的一轮:你说的(全文)、Claude / Codex 最后说的(全文;在跑的还没有)、一行数字
@@ -550,20 +581,9 @@ pub(crate) fn chat(t: &Trace, i: usize, live: bool, now: i64) -> Chat {
         }
         None => vec![],
     };
+    // 时刻 · 时长 · 钱;几次调用、几个工具在右栏
     let s = t.sum(i);
     let mut parts = vec![clock(n.t0, t.tz, false), fmt_dur(t.dur(i, running, now))];
-    if s.calls > 0 {
-        let (k, w) = (s.calls, noun(s.calls as u64, "call", "calls"));
-        parts.push(tr!("{k} 调用", "{k} {w}"));
-    }
-    if s.tools > 0 {
-        let (k, w) = (s.tools, noun(s.tools as u64, "tool", "tools"));
-        parts.push(tr!("{k} 工具", "{k} {w}"));
-    }
-    if s.subs > 0 {
-        let (k, w) = (s.subs, noun(s.subs as u64, "subagent", "subagents"));
-        parts.push(tr!("{k} 子代理", "{k} {w}"));
-    }
     parts.push(if n.copied {
         t!("不计", "not counted").into()
     } else if s.calls > 0 {
@@ -626,11 +646,8 @@ fn steps_item(t: &Trace, turn: usize, list: &[usize], k: usize, live: bool, now:
     if k > 0 {
         return flow_item(t, turn, list, k, live, now, true, open);
     }
-    let mut head = turn_head(t, turn, live, now);
+    let mut head = side_head(t, turn);
     head.push(blank());
-    if list.len() == 1 && !t.running(turn, live) {
-        head.push(minor(t!("没有调用", "no calls")));
-    }
     Step { node: turn, paras: head, fold: false }
 }
 
@@ -642,6 +659,17 @@ fn edits_detail(t: &Trace, out: &mut Vec<Para>, edits: &[(String, Vec<Change>)])
         }
         out.extend(change_paras(&ch.iter().collect::<Vec<_>>(), &vec![], path));
     }
+}
+
+/// 一次调用为什么停:正常的(要调工具、说完了)不写,别的说成话;不认得的照写
+fn stop_why(stop: &str) -> Option<String> {
+    Some(match stop {
+        "" | "tool_use" | "end_turn" | "stop_sequence" | "pause_turn" => return None,
+        "max_tokens" => t!("输出到上限,截断了", "hit the output limit, cut off").into(),
+        "model_context_window_exceeded" => t!("上下文满了", "the context is full").into(),
+        "refusal" => t!("模型拒绝回答", "the model refused").into(),
+        x => tr!("停在 {x}", "stopped at {x}"),
+    })
 }
 
 pub(crate) fn detail(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
@@ -681,16 +709,13 @@ pub(crate) fn detail(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
                 tr!("{model} · 思考 {}", "{model} · thinking {}", n.effort)
             }));
             let mut when = span(false);
-            if !n.stop.is_empty() {
-                when += &tr!(" · 停在 {}", " · stopped at {}", n.stop);
+            if let Some(why) = stop_why(&n.stop) {
+                when += &format!(" · {why}");
             }
             out.push(minor(when));
             let mut tok = tr!("上下文 {}:输入 {}", "context {}: input {}", thousands(n.context()), thousands(n.tok[0]));
-            if n.tok[1] > 0 {
-                tok += &tr!(" · 缓存写 {}(5 分钟)", " · cache write {} (5 min)", thousands(n.tok[1]));
-            }
-            if n.tok[2] > 0 {
-                tok += &tr!(" · 缓存写 {}(1 小时)", " · cache write {} (1 hour)", thousands(n.tok[2]));
+            if n.tok[1] + n.tok[2] > 0 {
+                tok += &tr!(" · 缓存写 {}", " · cache write {}", thousands(n.tok[1] + n.tok[2]));
             }
             tok += &tr!(" · 缓存读 {}", " · cache read {}", thousands(n.tok[3]));
             out.push(minor(tok));
@@ -698,12 +723,12 @@ pub(crate) fn detail(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
             if n.think > 0 {
                 outs += &tr!("(思考 {})", " (thinking {})", thousands(n.think));
             }
-            outs += &format!(" · {}", t.cost(i).map_or(t!("不在价目表里", "not in the price list").into(), fmt_cost));
+            outs += &format!(" · {}", t.cost(i).map_or(t!("没算钱", "not priced").into(), fmt_cost));
             if n.searches > 0 {
                 outs += &tr!(" · 搜索 {} 次", " · {} searches", n.searches);
             }
             if n.copied {
-                outs += t!(" · 接续过来的,不计", " · carried over, not counted");
+                outs += t!(" · 上一段 · 不计", " · earlier · not counted");
             }
             out.push(minor(outs));
             if let Some(note) = call_note(t, i) {
@@ -904,7 +929,7 @@ fn tool_md(t: &Trace, i: usize, level: &str, live: bool, now: i64) -> String {
 /// 一次调用写成 Markdown:数字、想的(引用)、说的、调的工具
 fn call_md(t: &Trace, i: usize, level: &str, live: bool, now: i64) -> String {
     let n = &t.nodes[i];
-    let mut s = format!("{level} {} · {}\n\n", crate::trace::where_of(t, i), call_numbers(t, i, t.main_model()));
+    let mut s = format!("{level} {} · {}\n\n", crate::trace::where_of(t, i), call_numbers(t, i));
     let (thought, text) = said(t, i);
     for th in &thought {
         s += &th.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");

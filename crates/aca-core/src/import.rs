@@ -29,17 +29,18 @@ fn open_ro(db: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(format!("file:{}?mode=ro", db.display()), OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)
 }
 
-/// 这段对话的记录在哪个账号的配置目录里:(账号名, 记录)
-pub(crate) fn locate(cfg: &Config, kind: &str, conv: &str) -> Option<(String, PathBuf)> {
-    if kind != "claude" || conv.is_empty() {
-        return None;
-    }
+/// 这段对话的记录在哪个账号的配置目录里:(账号名, 记录)。怎么找是各家自己的([`crate::agent::Agent::conv_files`])。
+/// 几个账号都找得到(Codex 的几个账号常把 `sessions` 链到同一个目录)时,`prefer` 那个账号也有就是它
+pub(crate) fn locate(cfg: &Config, kind: &str, conv: &str, prefer: &str) -> Option<(String, PathBuf)> {
+    let agent = crate::agent::builtin(kind)?;
     let accounts = cfg.accounts.get(kind)?;
     // 不换目录的账号(只带 env / 参数)对话记在默认目录里,认不出是谁的
-    accounts.iter().filter(|(_, a)| !a.home.is_empty()).find_map(|(name, a)| {
-        let projects = PathBuf::from(&a.home).join("projects");
-        let hit = std::fs::read_dir(projects).ok()?.flatten().map(|d| d.path().join(format!("{conv}.jsonl"))).find(|f| f.is_file())?;
-        Some((name.clone(), hit))
+    let homes = accounts.iter().filter(|(_, a)| !a.home.is_empty());
+    let first = homes.clone().filter(|(name, _)| name.as_str() == prefer);
+    first.chain(homes).find_map(|(name, a)| {
+        let home = PathBuf::from(&a.home);
+        let rel = agent.conv_files(&home, conv).into_iter().next()?;
+        Some((name.clone(), home.join(rel)))
     })
 }
 
@@ -140,7 +141,7 @@ fn read(db: &Path, cfg: &Config, live: &[String]) -> rusqlite::Result<(Groups, V
         .map(|(mut s, tmux)| {
             let alive = !tmux.is_empty() && live.contains(&tmux);
             let kind = cfg.tool(&s.tool).map(|t| t.kind);
-            let located = kind.as_deref().and_then(|k| locate(cfg, k, &s.conv));
+            let located = kind.as_deref().and_then(|k| locate(cfg, k, &s.conv, &s.account));
             let skip = match &kind {
                 None => Some(tr!("config.toml 里没有 {} 这个工具", "no tool {} in config.toml", s.tool)),
                 Some(k) if !s.account.is_empty() && located.is_none() && cfg.account(k, &s.account).is_none() => {

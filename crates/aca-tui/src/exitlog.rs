@@ -1,6 +1,6 @@
 //! 界面不是自己退出时留个底:终端被关掉(kitty 关了窗口、ssh 断了)、程序出错。这时屏幕已经没了或者靠不住,
-//! 话只能写进文件 —— ~/.local/state/aca/ui/exit.log 每次追加一段细节;再在 ui/last-exit 记一行,
-//! 下次打开界面时底栏说一次就删掉。
+//! 话只能写进文件 —— ~/.local/state/aca/ui/exit.log 每次追加一段细节。出错退出的再在 ui/last-exit 记一行,
+//! 下次打开界面时底栏说一次就删掉;终端关掉、断线是常事,只记进 exit.log,不再提。
 //!
 //! 终端没了时不再碰它:往没了的终端打印会出错,ratatui 的出错善后又去恢复终端、又打印,出错时再出错,
 //! 程序直接中止(SIGABRT),一个字都没留下(2026-10-14 kitty ⌘W 关窗那次)。所以 ratatui::init 装的善后
@@ -100,9 +100,9 @@ fn watch(out: std::fs::File) {
     GONE.store(true, Ordering::Relaxed);
     std::thread::sleep(GRACE);
     // 主线程到现在还没退出:卡住了(多半是在 crossterm 里一直读 0 个字节)。替它收尾:记一笔,
-    // 这次删的放掉、另起进程真删,退出。输入法不切回去:那要在主线程上做
+    // 回收站里到期的另起进程真删,退出。输入法不切回去:那要在主线程上做
     log_gone(None, None, true);
-    if crate::trash::Trash::open(crate::trash::Trash::default_path()).release(None).unwrap_or(0) > 0 {
+    if crate::trash::Trash::open(crate::trash::Trash::default_path()).due(aca_core::paths::now()) {
         crate::trash::purge_detached();
     }
     std::process::exit(0);
@@ -124,8 +124,7 @@ fn log_gone(why: Option<&anyhow::Error>, restore: Option<&std::io::Error>, stuck
     if std::mem::replace(&mut *logged, true) {
         return;
     }
-    let place = place();
-    let name = place_name(place);
+    let name = place_name(place());
     let mut body = tr!("终端没了,界面跟着退出({name})\n", "the terminal went away and the interface quit with it ({name})\n");
     if let Some(e) = why {
         body += &tr!("  主循环停在:{e:#}\n", "  the main loop stopped on: {e:#}\n");
@@ -148,7 +147,6 @@ fn log_gone(why: Option<&anyhow::Error>, restore: Option<&std::io::Error>, stuck
     let dir = dir();
     let now = now_secs();
     append(&dir, &entry(now, TZ.load(Ordering::Relaxed), uptime(), &body));
-    write_last(&dir, now, "term", place, "");
 }
 
 fn on_panic(info: &PanicHookInfo<'_>, main: bool) {
@@ -169,12 +167,11 @@ fn on_panic(info: &PanicHookInfo<'_>, main: bool) {
     if main {
         write_last(&dir, now, "panic", place(), &short);
     } else if let Ok(mut live) = LIVE.lock() {
-        let log = shown(&dir.join("exit.log"));
-        *live = Some(tr!("后台出错了:{short} · 细节在 {log}", "something failed in the background: {short} · details in {log}"));
+        *live = Some(tr!("后台出错了:{short} · 细节在 exit.log", "something failed in the background: {short} · details in exit.log"));
     }
 }
 
-/// 上次的界面不是自己退出的:底栏说一句。说完就删,只说一次
+/// 上次的界面出错退出了:底栏说一句。说完就删,只说一次
 pub fn take_notice() -> Option<String> {
     take_notice_in(&dir(), now_secs(), crate::usage::local_offset())
 }
@@ -185,22 +182,17 @@ fn take_notice_in(dir: &Path, now: i64, tz: i64) -> Option<String> {
     let _ = std::fs::remove_file(&path);
     let mut f = line.trim_end_matches('\n').splitn(4, '\t');
     let at = f.next()?.parse::<i64>().ok()?;
-    let (kind, place, note) = (f.next()?, f.next().unwrap_or(""), f.next().unwrap_or(""));
+    // 旧版本还会记终端关掉的(term),不说
+    if f.next()? != "panic" {
+        return None;
+    }
+    // 跳过开在哪
+    let note = f.nth(1).unwrap_or("");
     let when = when(at, now, tz);
-    let log = shown(&dir.join("exit.log"));
-    Some(match kind {
-        "panic" => tr!(
-            "上次的界面 {when} 出错退出了:{note} · 细节在 {log}",
-            "the last interface quit on an error at {when}: {note} · details in {log}"
-        ),
-        _ => {
-            let name = place_name(place);
-            tr!(
-                "上次的界面 {when} 随终端关掉退出了({name}) · 细节在 {log}",
-                "the last interface quit at {when} when its terminal closed ({name}) · details in {log}"
-            )
-        }
-    })
+    Some(tr!(
+        "上次的界面 {when} 出错退出了:{note} · 细节在 exit.log",
+        "the last interface quit on an error at {when}: {note} · details in exit.log"
+    ))
 }
 
 /// 开在哪:写进 last-exit 的是代号,说的时候再翻成当时的话
@@ -253,7 +245,7 @@ fn append(dir: &Path, text: &str) {
     }
 }
 
-/// last-exit:一行 `<几时(秒)>\t<term|panic>\t<开在哪>\t<出错信息>`,只留最近一次
+/// last-exit:一行 `<几时(秒)>\t<panic>\t<开在哪>\t<出错信息>`,只留最近一次
 fn write_last(dir: &Path, at: i64, kind: &str, place: &str, note: &str) {
     let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::write(dir.join("last-exit"), format!("{at}\t{kind}\t{place}\t{}\n", note.replace(['\t', '\n'], " ")));
@@ -308,15 +300,6 @@ fn one_line(s: &str, max: usize) -> String {
     format!("{}…", s.chars().take(max).collect::<String>())
 }
 
-/// 家目录写成 ~
-fn shown(p: &Path) -> String {
-    let s = p.to_string_lossy().into_owned();
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
-        _ => s,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,14 +315,12 @@ mod tests {
     const CST: i64 = 8 * 3600;
 
     #[test]
-    fn the_terminal_going_away_is_told_once_at_the_next_start() {
+    fn the_terminal_going_away_is_not_told() {
+        // 旧版本记下的那种:不说,也删掉
         let d = tmp("term");
         write_last(&d, AT, "term", "kitty", "");
-        let m = take_notice_in(&d, AT + 600, CST).unwrap();
-        assert!(m.starts_with("上次的界面 22:59 随终端关掉退出了(kitty 窗口) · 细节在 "), "{m}");
-        assert!(m.ends_with("exit.log"), "{m}");
-        // 说过就删了
         assert_eq!(take_notice_in(&d, AT + 600, CST), None);
+        assert!(!d.join("last-exit").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -348,7 +329,9 @@ mod tests {
         let d = tmp("panic");
         write_last(&d, AT, "panic", "ssh", "index out of\tbounds\nline two");
         let m = take_notice_in(&d, AT + 86400, CST).unwrap();
-        assert!(m.starts_with("上次的界面 10/14 22:59 出错退出了:index out of bounds line two · 细节在 "), "{m}");
+        assert_eq!(m, "上次的界面 10/14 22:59 出错退出了:index out of bounds line two · 细节在 exit.log");
+        // 说过就删了
+        assert_eq!(take_notice_in(&d, AT + 86400, CST), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 

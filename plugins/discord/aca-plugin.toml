@@ -4,6 +4,7 @@ version = "0.1.0"
 api = 1
 needs = ["curl", "jq"]
 description = "跑完了、在等你确认、出错了,往 Discord 频道发一条(webhook)。有人正连着那个会话(在看)就不发。只往外发:在 Discord 里回话发进会话是另一件事,还没做"
+description_en = "When a session finishes, waits for you or fails, post a message to a Discord channel (webhook). Nothing is posted while someone is attached to that session (watching it). Outgoing only: replying in Discord to type into a session is a separate thing, not done yet."
 
 # 地址在 plugins.toml 里填:[plugins."aca.discord"] settings = { url = "https://discord.com/api/webhooks/…" }
 # 或者 aca plugin setting aca.discord url <地址>
@@ -12,18 +13,22 @@ description = "跑完了、在等你确认、出错了,往 Discord 频道发一�
 default = ""
 secret = true
 desc = "频道的 webhook 地址(频道设置 → 整合 → Webhooks → 复制网址)。空着不发"
+desc_en = "The channel's webhook URL (channel settings → Integrations → Webhooks → Copy Webhook URL). Empty: post nothing."
 
 [settings.mention]
 default = ""
 desc = "在等你确认时 @ 谁:你的 Discord 用户 id(一串数字)。空着不 @"
+desc_en = "Who to @ when a session waits for you: your Discord user id (a string of digits). Empty: @ nobody."
 
 [settings.workers]
 default = false
 desc = "派出去的 worker(有 parent 的)也发。默认不发:它们跑完会告诉派它们的那个会话"
+desc_en = "Also post for dispatched workers (sessions with a parent). Off by default: a finished worker reports to the session that dispatched it."
 
 [settings.username]
 default = "aca"
 desc = "消息在频道里署的名字"
+desc_en = "The name the messages are posted under in the channel."
 
 [[events]]
 on = "turn.done"
@@ -40,5 +45,8 @@ command = ["sh", "post.sh"]
 [[commands]]
 id = "test"
 title = "发一条试试"
+title_en = "Post a test one"
 desc = "Post a test message to check the Discord webhook URL."
+# 诊断用的,不进 : 菜单(那里是对着高亮那一行做事的);aca plugin run aca.discord.test
+expose = ["cli"]
 command = ["sh", "post.sh", "test"]

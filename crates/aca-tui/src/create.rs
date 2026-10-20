@@ -437,7 +437,7 @@ fn subdirs(root: &str, depth: usize) -> Vec<String> {
 pub struct DirRow {
     /// ~/…
     pub dir: String,
-    /// 行首的图标:● 有会话 ◆ 登记过 ↗ zoxide 常去 空格 = 旁边扫到的
+    /// 行首的图标:● 有会话 ◇ 登记过 ↗ zoxide 常去 空格 = 旁边扫到的
     pub mark: char,
     /// 开在这会进哪个组、是不是新分组
     pub group: (String, bool),
@@ -490,7 +490,7 @@ impl DirPick {
                 let tag = if wide {
                     let t = match r.mark {
                         '●' => tr!("会话 {}", "sessions {}", r.sessions.len()),
-                        '◆' => t!("项目", "project").into(),
+                        '◇' => t!("项目", "project").into(),
                         '↗' => t!("常去", "frequent").into(),
                         _ => t!("附近", "nearby").into(),
                     };
@@ -508,7 +508,7 @@ impl DirPick {
                 let titles: Vec<String> = r.sessions.iter().map(|(_, t)| one_line(t)).collect();
                 // 手机页脚固定两行(换行时列表不跳)
                 let foot = match titles.len() {
-                    0 => tr!("→ {into}{NL}  还没有会话", "→ {into}{NL}  no sessions yet"),
+                    0 => tr!("→ {into}{NL}", "→ {into}{NL}"),
                     n => tr!("→ {into}{NL}  已有 {n} 个:{}", "→ {into}{NL}  already {n}: {}", titles.join(t!("、", ", "))),
                 };
                 let mut prev = vec![r.dir.clone(), String::new(), format!("→ {into}")];
@@ -659,13 +659,13 @@ pub struct Removal {
 /// 删成了什么样
 #[derive(Clone, Debug, PartialEq)]
 pub enum Removed {
-    /// 登记的会话:归档了(was = 本来就归档着),界面退出时才真删,之前能撤回(见 trash.rs)
-    Archived { was: bool },
+    /// 登记的会话:归档了(was = 本来就归档着;group = 它在哪个组),进回收站,1 天后才真删(见 trash.rs)
+    Archived { was: bool, group: String },
     /// 窗格 / 普通 tmux 会话:没了
     Gone,
 }
 
-/// 删会话。登记的先归档(tmux 会话关掉、登记留着),真删等界面退出,见 trash.rs。Claude / Codex 的对话记录不动。
+/// 删会话。登记的先归档(tmux 会话关掉、登记留着),进回收站,1 天后才真删,见 trash.rs。Claude / Codex 的对话记录不动。
 /// 别的 tmux 会话直接 kill-session。要等会话里的进程退干净(最长几秒),所以在后台跑(`Job::Remove`)
 pub fn remove(t: &Target, pane: Option<&str>) -> Result<Removed, String> {
     // tmux 关窗格只发 SIGHUP,不理它的进程会留下来接着跑、哪儿都找不到了:先收干净(见 park.rs)
@@ -680,9 +680,9 @@ pub fn remove(t: &Target, pane: Option<&str>) -> Result<Removed, String> {
         return if o.status.success() { Ok(Removed::Gone) } else { Err(first_line(&o.stderr)) };
     }
     let store = Store::open()?;
-    let was = store.get(&t.id).is_ok_and(|s| s.archived > 0);
+    let (was, group) = store.get(&t.id).map(|s| (s.archived > 0, s.group)).unwrap_or_default();
     session::archive(&store, &t.id, true)?;
-    Ok(Removed::Archived { was })
+    Ok(Removed::Archived { was, group })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -851,7 +851,7 @@ mod tests {
         DirPick {
             rows: vec![
                 row("~/code/app", '●', "app", false, &[("!", "修\t登录"), ("▶", "加测试")]),
-                row("~/work/far/away/very-long-project-name", '◆', "far/very-long-project-name", true, &[]),
+                row("~/work/far/away/very-long-project-name", '◇', "far/very-long-project-name", true, &[]),
                 row("~", '↗', "~", true, &[]),
             ],
             what: "Claude·甲".into(),
@@ -883,11 +883,11 @@ mod tests {
         assert_eq!(f[0], format!("{home}/code/app")); // 输出的、预览 cd 的都是绝对路径
         assert_eq!(strip_ansi(f[1]), format!("● app{}~/code", " ".repeat(9 + 2))); // 名字那列 12 宽(40 列的 2/5 减 4)
         // 太长的名字把这一行撑开也不截:fzf 按显示的文字搜,截掉的字就搜不到了
-        assert_eq!(strip_ansi(phone[1].split('\t').nth(1).unwrap()), "◆ very-long-project-name  ~/work/far/away");
+        assert_eq!(strip_ansi(phone[1].split('\t').nth(1).unwrap()), "◇ very-long-project-name  ~/work/far/away");
         assert_eq!(strip_ansi(phone[2].split('\t').nth(1).unwrap()), "↗ ~");
         // 手机页脚两行:进哪个组、这里已有什么
         assert_eq!(f[2], "→ 分组 app\x1f  已有 2 个:修 登录、加测试");
-        assert_eq!(phone[1].split('\t').nth(2).unwrap(), "→ 新分组 far/very-long-project-name\x1f  还没有会话");
+        assert_eq!(phone[1].split('\t').nth(2).unwrap(), "→ 新分组 far/very-long-project-name\x1f");
         // 桌面:多一列来源;预览里列出会话和状态
         let desk = pick(120, 30).lines();
         let f: Vec<&str> = desk[0].split('\t').collect();

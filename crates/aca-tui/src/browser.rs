@@ -97,12 +97,7 @@ impl Pick {
     }
 
     fn with(title: &str, link: Link, far: bool, browsers: Vec<Item>, open: fn(&How, &str) -> Result<(), String>) -> Pick {
-        let copy = if far {
-            t!("复制链接,到手机 / 别的电脑上打开", "copy the link, open it on your phone / another computer")
-        } else {
-            t!("复制链接,自己贴到浏览器里", "copy the link, paste it yourself")
-        };
-        let mut items = vec![Item { label: copy.into(), how: How::Copy }];
+        let mut items = vec![Item { label: t!("复制链接", "copy the link").into(), how: How::Copy }];
         if let Some(code) = &link.code {
             items.push(Item { label: tr!("复制一次性码 {code}", "copy the one-time code {code}"), how: How::CopyCode });
         }
@@ -118,7 +113,7 @@ impl Pick {
             how => {
                 return match (self.open)(how, &self.link.url) {
                     Ok(()) => {
-                        fx.say(tr!("在 {} 里开了登录链接,登完回终端看结果", "opened the login link in {}; log in, then check the terminal", it.label));
+                        fx.say(tr!("已在 {} 打开 · 登完回终端", "opened in {} · log in, then back to the terminal", it.label));
                         Flow::Close
                     }
                     Err(e) => {
@@ -399,8 +394,7 @@ impl Overlay for Pick {
             out.push(kit::picked(line, w, i == self.sel));
         }
         out.push(Line::raw(""));
-        let keys = [("1-9", t!("直接选", "pick")), ("⏎", t!("选中的", "selected")), ("c", t!("复制链接", "copy the link"))];
-        out.push(kit::keys_line(&keys, vec![], w));
+        out.push(kit::keys_line(&[("⏎", t!("选定", "select"))], vec![], w));
         out
     }
 
@@ -408,7 +402,7 @@ impl Overlay for Pick {
         let n = self.items.len();
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                fx.say(t!("没开浏览器:链接还在登录终端里,工具接着等", "no browser opened: the link is still in the login terminal, which keeps waiting"));
+                fx.say(t!("没开 · 链接还在登录终端里", "not opened · the link is still in the login terminal"));
                 Flow::Close
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -483,7 +477,7 @@ mod tests {
                 "登录链接怎么开?",
                 "登录 Claude Code · ding",
                 "claude.com/cai/oauth/authorize?…",
-                "1  复制链接,自己贴到浏览器里",
+                "1  复制链接",
                 "2  Google Chrome(默认)",
                 "3  Safari",
                 "4  Zen Browser",
@@ -509,14 +503,14 @@ mod tests {
         assert_eq!((f, fx.copy.as_deref()), (Flow::Close, Some(URL)));
         let mut p = pick();
         let (f, fx) = press(&mut p, KeyCode::Char('3'));
-        assert_eq!((f, fx.flash.as_deref()), (Flow::Close, Some("在 Safari 里开了登录链接,登完回终端看结果")));
+        assert_eq!((f, fx.flash.as_deref()), (Flow::Close, Some("已在 Safari 打开 · 登完回终端")));
         // 开不了:说为什么,表留着
         let (f, fx) = press(&mut p, KeyCode::Char('4'));
         assert_eq!((f, fx.flash.as_deref()), (Flow::Stay, Some("开不了:Zen 坏了")));
         // ↓ 回车 = 第二个
         let mut p = pick();
         press(&mut p, KeyCode::Down);
-        assert_eq!(press(&mut p, KeyCode::Enter).1.flash.as_deref(), Some("在 Google Chrome(默认) 里开了登录链接,登完回终端看结果"));
+        assert_eq!(press(&mut p, KeyCode::Enter).1.flash.as_deref(), Some("已在 Google Chrome(默认) 打开 · 登完回终端"));
         assert_eq!(press(&mut pick(), KeyCode::Char('c')).1.copy.as_deref(), Some(URL));
         // 没有的号:不动
         assert_eq!(press(&mut pick(), KeyCode::Char('9')).0, Flow::Stay);
@@ -529,7 +523,7 @@ mod tests {
         // Claude 远程:要贴码的链接,只有复制
         let p = Pick::with("登录 Claude Code · ding", link(URL, None), true, vec![], fake);
         let rows = text(&p, 60);
-        shows(&rows, &["在手机 / 别的电脑上登录", "1  复制链接,到手机 / 别的电脑上打开", "网页给的码贴回下面的终端"]);
+        shows(&rows, &["在手机 / 别的电脑上登录", "1  复制链接", "网页给的码贴回下面的终端"]);
         assert_eq!(p.items.len(), 1);
         // Codex 设备码:码写在表上,链接和码都能复制,复制了一样表还留着
         let mut p = Pick::with("登录 Codex · px", link("https://auth.openai.com/codex/device", Some("AB12-CD3EF")), true, vec![], fake);

@@ -1,4 +1,6 @@
-//! `:` 插件菜单:开着的插件露给界面的能力、窗格、视图(见 `aca_core::plugin::menu`),按高亮的那行挑在这里有意义的。
+//! `:` 插件菜单:开着的插件露给界面的命令(清单的 `[[commands]]`,界面上就叫命令;给 agent 的叫「给 agent 的工具」)、
+//! 窗格、视图(见 `aca_core::plugin::menu`),按高亮的那行挑在这里有意义的。诊断用的(试一下、测连通)不进这里,
+//! 清单里只露给 cli。
 //!
 //! - ↑↓ 挑,⏎ 跑;清单 `[[keys]]` 给它绑了键的,直接按那个键;`/` 打字筛
 //! - 能力有参数的先弹一张表单(`Form`);跑完输出短的写在底栏,长的放进全屏阅读页
@@ -167,13 +169,7 @@ impl Overlay for Menu {
         let mut out = vec![kit::modal_title(&on, theme::accent(), kit::esc_hint(t!("关闭", "close")), w), Line::raw("")];
         let shown = self.shown();
         if self.items.is_empty() {
-            out.extend(wrap(
-                t!(
-                    "这里没有能用的插件能力。P 装插件(挂载、远端任务也是插件):清单里露给 menu 的 [[commands]]、[[panes]]、[[views]] 会列在这里",
-                    "No plugin commands here. Install plugins with P (mounts and remote tasks are plugins too): menu [[commands]], [[panes]] and [[views]] show up here"
-                ),
-                kit::dim(),
-            ));
+            out.extend(wrap(t!("还没有插件命令 · P 装插件", "No plugin commands yet · P installs plugins"), kit::dim()));
         } else if shown.is_empty() {
             out.extend(wrap(t!("没有对得上的", "nothing matches"), kit::dim()));
         }
@@ -309,16 +305,25 @@ impl Overlay for Form {
         let mut out = vec![kit::modal_title(&title, theme::accent(), kit::esc_hint(t!("不跑了", "cancel")), w), Line::raw("")];
         for (i, ((name, ty, opt), v)) in self.item.args.iter().zip(&self.vals).enumerate() {
             let on = i == self.at;
-            let hint = match (ty.as_str(), opt) {
-                ("bool", _) => t!("空格切换", "space toggles").to_string(),
-                (t, true) => tr!("{t},可不填", "{t}, optional"),
-                (t, false) => t.to_string(),
+            // 类型写人话(字符串不写),可以不填的标出来
+            let kind = match ty.as_str() {
+                "int" => t!("整数", "integer"),
+                "path" => t!("路径", "path"),
+                "bool" => t!("空格 开/关", "space: on/off"),
+                _ => "",
             };
+            let hint: Vec<&str> = [kind, if *opt { t!("可不填", "optional") } else { "" }].into_iter().filter(|x| !x.is_empty()).collect();
+            let hint = if hint.is_empty() { String::new() } else { format!("({})", hint.join(t!(",", ", "))) };
             out.push(Line::from(vec![
                 Span::styled(format!(" {name} "), if on { theme::accent() } else { Style::new().add_modifier(Modifier::BOLD) }),
-                Span::styled(format!("({hint})"), kit::dim()),
+                Span::styled(hint, kit::dim()),
             ]));
-            let shown = if ty == "bool" && v.is_empty() { t!("不给", "not given").to_string() } else { v.clone() };
+            let shown = match (ty.as_str(), v.as_str()) {
+                ("bool", "") => t!("不给", "not given").to_string(),
+                ("bool", "true") => t!("开", "on").to_string(),
+                ("bool", "false") => t!("关", "off").to_string(),
+                _ => v.clone(),
+            };
             let cursor = if on && ty != "bool" { "▏" } else { "" };
             let line = Line::from(vec![Span::raw("   "), Span::raw(shown), Span::raw(cursor)]);
             out.push(kit::picked(line, w, on));
@@ -671,6 +676,10 @@ mod tests {
         assert_eq!(m.pick(0, &mut fx), Flow::Close);
         assert!(fx.open.is_some() && fx.plugin.is_none());
         let mut f = Form::new(it, on_session());
+        // 类型写人话,字符串不写;bool 写开 / 关
+        let t = text(&f, 70);
+        assert!(t.contains(" host\n") && t.contains(" n (整数,可不填)") && t.contains(" dry (空格 开/关,可不填)"), "{t}");
+        assert!(!t.contains("string") && !t.contains("int") && !t.contains("bool"), "{t}");
         let mut fx = Fx::default();
         // 必填的没填:不跑
         for _ in 0..3 {
@@ -692,6 +701,13 @@ mod tests {
         assert_eq!(f.on_key(key(KeyCode::Enter), &mut fx), Flow::Close);
         let req = fx.plugin.unwrap();
         assert_eq!(req.args, vec![("host".into(), "nas".into()), ("n".into(), "3".into()), ("dry".into(), "false".into())]);
+        assert!(text(&f, 70).contains("   关"), "{}", text(&f, 70));
+    }
+
+    #[test]
+    fn an_empty_menu_says_where_plugins_come_from() {
+        let t = text(&Menu::new(vec![], on_session()), 70);
+        assert!(t.contains("还没有插件命令 · P 装插件") && !t.contains("[["), "{t}");
     }
 
     /// 挂载那样的一个列表视图:⏎ 复制地址、x 撤(按两次)、a 挂端口(要填)、p 开关发布(列表上的字段)

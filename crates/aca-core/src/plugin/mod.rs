@@ -41,8 +41,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub use manifest::{
-    AGENTS, ARG_TYPES, Action, AgentPart, AgentSpec, CONTEXTS, EXPOSE, Hook, INPUTS, Key, MANIFEST, MENU_KEYS_TAKEN, Manifest, McpSpec,
-    PaneDef, ROW_KEYS_TAKEN, RowKey, Setting, Timer, View, cond_matches, hotkey_ok, missing_note, parse, parse_user, read_manifest,
+    AGENTS, ARG_TYPES, Action, AgentPart, AgentSpec, CONTEXTS, EXPOSE, Hook, INPUTS, Key, MANIFEST, MCP_AGENTS, MENU_KEYS_TAKEN, Manifest,
+    McpSpec, PaneDef, ROW_KEYS_TAKEN, RowKey, Setting, Timer, View, cond_matches, hotkey_ok, missing_note, parse, parse_user,
+    read_manifest,
 };
 
 use crate::paths::{self, Res};

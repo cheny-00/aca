@@ -316,6 +316,14 @@ impl Store {
         Ok(moved)
     }
 
+    /// 只删分组(连子分组)的登记,里面的会话不动(界面删分组时会话已经一起归档了,见 aca-tui 的 trash.rs)。返回删了几个组
+    pub fn group_drop(&self, path: &str) -> Res<usize> {
+        // 不用 like:组名里的 _ % 会被当成通配
+        self.conn
+            .execute("delete from groups where path = ?1 or substr(path, 1, length(?2)) = ?2", params![path, format!("{path}/")])
+            .map_err(e)
+    }
+
     /// 按目录定分组(`-g .`),只看不建。规则见 [`group_by_dir`]
     pub fn dir_group(&self, dir: &str) -> Res<(String, bool)> {
         let groups: Vec<(String, String)> = self.groups()?.into_iter().map(|g| (g.path, paths::real(&g.default_path))).collect();
@@ -585,6 +593,20 @@ mod tests {
         assert!(st.sessions(false).unwrap().iter().all(|x| x.group == "work"));
         assert_eq!(st.groups().unwrap().len(), 1);
         assert!(st.group_remove("work/app").is_err());
+    }
+
+    #[test]
+    fn dropping_a_group_leaves_its_sessions_where_they_were() {
+        let st = Store::memory();
+        for g in ["my_app/deep", "myXapp", "my_apple"] {
+            st.group_create(g, "").unwrap();
+        }
+        st.insert(&s("a1", "a", "my_app/deep")).unwrap();
+        // 子分组一起删;名字里的 _ 不当通配
+        assert_eq!(st.group_drop("my_app").unwrap(), 2);
+        assert_eq!(st.groups().unwrap().into_iter().map(|g| g.path).collect::<Vec<_>>(), ["myXapp", "my_apple"]);
+        assert_eq!(st.get("a1").unwrap().group, "my_app/deep");
+        assert_eq!(st.group_drop("my_app").unwrap(), 0);
     }
 
     /// 测试用的目录:真建出来(按目录定组会解析成真实路径)

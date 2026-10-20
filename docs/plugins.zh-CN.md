@@ -146,6 +146,10 @@ scope = "shared"                 # 在 gateway 里:shared 大家共用一份 / s
 清单里不认识的字段不拦着链接,但会点名提醒(链接时、`aca plugin check`、插件页):多半是拼错了,或者写到了别的表底下
 —— TOML 里写在 `[[keys]]` 这种表头后面的字段都归那一条。
 
+**两种话**:`name`、`description`,还有各处的 `title`、`desc`,都可以按语言另写一份:`description_en = "…"`、
+`title_zh = "…"`。界面是那种话时用带后缀的那份,别的时候用不带后缀的那份(所以不带后缀的要写)。旧版 aca 不认后缀,
+照旧用不带后缀的。aca 自带的插件都是中文写在不带后缀的那份里、英文写在 `_en` 里。
+
 `[agent] dir`:aca 起 agent 时带上这个目录,只对那一次启动有效,不装进它的配置目录、不碰你的设置。
 插件停用 / 删掉后,agent 下次启动就没有了(正开着的要重启)。目录是一个普通的 Claude Code 插件
 (`.claude-plugin/plugin.json` 加 `commands/`、`skills/` ……)。命令文件头上写 `disable-model-invocation: true` 的,
@@ -463,14 +467,14 @@ plugins.toml 里写一个光秃秃的 `[plugins."aca.core"]`(不写 source)换�
 
 | 插件 | 给什么 |
 |---|---|
-| `aca.delegate` | `/aca:delegate`(Claude 是斜杠命令,敲 `/dele` 补全就是它;Codex 是一个 skill):领头的规划、经 aca 派 worker、验收、汇报;worker 临时失败自动续。设置:`worker`(派给谁,默认 `codex`)、`language`(回你用哪种话,空 = 跟着你)、`say`(替它说的那句)、`max_continue`、`delay` |
+| `aca.delegate` | `/aca:delegate`(Claude 是斜杠命令,敲 `/dele` 补全就是它;Codex 是一个 skill):领头的规划、经 aca 派 worker、验收、汇报;worker 临时失败自动续。还带一个 `/aca:spec`:一个变更从提案到归档(`openspec/changes/<slug>/`),每条任务经 `/aca:delegate` 做,活体验收过了才算完。设置:`worker`(派给谁,默认 `codex`)、`language`(回你用哪种话,空 = 跟着你)、`say`(替它说的那句)、`max_continue`、`delay` |
 | `aca.core` | 把 aca 的核心能力给 agent 当工具(两家都行):`sessions` 看会话、`dispatch` 派 worker(挂在调用者下面,可以带 worktree 分支)、`message` 递话、`wait` 等(最多 240 秒一次)、`answer` 替它回答、`interrupt` 中止。替谁回答、中止谁,只能是调用者自己派出去的 |
 | `aca.gateway` | MCP gateway,见下一节 |
 | `aca.remote` | 远端任务,整个在插件的脚本里(sh + jq + curl + ssh):把长任务派到别的机器上后台跑,结束时结果作为一条消息放进派它的会话的收件箱。`:` 菜单里 `r` 派、`t` 列表(⏎ 复制看日志的命令、`x` 撤掉、`r` 现在去取)、「测一下 server」;agent 有 `run`、`list` 两个工具。回调先落在一台一直在线的 server 上([jobhook](https://github.com/cheny-00/jobhook)),设置:`url`、`token`。有在等的才开着每 5 分钟去取的定时 |
 | `aca.tailnet` | tailnet 挂载,整个在插件的脚本里(sh + jq,要 `jq`):`:` 菜单里 `m` 是列表,一行一条 `tailscale serve`(目标在不在听),⏎ 复制地址、`x` 撤掉(写出怎么加回去)、`a` 把本机端口挂出去、`p` 开关发布(装了 tpub)。agent 能列;挂端口是 `agent?`,你点了名才给(`aca plugin allow aca.tailnet add`) |
-| `aca.bark` | 跑完了、在等你确认、出错了用 Bark 推到手机(有人正连着那个会话就不推)。设置:`url`(推送地址)、`workers`(派出去的 worker 也推)、`group`;`: 菜单`里「推一条试试」 |
+| `aca.bark` | 跑完了、在等你确认、出错了用 Bark 推到手机(有人正连着那个会话就不推)。设置:`url`(推送地址)、`workers`(派出去的 worker 也推)、`group`;试推一条:`aca plugin run aca.bark.test` |
 | `aca.discord` | 同样三件事发到 Discord 频道(webhook;有人正连着那个会话就不发)。设置:`url`(webhook 地址)、`mention`(在等你确认时 @ 的用户 id)、`workers`、`username`。只往外发;在 Discord 里回话发进会话还没做 |
-| `aca.notify` | 同样三件事在这台机器上弹桌面通知(你正连着那个会话就不弹)。设置:`command`(换一个弹通知的命令,标题、正文是它的两个参数;空着或者它发不出去时 macOS 用 `osascript`、Linux 用 `notify-send`)、`workers`、`attached`(正连着时也弹);`: 菜单`里「弹一条试试」 |
+| `aca.notify` | 同样三件事在这台机器上弹桌面通知(你正连着那个会话就不弹)。设置:`command`(换一个弹通知的命令,标题、正文是它的两个参数;空着或者它发不出去时 macOS 用 `osascript`、Linux 用 `notify-send`)、`workers`、`attached`(正连着时也弹);试弹一条:`aca plugin run aca.notify.test` |
 | `aca.copy` | 复制回复里的命令,整个在插件的脚本里(sh,要 `fzf`):在会话里按 Ctrl+Alt+Y(热键;`:` 菜单里是 `y`),从最后一条回复的原文里认出代码块和行内的命令 —— 只有一条直接复制,多了弹出来按数字键挑;shell 代码块里的每一条也单独列着。复制到 tmux 的缓冲区、外层终端(OSC 52)和本机剪贴板。设置:`inline`(行内的 `…` 要哪些)、`lines`、`copy`(换一个复制的命令) |
 
 ## MCP gateway
@@ -577,7 +581,10 @@ aca plugin disable / enable / unlink <id>
 (敲 `/delegate` 补全就是它),给 Codex 一个叫 delegate 的 skill —— 领头的规划、用 `aca new -w` 把活派给 worker
 (设置 `worker`,默认 `codex`;各在自己的 worktree 里)、`aca wait` 等它(Claude 放后台,Codex 在前台 `--any`)、
 自己验收、汇报;派出去的 worker 一轮因为限流 / 过载失败时,它的事件钩子过一阵替它说一句(设置 `say`,
-最多 `max_continue` 次,间隔 `delay`)。装:`aca plugin install aca.delegate`。
+最多 `max_continue` 次,间隔 `delay`)。同一个插件还带 `/aca:spec`(Codex 是叫 spec 的 skill):一个变更的提案、设计、
+任务记在 `openspec/changes/<slug>/`,每条任务交给 `/aca:delegate`,发到环境里、确认滚了、活体验收过了才算完,再归档;
+派活的 brief、worker 的结果、验收记录放 `doc/spec/<slug>/`。仓库自己的检查、发版、活体怎么看写在仓库的
+`.claude/spec-profile.md`。装:`aca plugin install aca.delegate`。
 
 ## 和 herdr 插件的区别
 

@@ -1,6 +1,6 @@
 # aca
 
-**在一个屏幕上管理你所有的 AI 编程助手会话** —— Claude Code、Codex,以及你自己接进来的其他 agent。
+**在一个屏幕上管理你所有的 AI 编程助手会话** —— Claude Code、Codex、pi、opencode,以及你自己接进来的其他 agent。
 
 [English](README.md) | 简体中文
 
@@ -16,7 +16,7 @@ aca 是参考 [agent-deck](https://github.com/asheshgoplani/agent-deck) 做的,�
 
 ## 它能做什么
 
-- **一个列表,状态一眼看清。** `●` 正在干活 · `◐` 在等你,或者做完了你还没看 · `○` 空闲 · `✕` 出错 · `■` 没在运行 · `☾` 闲太久被 aca 自动停的(见下面的 `[idle]`)。
+- **一个列表,状态一眼看清。** `●` 正在干活 · `◆` 要你答 · `◐` 做完了你还没看 · `○` 空闲 · `✕` 出错 · `■` 停了 · `☾` 闲太久被 aca 自动停的(见下面的 `[idle]`)。
 - **多个账号放在一起用。** 个人订阅、公司订阅、API key、Bedrock:所有账号的会话都在同一个列表里,
   而且 aca 保证一个账号的登录不会被另一个账号的会话用到。
 - **不改动你的 agent 配置。** aca 不会往 `~/.claude` 或 `~/.codex` 里写 hook 或者别的东西。
@@ -54,8 +54,9 @@ aca 就是一个程序 `aca`。有三种装法,都是把它放到 `~/.local/bin/
 - **[tmux](https://github.com/tmux/tmux) 3.3 或更新的版本。** aca 启动的每个会话都是一个 tmux 会话;用 aca 不需要会用 tmux。
   用 `tmux -V` 查看版本。macOS 上 `brew install tmux`;Linux 上用包管理器安装,但要注意 Ubuntu 22.04 自带的
   tmux 是 3.2a,版本不够;Ubuntu 24.04、Debian 12 的就够了。
-- **[Claude Code](https://github.com/anthropics/claude-code) 和 / 或 [Codex CLI](https://github.com/openai/codex),**
-  已经按你平时的方式装好并登录。运行一次 `claude` 或 `codex`,确认它能正常回答。aca 会启动它们,但不会替你安装,也不会替你登录。
+- **[Claude Code](https://github.com/anthropics/claude-code)、[Codex CLI](https://github.com/openai/codex)、
+  [pi](https://pi.dev) 或 [opencode](https://opencode.ai)(有一个就行),** 已经按你平时的方式装好并登录。运行一次 `claude`、`codex`、`pi`
+  或 `opencode`,确认它能正常回答。aca 会启动它们,但不会替你安装,也不会替你登录。pi 和 opencode 在 `PATH` 里找得到,新建会话的菜单里才有。
 - **`~/.local/bin` 在你的 `PATH` 里**(或者你安装到的那个目录)。不在的话,把
   `export PATH="$HOME/.local/bin:$PATH"` 加到 `~/.zshrc` 或 `~/.bashrc`,再开一个新终端。
 
@@ -176,8 +177,8 @@ aca                       # 打开界面
 ```
 
 1. 在界面里按 `n`,选 Claude 或 Codex,确认目录。一个会话就启动了。
-2. 按 `回车` 进入会话,像平时一样和 agent 对话。
-3. 按 `Ctrl+Q` 回到列表。agent 会继续干活。
+2. aca 直接带你进入会话,像平时一样和 agent 对话。
+3. 按 `Ctrl+Q` 回到列表。agent 会继续干活。在列表里选中会话按 `回车` 可以再进去。
 4. 再多开几个。留意列表里每个会话前面的标记;按 `i` 可以跳到下一个需要你处理的会话。
 5. 随时按 `?` 查看快捷键(常用的列在[按键](#按键)里)。
 
@@ -211,8 +212,10 @@ aca                       # 打开界面
 | `H` | 交接:新开一个会话(工具、账号随你选),接着它的活往下干 |
 | `X` | 换一个账号接着跑,用在这个账号额度用完的时候 |
 | `r` / `R` / `D` | 改名 / 重启 / 停止 |
-| `d` | 删除(退出 aca 之前都能用 `Ctrl+Z` 撤销) |
+| `d` | 删除:在分组上就是连里面的会话一起删。删掉的进回收站留 1 天,`Ctrl+Z` 撤销 |
+| `b` | 回收站:1 天内删掉的,`⏎` 拿回来;`v` 多选,几条一起拿回来或真删 |
 | `m` / `p` | 挪到别的分组 / 置顶 |
+| `v` `V` | 多选(同 yazi):`v` 再上下拉一段(`Esc` 定下)、`V` 拉一段去掉勾、`空格` 勾一个,然后 `d` `D` `R` `m` `u` `p` `Q` 对选上的一起做,`Ctrl+Z` 一步撤回 |
 | `Tab` | 选一个分组单独看,或者看全部 |
 | `$` | 用量和花费 |
 | `P` / `:` | 插件 / 插件菜单:插件能对选中的这一行做的事 |
@@ -283,7 +286,7 @@ aca help                                  # 一屏列出所有命令;aca help <�
 ```toml
 [tools.claude]
 account = "work"                          # 运行 aca new claude 而没有指定账号时,用哪个账号
-args = ["--model", "opus"]                # 每次启动都加上的参数
+args = ["--model", "opus"]                # 每次启动都加上的参数(账号页按 p 也能改)
 
 [tools.codex]
 hook_trust = "bypass"                     # 不再询问「Hooks need review」(见上手指南)
@@ -294,6 +297,8 @@ folder = true                             # 替你回答「是否信任这个目
 [idle]
 stop_after = "3h"                         # 界面开着时,把空闲这么久的会话停掉(⏎ 接着原来的对话再起);
                                           # 闲着的 agent 也一直占着 CPU
+remove_after = "30d"                      # 停着这么久没动的会话删掉(进回收站,1 天内 ^Z / b 拿回来);
+                                          # 写 "never" 或不写 = 不删
 
 [keys]
 next = "M-n"                              # 「跳到下一个在等你的会话」改用 Alt+N,不用 Ctrl+Alt+N
@@ -323,7 +328,7 @@ busy = ['Working\.\.\.']
 | `[login]` | 登录链接可以用哪些浏览器打开;通过 SSH 连着时改成在另一台设备上登录 | `aca help config` |
 | `[ui]` | 语言;`n` 菜单的顺序,以及要藏起来的项 | `aca help config` |
 | `[mcps.<名字>]` | 你的 MCP server 目录:用 `M` 挂到某个项目上,或者通过 gateway 插件提供给所有 agent | [docs/plugins.zh-CN.md](docs/plugins.zh-CN.md) |
-| `[theme]` `[ime]` `[new_group]` | 主题、自动切换输入法、新分组的默认目录 | 在设置页(`Ctrl+S`)里改 |
+| `[theme]` `[ime]` `[new_group]` | 主题、自动切换输入法(只有 macOS)、新分组的默认目录 | 在设置页(`Ctrl+S`)里改 |
 
 - `aca help config` 列出每一项配置并附有示例;`aca names` 列出现在能用的账号名和工具名。
 - 插件的设置单独放在 `~/.config/aca/plugins.toml` 里,在插件页(`P`)里改。见 [docs/plugins.zh-CN.md](docs/plugins.zh-CN.md)。
@@ -408,6 +413,9 @@ aca setup --statusline off     # 撤销:恢复成连接之前的样子
 - **aca**:由 aca 画一个两行的状态栏:上下文用量、模型、git 分支和改动、目录;
   第二行是这个账号的额度、花费和时长。(图标需要 Nerd Font 字体。)
 - **wrap**:你的状态栏保持原样,只是在你的命令前面加上 `aca limits --`。
+
+按模型分的周额度(比如 Fable)状态栏拿不到。有会话在用的账号,aca 每隔几分钟在后台问一次 Claude 自己
+(和 `/usage` 是同一个来源),把这一项补上。只问登记过的账号。
 
 这个设置只改一处:该账号 `settings.json` 里的 `statusLine` 这一项。文件的其他内容不会动,
 你原来的设置会被记下来,选 `off` 就恢复。正在运行的 Claude 会话会马上生效,不用重启。

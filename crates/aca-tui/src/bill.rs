@@ -1,6 +1,7 @@
-//! `$` 计费面板画什么。从上往下:订阅额度;四个时段各花了多少(按 API 价折美元,带环比和走势);
-//! 选中时段的概况和钱花在哪;按小时 / 天 / 月的走势;星期 × 钟点;按账号 / 模型 / 会话 / 目录分。
-//! 窄屏一栏往下排(手机);宽屏(≥ TWO_COL 格)分两栏:上面「额度 | 时段和概况」,下面「走势 | 各种分法」。
+//! `$` 计费面板画什么。从上往下:订阅额度;四个时段各花了多少(按 API 价折美元,带环比和走势,选中的那个底下写日均);
+//! 按小时 / 天 / 月的走势;按账号 / 模型 / 会话分。
+//! 看了也不会改变用法的(调用次数、token、缓存这些概况和钱花在哪几项,星期 × 钟点,按目录)平常收着,`m` 摆出来(`more`)。
+//! 窄屏一栏往下排(手机);宽屏(≥ TWO_COL 格)分两栏:上面「额度 | 时段」,下面「走势 | 各种分法」。
 //! 数据见 `usage`;标题、底栏、翻页是 ui 画的。
 //! 颜色只有两家:账号各有各的颜色(theme 的 series),其余的条、色阶都是主题强调色那一家的深浅(total / parts / heat);
 //! 灰的只有没颜色的账号(other)和额度条没用掉的那截(track)。次要的字 `dim()`,分隔线 `theme::faint()`
@@ -281,6 +282,9 @@ pub(crate) fn when(ts: i64, now: i64, off: i64) -> String {
     format!("{day} {h:02}:{m:02}")
 }
 
+/// 额度的数旧过这么久(秒)才写是几时的(同换账号的框)
+const STALE: i64 = 3600;
+
 /// 刚刚 / 3 分钟前
 pub(crate) fn ago(ts: i64, now: i64) -> String {
     match (now - ts).max(0) as u64 {
@@ -309,13 +313,18 @@ fn runs_out(used: f64, resets: i64, len: i64, at: i64) -> Option<i64> {
     (t < resets).then_some(t)
 }
 
-/// swatch:这个账号在走势、横条里的颜色,名字前面画一块,对得上是哪条;名字本身是正文色
-fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, now: i64, off: i64, w: usize) {
-    let name = match q.agent {
-        Agent::Claude => format!("Claude {}", q.who),
-        Agent::Codex => format!("Codex {}", q.who),
+/// 额度那块的账号全名(找颜色用的那个)
+fn quota_name(q: &Quota) -> String {
+    match q.agent {
+        Agent::Claude | Agent::Codex => crate::usage::account_name(q.agent, &q.who),
         _ => q.who.clone(),
-    };
+    }
+}
+
+/// swatch:这个账号在走势、横条里的颜色,名字前面画一块,对得上是哪条;名字本身是正文色。
+/// label_w:窗口名对齐到几格(整块里最长的那个,见 `label_width`)
+fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, (now, off): (i64, i64), w: usize, label_w: usize) {
+    let name = crate::usage::account_shown(&quota_name(q)).to_string();
     let mut left = vec![
         Span::raw(" "),
         Span::styled("■ ", Style::new().fg(swatch)),
@@ -326,8 +335,9 @@ fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, now: i64,
         left.push(Span::styled(format!(" · {extra}"), dim()));
         used_w += 3 + extra.width();
     }
-    let right = if q.updated > 0 { tr!("{}更新", "updated {}", ago(q.updated, now)) } else { String::new() };
-    if used_w + 2 + right.width() <= w {
+    // 数旧了才写是几时的
+    let right = if q.updated > 0 && now - q.updated > STALE { tr!("{}更新", "updated {}", ago(q.updated, now)) } else { String::new() };
+    if !right.is_empty() && used_w + 2 + right.width() <= w {
         left.push(Span::raw(" ".repeat(w - used_w - right.width())));
         left.push(Span::styled(right, dim()));
     }
@@ -339,13 +349,13 @@ fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, now: i64,
     };
     let p = theme::pal();
     for win in &q.wins {
-        let label = format!("   {} ", rpad(&win.label, 3));
+        let label = format!("   {} ", rpad(&win.label, label_w));
         // 过了重置时间还没有新数:不知道现在用了多少,照实说
         if win.resets.is_some_and(|r| r <= now) {
             out.push(Line::from(vec![
                 Span::raw(label),
                 Span::styled(BAR.repeat(bar_w), Style::new().fg(p.track)),
-                Span::styled(tr!("      已重置(之前 {:.0}%)", "      reset (was {:.0}%)", win.used), dim()),
+                Span::styled(t!("      已重置", "      reset"), dim()),
             ]));
             continue;
         }
@@ -365,7 +375,7 @@ fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, now: i64,
         ];
         if let Some(r) = win.resets {
             let at = when(r, now, off);
-            let room = w.saturating_sub(7 + bar_w + 5);
+            let room = w.saturating_sub(4 + label_w + bar_w + 5);
             let s = if tr!("  {at} 重置", "  resets {at}").width() <= room {
                 tr!("  {at} 重置", "  resets {at}")
             } else {
@@ -378,7 +388,9 @@ fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, now: i64,
         out.push(Line::from(spans));
         // 照这速度重置前就会用完:提前说
         let base = if q.updated > 0 { q.updated } else { now };
-        if let (Some(r), Some(len)) = (win.resets, window_secs(&win.label))
+        // Claude 按模型分的(Fable)都是周额度
+        let len = window_secs(&win.label).or((q.agent == Agent::Claude).then_some(7 * 86400));
+        if let (Some(r), Some(len)) = (win.resets, len)
             && let Some(t) = runs_out(win.used, r, len, base).filter(|&t| t > now)
         {
             let s = tr!("       照这速度 {} 用完", "       at this pace, used up {}", when(t, now, off));
@@ -389,6 +401,11 @@ fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, now: i64,
     }
 }
 
+/// 额度那块窗口名的宽度:所有账号里最长的那个,横条才从同一列开始(Claude 按模型分的那几个是模型名,Fable)
+fn label_width(qs: &[Quota]) -> usize {
+    qs.iter().flat_map(|q| &q.wins).map(|w| w.label.width()).max().unwrap_or(0).max(3)
+}
+
 fn quota_block(r: &Report, w: usize) -> Vec<Line<'static>> {
     if r.quotas.is_empty() && r.quota_note.is_empty() {
         return vec![];
@@ -397,14 +414,9 @@ fn quota_block(r: &Report, w: usize) -> Vec<Line<'static>> {
     if !r.quota_note.is_empty() {
         out.push(Line::from(Span::styled(format!("   {}", r.quota_note), dim())));
     }
-    let pal = account_palette(r);
+    let (pal, label_w) = (account_palette(r), label_width(&r.quotas));
     for q in &r.quotas {
-        let name = match q.agent {
-            Agent::Claude => format!("Claude {}", q.who),
-            Agent::Codex => format!("Codex {}", q.who),
-            _ => q.who.clone(),
-        };
-        quota_lines(&mut out, q, color_of(&pal, &name), r.now, r.off, w);
+        quota_lines(&mut out, q, color_of(&pal, &quota_name(q)), (r.now, r.off), w, label_w);
     }
     out
 }
@@ -434,8 +446,20 @@ fn oldest_first(g: &Range) -> Vec<f64> {
     g.series.iter().rev().map(|x| x.1).collect()
 }
 
+/// 选中的时段底下那行:近 7 / 30 天的日均(全部的日均在它那行上,今天没有),全部从哪天起
+fn picked_note(r: &Report, g: &Range, sel: usize) -> String {
+    match (sel, r.first) {
+        (1 | 2, _) if g.days > 0 && g.cost > 0.0 => tr!("日均 {}", "{}/day", money(g.cost / g.days as f64)),
+        (3, Some(f)) => {
+            let (y, m, d) = civil_from_days(local(f, r.off).0);
+            tr!("{y}/{m}/{d} 起", "since {y}/{m}/{d}")
+        }
+        _ => String::new(),
+    }
+}
+
 fn totals_block(r: &Report, sel: usize, w: usize) -> Vec<Line<'static>> {
-    let mut out = vec![head(t!("按 API 价折算(美元)", "At API prices (USD)"), "", w)];
+    let mut out = vec![head(t!("按 API 价", "At API prices"), "", w)];
     let fixed = 3 + 8 + MONEY_W;
     let pick = |long: bool| -> Vec<String> { r.ranges.iter().enumerate().map(|(i, g)| compare(g, i, long)).collect() };
     let fits = |c: &[String]| fixed + 2 + c.iter().map(|x| x.width()).max().unwrap_or(0) <= w;
@@ -461,24 +485,23 @@ fn totals_block(r: &Report, sel: usize, w: usize) -> Vec<Line<'static>> {
             spans.push(Span::styled(spark(&squeeze(&vals, room)), Style::new().fg(theme::pal().total)));
         }
         out.push(Line::from(spans));
+        let note = if on { picked_note(r, g, i) } else { String::new() };
+        if !note.is_empty() {
+            // 对着环比那一列;放不下就往左挪
+            let at = (fixed + 2).min(w.saturating_sub(note.width())).max(3);
+            out.push(Line::styled(format!("{}{note}", " ".repeat(at)), dim()));
+        }
     }
     out
 }
 
 // ---------- 选中的时段 ----------
 
-fn summary_block(r: &Report, g: &Range, sel: usize, w: usize) -> Vec<Line<'static>> {
-    let since = match (sel, r.first) {
-        (3, Some(f)) => {
-            let (y, m, d) = civil_from_days(local(f, r.off).0);
-            tr!("{y}/{m}/{d} 起", "since {y}/{m}/{d}")
-        }
-        _ => String::new(),
-    };
-    let mut out = vec![head(RANGES[sel].get(), &since, w)];
+/// m 摆出来的:选中时段的调用、token、缓存这些概况,钱花在哪几项(日均写在时段那块里了)
+fn usage_block(g: &Range, sel: usize, w: usize) -> Vec<Line<'static>> {
+    let mut out = vec![head(t!("用量", "Usage"), "", w)];
     let mut facts = vec![fact(t!("调用 ", ""), count(g.calls), t!(" 次", " calls")), fact("", tokens(g.tokens), t!(" token", " tokens"))];
     if sel > 0 && g.days > 0 {
-        facts.push(fact(t!("日均 ", "per day "), money(g.cost / g.days as f64), ""));
         facts.push(fact(&tr!("{} 天里用了 ", "of {} days, active on ", g.days), g.active.to_string(), t!(" 天", "")));
     }
     if g.calls > 0 {
@@ -758,8 +781,13 @@ fn trend_block(g: &Range, sel: usize, pal: &[(String, Color)], w: usize) -> Vec<
         columns(&mut out, &labels, &st, sel, w);
     }
     if st.names.len() > 1 {
-        let items =
-            st.names.iter().map(|(name, c)| vec![Span::styled("■ ", Style::new().fg(*c)), Span::styled(name.clone(), dim())]).collect();
+        let items = st
+            .names
+            .iter()
+            .map(|(name, c)| {
+                vec![Span::styled("■ ", Style::new().fg(*c)), Span::styled(crate::usage::account_shown(name).to_string(), dim())]
+            })
+            .collect();
         flow(&mut out, items, "   ", w);
     }
     out
@@ -808,21 +836,24 @@ enum Kind {
 /// 名字(+ 灰字)、按最大那行比例的横条、金额、占比
 /// 按账号、按会话的横条用账号的颜色(palette,没位子的是灰的);按模型、按目录不分账号,用 theme 的 total。
 /// 名字都是正文的颜色:颜色只在横条上,名字不跟着涂
+/// 只有一行的不画(就一个账号、一个模型:全是它的)
 fn rows_block(title: &str, rows: &[Row], total: f64, top: usize, kind: Kind, palette: &[(String, Color)], w: usize) -> Vec<Line<'static>> {
-    if rows.is_empty() {
+    if rows.len() < 2 {
         return vec![];
     }
-    let note = if rows.len() > top { tr!("共 {} 个", "{} in all", rows.len()) } else { String::new() };
-    let mut out = vec![head(title, &note, w)];
+    // 一共几个不写:多出来的末行写「其余 N 个」
+    let mut out = vec![head(title, "", w)];
     let shown = &rows[..rows.len().min(top)];
     let rest = &rows[shown.len()..];
+    // 灰字(会话的账号)每行都一样(就一个账号)就不写
+    let same_note = shown.iter().all(|r| r.note == shown[0].note);
     let tail = 1 + MONEY_W + 5;
     // 名字、灰字(会话的账号,单独一列)、横条分剩下的地方。先保名字(至少 NAME_MIN),再保灰字,横条最后
     const NAME_MIN: usize = 14;
     const BAR_MIN: usize = 6;
     let base = w.saturating_sub(2 + tail);
     let name_need = shown.iter().map(|r| r.name.width()).max().unwrap_or(0).max(if rest.is_empty() { 0 } else { 9 });
-    let note_most = shown.iter().map(|r| r.note.width()).max().unwrap_or(0);
+    let note_most = if same_note { 0 } else { shown.iter().map(|r| r.note.width()).max().unwrap_or(0) };
     let note_need = if note_most > 0 { note_most + 2 } else { 0 };
     let (name_col, note_col, bar_w) = if name_need + note_need + 1 + BAR_MIN <= base {
         (name_need, note_most, base - name_need - note_need - 1)
@@ -839,7 +870,8 @@ fn rows_block(title: &str, rows: &[Row], total: f64, top: usize, kind: Kind, pal
         let name = match kind {
             Kind::Dir => clip_left(&r.name, name_col),
             Kind::Session => clip_name(&r.name, name_col),
-            _ => clip(&r.name, name_col),
+            Kind::Src => clip(crate::usage::account_shown(&r.name), name_col),
+            Kind::Model => clip(&r.name, name_col),
         };
         let mut spans = vec![Span::raw("  "), Span::styled(name, name_style)];
         if note_col > 0 {
@@ -879,7 +911,7 @@ fn unpriced_block(g: &Range, w: usize) -> Vec<Line<'static>> {
     if g.unpriced.is_empty() {
         return vec![];
     }
-    let mut out = vec![head(t!("价目表里没有,没算进去", "Not in the price list, not counted"), "", w)];
+    let mut out = vec![head(t!("没算钱的模型", "Unpriced models"), "", w)];
     for (m, t) in &g.unpriced {
         out.push(Line::from(vec![
             Span::raw("  "),
@@ -922,29 +954,27 @@ fn side_by_side(left: Vec<Line<'static>>, right: Vec<Line<'static>>, cw: usize) 
         .collect()
 }
 
-/// 整个面板的内容(不含标题、底栏)。sel = 选中的时段(RANGES 的下标)
-pub fn lines(r: &Report, sel: usize, w: usize) -> Vec<Line<'static>> {
+/// 整个面板的内容(不含标题、底栏)。sel = 选中的时段(RANGES 的下标);more = m 摆出收着的那几块
+pub fn lines(r: &Report, sel: usize, more: bool, w: usize) -> Vec<Line<'static>> {
     if r.ranges.is_empty() {
         let w = w.min(MAX_W);
-        return stack(vec![quota_block(r, w), vec![head(t!("按 API 价折算(美元)", "At API prices (USD)"), "", w)]]);
+        return stack(vec![quota_block(r, w), vec![head(t!("按 API 价", "At API prices"), "", w)]]);
     }
     let sel = sel.min(r.ranges.len() - 1);
     let g = &r.ranges[sel];
     let pal = account_palette(r);
+    let usage = |w| if more { usage_block(g, sel, w) } else { vec![] };
+    let heat = |w| if more { heat_block(g, sel, w) } else { vec![] };
+    let dirs = |w| if more { rows_block(t!("按目录", "By directory"), &g.by_dir, g.cost, TOP_DIRS, Kind::Dir, &[], w) } else { vec![] };
     if w >= TWO_COL {
         let cw = ((w - GAP) / 2).min(COL_W);
         let quota = quota_block(r, cw);
         let (tl, tr) = if quota.is_empty() {
-            (totals_block(r, sel, cw), summary_block(r, g, sel, cw))
+            (totals_block(r, sel, cw), usage(cw))
         } else {
-            (quota, stack(vec![totals_block(r, sel, cw), summary_block(r, g, sel, cw)]))
+            (quota, stack(vec![totals_block(r, sel, cw), usage(cw)]))
         };
-        let left = stack(vec![
-            trend_block(g, sel, &pal, cw),
-            heat_block(g, sel, cw),
-            rows_block(t!("按目录", "By directory"), &g.by_dir, g.cost, TOP_DIRS, Kind::Dir, &[], cw),
-            unpriced_block(g, cw),
-        ]);
+        let left = stack(vec![trend_block(g, sel, &pal, cw), heat(cw), dirs(cw), unpriced_block(g, cw)]);
         let right = stack(vec![
             rows_block(t!("按账号", "By account"), &g.by_src, g.cost, usize::MAX, Kind::Src, &pal, cw),
             rows_block(t!("按模型", "By model"), &g.by_model, g.cost, usize::MAX, Kind::Model, &[], cw),
@@ -959,13 +989,13 @@ pub fn lines(r: &Report, sel: usize, w: usize) -> Vec<Line<'static>> {
     stack(vec![
         quota_block(r, w),
         totals_block(r, sel, w),
-        summary_block(r, g, sel, w),
+        usage(w),
         trend_block(g, sel, &pal, w),
-        heat_block(g, sel, w),
+        heat(w),
         rows_block(t!("按账号", "By account"), &g.by_src, g.cost, usize::MAX, Kind::Src, &pal, w),
         rows_block(t!("按模型", "By model"), &g.by_model, g.cost, usize::MAX, Kind::Model, &[], w),
         rows_block(t!("按会话", "By session"), &g.by_session, g.cost, TOP_SESSIONS, Kind::Session, &pal, w),
-        rows_block(t!("按目录", "By directory"), &g.by_dir, g.cost, TOP_DIRS, Kind::Dir, &[], w),
+        dirs(w),
         unpriced_block(g, w),
     ])
 }
@@ -1040,6 +1070,21 @@ mod tests {
         // 刚开头看不准、已经用完不猜
         assert_eq!(runs_out(5.0, 1000 + 7 * day - 60, 7 * day, 1000), None);
         assert_eq!(runs_out(100.0, 1000 + day, 7 * day, 1000), None);
+    }
+
+    #[test]
+    fn a_per_model_week_lines_up_with_5h_and_7d_and_gets_a_pace_too() {
+        let (day, now) = (86400, 1_000_000);
+        let win = |label: &str, used, resets| Win { label: label.into(), used, resets: Some(resets) };
+        let wins = vec![win("5h", 12.0, now + 3600), win("7d", 40.0, now + 3 * day), win("Fable", 80.0, now + 3 * day)];
+        let q = Quota { agent: Agent::Claude, who: "sub".into(), plan: String::new(), updated: now, wins, note: String::new() };
+        let mut out = vec![];
+        quota_lines(&mut out, &q, Color::Reset, (now, 0), 80, label_width(std::slice::from_ref(&q)));
+        let t = text(&out);
+        // 横条从同一列开始;Fable 过了四天用了八成,重置前用完
+        assert_eq!(t.len(), 5, "{t:#?}");
+        assert!(t[1].starts_with("      5h ") && t[2].starts_with("      7d ") && t[3].starts_with("   Fable "), "{t:#?}");
+        assert!(t[4].contains("照这速度"), "{t:#?}");
     }
 
     fn report() -> Report {
@@ -1138,11 +1183,12 @@ mod tests {
 
     #[test]
     fn the_panel_reads_top_down_quota_then_totals_then_breakdowns() {
-        let t = text(&lines(&report(), 0, 60));
+        let t = text(&lines(&report(), 0, false, 60));
         let at = |s: &str| find(&t, s).0;
-        assert!(at("订阅额度") < at("按 API 价折算") && at("按 API 价折算") < at("按小时") && at("按小时") < at("按账号"));
-        assert!(at("按账号") < at("按模型") && at("按模型") < at("按会话") && at("按会话") < at("按目录"));
-        assert!(find(&t, "Claude work").1.ends_with("3 分钟前更新"));
+        assert!(at("订阅额度") < at("按 API 价") && at("按 API 价") < at("按小时") && at("按小时") < at("按账号"));
+        assert!(at("按账号") < at("按模型") && at("按模型") < at("按会话"));
+        // 刚更新的额度不写几时更新,旧了才写
+        assert_eq!(find(&t, "Claude work").1, " ■ Claude work");
         assert!(find(&t, "   5h").1.contains("12%") && find(&t, "   5h").1.contains("今天 13:00 重置"));
         let (i7, l7) = find(&t, "   7d ▄▄");
         assert!(l7.contains("74%") && l7.contains("周五 10:00 重置"));
@@ -1150,29 +1196,65 @@ mod tests {
         assert!(t[i7 + 1].contains("照这速度") && t[i7 + 1].contains("用完"), "{}", t[i7 + 1]);
         assert!(!t[find(&t, "   5h").0 + 1].contains("照这速度"));
         // 过了重置时间的不瞎报
-        assert!(find(&t, "已重置").1.contains("之前 24%"));
+        assert!(find(&t, "已重置").1.ends_with("      已重置"));
         assert!(find(&t, "Codex cx · plus").1.ends_with("1 天前更新"));
         assert!(find(&t, " ▸ 今天").1.contains("$210.00") && find(&t, " ▸ 今天").1.contains("昨天 $323.30"));
         assert!(find(&t, "   近 7 天").1.contains("比前 7 天 ↓9%"));
         assert!(find(&t, "   近 30 天").1.contains("比前 30 天 ↑30%"));
         assert!(find(&t, "   全部").1.contains("$42,000") && find(&t, "   全部").1.contains("日均 $201.92"));
+        assert!(find(&t, "按小时").1.contains("最高 10 点 $200.00"));
+        // 一共几个只在末行说一次;会话的账号每行都一样,不写
+        assert!(find(&t, "其余 5 个").1.contains("$15.00"));
+        assert!(find(&t, "按会话").1.trim_end().ends_with('─'));
+        assert!(!find(&t, "会话3").1.contains("work"));
+        assert!(find(&t, "没算钱的模型").0 < find(&t, "gpt-5.5-codex").0);
+        assert!(find(&t, "gpt-5.5-codex").1.contains("1.2 万 token"));
+        // 收着的:用量、钱花在哪几项、按目录;今天本来就不画星期 × 钟点
+        for gone in ["调用 1,234 次", "缓存命中", "■ 缓存读", "按目录", "其余 2 个", "按星期和钟点"] {
+            assert!(!t.iter().any(|l| l.contains(gone)), "{gone}");
+        }
+        // m 摆出来
+        let t = text(&lines(&report(), 0, true, 60));
+        let at = |s: &str| find(&t, s).0;
+        assert!(at("按 API 价") < at("用量") && at("用量") < at("按小时") && at("按会话") < at("按目录"));
         assert!(find(&t, "调用 1,234 次").1.contains("3.4 亿 token"));
         assert!(t.iter().any(|l| l.contains("缓存命中 97%")) && t.iter().any(|l| l.contains("缓存省了 $1,500")));
         assert!(t.iter().any(|l| l.contains("■ 缓存读 $100.00 48%")) && t.iter().any(|l| l.contains("■ 输入 $1.00 <1%")));
         assert!(!t.iter().any(|l| l.contains("搜索")));
-        assert!(find(&t, "按小时").1.contains("最高 10 点 $200.00"));
-        assert!(find(&t, "其余 5 个").1.contains("$15.00"));
-        assert!(find(&t, "按会话").1.contains("共 20 个"));
         assert!(find(&t, "其余 2 个").1.contains("$43.00"));
-        assert!(find(&t, "gpt-5.5-codex").1.contains("1.2 万 token"));
-        // 今天不画星期 × 钟点
         assert!(!t.iter().any(|l| l.contains("按星期和钟点")));
     }
 
     #[test]
+    fn the_picked_range_says_its_daily_average_under_its_row() {
+        let t = text(&lines(&report(), 1, false, 60));
+        let (i, _) = find(&t, " ▸ 近 7 天");
+        assert_eq!(t[i + 1].trim(), "日均 $214.29");
+        // 全部的日均在它那行上,底下写从哪天起;今天不写
+        let t = text(&lines(&report(), 3, false, 60));
+        assert_eq!(t[find(&t, " ▸ 全部").0 + 1].trim(), "2026/3/6 起");
+        let t = text(&lines(&report(), 0, false, 60));
+        assert!(t[find(&t, " ▸ 今天").0 + 1].starts_with("   近 7 天"));
+    }
+
+    #[test]
+    fn a_block_of_one_row_and_a_default_account_name_are_left_out() {
+        let mut r = report();
+        let g = &mut r.ranges[0];
+        g.by_src = vec![Row { name: "Claude claude".into(), agent: Agent::Claude, cost: 210.0, ..Default::default() }];
+        g.by_model.truncate(1);
+        r.quotas[0].who = "claude".into();
+        let t = text(&lines(&r, 0, false, 60));
+        assert!(!t.iter().any(|l| l.contains("按账号") || l.contains("按模型")), "{t:#?}");
+        assert_eq!(find(&t, "■ Claude").1, " ■ Claude");
+        assert_eq!(crate::usage::account_shown("Codex codex"), "Codex");
+        assert_eq!(crate::usage::account_shown("Codex cx"), "Codex cx");
+    }
+
+    #[test]
     fn today_by_hour_is_24_columns_split_by_account() {
-        let t = text(&lines(&report(), 0, 80));
-        let ls = lines(&report(), 0, 80);
+        let t = text(&lines(&report(), 0, false, 80));
+        let ls = lines(&report(), 0, false, 80);
         let (i, _) = find(&t, "按小时");
         // 8 行竖条 + 底线 + 刻度 + 图例
         assert!(t[i + 9].trim().chars().all(|c| c == '─'));
@@ -1253,7 +1335,7 @@ mod tests {
     #[test]
     fn color_means_an_account_and_everything_else_is_the_theme_hue() {
         let p = theme::pal();
-        let ls = lines(&report(), 1, 60);
+        let ls = lines(&report(), 1, true, 60);
         let t = text(&ls);
         let fgs = |i: usize, ch: char| ls[i].spans.iter().filter(|s| s.content.contains(ch)).filter_map(|s| s.style.fg).collect::<Vec<_>>();
         // 额度条:没到七成是不分账号的颜色,没用掉的那截是 track;过了七成才上状态色
@@ -1269,7 +1351,7 @@ mod tests {
         assert_eq!(fgs(find(&t, "  Codex cx").0, '▄'), vec![p.series[1]]);
         assert_eq!(fgs(find(&t, " ▸ 近 7 天").0, '█'), vec![p.total]);
         // 按模型不分账号;钱花在哪是 parts 的几段
-        let ls = lines(&report(), 0, 60);
+        let ls = lines(&report(), 0, true, 60);
         let t = text(&ls);
         let fgs = |i: usize, ch: char| ls[i].spans.iter().filter(|s| s.content.contains(ch)).filter_map(|s| s.style.fg).collect::<Vec<_>>();
         assert_eq!(fgs(find(&t, "  claude-opus-5-5").0, '▄'), vec![p.total]);
@@ -1281,33 +1363,35 @@ mod tests {
 
     #[test]
     fn longer_ranges_show_days_and_when_in_the_week() {
-        let t = text(&lines(&report(), 2, 60));
+        let t = text(&lines(&report(), 2, false, 60));
         let (i, head) = find(&t, "按天");
         assert!(head.contains("最高"));
         let ticks = &t[i + t[i..].iter().position(|l| !l.trim().is_empty() && l.trim().chars().all(|c| c == '─')).unwrap() + 1];
         assert!(ticks.contains("9/28"), "30 天的刻度写周一:{ticks}");
         // 月里只有合计(没有分账号的数),走势不画图例(额度那边名字前的色块不算)
+        assert!(!t.iter().any(|l| l.contains("按星期和钟点")), "星期 × 钟点收着");
+        let t = text(&lines(&report(), 2, true, 60));
         let (h, hl) = find(&t, "按星期和钟点");
         assert!(!t[i..h].iter().any(|l| l.contains("■ ")));
         assert!(hl.contains("周二 15 点最多"));
         assert!(t[h + 1].trim_start().starts_with('0'));
         assert!(t[h + 3].starts_with("  周二") && t[h + 3].contains('▇'));
         assert!(t[h + 8].starts_with("  周日"));
-        assert!(find(&t, "30 天里用了 26 天").1.contains("日均 $433.33"));
+        assert!(find(&t, "30 天里用了 26 天").0 > find(&t, "日均 $433.33").0);
         // 7 天、全部是横条,新的在前,行尾是金额
-        let t = text(&lines(&report(), 1, 60));
+        let t = text(&lines(&report(), 1, false, 60));
         assert!(find(&t, "  9/30 周三").1.ends_with("$0.00") && find(&t, "  9/29 周二").1.contains('▄'));
-        let t = text(&lines(&report(), 3, 60));
+        let t = text(&lines(&report(), 3, false, 60));
         let (m, _) = find(&t, "按月");
         assert!(t[m + 1].contains("2026-09") && t[m + 2].contains("2026-08") && t[m + 2].contains("$0.00"));
-        assert!(find(&t, " 全部 ─").1.contains("2026/3/6 起"));
+        assert!(find(&t, "2026/3/6 起").0 == find(&t, " ▸ 全部").0 + 1);
     }
 
     #[test]
     fn nothing_overflows_from_a_phone_to_a_wide_screen() {
         for w in [34, 40, 46, 60, 80, 96, 107, 108, 120, 140, 160, 220] {
-            for sel in 0..4 {
-                for l in text(&lines(&report(), sel, w)) {
+            for (sel, more) in (0..4).flat_map(|s| [(s, false), (s, true)]) {
+                for l in text(&lines(&report(), sel, more, w)) {
                     assert!(l.width() <= w, "{w} 宽放不下:「{l}」({})", l.width());
                 }
             }
@@ -1316,12 +1400,12 @@ mod tests {
 
     #[test]
     fn a_wide_screen_puts_two_columns_side_by_side() {
-        let t = text(&lines(&report(), 1, 140));
-        assert!(t[0].starts_with(" 订阅额度") && t[0].contains("按 API 价折算"));
+        let t = text(&lines(&report(), 1, false, 140));
+        assert!(t[0].starts_with(" 订阅额度") && t[0].contains("按 API 价"));
         let (_, l) = find(&t, "按天");
         assert!(l.contains("按账号"), "走势和按账号并排:{l}");
         // 窄了就一栏
-        assert!(!text(&lines(&report(), 1, 100))[0].contains("按 API 价折算"));
+        assert!(!text(&lines(&report(), 1, false, 100))[0].contains("按 API 价"));
     }
 
     #[test]
@@ -1329,13 +1413,13 @@ mod tests {
     fn show() {
         let w: usize = std::env::var("W").ok().and_then(|x| x.parse().ok()).unwrap_or(60);
         let sel: usize = std::env::var("SEL").ok().and_then(|x| x.parse().ok()).unwrap_or(0);
-        // REPORT=<aca ui --cost-json 存下的文件> 看真数据;THEME=mocha 看深色(THEMES=<目录> 里的主题文件也行);ANSI=1 带颜色(转成图看配色)
+        // REPORT=<aca ui --cost-json 存下的文件> 看真数据;THEME=mocha 看深色(THEMES=<目录> 里的主题文件也行);ANSI=1 带颜色(转成图看配色);MORE=1 同按了 m
         let r = std::env::var("REPORT").ok().map_or_else(report, |f| serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap());
         if let Ok(t) = std::env::var("THEME") {
             let dir = std::env::var("THEMES").unwrap_or_default();
             theme::set(Box::leak(Box::new(theme::from_dir(&t, std::path::Path::new(&dir)).unwrap())));
         }
-        let ls = lines(&r, sel, w);
+        let ls = lines(&r, sel, std::env::var("MORE").is_ok(), w);
         if std::env::var("ANSI").is_err() {
             return println!("{}", text(&ls).join("\n"));
         }
@@ -1360,9 +1444,9 @@ mod tests {
 
     #[test]
     fn switching_range_changes_the_breakdown() {
-        let t = text(&lines(&report(), 1, 60));
+        let t = text(&lines(&report(), 1, false, 60));
         assert!(t.iter().any(|l| l.starts_with(" ▸ 近 7 天") && l.contains("$1,500")));
-        assert!(t.iter().any(|l| l.starts_with(" 近 7 天 ─")));
+        assert!(!t.iter().any(|l| l.starts_with(" 近 7 天 ─")), "选中的时段不再起一个标题");
         assert!(!t.iter().any(|l| l.contains("按会话")));
     }
 }

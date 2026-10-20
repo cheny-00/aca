@@ -306,7 +306,7 @@ impl Trace {
         i
     }
 
-    /// 顶层加一个(一轮 / 标记):抄过来的放进最后那一块「接着上一段对话」里
+    /// 顶层加一个(一轮 / 标记):抄过来的放进最后那一块「上一段」里
     pub(crate) fn add_top(&mut self, kind: Kind, t0: i64, copied: bool) -> usize {
         if !copied {
             return self.add(kind, None, t0, false);
@@ -591,7 +591,8 @@ pub fn find(s: &Session) -> Result<PathBuf, String> {
 pub fn load(s: &Session) -> Result<Trace, String> {
     let t = Trace::open(find(s)?, s.agent).map_err(|_| t!("读不了记录", "can't read the record").to_string())?;
     if t.cx.old {
-        return Err(t!("这份记录太老(Codex 0.107 以前的格式)", "this record is too old (the format before Codex 0.107)").into());
+        // Codex 0.107 以前的格式
+        return Err(t!("记录格式太老,看不了", "the record's format is too old to read").into());
     }
     Ok(t)
 }
@@ -711,12 +712,7 @@ pub fn row(t: &Trace, i: usize, opened: bool, w: usize) -> Line<'static> {
         Kind::Copied => {
             let turns = n.kids.iter().filter(|&&k| t.nodes[k].kind == Kind::Turn).count();
             let fold = Span::styled(if opened { "▾ " } else { "▸ " }, theme::faint());
-            fit(
-                vec![Span::raw(" "), fold],
-                &tr!("接着上一段对话 · {turns} 轮 · 不计", "continued from the previous conversation · {turns} turns · not counted"),
-                dim(),
-                w,
-            )
+            fit(vec![Span::raw(" "), fold], &tr!("上一段 · {turns} 轮 · 不计", "earlier · {turns} turns · not counted"), dim(), w)
         }
         _ => fit(vec![Span::raw("   "), Span::styled("── ", theme::faint())], &n.label, dim(), w),
     }
@@ -1157,7 +1153,7 @@ pub fn where_of(t: &Trace, i: usize) -> String {
     let no = match t.turn_no(turn) {
         Some(x) => tr!("第 {x} 轮", "turn {x}"),
         None if t.nodes[turn].rolled => t!("回退掉的", "rolled back").into(),
-        None => t!("接续的", "continued").into(),
+        None => t!("上一段", "earlier").into(),
     };
     match n.kind {
         Kind::Turn => no,
@@ -1169,7 +1165,7 @@ pub fn where_of(t: &Trace, i: usize) -> String {
         }
         Kind::Tool => format!("{} · {no}", tool_name(&n.name)),
         Kind::Mark => n.label.clone(),
-        Kind::Copied => t!("接着上一段对话", "continued from the previous conversation").into(),
+        Kind::Copied => t!("上一段", "earlier").into(),
     }
 }
 

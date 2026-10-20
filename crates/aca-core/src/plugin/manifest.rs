@@ -53,6 +53,8 @@ pub const MENU_KEYS_TAKEN: &[&str] = &["/"];
 pub const HOTKEYS_TAKEN: &[&str] = &["C-q", "C-c", "C-d", "C-z", "C-m", "C-i", "C-j", "C-h"];
 /// `[agent] for` 认的几家
 pub const AGENTS: &[&str] = &["claude", "codex"];
+/// 起的时候带得进插件 MCP 服务的几家(插件目录只有 [`AGENTS`] 那几家认)
+pub const MCP_AGENTS: &[&str] = &["claude", "codex", "pi", "opencode"];
 /// `contexts` 认的几处:在会话上、在分组上、哪儿都行
 pub const CONTEXTS: &[&str] = &["session", "group", "global"];
 
@@ -448,7 +450,10 @@ pub(crate) fn id_ok(id: &str, dots: bool) -> bool {
 
 /// 读清单并检查;第二个是提醒(不拦着链接的小问题)
 pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
-    let mut m: Manifest = toml::from_str(text).map_err(|e| tr!("清单读不懂:{}", "can't parse the manifest: {}", e.message()))?;
+    let unreadable = |e: toml::de::Error| tr!("清单读不懂:{}", "can't parse the manifest: {}", e.message());
+    let mut t: toml::Table = text.parse().map_err(unreadable)?;
+    localize(&mut t);
+    let mut m: Manifest = toml::Value::Table(t).try_into().map_err(unreadable)?;
     if !id_ok(&m.id, true) {
         return Err(t!("清单要有 id(字母、数字、. : _ -)", "the manifest needs an id (letters, digits, . : _ -)").into());
     }
@@ -834,7 +839,14 @@ const AGENT_PART_KEYS: &[&str] = &["plugin_dir"];
 /// 清单里不认识的字段,写成 `keys[1].requires` 这样(第几条从 1 数)。`args`、`if`、设置名这些自己起名的不算
 fn unknown_keys(t: &toml::Table) -> Vec<String> {
     fn check(t: &toml::Table, at: &str, known: &[&str], out: &mut Vec<String>) {
-        out.extend(t.keys().filter(|k| !known.contains(&k.as_str())).map(|k| if at.is_empty() { k.clone() } else { format!("{at}.{k}") }));
+        // 给人看的字另写一种话的那份(`desc_en`):这张表认 desc,就认它(见 [`localize`])
+        let other_lang =
+            |k: &str| ["_en", "_zh"].iter().any(|s| k.strip_suffix(s).is_some_and(|base| TEXTS.contains(&base) && known.contains(&base)));
+        out.extend(
+            t.keys()
+                .filter(|k| !known.contains(&k.as_str()) && !other_lang(k))
+                .map(|k| if at.is_empty() { k.clone() } else { format!("{at}.{k}") }),
+        );
     }
     fn list<'a>(t: &'a toml::Table, name: &str) -> impl Iterator<Item = (usize, &'a toml::Table)> {
         t.get(name).and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_table).enumerate()
@@ -898,6 +910,36 @@ pub fn read_manifest(dir: &Path) -> Res<(Manifest, Vec<String>)> {
     let f = dir.join(MANIFEST);
     let text = std::fs::read_to_string(&f).map_err(|e| tr!("读不了 {}:{e}", "can't read {}: {e}", f.display()))?;
     if super::user::is_dir(dir) { parse_user(&text) } else { parse(&text) }
+}
+
+/// 给人看的几样字(名字、说明、标题)可以按语言另写一份:`description_en`、`title_zh` 这样带后缀的,
+/// 界面是那种话时顶替不带后缀的那份;不带后缀的照旧是默认的、两种话都没另写时用的。
+/// 旧的 aca 不认后缀,照旧用不带后缀的 —— 只加不改(见 [`API`])
+const TEXTS: [&str; 4] = ["name", "description", "title", "desc"];
+
+/// 照现在的语言把带后缀的那份换上来,带后缀的都拿掉。每一层的表、表数组里的每一张都看
+fn localize(t: &mut toml::Table) {
+    let mine = match crate::i18n::lang() {
+        crate::i18n::Lang::Zh => "zh",
+        crate::i18n::Lang::En => "en",
+    };
+    for key in TEXTS {
+        for lang in ["en", "zh"] {
+            if let Some(v) = t.remove(&format!("{key}_{lang}"))
+                && lang == mine
+                && v.as_str().is_some_and(|s| !s.trim().is_empty())
+            {
+                t.insert(key.into(), v);
+            }
+        }
+    }
+    for (_, v) in t.iter_mut() {
+        match v {
+            toml::Value::Table(sub) => localize(sub),
+            toml::Value::Array(items) => items.iter_mut().filter_map(toml::Value::as_table_mut).for_each(localize),
+            _ => {}
+        }
+    }
 }
 
 /// 你自己的那份(`~/.config/aca/user/`,见 [`super::user`]):id 总是 `user`,name、version 可以不写
@@ -1063,6 +1105,33 @@ scope = "session"
     }
 
     const BASE: &str = "id = \"t.x\"\nname = \"x\"\nversion = \"1\"\n";
+
+    #[test]
+    fn text_can_be_written_per_language_and_the_plain_one_is_the_fallback() {
+        let m = format!(
+            "{BASE}description = \"中文说明\"\ndescription_en = \"In English\"\n[settings.a]\ndesc = \"甲\"\ndesc_en = \"A\"\n\
+             [settings.b]\ndesc = \"只有一种\"\n[[commands]]\nid = \"go\"\ntitle = \"走\"\ntitle_en = \"Go\"\ncommand = [\"true\"]\n\
+             [[panes]]\nid = \"p\"\ntitle = \"Pad\"\ntitle_zh = \"便签\"\ncommand = [\"true\"]\n"
+        );
+        let texts = |lang| {
+            let m = crate::i18n::with(lang, || parse(&m).unwrap().0);
+            [
+                m.description,
+                m.settings["a"].desc.clone(),
+                m.settings["b"].desc.clone(),
+                m.actions[0].title.clone(),
+                m.panes[0].title.clone(),
+            ]
+        };
+        assert_eq!(texts(crate::i18n::Lang::En), ["In English", "A", "只有一种", "Go", "Pad"]);
+        assert_eq!(texts(crate::i18n::Lang::Zh), ["中文说明", "甲", "只有一种", "走", "便签"]);
+        // 带后缀的那几样不算不认识;别的后缀、这张表本来就没有的字段带后缀,照样点名
+        let (_, warn) = crate::i18n::with(crate::i18n::Lang::Zh, || parse(&m).unwrap());
+        assert!(warn.is_empty(), "{warn:?}");
+        let odd = format!("{BASE}description_fr = \"x\"\n[settings.a]\ntitle_en = \"x\"\n");
+        let (_, warn) = crate::i18n::with(crate::i18n::Lang::Zh, || parse(&odd).unwrap());
+        assert!(warn.iter().any(|w| w.contains("description_fr")) && warn.iter().any(|w| w.contains("settings.a.title_en")), "{warn:?}");
+    }
 
     #[test]
     fn a_hotkey_is_a_chord_tmux_can_bind_and_opens_a_pane() {

@@ -39,7 +39,8 @@ impl State {
     pub fn glyph(self) -> &'static str {
         match self {
             State::Running => "●",
-            State::Ask | State::Unread => "◐",
+            State::Ask => "◆",
+            State::Unread => "◐",
             State::Idle => "○",
             State::Error => "✕",
             State::Exited | State::Stopped => "■",
@@ -68,7 +69,7 @@ pub struct Row {
     pub ask: String,
     /// 在跑时已经跑了几秒
     pub ran: u64,
-    /// 最近一次有动静的时刻
+    /// 最近一次有动静的时刻:登记的 agent 不在跑时是 hook 报的(见 [`Run::hook_at`]),别的是窗口最后有输出的时刻
     pub active: u64,
     pub bg: u32,
     pub locked: bool,
@@ -204,7 +205,11 @@ fn row(s: &Session, pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64)
         conv: if r.conv.is_empty() { s.conv.clone() } else { r.conv.clone() },
         ask,
         ran,
-        active: pane.map_or(0, |p| p.activity).max(r.ts).max(s.created),
+        active: match r.hook_at() {
+            // 不在跑、还开着的 agent 照 hook 报的(见 [`Run::hook_at`]):闲着的一重画,窗口的活动时间就成了「刚刚」
+            at if at > 0 && matches!(state, State::Idle | State::Unread | State::Ask | State::Error) => at,
+            _ => pane.map_or(0, |p| p.activity).max(r.ts).max(r.restored).max(s.created),
+        },
         bg: r.bg,
         locked: s.title_locked,
         created: s.created,

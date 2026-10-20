@@ -36,6 +36,7 @@ pub const ALL: &[Bundled] = &[
             file!("delegate", "continue.sh"),
             file!("delegate", "claude/.claude-plugin/plugin.json"),
             file!("delegate", "claude/commands/delegate.md"),
+            file!("delegate", "claude/commands/spec.md"),
         ],
     },
     Bundled { id: "aca.gateway", dir: "gateway", files: &[file!("gateway", "aca-plugin.toml")] },

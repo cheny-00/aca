@@ -184,8 +184,11 @@ Pass bar: you saw the evidence yourself — test output, diff, run result.
 
 ## 4. Tear down what you started
 After Phase 3 has passed (never before — the worker's session is where its reasoning lives, and
-what you send failures back into):
+what you send failures back into). Copy its result file into the main checkout first: it sits under
+the worktree's `doc/`, which is usually gitignored, and removing a worktree deletes ignored files
+without asking.
 ```bash
+mkdir -p doc/<area> && cp "$WT/doc/<area>/<slug>-result.md" doc/<area>/
 aca rm <id>
 ```
 That removes the session, and its worktree too when it's clean; the branch always stays. If the

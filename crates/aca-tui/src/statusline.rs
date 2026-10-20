@@ -197,7 +197,7 @@ fn render(v: &Value, f: &Facts) -> String {
     let cost = n("/cost/total_cost_usd").unwrap_or(0.0);
     if cost != 0.0 {
         let took = span(n("/cost/total_duration_ms").unwrap_or(0.0).max(0.0) as u64 / 1000);
-        l2.push(format!("{}{}", paint(SUBTEXT, "", format!("${cost:.3} ")), paint(SUBTEXT, "2;", took)));
+        l2.push(format!("{}{}", paint(SUBTEXT, "", format!("${cost:.2} ")), paint(SUBTEXT, "2;", took)));
     }
     if let Some((name, ver)) = &f.venv {
         let ver = if ver.is_empty() { String::new() } else { paint(YELLOW, "2;", format!("({ver})")) };
@@ -208,6 +208,27 @@ fn render(v: &Value, f: &Facts) -> String {
     }
     let sep = format!(" {} ", paint(OVERLAY, "", "│"));
     [l1, l2].iter().filter(|l| !l.is_empty()).map(|l| l.join(&sep)).collect::<Vec<_>>().join("\n")
+}
+
+/// 设置页上给人看的样子:编的一份数,画法和真的一样
+pub(crate) fn sample(who: &str) -> String {
+    let v = serde_json::json!({
+        "context_window": {"used_percentage": 42},
+        "model": {"display_name": "Opus"},
+        "workspace": {"current_dir": "/home/me/app", "project_dir": "/home/me/app"},
+        "cost": {"total_cost_usd": 1.2, "total_duration_ms": 754_000},
+    });
+    let wins = [("5h", 23.0, 7200), ("7d", 41.0, 259_200)];
+    let quota = Quota {
+        agent: crate::data::Agent::Claude,
+        who: who.to_string(),
+        plan: String::new(),
+        wins: wins.into_iter().map(|(label, used, resets)| Win { label: label.into(), used, resets: Some(resets) }).collect(),
+        updated: 0,
+        note: String::new(),
+    };
+    let git = Counts { modified: 2, added: 12, removed: 3, ..Default::default() };
+    render(&v, &Facts { branch: Some("main".into()), git, quota: Some(quota), home: "/home/me".into(), ..Default::default() })
 }
 
 fn git(branch: &str, c: &Counts) -> String {
@@ -476,7 +497,7 @@ mod tests {
                 format!(
                     "━━━━━━╌╌╌╌╌╌╌╌╌ 42% │ {I_MODEL} Opus │ {I_GIT} dev_ye {I_STAGED} 2 {I_MODIFIED} 11 {I_UNTRACKED} 12 +3845-1816 ⇡10 ⇣1 │ {I_DIR} app/src"
                 ),
-                format!("sub 5h 9% · 7d 87% 2h10m │ $1.500 1m5s │ {I_PY} .venv(3.11.4) │ {I_NODE} v22.1.0"),
+                format!("sub 5h 9% · 7d 87% 2h10m │ $1.50 1m5s │ {I_PY} .venv(3.11.4) │ {I_NODE} v22.1.0"),
             ]
         );
         // 分支是斜体的青色,模型是粗体的紫色
@@ -503,7 +524,7 @@ mod tests {
     fn a_long_session_reads_in_days_and_hours_not_thousands_of_minutes() {
         assert_eq!([0, 45, 65, 3600, 3725, 86400, 875655].map(span), ["0s", "45s", "1m5s", "1h0m", "1h2m", "1d0h", "10d3h"]);
         let v = serde_json::json!({"cost": {"total_cost_usd": 106.107, "total_duration_ms": 875655000u64}});
-        assert_eq!(crate::ansi::strip(&render(&v, &Facts::default())), "$106.107 10d3h");
+        assert_eq!(crate::ansi::strip(&render(&v, &Facts::default())), "$106.11 10d3h");
     }
 
     #[test]

@@ -35,7 +35,7 @@ die() {
   exit 1
 }
 
-command -v jq >/dev/null 2>&1 || die "$(t 'aca.remote 要用 jq,PATH 里没有(macOS 15 以上自带 /usr/bin/jq;别的:brew install jq)' 'aca.remote needs jq, which is not on PATH (macOS 15+ ships /usr/bin/jq; otherwise: brew install jq)')"
+command -v jq >/dev/null 2>&1 || die "$(t 'aca.remote 要用 jq,PATH 里没有(macOS 15 以上自带 /usr/bin/jq;别的用包管理器装:brew / apt / dnf install jq)' 'aca.remote needs jq, which is not on PATH (macOS 15+ ships /usr/bin/jq; otherwise install it with your package manager: brew / apt / dnf install jq)')"
 
 D="${ACA_PLUGIN_STATE_DIR:?}/tasks"
 mkdir -p "$D" || exit 1

@@ -202,7 +202,7 @@ pub(crate) fn line(t: &mut Trace, buf: &[u8], off: u64) {
         // fork 出来的子代理:接着父对话往下干(父对话的行没抄进来)
         Some("fork-context-ref") => {
             let i = t.add_top(Kind::Mark, ts, false);
-            t.nodes[i].label = t!("接着父对话", "continues the parent conversation").into();
+            t.nodes[i].label = t!("上一段在父对话里", "earlier: in the parent conversation").into();
             t.nodes[i].t1 = ts;
         }
         _ => {}
@@ -656,10 +656,19 @@ pub(crate) fn fail_text(t: &Trace, n: &Node) -> String {
     n.src.first().and_then(|&x| t.read_at(x)).map(|v| text_of(&content(&v))).unwrap_or_default()
 }
 
-/// 缓存为什么没命中(记录里写了才有)
+/// 缓存为什么没命中(记录里写了才有),说成话;不认得的照写
 pub(crate) fn call_note(t: &Trace, n: &Node) -> Option<String> {
     let last = t.read_at(*n.src.last()?)?;
-    let why = last.pointer("/message/diagnostics/cache_miss_reason/type")?.as_str()?;
+    let why = match last.pointer("/message/diagnostics/cache_miss_reason/type")?.as_str()? {
+        "unavailable" => return Some(t!("缓存没命中", "cache miss").into()),
+        "ttl_expired" => t!("过期了", "it expired"),
+        "previous_message_not_found" => t!("没找到上一条", "the previous message wasn't cached"),
+        "messages_changed" => t!("前面的对话变了", "earlier messages changed"),
+        "system_changed" => t!("系统提示变了", "the system prompt changed"),
+        "tools_changed" => t!("工具变了", "the tools changed"),
+        "model_changed" => t!("换了模型", "the model changed"),
+        x => x,
+    };
     Some(tr!("缓存没命中:{why}", "cache miss: {why}"))
 }
 
@@ -1041,9 +1050,9 @@ pub(crate) mod tests {
         assert_eq!(t.subs.len(), 2);
         let ag2 = s1.t.nodes[s1.t.nodes[s1.t.roots[0]].kids[0]].kids[0];
         assert_eq!(s1.t.sub_of(ag2).map(|s| s.kind.as_str()), Some("general-purpose"));
-        // fork 出来的开头一行「接着父对话」
+        // fork 出来的开头一行「上一段在父对话里」
         let s3 = t.sub_of(ag3).unwrap();
-        assert_eq!((s3.t.nodes[s3.t.roots[0]].kind, s3.t.nodes[s3.t.roots[0]].label.as_str()), (Kind::Mark, "接着父对话"));
+        assert_eq!((s3.t.nodes[s3.t.roots[0]].kind, s3.t.nodes[s3.t.roots[0]].label.as_str()), (Kind::Mark, "上一段在父对话里"));
         // 子代理收到的是任务;干完了、也收到了通知:不在跑
         assert_eq!(crate::trace::asked(&s1.t, s1.t.roots[0]), ("任务", "找出所有 width( 的调用".to_string()));
         assert!(!t.sub_live(ag1, true, ts_ms(&at(30_000))) && !t.sub_live(ag3, true, ts_ms(&at(30_000))));
@@ -1071,8 +1080,11 @@ pub(crate) mod tests {
         let text = plain(&ps, 80);
         assert!(fold && text[0].starts_with("▸ Agent Explore · 找 width") && text[0].contains("3 调用 · $"), "{text:#?}");
         assert_eq!(&text[1..], ["  找到 4 处:", "  src/bill.rs:12", "  src/ui.rs:88", "  … 另 2 行"]);
+        // 几个子代理写在右栏这一轮的头上,左栏底下只有时刻、时长、钱
+        let head = plain(&steps(&t, turn, false, 0, &|_| false)[0].paras, 80);
+        assert!(head[0].contains(" · 3 子代理 · "), "{head:?}");
         let c = crate::trace::chat(&t, turn, false, 0);
-        assert!(crate::ansi::plain(&c.foot.body).contains("3 子代理"), "{:?}", crate::ansi::plain(&c.foot.body));
+        assert!(!crate::ansi::plain(&c.foot.body).contains("子代理"), "{:?}", crate::ansi::plain(&c.foot.body));
         // e:连子代理的过程一起写进去
         let Some(View::Text { text, .. }) = view(&t, ag1, false, 0) else { panic!() };
         assert!(text.contains("## 任务\n\n找出所有 width( 的调用") && text.contains("rg -n 'width\\('"), "{text}");
@@ -1307,7 +1319,7 @@ pub(crate) mod tests {
         assert!(text.iter().any(|l| l.contains("/p/x.png")), "{text:?}");
         let call = t.nodes[t.roots[0]].kids[0];
         let text: Vec<String> = crate::trace::wrap(&crate::trace::detail(&t, call, false, 0), 200).iter().map(crate::ansi::plain).collect();
-        assert!(text.iter().any(|l| l.contains("缓存写 100(1 小时)")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains(" · 缓存写 100 · ")), "{text:?}");
     }
 
     #[test]
@@ -1497,6 +1509,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_call_names_its_model_only_where_the_model_changes() {
+        let with = |mut v: Value, m: &str| {
+            v["message"]["model"] = json!(m);
+            v
+        };
+        let say = |x: &str| json!({"type": "text", "text": x});
+        let t = open(
+            "models",
+            &[
+                prompt("u1", None, 0, "一"),
+                reply("a1", "u1", 1000, "m1", say("一"), 5, Some("end_turn")),
+                prompt("u2", Some("a1"), 2000, "二"),
+                with(reply("a2", "u2", 3000, "m2", say("二"), 5, Some("end_turn")), "claude-haiku-4-5"),
+                prompt("u3", Some("a2"), 4000, "三"),
+                with(reply("a3", "u3", 5000, "m3", say("三"), 5, Some("end_turn")), "claude-haiku-4-5"),
+                prompt("u4", Some("a3"), 6000, "四"),
+                reply("a4", "u4", 7000, "m4", say("四"), 5, Some("end_turn")),
+                prompt("u5", Some("a4"), 8000, "五"),
+                reply("a5", "u5", 9000, "m5", say("五"), 5, Some("end_turn")),
+            ],
+        );
+        let rules: Vec<String> = t
+            .roots
+            .iter()
+            .filter(|&&r| t.nodes[r].kind == Kind::Turn)
+            .map(|&r| {
+                let ls =
+                    crate::trace::wrap(&flow(&t, r, false, 0, false, &|_| false).into_iter().flat_map(|s| s.paras).collect::<Vec<_>>(), 80);
+                ls.iter().map(crate::ansi::plain).find(|l| l.starts_with("── ")).unwrap().trim_end_matches(['─', ' ']).to_string()
+            })
+            .collect();
+        // 头一次跟用得最多的(opus)比;换成 haiku 写一次,换回来再写一次
+        let model = |l: &String| l.split(" · ").nth(3).map(str::to_string);
+        assert_eq!(
+            rules.iter().map(model).collect::<Vec<_>>(),
+            [None, Some("haiku-4-5".into()), None, Some("opus-5-5".into()), None],
+            "{rules:#?}"
+        );
+    }
+
+    #[test]
     fn a_call_keeps_the_first_line_of_what_it_thought_and_said_without_marks() {
         let t = open(
             "said",
@@ -1518,7 +1571,8 @@ pub(crate) mod tests {
         };
         let closed = text(false);
         assert!(closed[0].starts_with("你  问"), "{closed:?}");
-        assert!(closed.iter().any(|l| l.starts_with("── ") && l.contains("出 9") && l.ends_with("──") && l.width() == 80), "{closed:?}");
+        let rule = closed.iter().find(|l| l.starts_with("── ")).expect("分隔线");
+        assert!(rule.starts_with("── 1.1s · 1.1k · $0.00 ─") && rule.ends_with("──") && rule.width() == 80, "{rule}");
         assert!(closed.iter().any(|l| l == "思考 先想想 · 再说"), "{closed:?}");
         assert!(closed.iter().any(|l| l == "结论:用 width()"), "{closed:?}");
         let open = text(true);

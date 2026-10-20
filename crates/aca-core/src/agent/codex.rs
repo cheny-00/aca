@@ -19,7 +19,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use super::{Agent, How, Live};
+use super::{Agent, How, Live, tail};
 use crate::config::Tool;
 use crate::paths::Res;
 use crate::runtime::Run;
@@ -29,21 +29,43 @@ use crate::tr;
 
 pub struct Codex;
 
-const EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "Stop", "Interrupt", "PermissionRequest", "SessionEnd"];
+/// 挂的事件。工具事件只挂 `request_user_input`(它在问你,Plan 模式里才有;和 Claude 的 AskUserQuestion 一个形状),
+/// matcher 是正则:不挂全部,那样每跑一条命令都要多起一个进程。`request_user_input_async` 不挂:它问完马上返回、接着干,
+/// 问题留在屏幕上,读屏幕认得出
+const EVENTS: &[(&str, Option<&str>)] = &[
+    ("SessionStart", None),
+    ("UserPromptSubmit", None),
+    ("Stop", None),
+    ("Interrupt", None),
+    ("PermissionRequest", None),
+    ("PreCompact", None),
+    ("PostCompact", None),
+    ("SessionEnd", None),
+    ("PreToolUse", Some("^request_user_input$")),
+    ("PostToolUse", Some("^request_user_input$")),
+];
 
-/// 启动时的几道关(更新、信任目录、审 hook)和运行中的确认框
+/// 启动时的几道关(更新、信任目录、审 hook)和运行中的确认框、问你的题
 static ASK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)enter (?:to )?(?:confirm|continue|submit)|esc to cancel|allow command\?|\[y/n\]").unwrap());
-/// 「• Working (1m 05s • esc to interrupt)」
+/// 「• Working (1m 05s • esc to interrupt)」,压缩时是「• Compacting context (4s • esc to interrupt)」
 static RUNNING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\((?:(\d+)h )?(?:(\d+)m )?(\d+)s • [^)]*to interrupt\)").unwrap());
+/// 问你的题头上那行「Question 1/2 (2 unanswered)」:下一行就是题
+static QUESTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^Question \d+/\d+\b").unwrap());
+/// 在等你(确认框、问你的题)时,窗格标题开头转圈的那一格换成一句闪着的「[ ! ] Action Required」/「[ . ] Action Required」(0.163)
+static ACTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\[ \S \] Action Required(?: \| |$)").unwrap());
 const SPINNER: &str = "⠁⠂⠄⡀⢀⠠⠐⠈⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
-/// 一个事件的 `-c` 值:TOML 写的一条 hook,`hooks.Stop=[{ hooks = [{ type = "command", command = "…" }] }]`
-fn hook_flag(event: &str, aca: &str) -> String {
+/// 一个事件的 `-c` 值:TOML 写的一条 hook,`hooks.Stop=[{ hooks = [{ type = "command", command = "…" }] }]`,
+/// 工具事件多一个 `matcher`
+fn hook_flag(event: &str, matcher: Option<&str>, aca: &str) -> String {
     let mut handler = toml::Table::new();
     handler.insert("type".into(), "command".into());
     handler.insert("command".into(), format!("{} hook codex", super::sh_quote(aca)).into());
     let mut group = toml::Table::new();
+    if let Some(m) = matcher {
+        group.insert("matcher".into(), m.into());
+    }
     group.insert("hooks".into(), toml::Value::Array(vec![handler.into()]));
     format!("hooks.{event}={}", toml::Value::Array(vec![group.into()]))
 }
@@ -55,8 +77,8 @@ fn plan(tool: &Tool, s: &Session, how: &How, aca: &str) -> Vec<String> {
         How::Resume(conv) => argv.extend(["resume".to_string(), conv.clone()]),
         How::Fork(from) => argv.extend(["fork".to_string(), from.clone()]),
     }
-    for ev in EVENTS {
-        argv.extend(["-c".to_string(), hook_flag(ev, aca)]);
+    for (ev, matcher) in EVENTS {
+        argv.extend(["-c".to_string(), hook_flag(ev, *matcher, aca)]);
     }
     if tool.hook_trust == "bypass" {
         argv.push("--dangerously-bypass-hook-trust".into());
@@ -153,18 +175,6 @@ fn defaults(home: &Path, args: &[String]) -> Defaults {
     Defaults { model: get("model"), provider: get("model_provider").unwrap_or_else(|| "openai".into()) }
 }
 
-/// 文件末尾这么多字节,从下一个整行开始
-fn tail(path: &str, n: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let start = f.metadata().ok()?.len().saturating_sub(n);
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    Some(if start == 0 { text } else { text.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or_default() })
-}
-
 /// 记录里的最后一轮已经结束了的:替它补的那个事件,带着结束的时刻 `at`。还在跑、被打断的是 None。
 /// - 带着 `error` 结束:`StopFailure`(原文和类别)
 /// - 正常结束:`Stop`(最后一条回复)。没写结束时刻的不补:分不出是不是上一轮的
@@ -219,10 +229,50 @@ fn last_turn_end(text: &str, since: u64) -> Option<serde_json::Value> {
     Some(serde_json::json!({ "hook_event_name": "StopFailure", "error": message, "error_kind": kind, "codex_error": key, "at": at }))
 }
 
-/// 窗格标题 `⠴ 修登录 | api` → `修登录`;还没起标题时只有目录名,不算
+/// 一个正在跑的 Codex 现在是哪段对话:(对话 id, 记录, 标题)。它不留「这个进程是哪段」的文件,但它的日志库
+/// (`logs_2.sqlite`,在 config.toml 的 `sqlite_home` 里,没写就是配置目录)每一行都记着进程(`pid:<进程号>:<uuid>`)和线程。
+/// 这个进程最近写过日志的线程里,第一个是真的对话的:有写入锁(`thread-writer-locks/<id>.lock`;它内部起标题那次调用的线程没有)、
+/// 又不是它派出去的子线程(状态库 `state_5.sqlite` 的 threads 里 `source` 是一段 JSON)。标题、记录在哪也看 threads
+/// (`name` 是它起的标题,`rollout_path`);`/new` 之后还没说过话的那段 threads 里还没有,只有 id。0.163 上实测
+fn live_in(home: &Path, pid: u32) -> Option<(String, String, String)> {
+    use rusqlite::{Connection, OpenFlags, OptionalExtension};
+    let t: toml::Table = std::fs::read_to_string(home.join("config.toml")).ok().and_then(|t| t.parse().ok()).unwrap_or_default();
+    let dir = t.get("sqlite_home").and_then(|v| v.as_str()).map_or_else(|| home.to_path_buf(), |d| PathBuf::from(crate::paths::expand(d)));
+    let open = |name: &str| -> Option<Connection> {
+        let db = dir.join(name);
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        db.is_file().then(|| Connection::open_with_flags(format!("file:{}?mode=ro", db.display()), flags).ok()).flatten()
+    };
+    let logs = open("logs_2.sqlite")?;
+    // 日志 id 是一直往后加的:最近写过的排前面。进程号用范围比(`pid:12:` 到 `pid:12;`):`like 'pid:1%'` 会碰上 `pid:12`
+    let (lo, hi) = (format!("pid:{pid}:"), format!("pid:{pid};"));
+    let mut st = logs
+        .prepare(
+            "select thread_id from logs where process_uuid >= ?1 and process_uuid < ?2 and thread_id is not null \
+             group by thread_id order by max(id) desc limit 20",
+        )
+        .ok()?;
+    let threads: Vec<String> = st.query_map([&lo, &hi], |r| r.get(0)).ok()?.flatten().collect();
+    let state = open("state_5.sqlite");
+    let row = |id: &str| -> Option<(String, String, String)> {
+        let q = "select source, coalesce(name, ''), rollout_path from threads where id = ?1";
+        state.as_ref()?.query_row(q, [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().ok().flatten()
+    };
+    threads.into_iter().filter(|id| !id.contains('/') && home.join("thread-writer-locks").join(format!("{id}.lock")).is_file()).find_map(
+        |id| match row(&id) {
+            Some((source, _, _)) if source.trim_start().starts_with('{') => None,
+            Some((_, name, rollout)) => Some((id, rollout, name)),
+            None => Some((id, String::new(), String::new())),
+        },
+    )
+}
+
+/// 窗格标题 `⠴ 修登录 | api` → `修登录`;还没起标题时只有目录名,不算。
+/// 在等你时是 `[ ! ] Action Required | 修登录 | api`:那一段是转圈那一格,不是标题
 fn pane_title(title: &str) -> Option<String> {
+    let t = ACTION.replace(title.trim_start(), "");
     // 干活时前面是转圈的字符,标题还没起好时那个位置也是一个(`⠸ ⠸ | api`)
-    let t = title.trim_start_matches(|c: char| c.is_whitespace() || SPINNER.contains(c));
+    let t = t.trim_start_matches(|c: char| c.is_whitespace() || SPINNER.contains(c));
     let (name, _dir) = t.rsplit_once(" | ")?;
     let name = name.trim();
     (!name.is_empty()).then(|| name.to_string())
@@ -314,15 +364,24 @@ impl Agent for Codex {
         pane_title(title)
     }
 
-    /// 正在跑的 Codex 不留「我现在是哪段对话」的记号(它的对话在共用的后台 server 里):只有命令行里写着的认得出
-    /// (`codex resume <id>`)。手动新开的,对话 id 要等它在 aca 下面重启、说过一句话后 hook 报上来
-    fn live(&self, _pid: u32, _home: Option<&str>, argv: &[String]) -> Live {
+    /// 正在跑的 Codex 不留「我现在是哪段对话」的文件:看它的日志库(见 [`live_in`]),`/new` 之后换了也跟得上。
+    /// 日志库里认不出的(老版本、库不在),只有命令行里写着的认得出(`codex resume <id>`)
+    fn live(&self, pid: u32, home: Option<&str>, argv: &[String]) -> Live {
+        let args = super::carry(argv, |rest| not_carried(rest, rest.len() + 1 == argv.len()));
+        let conf = home.map_or_else(|| PathBuf::from(crate::paths::expand("~/.codex")), PathBuf::from);
+        if let Some((conv, transcript, title)) = live_in(&conf, pid) {
+            let transcript = match transcript.is_empty() {
+                true => self.conv_files(&conf, &conv).first().map(|f| conf.join(f).to_string_lossy().into_owned()).unwrap_or_default(),
+                false => transcript,
+            };
+            return Live { conv, transcript, title, args };
+        }
         let id = argv.get(2).filter(|v| !v.starts_with('-'));
         let conv = match argv.get(1).map(String::as_str) {
             Some("resume") => id.cloned().unwrap_or_default(),
             _ => String::new(),
         };
-        Live { conv, args: super::carry(argv, |rest| not_carried(rest, rest.len() + 1 == argv.len())), ..Default::default() }
+        Live { conv, args, ..Default::default() }
     }
 
     fn delivery(&self) -> super::Delivery {
@@ -341,9 +400,15 @@ impl Agent for Codex {
         Some('›')
     }
 
+    /// 「› 1. Yes, proceed (y) / 2. Yes, and don't ask again … (p) / 3. No, and tell Codex what to do differently (esc)」:
+    /// 同意按 y;拒绝按 Esc,这一轮就停了,它自己报 Interrupt(0.163 上实测)
+    fn permission_keys(&self) -> Option<(&'static str, &'static str)> {
+        Some(("y", "Escape"))
+    }
+
     /// 「esc to interrupt」:按一下就停,它自己报 Interrupt
-    fn interrupt_key(&self) -> Option<&'static str> {
-        Some("Escape")
+    fn interrupt_keys(&self) -> Option<&'static [&'static str]> {
+        Some(&["Escape"])
     }
 
     fn reports_interrupt(&self) -> bool {
@@ -380,12 +445,15 @@ impl Agent for Codex {
         let nonempty: Vec<&str> = lines.iter().map(|l| l.as_str()).filter(|l| !l.trim().is_empty()).collect();
         let tail = &nonempty[nonempty.len().saturating_sub(14)..];
         if tail.iter().any(|l| ASK.is_match(l)) {
-            // 问的那句:以问号结尾的;启动那几道关没有问号,取框里的第一行
-            let q = tail
+            // 问的那句:问你的题是「Question 1/1」下面那行(不一定带问号);别的取以问号结尾的;
+            // 启动那几道关没有问号,取框里第一行有字的(没登录时那一屏上面是点阵画的 logo,最后几行会落进 tail)
+            let rows: Vec<&str> = tail.iter().map(|l| l.trim()).collect();
+            let q = rows
                 .iter()
-                .map(|l| l.trim())
-                .find(|l| l.ends_with('?') || l.ends_with('？'))
-                .or(tail.first().map(|l| l.trim()))
+                .rposition(|l| QUESTION.is_match(l))
+                .and_then(|i| rows.get(i + 1).copied())
+                .or_else(|| rows.iter().copied().find(|l| l.ends_with('?') || l.ends_with('？')))
+                .or_else(|| rows.iter().copied().find(|l| l.chars().any(char::is_alphanumeric)))
                 .unwrap_or("");
             return Seen::Ask(q.to_string());
         }
@@ -471,13 +539,32 @@ mod tests {
 
     #[test]
     fn hooks_ride_along_as_config_overrides() {
-        let flag = hook_flag("Stop", "/a b/aca");
+        let flag = hook_flag("Stop", None, "/a b/aca");
         let (key, value) = flag.split_once('=').unwrap();
         assert_eq!(key, "hooks.Stop");
         // 值得是 Codex 读得懂的 TOML:一个数组,里面一组,组里一条命令
         let v: toml::Value = toml::from_str(&format!("x = {value}")).unwrap();
         let h = &v["x"][0]["hooks"][0];
         assert_eq!((h["type"].as_str(), h["command"].as_str()), (Some("command"), Some("'/a b/aca' hook codex")));
+        assert!(v["x"][0].get("matcher").is_none());
+        // 工具事件只挂问你的那个(matcher 是正则,0.163 上实测跑 Bash 不触发)
+        let (key, value) = EVENTS
+            .iter()
+            .find(|e| e.0 == "PreToolUse")
+            .map(|e| hook_flag(e.0, e.1, "aca"))
+            .unwrap()
+            .split_once('=')
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .unwrap();
+        let v: toml::Value = toml::from_str(&format!("x = {value}")).unwrap();
+        assert_eq!((key.as_str(), v["x"][0]["matcher"].as_str()), ("hooks.PreToolUse", Some("^request_user_input$")));
+        assert!(EVENTS.iter().filter(|e| e.0.ends_with("ToolUse")).all(|e| e.1.is_some()));
+        assert!(EVENTS.iter().any(|e| e.0 == "PreCompact") && EVENTS.iter().any(|e| e.0 == "PostCompact"));
+    }
+
+    #[test]
+    fn a_permission_is_granted_with_y_and_refused_with_escape() {
+        assert_eq!(Codex.permission_keys(), Some(("y", "Escape")));
     }
 
     #[test]
@@ -561,7 +648,8 @@ mod tests {
 
     #[test]
     fn a_running_codex_only_shows_its_thread_when_it_was_resumed_by_id() {
-        let live = |words: &[&str]| Codex.live(1, None, &words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
+        // 配置目录给一个不存在的:不去碰真的 ~/.codex 的日志库
+        let live = |words: &[&str]| Codex.live(1, Some("/nonexistent/aca-test"), &words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
         let some = |words: &[&str]| Some(words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
         // 手动新开的:不知道是哪段对话;参数照搬
         assert_eq!(
@@ -591,6 +679,14 @@ mod tests {
         assert_eq!(pane_title("⠸ | api"), None);
         assert_eq!(pane_title("⠸ ⠸ | api"), None);
         assert_eq!(pane_title(""), None);
+        // 0.163 在等你时转圈那一格换成闪着的一句,不是标题(以前被认成了标题,tmux 会话名也跟着改成了它)
+        assert_eq!(
+            pane_title("[ . ] Action Required | Ask to choose option A or B | proj").as_deref(),
+            Some("Ask to choose option A or B")
+        );
+        assert_eq!(pane_title("[ ! ] Action Required | Run ls and reply OK | proj").as_deref(), Some("Run ls and reply OK"));
+        assert_eq!(pane_title("[ . ] Action Required | agent-factory-runtime"), None);
+        assert_eq!(pane_title("[ ! ] Action Required"), None);
     }
 
     #[test]
@@ -602,10 +698,84 @@ mod tests {
         assert!(matches!(Codex.screen(&lines(trust)), Seen::Ask(_)));
         let update = "  Update available · 0.159.3 → 0.160.0\n› 1. Update now\n  2. Skip\n  enter continue · esc skip";
         assert!(matches!(Codex.screen(&lines(update)), Seen::Ask(_)));
+        // 没登录:0.163 上实际抓的,上面 logo 的最后几行不是问的那句
+        let login = "  ⢸⣿⣿⡿⢿⣿⣿⣿⣦⣤⣴⣿⣿⣿⡿⠟⠋⢸⣿⣿  ⣿⣿⣿⣴⣿⣿⣿⠃\n  ⠘⣿⣿⣷ ⠈⠛⠿⣿⣿⣿⠿⠋⠉ ⣠⣴⣿⣿⣿  ⣿⣿⣿⣿⣿⠟⠁\n   ⠹⣿⣿⣿⣤⣀ ⠈⠉⠁⢀⣤⣶⣿⣿⣿⡿⠟⠃ ⣸⣿⣿⡟⠋⠁\n    \
+                     ⠙⠿⣿⣿⣿⣿⣶⣾⣿⣿⣿⣿⠟⠛⠁  ⣠⣴⣿⣿⡟\n      ⠈⠙⠛⠛⠛⠿⠟⢿⣿⣿⣿⣿⣿⣾⣿⣿⣿⡿⠏\n\n  Welcome to Codex, OpenAI's command-line coding agent\n\n  \
+                     Sign in with ChatGPT to use Codex as part of your paid plan\n  or connect an API key for usage-based billing\n\n\
+                     > 1. Sign in with ChatGPT\n     Usage included with Plus, Pro, Business, and Enterprise plans\n\n  \
+                     2. Sign in with Device Code\n     Sign in from another device with a one-time code\n\n  \
+                     3. Provide your own API key\n     Pay for what you use\n\n  Press enter to continue";
+        assert_eq!(Codex.screen(&lines(login)), Seen::Ask("Welcome to Codex, OpenAI's command-line coding agent".into()));
         assert_eq!(
             Codex.screen(&lines("› 写一篇长文\n\n• Working (1m 05s • esc to interrupt)\n\n› Ask Codex to do anything")),
             Seen::Running(65)
         );
         assert_eq!(Codex.screen(&lines("• ok\n  Worked for 5s • 2:35 AM\n› Ask Codex to do anything\n  Context 97% left")), Seen::Quiet);
+        // 0.163 上抓的:问你的题(题不一定带问号,取「Question 1/1」下面那行)、权限框、手动压缩
+        let question = "› Use request_user_input to ask me to choose between option A and option B. Do nothing else?\n\n  Question 1/1 (1 unanswered)\n  Choose option A or option B.\n\n  › 1. Option A           Select option A.\n    2. Option B           Select option B.\n    3. None of the above  Optionally, add details in notes (tab)\n\n  tab to add notes | enter to submit answer | esc to interrupt";
+        assert_eq!(Codex.screen(&lines(question)), Seen::Ask("Choose option A or option B.".into()));
+        let perm = "• Running touch made.txt\n\n  Would you like to run the following command?\n\n  Environment: local\n\n  Reason: Allow creating made.txt in the current directory?\n\n  $ touch made.txt\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `touch made.txt` (p)\n  3. No, and tell Codex what to do differently (esc)\n\n  Press enter to confirm or esc to cancel";
+        assert_eq!(Codex.screen(&lines(perm)), Seen::Ask("Would you like to run the following command?".into()));
+        assert_eq!(
+            Codex.screen(&lines("› /compact\n\n• Compacting context (4s • esc to interrupt)\n\n› Ask Codex to do anything")),
+            Seen::Running(4)
+        );
+    }
+
+    #[test]
+    fn a_running_codex_is_found_in_its_log_by_process_id() {
+        use rusqlite::Connection;
+        let d = std::env::temp_dir().join(format!("aca-codex-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("thread-writer-locks")).unwrap();
+        // 0.163 的两张表(只留用到的列)
+        let logs = Connection::open(d.join("logs_2.sqlite")).unwrap();
+        logs.execute_batch("create table logs (id integer primary key autoincrement, ts integer, thread_id text, process_uuid text);")
+            .unwrap();
+        let state = Connection::open(d.join("state_5.sqlite")).unwrap();
+        state
+            .execute_batch("create table threads (id text primary key, rollout_path text not null, source text not null, name text);")
+            .unwrap();
+        let log = |pid: &str, th: Option<&str>| {
+            logs.execute("insert into logs (ts, thread_id, process_uuid) values (0, ?1, ?2)", rusqlite::params![th, pid]).unwrap();
+        };
+        let lock = |th: &str| std::fs::write(d.join("thread-writer-locks").join(format!("{th}.lock")), "").unwrap();
+        let thread = |th: &str, source: &str, name: &str| {
+            state.execute("insert into threads values (?1, ?2, ?3, ?4)", [th, &format!("/r/{th}.jsonl"), source, name]).unwrap();
+        };
+        // 进程 12:先说了一段 th-a;它内部起标题的那次调用(th-t,没有写入锁、不在 threads 里);派出去一个子线程 th-s
+        thread("th-a", "cli", "修登录");
+        lock("th-a");
+        thread("th-s", r#"{"subagent":{"thread_spawn":{"parent_thread_id":"th-a"}}}"#, "");
+        lock("th-s");
+        log("pid:12:u1", None);
+        log("pid:12:u1", Some("th-a"));
+        log("pid:12:u1", Some("th-t"));
+        log("pid:12:u1", Some("th-s"));
+        // 进程 1 是别人(`pid:1` 不能碰上 `pid:12`)
+        thread("th-o", "cli", "别的");
+        lock("th-o");
+        log("pid:1:u2", Some("th-o"));
+        assert_eq!(live_in(&d, 12), Some(("th-a".into(), "/r/th-a.jsonl".into(), "修登录".into())));
+        assert_eq!(live_in(&d, 1).map(|l| l.0).as_deref(), Some("th-o"));
+        assert_eq!(live_in(&d, 3), None);
+        // /new 之后:新的那段有写入锁、threads 里还没有,只认得 id
+        lock("th-n");
+        log("pid:12:u1", Some("th-n"));
+        assert_eq!(live_in(&d, 12), Some(("th-n".into(), String::new(), String::new())));
+        // 接管时:认出来的优先于命令行;日志库认不出的照旧看命令行
+        let argv: Vec<String> = ["codex", "resume", "th-x", "--search"].map(String::from).to_vec();
+        let l = Codex.live(12, Some(&d.to_string_lossy()), &argv);
+        assert_eq!((l.conv.as_str(), l.args), ("th-n", Some(vec!["--search".to_string()])));
+        assert_eq!(Codex.live(3, Some(&d.to_string_lossy()), &argv).conv, "th-x");
+        // 库放在别处的(config.toml 的 sqlite_home)
+        let moved = d.join("db");
+        std::fs::create_dir_all(&moved).unwrap();
+        std::fs::rename(d.join("logs_2.sqlite"), moved.join("logs_2.sqlite")).unwrap();
+        std::fs::rename(d.join("state_5.sqlite"), moved.join("state_5.sqlite")).unwrap();
+        assert_eq!(live_in(&d, 1), None);
+        std::fs::write(d.join("config.toml"), format!("sqlite_home = \"{}\"\n", moved.display())).unwrap();
+        assert_eq!(live_in(&d, 1).map(|l| l.2).as_deref(), Some("别的"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

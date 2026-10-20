@@ -797,7 +797,7 @@ fn path_bytes(p: &Path) -> &[u8] {
     p.as_os_str().as_bytes()
 }
 
-const AGENTS: [Agent; 4] = [Agent::None, Agent::Claude, Agent::Codex, Agent::Other];
+const AGENTS: [Agent; 6] = [Agent::None, Agent::Claude, Agent::Codex, Agent::Other, Agent::Pi, Agent::Opencode];
 
 impl Scanner {
     /// 读存着的那份;不是这个 aca 写的、坏了、没有,都当没有(从头读)
@@ -1008,6 +1008,14 @@ pub fn account_name(agent: Agent, who: &str) -> String {
     format!("{} {who}", if agent == Agent::Codex { "Codex" } else { "Claude" })
 }
 
+/// 面板上怎么写一个账号(account_name 起的全名):账号名就是家名的(默认目录 ~/.claude、~/.codex)只写家名
+pub fn account_shown(name: &str) -> &str {
+    match name.split_once(' ') {
+        Some((home, who)) if who.eq_ignore_ascii_case(home) => home,
+        _ => name,
+    }
+}
+
 /// 这个账号在不在只看的里面:空 = 都在;写全名(「Claude 甲」)或账号名都认,链在一起的(`甲·乙`)写哪个都算
 pub fn picked(only: &[String], agent: Agent, who: &str) -> bool {
     only.is_empty() || {
@@ -1059,6 +1067,35 @@ pub fn deck() -> Deck {
     d
 }
 
+/// 这个 Codex 目录是用 API key 登录的(按量付费,没有订阅额度)
+fn api_key_login(dir: &Path) -> bool {
+    let Ok(text) = std::fs::read(dir.join("auth.json")) else { return false };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&text) else { return false };
+    match v.get("auth_mode").and_then(|m| m.as_str()) {
+        Some(mode) => mode == "apikey",
+        // 老版本不写 auth_mode:有 key、没有 ChatGPT 的 tokens
+        None => v.get("OPENAI_API_KEY").is_some_and(|k| k.is_string()) && v.get("tokens").is_none_or(|t| t.is_null()),
+    }
+}
+
+/// 几个 Codex 账号的 sessions 链到一处时(见 `sources`)额度记在一起,名字是「甲·乙」;记录里的额度只是其中订阅账号的,
+/// 用 API key 登录的那几个名字去掉,一个不剩的不要。accounts 同 `sources`
+pub fn subscribed(quotas: Vec<Quota>, accounts: &[(Agent, String, String)], home: &str) -> Vec<Quota> {
+    let dir_of = |n: &str| {
+        let found = accounts.iter().find(|(a, name, _)| *a == Agent::Codex && name == n);
+        found.map_or_else(|| PathBuf::from(format!("{home}/.{n}")), |(_, _, d)| PathBuf::from(d))
+    };
+    quotas
+        .into_iter()
+        .filter_map(|mut q| {
+            if q.agent == Agent::Codex {
+                q.who = q.who.split('·').filter(|n| !api_key_login(&dir_of(n))).collect::<Vec<_>>().join("·");
+            }
+            (!q.who.is_empty()).then_some(q)
+        })
+        .collect()
+}
+
 fn codex_quota(src: &Source, ts: i64, r: &XRate) -> Option<Quota> {
     let win = |w: &XWin| Win {
         label: match w.window_minutes {
@@ -1085,7 +1122,8 @@ fn codex_quota(src: &Source, ts: i64, r: &XRate) -> Option<Quota> {
 }
 
 /// 一个 Codex 账号现在的额度,不扫整个目录(换账号的框里用,要快):最近三天里最近改过的几份对话记录,
-/// 从末尾往前找最后一次记下的 rate_limits。没有(API key 的账号不记、最近没用过)= None
+/// 从末尾往前找最后一次记下的 rate_limits。没有(API key 的账号不记、最近没用过)= None;
+/// 最后一次记的是空的(走中转的不带额度)也是 None,不拿更早的旧数顶上 —— 和 `codex_rates` 一样,只认最新的那次
 pub fn codex_now(src: &Source) -> Option<Quota> {
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = vec![];
     for day in newest_dirs(&src.dir.join("sessions"), 3, 3) {
@@ -1098,7 +1136,8 @@ pub fn codex_now(src: &Source) -> Option<Quota> {
         }
     }
     files.sort_by_key(|f| std::cmp::Reverse(f.0));
-    files.iter().take(8).find_map(|(_, f)| last_rate(f).and_then(|(ts, r)| codex_quota(src, ts, &r)))
+    let (ts, r) = files.iter().take(8).find_map(|(_, f)| last_rate(f))?;
+    codex_quota(src, ts, &r)
 }
 
 /// `dir` 底下 `depth` 层的目录(年 / 月 / 日),名字大的(新的)在前,最多 n 个
@@ -1515,12 +1554,14 @@ pub fn build_cached(only: &[String]) -> Report {
 /// 整个流程:读配置 → 读新写的记录 → 汇总
 pub fn build(sc: &mut Scanner, only: &[String]) -> Report {
     let home = std::env::var("HOME").unwrap_or_default();
-    let srcs = sources(&crate::data::accounts(&aca_core::config::load()), &home);
+    let accounts = crate::data::accounts(&aca_core::config::load());
+    let srcs = sources(&accounts, &home);
     sc.scan(srcs.clone());
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     // Claude 的额度是 statusLine 记下的(带数据时间,见 limits)
     let quotas = crate::limits::dir().map(|d| crate::limits::quotas(&d, &srcs, now)).unwrap_or_default();
     let mut r = sc.report(now, local_offset(), &deck(), quotas, only);
+    r.quotas = subscribed(std::mem::take(&mut r.quotas), &accounts, &home);
     r.quota_note = crate::limits::mod_note(&aca_core::config::load());
     // 头一回分位子的顺序:近 30 天花得多的先拿(色盘前面几个挨着的颜色最好分),再是更早用过的、只有额度的。
     // 已经有位子的不受这个顺序影响
@@ -1895,6 +1936,33 @@ pub(crate) mod tests {
         let wins: Vec<(&str, f64)> = q.wins.iter().map(|w| (w.label.as_str(), w.used)).collect();
         assert_eq!((q.who.as_str(), q.plan.as_str(), wins), ("cx", "plus", vec![("5h", 97.5), ("7d", 40.0)]));
         assert_eq!(q.updated, parse_ts("2026-10-14T02:00:00Z"));
+        // 后来走中转用的:记了 rate_limits 但里面是空的 —— 空着,不拿上面那份旧数顶
+        let relay = day.join("rollout-2026-10-14T03-00-00-c.jsonl");
+        std::fs::write(&relay, "{\"timestamp\":\"2026-10-14T03:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"limit_id\":\"codex\",\"primary\":null,\"secondary\":null,\"plan_type\":null}}}\n").unwrap();
+        let later = std::fs::metadata(day.join("rollout-2026-10-14T01-00-00-a.jsonl")).unwrap().modified().unwrap()
+            + std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&relay).unwrap().set_modified(later).unwrap();
+        assert_eq!(codex_now(&src), None);
+        // sessions 链到这里的另一个账号用的是 API key(新老两种 auth.json):额度只是 cx 的
+        let quotas =
+            |who: &str| vec![Quota { who: who.into(), ..q.clone() }, Quota { agent: Agent::Claude, who: "key".into(), ..q.clone() }];
+        let key = d.join("key");
+        std::fs::create_dir_all(&key).unwrap();
+        std::fs::write(d.join("auth.json"), r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{}}"#).unwrap();
+        let accounts = [
+            (Agent::Codex, "cx".to_string(), d.to_string_lossy().into_owned()),
+            (Agent::Codex, "key".into(), key.to_string_lossy().into_owned()),
+        ];
+        for auth in [r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-x"}"#, r#"{"OPENAI_API_KEY":"sk-x","tokens":null}"#] {
+            std::fs::write(key.join("auth.json"), auth).unwrap();
+            let kept = subscribed(quotas("cx·key"), &accounts, "/nowhere");
+            assert_eq!(
+                kept.iter().map(|q| (q.agent, q.who.as_str())).collect::<Vec<_>>(),
+                [(Agent::Codex, "cx"), (Agent::Claude, "key")],
+                "{auth}"
+            );
+            assert_eq!(subscribed(quotas("key"), &accounts, "/nowhere").len(), 1);
+        }
         assert_eq!(codex_now(&Source { dir: d.join("nothing"), ..src }), None);
         let _ = std::fs::remove_dir_all(&d);
     }

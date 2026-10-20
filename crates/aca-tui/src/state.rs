@@ -1,6 +1,6 @@
 //! 界面自己记的东西,都在 ~/.local/state/aca/ui/ 下:置顶(pins.rs)和上次的视图(这里)。
 //!
-//! 视图 = 分组 / 范围(和「近几天」)/ 预览开关 / 高亮的会话,下次打开恢复。一行一个 key=value,**一变就写**:
+//! 视图 = 分组 / 范围(和「近几天」)/ 只看开着的 / 预览开关 / 高亮的会话,下次打开恢复。一行一个 key=value,**一变就写**:
 //! 手机断线时 aca 是被直接杀掉的,等不到正常退出。过滤词不记 —— 本来就是临时的,
 //! 而且 Moshi 代敲的命令正是落进了过滤框。
 
@@ -30,8 +30,10 @@ pub struct View {
     /// None = 全部分组
     pub group: Option<String>,
     pub scope: Scope,
-    /// w / a 再按一次回到的范围(进「开着的」/「全部」之前的)
-    pub back: Scope,
+    /// w:只看开着的
+    pub open: bool,
+    /// 按 w 之前的范围,再按 w 回到这里(在开着的里按过 * / a 是 None)
+    pub back: Option<Scope>,
     /// 「近几天」的几天(`*` 轮换)
     pub days: u64,
     /// 宽屏(桌面)的布局
@@ -53,7 +55,8 @@ impl Default for View {
         View {
             group: None,
             scope: Scope::Recent,
-            back: Scope::Recent,
+            open: false,
+            back: None,
             days: 1,
             preview: Preview::Auto,
             preview_narrow: Preview::Auto,
@@ -65,12 +68,11 @@ impl Default for View {
     }
 }
 
-fn scope(val: &str) -> Scope {
+fn scope(val: &str) -> Option<Scope> {
     match val {
-        "all" => Scope::All,
-        // 旧版叫 pending(只看 ! ● ✗)
-        "working" | "pending" => Scope::Working,
-        _ => Scope::Recent,
+        "all" => Some(Scope::All),
+        "recent" => Some(Scope::Recent),
+        _ => None,
     }
 }
 
@@ -83,7 +85,10 @@ impl View {
             let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
             match k {
                 "group" => v.group = some(val),
-                "scope" => v.scope = scope(val),
+                // 旧版「开着的」是一种范围(scope=working,更早叫 pending):就是全部里开着的
+                "scope" if matches!(val, "working" | "pending") => (v.scope, v.open) = (Scope::All, true),
+                "scope" => v.scope = scope(val).unwrap_or(Scope::Recent),
+                "open" => v.open = val == "1",
                 "back" => v.back = scope(val),
                 "days" => v.days = val.parse().ok().filter(|d| DAYS.contains(d)).unwrap_or(1),
                 // 旧版写的是 1 / 0,再后来有过 right(现在就是宽屏的默认)
@@ -133,9 +138,8 @@ impl View {
         let scope = |s: Scope| match s {
             Scope::Recent => "recent",
             Scope::All => "all",
-            Scope::Working => "working",
         };
-        let (back, scope) = (scope(self.back), scope(self.scope));
+        let (back, scope) = (self.back.map_or("", scope), scope(self.scope));
         let name = |p: Preview| match p {
             Preview::Auto => "auto",
             Preview::Below => "below",
@@ -144,8 +148,9 @@ impl View {
         };
         let (preview, narrow) = (name(self.preview), name(self.preview_narrow));
         let text = format!(
-            "group={}\nscope={scope}\nback={back}\ndays={}\npreview={preview}\npreview_narrow={narrow}\nselected={}\nfolded={}\nspace={}\nlast_space={}\n",
+            "group={}\nscope={scope}\nopen={}\nback={back}\ndays={}\npreview={preview}\npreview_narrow={narrow}\nselected={}\nfolded={}\nspace={}\nlast_space={}\n",
             self.group.as_deref().unwrap_or(""),
+            u8::from(self.open),
             self.days,
             self.selected.as_deref().unwrap_or(""),
             self.folded.join("\t"),
@@ -167,8 +172,9 @@ mod tests {
         assert_eq!(View::load(&path), View::default()); // 还没有文件
         let v = View {
             group: Some("work/sub".into()),
-            scope: Scope::Working,
-            back: Scope::All,
+            scope: Scope::Recent,
+            open: true,
+            back: Some(Scope::All),
             days: 7,
             preview: Preview::Below,
             preview_narrow: Preview::Focus,
@@ -181,6 +187,8 @@ mod tests {
         assert_eq!(View::load(&path), v);
         std::fs::write(&path, "scope=all\ngarbage\nnew_key=1\n").unwrap(); // 旧版 / 新版写的也能读
         assert_eq!(View::load(&path), View { scope: Scope::All, ..View::default() });
+        std::fs::write(&path, "scope=working\nback=working\n").unwrap(); // 旧版的「开着的」是一种范围
+        assert_eq!(View::load(&path), View { scope: Scope::All, open: true, back: None, ..View::default() });
         std::fs::write(&path, "space=q\n").unwrap(); // q 不能当工作区
         assert_eq!(View::load(&path).space, '1');
         std::fs::write(&path, "space=ab\n").unwrap();

@@ -18,11 +18,17 @@
 //! 各记各的文件(`mod-<aca 的会话 id>.json`):同一个会话两条路都报时,数差一位小数也不会互相当成「变了」。
 //! 所有会话每次刷新都跑这个程序(hook 也是每个事件跑一次),所以装新版 aca 要拷成临时名再改名换过去,
 //! 别直接往原文件上拷:拷到一半时起来的那些进程读到的是半个程序。
+//!
+//! 上面两条路都只有 5h、7d,按模型分的周额度(Fable)只有 Claude 自己的 `/usage` 有。所以还有第三条:
+//! 一个账号有会话报来新数、离上次问过了 [`ASK_EVERY`],就在后台起 `aca limits --ask` 问 Claude 自己(见 [`ask`]),
+//! 记在 `ask-<账号>.json`,时间也是问的那一刻。
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use aca_core::agent::claude_mod::Verdict;
 use aca_core::config::Tool;
@@ -33,7 +39,7 @@ use ratatui::text::Span;
 use serde::{Deserialize, Serialize};
 
 use crate::data::Agent;
-use crate::overlay::{Fx, Setting, kit};
+use crate::overlay::{Fx, Setting};
 use crate::usage::{Quota, Source, Win, parse_ts};
 
 /// 一个会话记下的
@@ -62,6 +68,9 @@ pub fn dir() -> Option<PathBuf> {
 pub fn run(args: &[String]) -> i32 {
     let mut payload = vec![];
     let _ = std::io::stdin().read_to_end(&mut payload);
+    if args.first().is_some_and(|a| a == "--ask") {
+        return args.get(1).map_or(0, |acct| ask(acct));
+    }
     if args.first().is_some_and(|a| a == "--mod") {
         return from_mod(&payload);
     }
@@ -70,7 +79,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     let cmd: Vec<&String> = args.iter().skip_while(|a| *a != "--").skip(1).collect();
     let Some((prog, rest)) = cmd.split_first() else { return 0 };
-    let child = std::process::Command::new(prog).args(rest).stdin(std::process::Stdio::piped()).spawn();
+    let child = Command::new(prog).args(rest).stdin(Stdio::piped()).spawn();
     let Ok(mut child) = child else { return 1 };
     if let Some(mut i) = child.stdin.take() {
         let _ = i.write_all(&payload);
@@ -128,7 +137,10 @@ pub fn record(payload: &[u8], dir: &Path, now: i64) {
         .iter()
         .filter_map(|(k, v)| Some((label_of(k), v.get("used_percentage")?.as_f64()?, v.get("resets_at").and_then(|x| x.as_i64()))))
         .collect();
-    update(&dir.join(format!("{sid}.json")), got, p.transcript_path.map(PathBuf::from).as_deref(), now, false);
+    let transcript = p.transcript_path.map(PathBuf::from);
+    let acct = account_dir(transcript.as_deref());
+    let moved = update(&dir.join(format!("{sid}.json")), got, &acct, transcript.as_deref(), now, false);
+    ask_if_due(dir, &acct, moved, now);
 }
 
 /// mod 交来的 `session.measure`(Claude 2.1.295 上的样子):
@@ -157,17 +169,158 @@ fn from_mod(payload: &[u8]) -> i32 {
     let got = measured(payload);
     aca_core::agent::claude_mod::heard(&id, got.is_some());
     if let (Some(got), Some(d)) = (got, dir()) {
-        update(&d.join(format!("mod-{id}.json")), got, None, now(), true);
+        let (acct, now) = (account_dir(None), now());
+        let moved = update(&d.join(format!("mod-{id}.json")), got, &acct, None, now, true);
+        ask_if_due(&d, &acct, moved, now);
     }
     0
 }
 
+/// 一个账号多久问一次 Claude 自己(秒)
+const ASK_EVERY: i64 = 300;
+/// 问 Claude 最多等多久(秒):实测两三秒答完
+const ASK_WAIT: u64 = 20;
+
+/// 一个账号问 Claude 自己记下的那份(`ask-<账号>.json`,`quotas` 和会话的一起读)和它的锁(`.lock`,里面写上次问的时间)
+fn ask_files(dir: &Path, acct: &str) -> (PathBuf, PathBuf) {
+    let mut h = DefaultHasher::new();
+    std::fs::canonicalize(acct).unwrap_or_else(|_| PathBuf::from(acct)).hash(&mut h);
+    let key = format!("ask-{:016x}", h.finish());
+    (dir.join(format!("{key}.json")), dir.join(format!("{key}.lock")))
+}
+
+/// 状态栏 / mod 刚记了一次:这个账号的数动了(有会话刚调过 API)、离上次问过了 [`ASK_EVERY`],或者从没问过,
+/// 就在后台起一个 `aca limits --ask`。这里只看锁文件的修改时间,几十个会话一起刷新也不多花什么;
+/// 一起起了好几个的,真去问的只有一个(见 [`ask`])
+fn ask_if_due(dir: &Path, acct: &str, moved: bool, now: i64) {
+    use std::os::unix::process::CommandExt;
+    let (_, lock) = ask_files(dir, acct);
+    let last = std::fs::metadata(&lock).and_then(|m| m.modified()).ok();
+    let age = last.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| now - d.as_secs() as i64);
+    // 测试里的「自己」是测试程序
+    if !due(age, moved) || cfg!(test) {
+        return;
+    }
+    // 自己一个进程组、不接管道:状态栏的命令等的是它自己的输出,不等这个
+    let _ = Command::new(aca_core::agent::self_exe())
+        .args(["limits", "--ask", acct])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+}
+
+/// age = 上次问到现在几秒,没问过是 None
+fn due(age: Option<i64>, moved: bool) -> bool {
+    age.is_none_or(|a| moved && a >= ASK_EVERY)
+}
+
+/// `aca limits --ask <账号目录>`:问 Claude 自己这个账号的额度(SDK 的 `get_usage`,和 `/usage` 一个来源),
+/// 按模型分的周额度(Fable)只有这里有。带着这个账号的环境起一个 `claude -p`(同 `aca run`:不带 hook),
+/// 不读设置、不连 MCP、不留对话记录,问完就关。只问登记了配置目录的账号:没登记的带着的可能是外层会话的账号。
+/// 先锁住锁文件、再看一次上次是什么时候问的,一起起来的几个只有一个真问。同 hook:永远退出 0、一个字不写
+fn ask(acct: &str) -> i32 {
+    let Some(dir) = dir() else { return 0 };
+    let (file, lock) = ask_files(&dir, acct);
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(held) = std::fs::OpenOptions::new().create(true).append(true).open(&lock) else { return 0 };
+    if held.try_lock().is_err() {
+        return 0;
+    }
+    let now = now();
+    let last: Option<i64> = std::fs::read_to_string(&lock).ok().and_then(|s| s.trim().parse().ok());
+    if last.is_some_and(|t| now - t < ASK_EVERY) {
+        return 0;
+    }
+    // 问不到(没登录、限流)也算问过:不然下一次刷新又来
+    let _ = std::fs::write(&lock, now.to_string());
+    let cfg = aca_core::config::load();
+    let Some(spec) = spec_of(&cfg, acct) else { return 0 };
+    if let Some(got) = asked(&cfg, &spec) {
+        update(&file, got, acct, None, self::now(), true);
+    }
+    0
+}
+
+/// 账号目录 → `aca run` 的写法(`claude:work`):登记了配置目录的才有
+fn spec_of(cfg: &aca_core::config::Config, acct: &str) -> Option<String> {
+    let real = std::fs::canonicalize(acct).ok()?;
+    let same = |home: &str| !home.is_empty() && std::fs::canonicalize(home).is_ok_and(|h| h == real);
+    let name = cfg.accounts.get("claude")?.iter().find(|(_, a)| same(&a.home))?.0;
+    Some(format!("claude:{name}"))
+}
+
+/// 起 Claude 问一次,它答了就是那几个窗口;没答、起不来、不是订阅的(rate_limits 是 null)= None / 空的
+fn asked(cfg: &aca_core::config::Config, spec: &str) -> Option<Vec<Got>> {
+    use std::os::unix::process::CommandExt;
+    let args = [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--strict-mcp-config",
+        "--setting-sources",
+        "",
+        "--no-session-persistence",
+    ]
+    .map(String::from);
+    let l = aca_core::agent::direct(cfg, spec, &args).ok()?;
+    let mut child = Command::new(&l.argv[0])
+        .args(&l.argv[1..])
+        .envs(l.env)
+        .current_dir(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    // 发完就关:它答完这一条自己退出(2.1.303 上实测)
+    let ask =
+        serde_json::json!({"type": "control_request", "request_id": "aca", "request": {"subtype": "get_usage", "skip_behaviors": true}});
+    if let Some(mut i) = child.stdin.take() {
+        let _ = writeln!(i, "{ask}");
+    }
+    let began = std::time::Instant::now();
+    while child.try_wait().ok()?.is_none() {
+        if began.elapsed().as_secs() >= ASK_WAIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    usage_of(&child.wait_with_output().ok()?.stdout)
+}
+
+/// `get_usage` 的回答(Claude 2.1.303 上的样子,SDK 里标着 experimental):
+/// `{"type":"control_response","response":{"subtype":"success","request_id":"aca","response":{"rate_limits":{"five_hour":{"utilization":47,"resets_at":"2026-10-19T11:30:00.428198+00:00",…},"seven_day":{…},…,"model_scoped":[{"display_name":"Fable","utilization":48,"resets_at":"…"}]},…}}}`。
+/// model_scoped 里的窗口名字是 Claude 给的(Fable),照着记
+fn usage_of(out: &[u8]) -> Option<Vec<Got>> {
+    out.split(|&b| b == b'\n').find_map(|line| {
+        let v: serde_json::Value = serde_json::from_slice(line).ok()?;
+        let r = v.get("response").filter(|r| r.get("request_id").and_then(|x| x.as_str()) == Some("aca"))?;
+        let rl = r.pointer("/response/rate_limits")?;
+        let win = |label: String, w: &serde_json::Value| {
+            let resets = w.get("resets_at").and_then(|x| x.as_str()).map(parse_ts).filter(|&t| t > 0);
+            Some((label, w.get("utilization")?.as_f64()?, resets))
+        };
+        let mut got: Vec<Got> = ["five_hour", "seven_day"].iter().filter_map(|k| win(label_of(k), rl.get(*k)?)).collect();
+        let scoped = rl.get("model_scoped").and_then(|x| x.as_array()).into_iter().flatten();
+        got.extend(scoped.filter_map(|m| win(m.get("display_name")?.as_str()?.to_string(), m)));
+        Some(got)
+    })
+}
+
 /// 计费面板额度那一段顶上的一句:开了 mod(`[tools.<claude 那一家的>] mod = true`),现在这一版 Claude 上却没带。
-/// 没开、带着、还没起过会话(没验过)= 空的
+/// 没开、带着、还没起过会话(没验过)= 空的。为什么没带写在设置页 mod 那一行
 pub fn mod_note(cfg: &aca_core::config::Config) -> String {
     let on = cfg.names().iter().filter_map(|n| cfg.tool(n.split(':').next()?)).any(|t| t.kind == "claude" && t.mods);
     match on.then(aca_core::agent::claude_mod::verdict).flatten() {
-        Some(v) if !v.ok => tr!("aca 的 mod 没带(Claude {}):{}", "aca's mod not loaded (Claude {}): {}", v.build, v.why),
+        Some(v) if !v.ok => t!("额度可能不是最新的", "quotas may be out of date").into(),
         _ => String::new(),
     }
 }
@@ -182,7 +335,7 @@ pub struct ModIo {
     set: fn(&str, &str, toml::Value) -> Result<(), String>,
 }
 
-/// 设置页里的一行:「m  Claude mod  开 · 2.1.295 能带」。⏎ 当场切,改的是 `[tools.claude] mod`;
+/// 设置页里的一行:「m  Claude mod  开」,开着却不生效的后面写为什么。⏎ 当场切,改的是 `[tools.claude] mod`;
 /// 开着的会话不动,下次起(新建、重启)才跟着变
 pub struct ModRow {
     io: ModIo,
@@ -199,27 +352,20 @@ impl ModRow {
         }
     }
 
-    /// 开着时这一版带不带:行上写的短的那句、要不要标成提醒、不带的原因(带着就是空的)
-    fn carried(&self, tool: &Tool) -> (String, bool, String) {
+    /// 开着却不生效:行上括号里写的、开它时底栏说的为什么。带得上(还没验过的也算)= None
+    fn not_carried(&self, tool: &Tool) -> Option<(String, String)> {
+        // 自己包了一层命令:不知道里面跑的是哪一版 Claude,不带
         if !tool.cmd.is_empty() {
-            return (
-                t!("写了 cmd,不带", "cmd set, not loaded").into(),
-                true,
-                t!(
-                    "[tools.claude] 写了 cmd:不知道里面跑的是哪一版 Claude,mod 不带",
-                    "[tools.claude] sets cmd: no telling which Claude version runs inside, so no mod"
-                )
-                .into(),
-            );
+            return Some((
+                t!("自定义了命令", "custom command").into(),
+                t!("自定义了命令,mod 不生效", "a custom command is set; the mod has no effect").into(),
+            ));
         }
         match (self.io.verdict)() {
-            None => (t!("起 Claude 时验", "checked when Claude starts").into(), false, String::new()),
-            Some(v) if v.ok => (tr!("{} 能带", "{} can load it", v.build), false, String::new()),
-            Some(v) => (
-                tr!("{} 不带", "{} can't load it", v.build),
-                true,
-                tr!("Claude {} 不带 mod:{}", "Claude {} won't load the mod: {}", v.build, v.why),
-            ),
+            Some(v) if !v.ok => {
+                Some((format!("Claude {}", v.build), tr!("Claude {} 不带 mod:{}", "Claude {} won't load the mod: {}", v.build, v.why)))
+            }
+            _ => None,
         }
     }
 }
@@ -239,8 +385,11 @@ impl Setting for ModRow {
         if !tool.mods {
             return vec![Span::styled(t!("关", "off"), bold)];
         }
-        let (short, warn, _) = self.carried(&tool);
-        vec![Span::styled(t!("开", "on"), bold), Span::styled(format!(" · {short}"), if warn { crate::theme::warn() } else { kit::dim() })]
+        let mut out = vec![Span::styled(t!("开", "on"), bold)];
+        if let Some((short, _)) = self.not_carried(&tool) {
+            out.push(Span::styled(tr!(" · 不生效({short})", " · no effect ({short})"), crate::theme::warn()));
+        }
+        out
     }
 
     fn mark(&self) -> &'static str {
@@ -253,33 +402,29 @@ impl Setting for ModRow {
         if let Err(e) = (self.io.set)("tools.claude", "mod", toml::Value::Boolean(on)) {
             return fx.say(e);
         }
-        let why = self.carried(&tool).2;
-        fx.say(match (on, why.is_empty()) {
-            (false, _) => t!(
-                "新起、重启的 Claude 不带 mod 了(开着的会话不动)",
-                "new and restarted Claudes go without the mod (open sessions unchanged)"
-            )
-            .to_string(),
-            (true, true) => {
-                t!("新起、重启的 Claude 带上 mod:额度不靠状态栏", "new and restarted Claudes load the mod: quotas without the status bar")
-                    .to_string()
-            }
-            (true, false) => why,
+        // 开着的会话不动,新起、重启的才跟着变
+        fx.say(match self.not_carried(&tool) {
+            Some((_, why)) if on => why,
+            _ => t!("存了,新会话生效", "saved; new sessions use it").into(),
         });
     }
 }
 
-/// 一个会话这次报的几个窗口 → 它的文件。`live` = 这些数就是现在的(mod 交来的);不是的话时间照文件头的规则从对话记录里推
-fn update(path: &Path, mut got: Vec<Got>, transcript: Option<&Path>, now: i64, live: bool) {
+/// 一个会话这次报的几个窗口 → 它的文件,acct 是它的账号目录。`live` = 这些数就是现在的(mod 交来的、问来的);
+/// 不是的话时间照文件头的规则从对话记录里推。返回有没有哪个窗口的数变了(头一回报的也算)
+fn update(path: &Path, mut got: Vec<Got>, acct: &str, transcript: Option<&Path>, now: i64, live: bool) -> bool {
     if got.is_empty() {
-        return;
+        return false;
     }
     got.sort_by_key(|w| order(&w.0));
     let old: Rec = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let last = if live { None } else { transcript.and_then(last_reply) };
-    let mut rec = Rec { dir: account_dir(transcript), wins: old.wins.clone() };
+    let mut rec = Rec { dir: acct.to_string(), wins: old.wins.clone() };
+    let mut moved = false;
     for (label, used, resets) in got {
-        let at = match old.wins.iter().find(|w| w.label == label) {
+        let before = old.wins.iter().find(|w| w.label == label);
+        moved |= before.is_none_or(|w| w.used != used || w.resets != resets);
+        let at = match before {
             _ if live => now,
             Some(w) if w.used == used && w.resets == resets => w.at.max(last.unwrap_or(0)),
             Some(_) => now,
@@ -297,6 +442,7 @@ fn update(path: &Path, mut got: Vec<Got>, transcript: Option<&Path>, now: i64, l
     {
         let _ = crate::state::write_atomic(path, &text);
     }
+    moved
 }
 
 /// 对话记录是 `<账号目录>/projects/<项目>/<会话>.jsonl`;对不上就按 Claude Code 自己的规矩猜
@@ -508,17 +654,58 @@ mod tests {
         // 记在它自己的文件里;交来的就是那一刻的数,没变时间也跟着走(状态栏那条路没变就不动);空的不写
         let root = std::env::temp_dir().join(format!("aca-limits-mod-{}", std::process::id()));
         let file = root.join("mod-ab12.json");
-        update(&file, got.clone(), None, 700, true);
-        update(&file, got, None, 900, true);
-        update(&root.join("mod-none.json"), vec![], None, 900, true);
+        // 头一回报算动了,数一样的再报不算
+        let first = update(&file, got.clone(), "/x/.claude", None, 700, true);
+        let again = update(&file, got, "/x/.claude", None, 900, true);
+        assert!(!update(&root.join("mod-none.json"), vec![], "/x/.claude", None, 900, true));
         let rec: Rec = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         let left = std::fs::read_dir(&root).unwrap().count();
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(first && !again);
         assert_eq!(
             rec.wins.iter().map(|w| (w.label.as_str(), w.used, w.at)).collect::<Vec<_>>(),
             vec![("5h", 6.0, 900), ("7d", 17.5, 900)]
         );
         assert_eq!(left, 1);
+    }
+
+    #[test]
+    fn what_claude_says_when_asked_adds_the_per_model_week() {
+        // Claude 2.1.303 对 get_usage 的回答(删短了):Fable 是按模型分的周额度,状态栏里没有
+        let out = br#"{"type":"system","subtype":"init"}
+{"type":"control_response","response":{"subtype":"success","request_id":"aca","response":{"subscription_type":"max","rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":12,"resets_at":"2026-10-19T11:30:00.608788+00:00"},"seven_day":{"utilization":40,"resets_at":"2026-10-22T06:59:59.609015+00:00"},"seven_day_opus":null,"limits":[],"model_scoped":[{"display_name":"Fable","utilization":48,"resets_at":"2026-10-22T06:59:59.609039+00:00"}]},"behaviors":null}}}
+"#;
+        let (five, week) = (parse_ts("2026-10-19T11:30:00Z"), parse_ts("2026-10-22T06:59:59Z"));
+        let got = usage_of(out).unwrap();
+        assert_eq!(got, vec![("5h".into(), 12.0, Some(five)), ("7d".into(), 40.0, Some(week)), ("Fable".into(), 48.0, Some(week))]);
+        // 不是订阅的账号:rate_limits 是 null,什么都不记;别的请求的回答、不是 JSON 的不认
+        let api_key =
+            br#"{"type":"control_response","response":{"request_id":"aca","response":{"rate_limits_available":false,"rate_limits":null}}}"#;
+        assert_eq!(usage_of(api_key), Some(vec![]));
+        assert_eq!(usage_of(br#"{"type":"control_response","response":{"request_id":"other","response":{}}}"#), None);
+        assert_eq!(usage_of(b"Error: not logged in\n"), None);
+
+        // 没问过的就问;问过的要等这个账号的数又动了、隔了五分钟
+        assert!(due(None, false));
+        assert!(!due(Some(ASK_EVERY + 1), false) && !due(Some(ASK_EVERY - 1), true));
+        assert!(due(Some(ASK_EVERY), true));
+
+        // 问来的和状态栏记的按账号合在一起:Fable 排在 5h、7d 后面
+        let root = std::env::temp_dir().join(format!("aca-limits-ask-{}", std::process::id()));
+        let acct = root.join(".claude-sub");
+        std::fs::create_dir_all(&acct).unwrap();
+        let store = root.join("limits");
+        let acct_s = acct.to_string_lossy().into_owned();
+        update(&store.join("s1.json"), vec![("5h".into(), 13.0, Some(five)), ("7d".into(), 40.0, Some(week))], &acct_s, None, 2000, true);
+        update(&ask_files(&store, &acct_s).0, got, &acct_s, None, 1000, true);
+        let srcs = vec![Source { agent: Agent::Claude, who: "sub".into(), dir: acct.clone() }];
+        let q = quotas(&store, &srcs, 3000);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(
+            q[0].wins.iter().map(|w| (w.label.as_str(), w.used)).collect::<Vec<_>>(),
+            vec![("5h", 13.0), ("7d", 40.0), ("Fable", 48.0)]
+        );
     }
 
     thread_local! {
@@ -549,18 +736,18 @@ mod tests {
             fx.flash.unwrap()
         };
         assert_eq!((row.key(), row.mark(), shown(&row).as_str()), ('m', "", "关"));
-        // 开:还没起过 Claude,没验过
-        assert!(enter(&row).contains("带上 mod"));
+        // 开:还没起过 Claude,没验过 —— 只写开
+        assert_eq!(enter(&row), "存了,新会话生效");
         assert_eq!(WROTE.with(|w| w.borrow_mut().drain(..).collect::<Vec<_>>()), ["[tools.claude] mod = true"]);
-        assert_eq!(shown(&row), "开 · 起 Claude 时验");
-        // 这一版验过了
+        assert_eq!(shown(&row), "开");
+        // 这一版验过了,带得上:还是只写开
         let verdict = |ok: bool, why: &str| Some(Verdict { build: "2.1.295".into(), ok, why: why.into(), at: 1 });
         VERDICT.with(|v| *v.borrow_mut() = verdict(true, ""));
-        assert_eq!(shown(&row), "开 · 2.1.295 能带");
+        assert_eq!(shown(&row), "开");
         // 这一版不带:行上标出来;关了再开,底栏说为什么
         VERDICT.with(|v| *v.borrow_mut() = verdict(false, "它交来的用量认不出了"));
-        assert_eq!((shown(&row).as_str(), row.value()[1].style), ("开 · 2.1.295 不带", crate::theme::warn()));
-        assert!(enter(&row).contains("不带 mod 了"));
+        assert_eq!((shown(&row).as_str(), row.value()[1].style), ("开 · 不生效(Claude 2.1.295)", crate::theme::warn()));
+        assert_eq!(enter(&row), "存了,新会话生效");
         assert_eq!(shown(&row), "关");
         assert_eq!(enter(&row), "Claude 2.1.295 不带 mod:它交来的用量认不出了");
         assert_eq!(
@@ -569,7 +756,7 @@ mod tests {
         );
         // 工具自己包了一层命令:哪一版都不带
         TOOL.with(|t| t.borrow_mut().cmd = vec!["wrap.sh".into()]);
-        assert_eq!(shown(&row), "开 · 写了 cmd,不带");
+        assert_eq!(shown(&row), "开 · 不生效(自定义了命令)");
     }
 
     #[test]

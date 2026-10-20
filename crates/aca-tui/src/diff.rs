@@ -12,7 +12,6 @@ use std::process::{Command, Stdio};
 
 use ratatui::style::{Modifier, Style};
 
-use aca_core::i18n::noun;
 use aca_core::{t, tr};
 
 use crate::ansi::{Seg, Styled};
@@ -145,9 +144,9 @@ fn untracked(top: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 和登记的不是一个目录时,在顶上说一声
+/// 和会话开的不是一个目录时,在顶上说一声
 fn moved(w: &Where, found: &workdir::Found) -> Option<String> {
-    (!found.how.is_empty() && found.dir != w.dir).then(|| tr!("登记在 {}", "registered at {}", crate::create::tilde(&w.dir)))
+    (!found.how.is_empty() && found.dir != w.dir).then(|| tr!("会话开在 {}", "session opened in {}", crate::create::tilde(&w.dir)))
 }
 
 /// 预览顶上的:找目录、数改动(同 `x` 默认看的:未提交的,没 git add 的新文件也算)
@@ -283,7 +282,7 @@ pub struct Head {
     pub note: Option<String>,
     /// diff 太大,只读了前面一截
     pub cut: bool,
-    /// 目录不是登记的那个:登记的是哪
+    /// 目录不是会话开的那个:开在哪
     pub moved: Option<String>,
 }
 
@@ -512,29 +511,26 @@ pub fn render(h: &Head, patch: &str, new_files: &[(String, Option<String>)]) -> 
     let pos: Vec<Pos> = files.iter().map(|f| positions(&f.body)).collect();
     let first: Vec<usize> = pos.iter().map(|p| p.first().unwrap_or(1)).collect();
     let mut out = Out::default();
+    // 未提交 / 连同提交、几个文件,标题栏写了;这里只加总共加删几行
     let mut head = vec![seg(format!(" {}", clean(&h.dir)), Style::new())];
     if !h.branch.is_empty() {
         head.push(seg(format!("  {}", clean(&h.branch)), dim_c()));
     }
+    let (add, del) = files.iter().fold((0, 0), |(a, d), f| (a + f.add, d + f.del));
+    head.extend(counts(&File { add, del, ..Default::default() }));
     out.push(head, None);
     if let Some(m) = &h.moved {
         out.push(vec![seg(format!(" {}", clean(m)), dim_c())], None);
     }
-    let (add, del) = files.iter().fold((0, 0), |(a, d), f| (a + f.add, d + f.del));
-    let what = match &h.against {
-        Some(t) => tr!("{t} 以来 {} 个提交 + 未提交", "{} commits since {t} + uncommitted", h.commits.len()),
-        None => t!("未提交", "uncommitted").into(),
-    };
+    let mut what = vec![];
+    if let Some(t) = &h.against {
+        what.push(tr!("{t} 以来 {} 个提交", "{} commits since {t}", h.commits.len()));
+    }
     if files.is_empty() {
-        out.push(vec![seg(tr!(" {what}:没有", " {what}: nothing"), bold)], None);
-        if h.against.is_none() && h.note.is_none() {
-            out.push(vec![seg(t!(" m 连同提交", " m includes commits"), dim_c())], None);
-        }
-    } else {
-        let (k, w) = (files.len(), noun(files.len() as u64, "file", "files"));
-        let mut l = vec![seg(tr!(" {what}:{k} 个文件", " {what}: {k} {w}"), bold)];
-        l.extend(counts(&File { add, del, ..Default::default() }));
-        out.push(l, None);
+        what.push(t!("没有改动", "no changes").into());
+    }
+    if !what.is_empty() {
+        out.push(vec![seg(format!(" {}", what.join(" · ")), bold)], None);
     }
     if let Some(n) = &h.note {
         out.push(vec![seg(format!(" {n}"), theme::warn())], None);
@@ -642,10 +638,9 @@ Binary files a/logo.png and b/logo.png differ
         let d = render(&h, PATCH, &new);
         let t = text(&d);
         assert_eq!(
-            t[..9],
+            t[..8],
             [
-                " ~/p  main",
-                " 未提交:6 个文件 +5 −3",
+                " ~/p  main +5 −3",
                 "",
                 "  M src/a.rs +2 −1",
                 "  D gone.txt −1",
@@ -687,13 +682,14 @@ Binary files a/logo.png and b/logo.png differ
     }
 
     #[test]
-    fn nothing_changed_says_so_and_points_at_m() {
+    fn nothing_changed_says_so_once() {
         let h = Head { dir: "~/p".into(), branch: "main".into(), ..Default::default() };
-        assert_eq!(text(&render(&h, "", &[])), [" ~/p  main", " 未提交:没有", " m 连同提交"]);
+        assert_eq!(text(&render(&h, "", &[])), [" ~/p  main", " 没有改动"]);
         let h = Head { against: Some("origin/main".into()), commits: vec!["abc1234 fix: a thing".into()], ..h };
         let t = text(&render(&h, PATCH, &[]));
-        assert_eq!(t[1], " origin/main 以来 1 个提交 + 未提交:4 个文件 +3 −3");
-        assert_eq!(t[3], "  abc1234 fix: a thing");
+        assert_eq!(t[..4], [" ~/p  main +3 −3", " origin/main 以来 1 个提交", "", "  abc1234 fix: a thing"]);
+        let t = text(&render(&Head { commits: vec![], moved: Some("会话开在 ~/q".into()), ..h }, "", &[]));
+        assert_eq!(t, [" ~/p  main", " 会话开在 ~/q", " origin/main 以来 0 个提交 · 没有改动"]);
     }
 
     #[test]

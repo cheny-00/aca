@@ -127,7 +127,7 @@ With fzf-tab, type a title or a group name in fzf to find a session. To preview 
   --notify 哪些  它在哪些事上通知 parent(叫醒它):done failed exited waiting 里挑(逗号隔开),all = 都要,
                  none = 都不。不写照 config.toml 的 [inbox] notify,那也没写就都不通知(aca help msg)
   --hold         只登记,不启动(之后 aca start)
-  --say 话       开场那句话。Claude、Codex 当启动参数带进去:它起来了自己发,这条命令不等;
+  --say 话       开场那句话。Claude、Codex、pi、opencode 当启动参数带进去:它起来了自己发,这条命令不等;
                  别的工具等它起来、空下来再打字进去(最多等一分钟)
   -- …           每次启动都原样交给 agent 的参数
 
@@ -155,8 +155,8 @@ Prints the new session's id (the only line on standard output).
                   all = everything, none = nothing. Default: [inbox] notify in config.toml, and if that's unset
                   nothing (aca help msg)
   --hold          register only, don't start (aca start later)
-  --say TEXT      the opening message. Claude and Codex get it as a launch argument: they send it once
-                  they're up, and this command doesn't wait; other tools get it typed in once up and idle
+  --say TEXT      the opening message. Claude, Codex, pi and opencode get it as a launch argument: they send
+                  it once they're up, and this command doesn't wait; other tools get it typed in once up and idle
                   (waits up to a minute)
   -- …            arguments handed to the agent as they are on every start
 
@@ -186,18 +186,19 @@ Examples:
 接管 = 登记一行 + 在那个 tmux 会话上记个记号 + 会话名改成标题。里面的进程原样跑着,一个键都不往里按。
 之后它就是普通的 aca 会话:改名、挪组、停、在原地重启、分叉。不想要了:aca release <id> 放手,进程照留。
 
-  不带参数         列出能直接接管的(没登记过、第一格里跑着认得出的 claude / codex),只看不动
+  不带参数         列出能直接接管的(没登记过、第一格里跑着认得出的 claude / codex / pi / opencode),只看不动
   tmux 会话        会话名、名字里的一段(只对上一个时)、$会话号;agent 不在第一格时写 %窗格号 指明是哪一格。可以给几个
   --all            列出来的全接管
   -t 标题          不写:agent-deck 起的用它那边的标题,别的用现在的 tmux 会话名(你自己起的名字会锁住)
   -g 分组          写 . = 各自按目录定(见 aca help group)。不写:agent-deck 起的进它那边的分组,别的没分组
   --as 工具[:账号] 不看进程,照这个登记(没认出来、认错了时用)
-  --conv 对话id    认不出对话时自己给(手动起的 Codex 认不出:在它里面 /status 看)
+  --conv 对话id    认不出对话时自己给(老版本的 Codex 认不出:在它里面 /status 看)
   -n               只看会怎么登记,不动
   -- …             每次启动带的参数;不写就照搬它现在命令行里的(「接哪段对话」的那几个不搬)
 
 认得出什么:哪一家看进程名;账号看进程环境里的配置目录,对回 config.toml 里登记的;Claude 现在的对话和标题读它自己记的
-(配置目录里的 sessions/<pid>.json);agent-deck 起的,标题、分组、id 照它那边登记的(只读它的库)。
+(配置目录里的 sessions/<pid>.json),Codex 的读它的日志库(按进程号,0.163 起);
+agent-deck 起的,标题、分组、id 照它那边登记的(只读它的库)。
 接管之后、重启之前它没带 aca 的 hook:状态只靠读屏幕,没有「跑完没看」。重启一次(aca restart <id>,对话接着来)就全了。
 agent-deck 起的例外:它自己的 hook 还在报,「跑完没看」借它记的,不用等重启。",
                     "\
@@ -206,7 +207,7 @@ keep running untouched; not a single key is sent in.
 From then on it's an ordinary aca session: rename, move, stop, restart in place, fork. Don't want it any more:
 aca release <id> lets go, and the processes keep running.
 
-  (no arguments)       list what can be adopted as is (unregistered, a recognizable claude / codex in the first pane);
+  (no arguments)       list what can be adopted as is (unregistered, a recognizable claude / codex / pi / opencode in the first pane);
                        only looks
   TMUX-SESSION         session name, part of a name (when only one matches), or $session-number; when the agent isn't
                        in the first pane, %pane-number says which pane. Several are fine
@@ -216,14 +217,15 @@ aca release <id> lets go, and the processes keep running.
   -g GROUP             . = each decided by its directory (see aca help group). Default: agent-deck's go into its
                        group, others get none
   --as TOOL[:ACCOUNT]  ignore the process and register it as this (when not recognized, or recognized wrong)
-  --conv CONV-ID       give the conversation when it can't be recognized (a hand-started Codex can't: /status inside)
+  --conv CONV-ID       give the conversation when it can't be recognized (an older Codex can't: /status inside)
   -n                   only show how it would be registered; change nothing
   -- …                 arguments for every start; default: copied from its current command line (minus the ones that
                        pick which conversation to resume)
 
 What it recognizes: the agent from the process name; the account from the config directory in the process environment,
 matched against config.toml; Claude's current conversation and title from its own records (sessions/<pid>.json in the
-config directory); for agent-deck's sessions, title, group and id as registered there (its database is only read).
+config directory), Codex's from its log database (by process id, 0.163 on); for agent-deck's sessions, title, group
+and id as registered there (its database is only read).
 After adopting and before a restart it carries no aca hooks: state comes from the screen alone, and there is no
 \"finished, unread\". Restart once (aca restart <id>, the conversation continues) and it's complete.
 agent-deck's are the exception: its own hooks still report, and \"finished, unread\" comes from its records, no restart.",
@@ -238,14 +240,14 @@ agent-deck's are the exception: its own hooks still report, and \"finished, unre
                     "  --json         打成 JSON(给脚本读)
   --no-screen    不读屏幕,只用 hook 报的状态(几毫秒;按 Esc 打断这类 hook 不报的事看不出来)
 
-状态:● 在跑  ◐ 在等你 / 跑完没看  ○ 空闲  ✕ 出错  ■ 没在跑  ☾ 闲着被停的。在等你的下面多一行它问的。
+状态:● 在跑  ◆ 要你答  ◐ 没看  ○ 空闲  ✕ 出错  ■ 停了  ☾ 自动停(闲着被停的)。要你答的下面多一行它问的。
 在终端里是排好、上了色的:id 只打前 8 位,加粗的那几位就够敲(aca attach 3f);最底下一行是总数。
 接到管道、文件里是不带颜色的原样,id 是完整的。",
                     "  --json         print as JSON (for scripts)
   --no-screen    don't read screens, only the state hooks report (milliseconds; misses what hooks don't report,
                  like an Esc interrupt)
 
-States: ● running  ◐ waiting for you / finished, unread  ○ idle  ✕ error  ■ not running  ☾ stopped for idling. One waiting for you
+States: ● running  ◆ needs you  ◐ unread  ○ idle  ✕ error  ■ stopped  ☾ auto-stopped (for idling). One that needs you
 gets an extra line with what it asked.
 In a terminal it's laid out and colored: ids show their first 8 characters, the bold ones are enough to type
 (aca attach 3f); the last line is the total. Piped or redirected it's plain, with full ids.",
@@ -327,8 +329,9 @@ kept as [keys] next in config.toml; to change it: aca tmux key next <key>.
                     "  stop           让 agent 自己退出(3 秒不走再强制)。它那一格连最后的画面留着,同一个 tmux 会话里另开的窗口不动。
                  列表里标 ■
   --idle 时长    不写 id:停掉空闲了这么久的会话(30m、3h、1d、1h30m),列表里标 ☾,和一个个停的 ■ 分开。
-                 空闲从最后一次有动静算起:屏幕有输出(干活时转圈、计时一直在刷)、有人进去过、hook 报事、对话记录
-                 (连同子代理的)有写入。不停:这一轮没跑完的(hook 只报了开头,屏幕看着再闲也不停)、跑完没看的、
+                 空闲从最后一次有动静算起:hook 报这一轮开始 / 跑完、有人进去过、子代理的记录有写入;屏幕有输出
+                 (干活时转圈、计时一直在刷)、对话记录有写入只算一分钟以内的,更早的多半是闲着重画了一下
+                 (hook 从没报过事的,比如 shell,多久以前的都算)。不停:这一轮没跑完的(hook 只报了开头,屏幕看着再闲也不停)、跑完没看的、
                  在等你的、出错的、有人连着的、有后台任务的、输入框里有没发的字的、派出去的会话还开着的、
                  给自己定了还没到点的(Claude 的 CronCreate、/loop 的下一次:只在它进程里,停了就没了)、
                  再起接不上原来对话的。打出停了哪些
@@ -341,9 +344,11 @@ aca 界面开着时每 5 分钟照 stop --idle 3h 停一次(你连进哪个会�
                     "  stop           ask the agent to exit (forced after 3 seconds). Its pane stays with the last screen; other
                  windows in the same tmux session are left alone. Drawn ■ in the list
   --idle DURATION  without an id: stop the sessions idle this long (30m, 3h, 1d, 1h30m), drawn ☾ in the list,
-                 apart from the ■ of ones stopped one by one. Idle counts from the last sign of life: output on screen
-                 (a working agent's spinner and timer keep redrawing), someone attaching, a hook, a write to its
-                 conversation record (or a subagent's). Never stopped: a turn that hasn't finished (the hook reported
+                 apart from the ■ of ones stopped one by one. Idle counts from the last sign of life: a hook reporting
+                 a turn starting or finishing, someone attaching, a write to a subagent's record; output on screen (a
+                 working agent's spinner and timer keep redrawing) and writes to its conversation record count only
+                 within the last minute, as an older one is most likely an idle redraw (all of them count for one that
+                 never reported a hook, like a shell). Never stopped: a turn that hasn't finished (the hook reported
                  only its start, however idle the screen looks), finished-unread, waiting for you, failed, attached,
                  background tasks, unsent text in its input box, dispatched sessions still open, a schedule of its own
                  not yet due (Claude's CronCreate, /loop's next wakeup: they live only in its process), or one that
@@ -524,7 +529,7 @@ To pass a message to another session (without touching its input box, kept until
             Cmd {
                 names: &["seen"],
                 short: Tr::same("seen <id>"),
-                brief: Tr::new("标成看过了(◐ 跑完没看 → ○)", "mark as seen (◐ finished, unread → ○)"),
+                brief: Tr::new("标成看过了(◐ 没看 → ○)", "mark as seen (◐ unread → ○)"),
                 usage: &[Tr::same("seen <id>")],
                 more: Tr::same(""),
             },
@@ -762,7 +767,8 @@ Called from inside a session, it can only stop the ones it dispatched.",
                 more: Tr::new(
                     "  ls              登记了的账号:工具:名字、配置目录(不带参数也是它)。顺序是界面账号页里排的那个
   status          各账号登录着没有:问的是工具自己(claude auth status / codex login status),aca 不读凭据;
-                  配置目录不在的、目录其实是另一家的(把 ~/.codex 登记成了 Claude 的账号)也在这说
+                  配置目录不在的、目录其实是另一家的(把 ~/.codex 登记成了 Claude 的账号)也在这说。
+                  不登记时用的那个(装着的那家自己的 ~/.claude、~/.codex)也列在里面
   add             登记一个:往 config.toml 的 [accounts.claude] / [accounts.codex] 加一行「名字 = 目录」,
                   别的内容和注释不动;目录没有就建。目录是另一家的配置目录的不给登记
   rm              删一个登记:只去掉 config.toml 里那一行(删之前的存成 config.toml.bak-aca),
@@ -783,7 +789,8 @@ aca 不扫、不猜有哪些账号,也不碰登录:新建的目录要登录一�
                   set on the interface's accounts page
   status          whether each account is logged in: asks the tool itself (claude auth status / codex login status),
                   aca reads no credentials; also says when a config directory is missing or belongs to the other
-                  tool (~/.codex registered as a Claude account)
+                  tool (~/.codex registered as a Claude account). The one used when you name no account (an
+                  installed tool's own ~/.claude or ~/.codex) is listed too
   add             register one: adds a \"name = directory\" line under [accounts.claude] / [accounts.codex] in
                   config.toml, leaving everything else and the comments alone; creates the directory if missing.
                   A directory that is the other tool's config directory is refused
@@ -908,12 +915,17 @@ Same as $ in the interface. Reads local conversation records only, no network.",
                     "\
 想留着自己的状态栏时用:在 Claude 的 settings.json 里把 statusLine 的命令写成「aca limits -- 原来的命令」。
 记下的额度显示在计费面板顶上。状态栏也交给 aca 画的话用 aca statusline,不用这条。
+按模型分的周额度(Fable)状态栏里没有:账号的数动了,隔五分钟以上它在后台起 aca limits --ask 问 Claude 自己
+(claude -p 的 get_usage,和 /usage 同一个来源),只问登记过的账号。
 
 不过状态栏的记法:界面 ^S 的 m 打开(config.toml 的 [tools.claude] mod = true),aca 起 Claude 时带上自己的 mod,
 由它在 Claude 里调 aca limits --mod(你不用敲)。见 aca help config。",
                     "\
 For keeping your own status bar: in Claude's settings.json make the statusLine command \"aca limits -- <yours>\".
 The recorded quotas show at the top of the billing panel. To have aca draw the status bar too, use aca statusline.
+Per-model weekly quotas (Fable) aren't in the status bar: when an account's numbers move, at most every five minutes
+it starts aca limits --ask in the background to ask Claude itself (claude -p's get_usage, the same source as /usage);
+only registered accounts are asked.
 
 To record them without the status bar: turn on m in ^S of the interface ([tools.claude] mod = true in config.toml) and aca starts
 Claude with its own mod, which calls aca limits --mod inside Claude (you don't type it). See aca help config.",
@@ -934,7 +946,7 @@ Claude with its own mod, which calls aca limits --mod inside Claude (you don't t
   off           撤掉 aca 接的,恢复成接之前的样子
 
 不带参数是一张表:一行一个账号(登记了的,和没登记的 ~/.claude),Claude 的账号右边是状态栏的接法。
-  ↑↓ 挑账号 · ←→ 换接法(aca 画 / 自己的 + 记额度 / 不接)· a 都照这一行 · + 登记账号(名字、配置目录)· x 这次登记的不要了
+  ↑↓ 挑账号 · ←→ 换接法(aca 画 / 自己的 + 记额度 / 不接)· a 都照这一行 · + 加账号(名字、配置目录)· x 不加了
   ⏎ 照办:先登记账号,再改状态栏(只动挑的和现在不一样的),办了什么、新目录怎么登录打出来;Esc 什么都不动
 不在终端里跑就只列出来。不开表登记账号:aca account add。界面里设置页(^S)的账号页按 s 是同一张表。
 
@@ -948,7 +960,7 @@ Claude 只在状态栏的输入里给订阅额度,所以要在它每个账号的
 
 Without arguments it's a table: one row per account (the registered ones, and an unregistered ~/.claude); Claude
 accounts show how their status bar is wired on the right.
-  ↑↓ pick an account · ←→ change wiring (aca draws / yours + quotas / none) · a: all like this row · + register one · x: undo that
+  ↑↓ pick an account · ←→ change wiring (aca draws / yours + quotas / none) · a: all like this row · + add an account · x: don't add it
   ⏎ do it: register first, then change status bars (only rows changed), print what was done and how to log in; Esc: nothing
 Not in a terminal it only lists. Registering without the table: aca account add. In the interface's settings page (^S),
 s on the accounts opens the same table.
@@ -1014,8 +1026,8 @@ directory for 5 seconds. Colors are Catppuccin Latte; the icons need a Nerd Font
   next         进下一个在等你的(aca help next),默认 Ctrl+Alt+N。后面给一个键就换成它(tmux 的键名:M-n、C-M-n、F7),
                记在 config.toml 的 [keys] next,马上绑上
   --none       不要这个键(aca next 照样能敲)
-  tmux-status  状态栏上那一段,打出来像「 ! 2  ● 3」:只有种类和个数。! 在等你确认 / 选择(派出去的 worker 也算),
-               agent 停着等你,红底;● 跑完了还没看(只算你自己开的),次要的字色。名字不打:是谁、在问什么在列表里,
+  tmux-status  状态栏上那一段,打出来像「 ◆ 2  ◐ 3」:只有种类和个数,符号同列表。◆ 要你答(派出去的 worker 也算),
+               agent 停着等你,红底;◐ 没看:跑完了还没看(只算你自己开的),次要的字色。名字不打:是谁、在问什么在列表里,
                过去按 Ctrl+Alt+N(aca next)。后面 ⚠ bark 是出错了的插件(钩子、定时上次没跑成,gateway 的服务停下了;
                哪一处见 aca plugin ls)。id 是你正看着的会话(#{@aca_id}),不算它;都没有就什么都不打。
                tmux 每隔 status-interval 秒跑一次,所以只读状态文件和一条 tmux list-panes,不读屏幕:偶尔比列表慢一拍
@@ -1035,9 +1047,9 @@ aca 那份归 aca:每次 install 照新的重写,升级以后打开界面(^L 重
   next         go to the next session waiting for you (aca help next), Ctrl+Alt+N by default. Give a key to change it
                (a tmux key name: M-n, C-M-n, F7); kept as [keys] next in config.toml and bound at once
   --none       no key for it (aca next still works typed)
-  tmux-status  the status-bar segment, like \" ! 2  ● 3\": kinds and counts only. ! waits for your confirmation /
-               choice (dispatched workers count too): an agent is stopped until you answer, so it's a red block;
-               ● finished and not looked at (only the ones you started), in a minor color. No names: who and what they
+  tmux-status  the status-bar segment, like \" ◆ 2  ◐ 3\": kinds and counts only, same symbols as the list. ◆ needs you
+               (dispatched workers count too): an agent is stopped until you answer, so it's a red block;
+               ◐ unread: finished and not looked at (only the ones you started), in a minor color. No names: who and what they
                ask is in the list, and Ctrl+Alt+N (aca next) takes you there. Then ⚠ bark names plugins that are failing
                (a hook or timer failed last time, a gateway server stopped; aca plugin ls says where). The id is the
                session you're looking at (#{@aca_id}), which doesn't count; nothing to show prints nothing.
@@ -1353,7 +1365,7 @@ const CONFIG: &str = "\
   没登记的目录不用写在这:aca new codex:~/.codex-try
 
 工具
-  [tools.claude]                   # 内置的三家(claude / codex / shell)的默认值
+  [tools.claude]                   # 内置的几家(claude / codex / pi / opencode / shell)的默认值
   account = \"work\"                 # 没写账号时用哪个
   args = [\"--dangerously-skip-permissions\"]                   # 每次启动都带的参数
   env = { ANTHROPIC_BASE_URL = \"https://…\" }
@@ -1379,9 +1391,12 @@ const CONFIG: &str = "\
 
 闲着的会话(aca help stop;写错了只这一节当没写)
   [idle]
-  stop_after = \"3h\"                # 空闲这么久就停掉,列表里标 ☾(30m、3h、1d、1h30m;不写 = 不自动停)。aca 界面开着时每 5 分钟看一次;
+  stop_after = \"3h\"                # 空闲这么久就停掉,列表里标 ☾(30m、3h、1d、1h30m;never 或不写 = 不自动停)。aca 界面开着时每 5 分钟看一次;
                                    # 这一轮没跑完的、跑完没看的、在等你的、有人连着的、有后台任务的、输入框里有没发的字的、
                                    # 派出去的会话还开着的、给自己定了还没到点的定时的不停(aca help stop)。⏎ 接着原来的对话再起
+  remove_after = \"30d\"             # 停着(■ ☾,连归档的)这么久没动就删掉,和 d 一样进回收站,1 天内 ^Z / b 拿回来
+                                   # (never 或不写 = 不删)。置顶的、有便签的、派出去的会话还开着的不删。Claude 自己的对话记录
+                                   # 默认留 30 天,停得比这久的再起也接不上原来的对话
 
 aca 绑在 tmux 上的键(不用前缀,只在 aca 的会话里拦;不写进你的 tmux.conf)
   [keys]
@@ -1423,7 +1438,7 @@ Accounts = what to bring along when starting an agent, written once in its own t
   Unregistered directories don't need to be here: aca new codex:~/.codex-try
 
 Tools
-  [tools.claude]                   # defaults for the three built-ins (claude / codex / shell)
+  [tools.claude]                   # defaults for the built-ins (claude / codex / pi / opencode / shell)
   account = \"work\"                 # which account when none is given
   args = [\"--dangerously-skip-permissions\"]                   # arguments for every start
   env = { ANTHROPIC_BASE_URL = \"https://…\" }
@@ -1450,10 +1465,14 @@ Startup gates
 
 Idle sessions (aca help stop; a mistake drops only this)
   [idle]
-  stop_after = \"3h\"                # stop sessions idle this long, drawn ☾ in the list (30m, 3h, 1d, 1h30m; unset = never).
+  stop_after = \"3h\"                # stop sessions idle this long, drawn ☾ in the list (30m, 3h, 1d, 1h30m; never or unset = never).
                                    # Checked every 5 minutes while the aca interface is open; never mid-turn, finished-unread,
                                    # waiting for you, attached, with background tasks or unsent text, with dispatched
                                    # sessions still open, or with a schedule of its own not yet due (aca help stop). ⏎ resumes
+  remove_after = \"30d\"             # delete sessions stopped (■ ☾, archived ones too) this long, into the trash like d: ^Z / b
+                                   # brings them back within a day (never or unset = never). Not pinned ones, ones with a note,
+                                   # or ones with dispatched sessions still open. Claude keeps its own records 30 days by
+                                   # default, so one stopped longer can't resume its conversation anyway
 
 Keys aca binds in tmux (no prefix, only inside aca's sessions; nothing written to your tmux.conf)
   [keys]

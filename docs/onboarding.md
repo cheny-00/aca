@@ -28,7 +28,7 @@ or you would rather download it yourself? [Install](../README.md#install) in the
 When it finishes you should see:
 
 ```
-Installed: /Users/you/.local/bin/aca (aca 0.1.0)
+Installed aca 0.1.0 (ceaf172 2026-10-19) at /Users/you/.local/bin/aca
 Next:
   aca setup    optional: register extra accounts and choose whether aca shows Claude's usage limits; Esc changes nothing
   aca          open the interface (n starts a session, ? lists the keys)
@@ -57,8 +57,8 @@ You see an empty list. Now:
 2. Pick Claude or Codex with its number.
 3. Type the directory of a project (Tab completes paths) and press `Enter`.
 
-A session appears in the list, and its live screen shows on the right. Press `Enter` to go in. You are now
-talking to the agent exactly as if you had started it yourself.
+The session starts and aca takes you straight into it. You are now talking to the agent exactly as if you
+had started it yourself. Later, `Enter` on a session in the list goes into it again.
 
 ### Two questions you will be asked the first time
 
@@ -103,7 +103,8 @@ mark in front of each session tells you its state:
 | Mark | Meaning | What to do |
 |---|---|---|
 | `●` | The agent is working | Nothing. Let it run |
-| `◐` | It is waiting for you (a question, a permission prompt), or it finished and you haven't read the result | Go in. `i` takes you to the next one like this |
+| `◆` | Needs you: a question or a permission prompt | Go in and answer. `i` takes you to the next one to look at |
+| `◐` | Unread: it finished and you haven't read the result | Go in and look |
 | `○` | Idle, and you have seen its last reply | |
 | `✕` | Something went wrong | Go in and look |
 | `■` | Not running | `Enter` starts it again and resumes the conversation |
@@ -222,7 +223,8 @@ aca send "$id" -m 'now add a test for it'
 | What you see | Likely cause and fix |
 |---|---|
 | `aca: command not found` | `~/.local/bin` is not on your `PATH`. See step 2 |
-| A new session shows `■` straight away | The agent exited as soon as it started. Run `claude` (or `codex`) on its own in that directory and fix what it reports, usually a missing login |
+| A new session shows the agent's own welcome or sign-in screen | It is not logged in. Log in right there in the session. `aca account status` (or `Ctrl+S` then `a`) shows which ones are logged in, the defaults `~/.claude` and `~/.codex` included |
+| A new session shows `■` straight away | The agent exited as soon as it started. Run `claude` (or `codex`) on its own in that directory and fix what it reports |
 | A Codex session finishes but is never marked `◐` (finished, not read yet) | Its hooks were not approved. Restart it (`R`) and choose "Trust all" when Codex asks. See step 3 |
 | `Ctrl+Q` does nothing | You are in a tmux session aca did not start: use the tmux prefix then `d`. Or your terminal or tmux configuration already uses `Ctrl+Q` |
 | Boxes or question marks instead of icons in Claude's status bar | The status bar drawn by aca uses Nerd Font icons. Install a [Nerd Font](https://www.nerdfonts.com), or choose `wrap` in `aca setup` to keep your own status bar |

@@ -63,11 +63,13 @@ pub struct Menu {
     logins: Arc<Mutex<HashMap<String, Login>>>,
 }
 
-/// 这一家所有账号现在的额度:Claude 是状态栏记下的(`limits`),Codex 读它最近的对话记录(`usage::codex_now`)
+/// 这一家所有账号现在的额度:Claude 是状态栏记下的(`limits`),Codex 读它最近的对话记录(`usage::codex_now`,
+/// 用 API key 登录的没有,见 `usage::subscribed`)
 pub fn quotas(agent: Agent) -> Vec<Quota> {
     let cfg = aca_core::config::load();
     let home = std::env::var("HOME").unwrap_or_default();
-    let srcs: Vec<Source> = crate::usage::sources(&crate::data::accounts(&cfg), &home);
+    let accounts = crate::data::accounts(&cfg);
+    let srcs: Vec<Source> = crate::usage::sources(&accounts, &home);
     match agent {
         Agent::Claude => crate::limits::dir()
             .map(|d| crate::limits::quotas(&d, &srcs, crate::limits::now()))
@@ -75,14 +77,50 @@ pub fn quotas(agent: Agent) -> Vec<Quota> {
             .into_iter()
             .filter(|q| q.agent == Agent::Claude)
             .collect(),
-        Agent::Codex => srcs.iter().filter(|s| s.agent == Agent::Codex).filter_map(crate::usage::codex_now).collect(),
+        Agent::Codex => {
+            let now = srcs.iter().filter(|s| s.agent == Agent::Codex).filter_map(crate::usage::codex_now).collect();
+            crate::usage::subscribed(now, &accounts, &home)
+        }
         _ => vec![],
     }
 }
 
 /// 额度按账号名对上(两个账号共用一个目录的记成「甲·乙」,写哪个都算)
-fn quota_of(qs: &[Quota], agent: Agent, name: &str) -> Option<Quota> {
+pub fn quota_of(qs: &[Quota], agent: Agent, name: &str) -> Option<Quota> {
     qs.iter().find(|q| q.agent == agent && !name.is_empty() && (q.who == name || q.who.split('·').any(|w| w == name))).cloned()
+}
+
+/// 「5h 98% · 7d 61%  今天 17:00 重置」:颜色同计费页;用满了的说什么时候重置,数是一小时前的说一声;没记到的空着。
+/// at 是拿额度的时刻,off 是本地时区偏移。`n` 的菜单也用它
+pub fn quota_spans(q: Option<&Quota>, at: i64, off: i64) -> Vec<Span<'static>> {
+    let Some(q) = q else { return vec![] };
+    let p = theme::pal();
+    let mut v = vec![];
+    for (i, win) in q.wins.iter().enumerate() {
+        if i > 0 {
+            v.push(Span::styled(" · ", theme::faint()));
+        }
+        v.push(Span::styled(format!("{} ", win.label), kit::dim()));
+        // 过了重置时间还没有新数:不知道现在用了多少,只知道重置过
+        if win.resets.is_some_and(|r| r <= at) {
+            v.push(Span::styled(t!("已重置", "reset"), Style::new().fg(p.green)));
+            continue;
+        }
+        let color = match win.used {
+            u if u >= 90.0 => Some(p.red),
+            u if u >= 70.0 => Some(p.amber),
+            _ => None,
+        };
+        v.push(Span::styled(format!("{:.0}%", win.used), color.map_or(Style::new(), |c| Style::new().fg(c)).add_modifier(Modifier::BOLD)));
+    }
+    let full = q.wins.iter().filter(|w| w.used >= 100.0).filter_map(|w| w.resets).filter(|r| *r > at).max();
+    if let Some(r) = full {
+        v.push(Span::styled(tr!("  {} 重置", "  resets {}", crate::bill::when(r, at, off)), kit::dim()));
+    }
+    if q.updated > 0 && at - q.updated > 3600 {
+        v.push(Span::styled(tr!("  ({}的数)", "  (as of {})", crate::bill::ago(q.updated, at)), kit::dim()));
+    }
+    v
 }
 
 impl Menu {
@@ -145,50 +183,15 @@ impl Menu {
             return Flow::Stay;
         }
         if self.login(r) == Some(Login::Out) {
-            fx.flash = Some(tr!(
-                "{} 没登录 · a 去账号页登录,登好再按 X",
-                "{} isn't logged in · a opens the accounts page; log in, then X again",
-                r.name
-            ));
+            fx.flash = Some(tr!("{} 没登录 · a 去登录", "{} isn't logged in · a to log in", r.name));
             return Flow::Stay;
         }
         fx.job = Some(Job::Rehome { t: self.t.clone(), to: r.spec.clone(), label: r.name.clone() });
         Flow::Close
     }
 
-    /// 「5h 98% · 7d 61%  今天 17:00 重置」:颜色同计费页;用满了的说什么时候重置,数是一小时前的说一声
     fn quota_spans(&self, q: Option<&Quota>) -> Vec<Span<'static>> {
-        let Some(q) = q else { return vec![Span::styled(t!("额度没记到", "no quota on record"), kit::dim())] };
-        let p = theme::pal();
-        let mut v = vec![];
-        for (i, win) in q.wins.iter().enumerate() {
-            if i > 0 {
-                v.push(Span::styled(" · ", theme::faint()));
-            }
-            v.push(Span::styled(format!("{} ", win.label), kit::dim()));
-            // 过了重置时间还没有新数:不知道现在用了多少,只知道重置过
-            if win.resets.is_some_and(|r| r <= self.at) {
-                v.push(Span::styled(t!("已重置", "reset"), Style::new().fg(p.green)));
-                continue;
-            }
-            let color = match win.used {
-                u if u >= 90.0 => Some(p.red),
-                u if u >= 70.0 => Some(p.amber),
-                _ => None,
-            };
-            v.push(Span::styled(
-                format!("{:.0}%", win.used),
-                color.map_or(Style::new(), |c| Style::new().fg(c)).add_modifier(Modifier::BOLD),
-            ));
-        }
-        let full = q.wins.iter().filter(|w| w.used >= 100.0).filter_map(|w| w.resets).filter(|r| *r > self.at).max();
-        if let Some(r) = full {
-            v.push(Span::styled(tr!("  {} 重置", "  resets {}", crate::bill::when(r, self.at, self.off)), kit::dim()));
-        }
-        if q.updated > 0 && self.at - q.updated > 3600 {
-            v.push(Span::styled(tr!("  ({}的数)", "  (as of {})", crate::bill::ago(q.updated, self.at)), kit::dim()));
-        }
-        v
+        quota_spans(q, self.at, self.off)
     }
 
     /// 登录那一栏,宽度固定(后面的额度对得齐)
@@ -226,16 +229,9 @@ impl Overlay for Menu {
         out.extend([Line::from(now), Line::raw("")]);
         if self.rows.is_empty() {
             let kind = if self.agent == Agent::Codex { "Codex" } else { "Claude" };
-            out.push(Line::raw(tr!("没有别的 {kind} 账号可以换。", "There's no other {kind} account to move to.")));
-            out.push(Line::raw(t!("按 + 加一个,登录好再按 X。", "Press + to add one; once it's logged in, press X again.")));
-            out.push(Line::raw(""));
-            out.push(kit::keys_line(&[("+", t!("加账号", "add account")), ("Esc", t!("关闭", "close"))], vec![], w));
+            out.push(Line::raw(tr!("没有别的 {kind} 账号 · + 加一个", "No other {kind} account · + adds one")));
             return out;
         }
-        out.push(Line::styled(
-            t!("换到哪个账号 —— 对话整段带过去,在原地重启:", "Move it to — the whole conversation comes along, restarted in place:"),
-            Style::new().add_modifier(Modifier::BOLD),
-        ));
         let name_w = self.rows.iter().map(|r| r.name.width()).max().unwrap_or(0).clamp(4, 12);
         for (i, r) in self.rows.iter().enumerate() {
             let on = i == self.sel;
@@ -256,24 +252,12 @@ impl Overlay for Menu {
         }
         out.push(Line::raw(""));
         if self.busy {
-            out.push(Line::styled(
-                t!("⚠ 它正在跑 / 在等你选:换账号会打断这一轮", "⚠ it's running or waiting for you: switching interrupts this turn"),
-                theme::warn(),
-            ));
+            out.push(Line::styled(t!("⚠ 换了会打断这一轮", "⚠ switching interrupts this turn"), theme::warn()));
         }
-        out.push(Line::raw(t!(
-            "新账号的缓存是空的:头一轮要把整段上下文重新写一遍缓存",
-            "The new account's cache is cold: the first turn writes the whole context to it again"
-        )));
+        out.push(Line::raw(t!("新账号头一轮要重建缓存", "The new account rebuilds the cache on its first turn")));
         out.push(Line::raw(""));
         out.push(kit::keys_line(
-            &[
-                ("⏎", t!("换过去", "switch")),
-                ("1-9", t!("直接换", "pick")),
-                ("a", t!("账号页·登录", "accounts · log in")),
-                ("+", t!("加账号", "add")),
-                ("Esc", t!("取消", "cancel")),
-            ],
+            &[("⏎", t!("换过去", "switch")), ("a", t!("账号页", "accounts")), ("+", t!("加账号", "add account"))],
             vec![],
             w,
         ));

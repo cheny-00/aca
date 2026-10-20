@@ -30,7 +30,7 @@ die() {
   exit 1
 }
 
-command -v jq >/dev/null 2>&1 || die "$(t 'aca.tailnet 要用 jq,PATH 里没有(macOS 15 以上自带 /usr/bin/jq;别的:brew install jq)' 'aca.tailnet needs jq, which is not on PATH (macOS 15+ ships /usr/bin/jq; otherwise: brew install jq)')"
+command -v jq >/dev/null 2>&1 || die "$(t 'aca.tailnet 要用 jq,PATH 里没有(macOS 15 以上自带 /usr/bin/jq;别的用包管理器装:brew / apt / dnf install jq)' 'aca.tailnet needs jq, which is not on PATH (macOS 15+ ships /usr/bin/jq; otherwise install it with your package manager: brew / apt / dnf install jq)')"
 TS=$(command -v tailscale 2>/dev/null) || TS=
 [ -z "$TS" ] && [ -x "$APP" ] && TS=$APP
 TPUB=$(command -v tpub 2>/dev/null) || TPUB=

@@ -1,7 +1,8 @@
 //! hook 事件 → 会话状态。这就是 aca 的 **hook 协议**:Claude Code 和 Codex 的 hook 天生是这个形状
 //! (事件名、`session_id`、`transcript_path`、`prompt`、`last_assistant_message`、`tool_name` / `tool_input` …),
 //! 别的 agent 写个转发按这个形状报就行。
-//! 哪家没有的事件(Codex 没有 AskUserQuestion,Claude 没有 Interrupt)自然走不到那一支。
+//! 哪家没有的事件(Claude 没有 Interrupt)自然走不到那一支。问你的题 Claude 是 AskUserQuestion、Codex 是 request_user_input,
+//! 载荷是同一个形状(`tool_input.questions[0].question`、`options[].label`)。
 //! 协议比 Claude 多一个字段:`title`,任何事件上都能带,是 agent 自己起的标题。
 
 use serde_json::{Value, json};
@@ -33,7 +34,7 @@ fn waiting(r: &mut Run, ask: String, kind: &str, out: &mut Events) {
     }
 }
 
-/// AskUserQuestion 的题:记下第一题的选项(`aca answer` 按数字答),一次问好几题或者能多选的标出来
+/// AskUserQuestion / request_user_input 的题:记下第一题的选项(`aca answer` 按数字答),一次问好几题或者能多选的标出来
 fn choice(r: &mut Run, input: &Value) {
     let qs = input["questions"].as_array().map(Vec::as_slice).unwrap_or_default();
     let first = qs.first().unwrap_or(&Value::Null);
@@ -92,7 +93,7 @@ pub fn error_kind(text: &str) -> &'static str {
     }
 }
 
-/// 它用 AskUserQuestion 问你:第一题的那句就是「它问的」
+/// 它用 AskUserQuestion / request_user_input 问你:第一题的那句就是「它问的」
 fn question(r: &mut Run, v: &Value, out: &mut Events) {
     let q = v["tool_input"]["questions"][0]["question"].as_str().unwrap_or("").to_string();
     // 选项先记上:「在等你」的那个事件里带着它们
@@ -140,7 +141,7 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
             r.clear_error();
             out.push(("turn.started", json!({ "prompt": r.prompt })));
         }
-        // 只挂了 AskUserQuestion:它在问你
+        // 只挂了问你的那个工具(Claude 的 AskUserQuestion、Codex 的 request_user_input):它在问你
         "PreToolUse" => question(r, v, &mut out),
         "PostToolUse" if r.status == "waiting" => {
             r.status = "running".into();
@@ -348,6 +349,30 @@ mod tests {
         );
         assert_eq!(ev(&mut r, r#"{"session_id":"01a0","turn_id":"t1","hook_event_name":"Interrupt"}"#, 13), ["turn.interrupted"]);
         assert_eq!((r.status.as_str(), r.done, r.conv.as_str()), ("idle", 0, "01a0"));
+    }
+
+    #[test]
+    fn codex_asks_with_request_user_input_and_reports_its_compaction_like_claude() {
+        // Codex 0.163 实际发来的(去掉了路径、id):Plan 模式里问你一道题,答完;手动 /compact
+        let mut r = Run { status: "running".into(), ..Default::default() };
+        let pre = r#"{"session_id":"01a1","hook_event_name":"PreToolUse","permission_mode":"default","tool_name":"request_user_input","tool_input":{"questions":[{"header":"Choice","id":"choice","question":"Choose option A or option B.","options":[{"label":"Option A","description":"Select option A."},{"label":"Option B","description":"Select option B."}]}]},"tool_use_id":"call_05"}"#;
+        assert_eq!(ev(&mut r, pre, 1), ["agent.waiting"]);
+        assert_eq!(
+            (r.status.as_str(), r.ask.as_str(), r.ask_kind.as_str(), r.ask_opts.as_slice(), r.ask_multi),
+            ("waiting", "Choose option A or option B.", "choice", ["Option A".to_string(), "Option B".to_string()].as_slice(), false)
+        );
+        let post = r#"{"session_id":"01a1","hook_event_name":"PostToolUse","tool_name":"request_user_input","tool_response":"{\"answers\":{\"choice\":{\"answers\":[\"Option B\"]}}}"}"#;
+        ev(&mut r, post, 2);
+        assert_eq!((r.status.as_str(), r.ask_kind.as_str()), ("running", ""));
+        // 权限框:Bash 加一句为什么要
+        let perm = r#"{"session_id":"01a1","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"touch made.txt","description":"Allow creating made.txt in the current directory?"}}"#;
+        assert_eq!(ev(&mut r, perm, 3), ["agent.waiting"]);
+        assert_eq!((r.ask.as_str(), r.ask_kind.as_str()), ("Bash:touch made.txt", "permission"));
+        let mut idle = Run { status: "done".into(), done: 4, ..Default::default() };
+        ev(&mut idle, r#"{"session_id":"01a1","hook_event_name":"PreCompact","trigger":"manual"}"#, 5);
+        assert_eq!((idle.status.as_str(), idle.compacting), ("done", 5));
+        ev(&mut idle, r#"{"session_id":"01a1","hook_event_name":"PostCompact","trigger":"manual"}"#, 9);
+        assert_eq!((idle.status.as_str(), idle.done, idle.compacting), ("done", 4, 0));
     }
 
     #[test]

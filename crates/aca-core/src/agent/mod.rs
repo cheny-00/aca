@@ -23,6 +23,8 @@ pub mod claude_mod;
 mod codex;
 pub mod declared;
 pub mod lifecycle;
+mod opencode;
+mod pi;
 mod shell;
 
 use std::path::{Path, PathBuf};
@@ -114,8 +116,9 @@ pub trait Agent: Sync {
     /// 要跑的命令:第一个是程序名(还没换成完整路径)。`aca` 是 hook 要回头调的那个程序
     fn argv(&self, tool: &Tool, s: &Session, how: &How, aca: &str) -> Res<Vec<String>>;
 
-    /// 启动时再放进环境的(hook / 扩展要靠环境变量带进去的那几家用,比如指一个只有 aca 插件的配置目录)
-    fn env(&self, _tool: &Tool, _aca: &str) -> Res<Vec<(String, String)>> {
+    /// 启动时再放进环境的(hook / 扩展要靠环境变量带进去的那几家用,比如 opencode 的 `OPENCODE_CONFIG_CONTENT`)。
+    /// `set` 是工具、账号那两层已经要放的(同名的以这里返回的为准:要合进去的自己合)
+    fn env(&self, _tool: &Tool, _aca: &str, _set: &[(String, String)]) -> Res<Vec<(String, String)>> {
         Ok(vec![])
     }
 
@@ -192,8 +195,9 @@ pub trait Agent: Sync {
         None
     }
 
-    /// 中止正在跑的这一轮按的键(`aca interrupt`)。None = 没试过,不替它按
-    fn interrupt_key(&self) -> Option<&'static str> {
+    /// 中止正在跑的这一轮按的键(`aca interrupt`),一个一个按、中间隔一下(opencode 要连按两下 Esc,
+    /// 同一下送进去的两个它只当成一个)。None = 没试过,不替它按
+    fn interrupt_keys(&self) -> Option<&'static [&'static str]> {
         None
     }
 
@@ -279,7 +283,7 @@ pub(crate) fn optional(rest: &[String], names: &[&str]) -> usize {
 }
 
 /// 内置的几家。**加一家 = 这个目录加一个文件,这里加一行**
-static BUILTIN: &[&dyn Agent] = &[&claude::Claude, &codex::Codex, &shell::Shell];
+static BUILTIN: &[&dyn Agent] = &[&claude::Claude, &codex::Codex, &pi::Pi, &opencode::Opencode, &shell::Shell];
 
 pub fn builtin(kind: &str) -> Option<&'static dyn Agent> {
     BUILTIN.iter().copied().find(|a| a.name() == kind)
@@ -532,6 +536,18 @@ fn codex_home(env: &[(String, String)]) -> std::path::PathBuf {
     home.map(std::path::PathBuf::from).unwrap_or_else(|| paths::home().join(".codex"))
 }
 
+/// 文件末尾这么多字节,从下一个整行开始(读对话记录的最后几段)
+pub(crate) fn tail(path: &str, n: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let start = f.metadata().ok()?.len().saturating_sub(n);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Some(if start == 0 { text } else { text.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or_default() })
+}
+
 /// hook 要用的文件(Claude 的 settings、扩展脚本……)放在 `state/hooks/<名字>`:写好(内容没变就不动),返回路径
 pub(crate) fn hook_file(name: &str, content: &str) -> Res<PathBuf> {
     let path = paths::state_dir().join("hooks").join(name);
@@ -570,7 +586,8 @@ pub fn launch(cfg: &Config, s: &Session, how: &How, say: Option<&str>) -> Res<La
         let file = opening_file(&s.id, text)?;
         cmd = [aca.clone(), "exec-saying".to_string(), file].into_iter().chain(cmd).chain(lead).collect();
     }
-    env.extend(agent.env(&tool, &aca)?);
+    let more = agent.env(&tool, &aca, &env)?;
+    env.extend(more);
     env.extend([("ACA_SESSION_ID".to_string(), s.id.clone()), ("ACA_TOOL".to_string(), s.tool.clone()), ("ACA_BIN".to_string(), aca)]);
     // 换了目录 / 换了 tmux 服务的(测试),会话里的 hook 也得写到同一个地方
     for k in ["ACA_HOME", "ACA_TMUX_SOCKET"] {

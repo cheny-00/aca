@@ -57,7 +57,7 @@ pub fn default_dir(a: Agent, name: &str) -> String {
 /// 带着这个账号跑它自己的命令(`aca run <家>:<账号> -- 参数`):环境由 aca 叠好,外层会话留下的身份变量也拿掉了
 fn run_cmd(a: Agent, name: &str, args: &str) -> String {
     let aca = aca_core::agent::self_exe().replace('\'', "'\\''");
-    let spec = format!("{}:{name}", fam(a).unwrap_or("claude"));
+    let spec = crate::tools::spec(fam(a).unwrap_or("claude"), name);
     if args.is_empty() { format!("'{aca}' run {spec}") } else { format!("'{aca}' run {spec} -- {args}") }
 }
 
@@ -152,6 +152,35 @@ fn ordered(text: &str, home: &str, menu: &[String]) -> Vec<(Account, String)> {
     out
 }
 
+/// 不登记时各家用的那个(`aca new claude` 不写账号时):账号名空着,目录是它自己的 ~/.claude / ~/.codex。
+/// 装着的才算;写了默认账号(`[tools.<家>] account`)的、自己的目录已经登记成账号的不算 —— 那就是列着的那一个。
+/// `aca account status`、账号页拿它说登录着没有:没登记过账号的新用户也看得出来
+pub(crate) fn defaults(text: &str, home: &str, installed: fn(&str) -> bool) -> Vec<Account> {
+    let cfg = aca_core::config::parse(text);
+    let listed = listed(text, home);
+    let mut out = vec![];
+    for a in [Agent::Claude, Agent::Codex] {
+        let Some(f) = fam(a) else { continue };
+        let Some(tool) = cfg.tool(f) else { continue };
+        let own = format!("{home}/.{f}");
+        let taken = !tool.account.is_empty() || listed.iter().any(|(x, abs)| x.agent == a && *abs == own);
+        let prog = tool.cmd.first().map_or(f, String::as_str);
+        if !taken && installed(prog) {
+            out.push(Account { agent: a, name: String::new(), dir: format!("~/.{f}") });
+        }
+    }
+    out
+}
+
+/// 这个程序装了没有:写了 / 的看那个文件(~ 展开),不然在 PATH 里找
+pub(crate) fn on_path(prog: &str) -> bool {
+    if prog.contains('/') {
+        return Path::new(&expand(prog, &home())).is_file();
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path).any(|d| d.join(prog).is_file())
+}
+
 /// 一个目录里哪些文件是哪一家自己才有的(两家都有的 history.jsonl、sessions、plugins 不算)
 const MARKS: [(Agent, &[&str]); 2] = [
     (Agent::Claude, &[".claude.json", "settings.json", "projects", "CLAUDE.md", "shell-snapshots", ".credentials.json"]),
@@ -186,8 +215,8 @@ pub(crate) fn foreign(a: Agent, abs: &str, home: &str) -> Option<(Agent, String)
 /// 登记不了的那句话
 fn foreign_said(a: Agent, shown: &str, (other, why): &(Agent, String)) -> String {
     tr!(
-        "{shown} 是 {} 的配置目录({why}),不能登记成 {} 的账号",
-        "{shown} is a {} config directory ({why}); it can't be a {} account",
+        "{shown} 是 {} 的目录({why}),不能加成 {} 的账号",
+        "{shown} is a {} directory ({why}); it can't be a {} account",
         who(*other),
         who(a)
     )
@@ -243,7 +272,7 @@ fn first_line(out: &str) -> String {
 /// 问工具自己这个账号登录着没有:带着账号的环境跑它的命令(`aca run <家>:<账号> -- …`),只读,几秒没答就不等了
 pub fn login(a: Agent, name: &str) -> Login {
     use std::process::{Command, Stdio};
-    let spec = format!("{}:{name}", fam(a).unwrap_or("claude"));
+    let spec = crate::tools::spec(fam(a).unwrap_or("claude"), name);
     let ask: &[&str] = if a == Agent::Codex { &["login", "status"] } else { &["auth", "status", "--json"] };
     let mut cmd = Command::new(aca_core::agent::self_exe());
     cmd.args(["run", &spec, "--"]).args(ask).current_dir(home()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -417,12 +446,8 @@ fn drop_line(text: &str, fam: &str, name: &str) -> Result<String, String> {
         .to_string()
     };
     let doc: Table = text.parse().map_err(|_| t!("config.toml 格式不对,没改", "config.toml is malformed; nothing changed").to_string())?;
-    let header = Regex::new(&format!(r"(?m)^[ \t]*\[[ \t]*accounts[ \t]*\.[ \t]*{fam}[ \t]*\][ \t]*(?:#[^\n]*)?(?:\r?\n|\z)")).unwrap();
-    let h = header.find(text).ok_or_else(odd)?;
-    let end = next_table(text, h.end());
-    let key = Regex::new(&format!(r#"(?m)^[ \t]*["']?{}["']?[ \t]*=[^\n]*(?:\n|\z)"#, regex::escape(name))).unwrap();
-    let line = key.find(&text[h.end()..end]).ok_or_else(odd)?;
-    let out = format!("{}{}", &text[..h.end() + line.start()], &text[h.end() + line.end()..]);
+    let line = account_line(text, fam, name).ok_or_else(odd)?;
+    let out = format!("{}{}", &text[..line.start], &text[line.end..]);
     let keys = ["accounts", fam, name];
     let back: Table = out.parse().map_err(|_| odd())?;
     let gone = back.get("accounts").and_then(|a| a.get(fam)).and_then(|f| f.get(name)).is_none();
@@ -430,6 +455,145 @@ fn drop_line(text: &str, fam: &str, name: &str) -> Result<String, String> {
         return Err(odd());
     }
     Ok(out)
+}
+
+/// `[accounts.<家>]` 下 `名 = …` 那一行在哪(连着行尾的换行)。没有这一节、这一行的 = None
+fn account_line(text: &str, fam: &str, name: &str) -> Option<std::ops::Range<usize>> {
+    let header = Regex::new(&format!(r"(?m)^[ \t]*\[[ \t]*accounts[ \t]*\.[ \t]*{fam}[ \t]*\][ \t]*(?:#[^\n]*)?(?:\r?\n|\z)")).unwrap();
+    let h = header.find(text)?;
+    let end = next_table(text, h.end());
+    let key = Regex::new(&format!(r#"(?m)^[ \t]*["']?{}["']?[ \t]*=[^\n]*(?:\n|\z)"#, regex::escape(name))).unwrap();
+    let line = key.find(&text[h.end()..end])?;
+    Some(h.end() + line.start()..h.end() + line.end())
+}
+
+/// 一个账号的值写成一行:只有目录的写成 `"目录"`,别的写成 `{ home = …, args = […] }`,目录在前、参数在后
+fn inline(v: &Value) -> String {
+    let Value::Table(t) = v else { return v.to_string() };
+    let first = ["home", "env", "env_file"];
+    let mut keys: Vec<&String> = t.keys().filter(|k| *k != "args").collect();
+    keys.sort_by_key(|k| first.iter().position(|f| f == k).unwrap_or(first.len()));
+    keys.extend(t.keys().filter(|k| *k == "args"));
+    let parts: Vec<String> = keys.into_iter().map(|k| format!("{k} = {}", inline(&t[k.as_str()]))).collect();
+    if parts.is_empty() { "{}".into() } else { format!("{{ {} }}", parts.join(", ")) }
+}
+
+/// config.toml 里换掉一个账号自己的启动参数(`args`)。`名 = "目录"` 加了参数写成 `名 = { home = "目录", args = […] }`,
+/// 参数清空后只剩目录的写回 `名 = "目录"`;那一行后面的注释留着。写成一张表的(`[accounts.<家>.<名>]`)改它的 args 那一行。
+/// 别的一个字不动;一个值占好几行之类认不出的不改
+fn with_args(text: &str, fam: &str, name: &str, args: &[String]) -> Result<String, String> {
+    let odd = || {
+        t!(
+            "这个账号在 config.toml 里的写法认不出,没改(自己改那几行)",
+            "can't make out how this account is written in config.toml; nothing changed (edit those lines yourself)"
+        )
+        .to_string()
+    };
+    let doc: Table = text.parse().map_err(|_| t!("config.toml 格式不对,没改", "config.toml is malformed; nothing changed").to_string())?;
+    let old = doc.get("accounts").and_then(|a| a.get(fam)).and_then(|f| f.get(name)).cloned();
+    let old = old.ok_or_else(|| tr!("没有这个账号:{fam}:{name}", "no such account: {fam}:{name}"))?;
+    let list = Value::Array(args.iter().cloned().map(Value::String).collect());
+    let line = account_line(text, fam, name);
+    // 改完它该是什么样
+    let want = match (&old, &line) {
+        (Value::String(dir), Some(_)) if args.is_empty() => Value::String(dir.clone()),
+        (Value::String(dir), Some(_)) => {
+            Value::Table(Table::from_iter([("home".into(), Value::String(dir.clone())), ("args".into(), list.clone())]))
+        }
+        (Value::Table(t), Some(_)) => {
+            let mut t = t.clone();
+            if args.is_empty() {
+                t.remove("args");
+            } else {
+                t.insert("args".into(), list.clone());
+            }
+            match (t.len(), t.get("home")) {
+                (1, Some(Value::String(dir))) => Value::String(dir.clone()),
+                _ => Value::Table(t),
+            }
+        }
+        (Value::Table(t), None) => {
+            let mut t = t.clone();
+            t.insert("args".into(), list.clone());
+            Value::Table(t)
+        }
+        _ => return Err(odd()),
+    };
+    if want == old {
+        return Ok(text.to_string());
+    }
+    let out = match line {
+        Some(line) => {
+            let row = &text[line.clone()];
+            let eq = row.find('=').ok_or_else(odd)?;
+            // 值到哪为止:后面有注释的话,# 前面那一段单独读得出原来的值
+            let rest = row[eq + 1..].trim_end_matches(['\n', '\r']);
+            let same = |v: &str| format!("x = {v}").parse::<Table>().is_ok_and(|t| t.get("x") == Some(&old));
+            let cut = rest.char_indices().filter(|(_, c)| *c == '#').map(|(i, _)| i).chain([rest.len()]).find(|i| same(&rest[..*i]));
+            let cut = cut.ok_or_else(odd)?;
+            let gap = &rest[rest[..cut].trim_end().len()..cut];
+            let tail = &row[eq + 1 + rest.len()..];
+            format!("{}{} {}{gap}{}{tail}{}", &text[..line.start], &row[..=eq], inline(&want), &rest[cut..], &text[line.end..])
+        }
+        // 写成一张表的:改它下面 args 那一行
+        None => crate::config::with_value(text, &format!("accounts.{fam}.{name}"), "args", &list).ok_or_else(odd)?,
+    };
+    let keys = ["accounts", fam, name];
+    let back: Table = out.parse().map_err(|_| odd())?;
+    let got = back.get("accounts").and_then(|a| a.get(fam)).and_then(|f| f.get(name));
+    if got != Some(&want) || without(doc, &keys) != without(back, &keys) {
+        return Err(odd());
+    }
+    Ok(out)
+}
+
+/// 换一个账号自己的启动参数(删之前的存成 config.toml.bak-aca)。回 false = 和原来一样,没写
+pub(crate) fn set_args_in(path: &Path, a: Agent, name: &str, args: &[String]) -> Result<bool, String> {
+    let fam = fam(a).ok_or(t!("只有 Claude / Codex 的账号", "only Claude / Codex have accounts"))?;
+    let text = read(path).map_err(|e| tr!("读不了 config.toml:{e}", "can't read config.toml: {e}"))?;
+    let new = with_args(&text, fam, name, args)?;
+    if new == text {
+        return Ok(false);
+    }
+    if !write(path, &text, &new).map_err(|e| tr!("写 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
+        return Err(t!("config.toml 刚被改过,再存一次", "config.toml just changed; save again").into());
+    }
+    Ok(true)
+}
+
+/// config.toml 里换掉这一家每个账号都带的启动参数(`[tools.<家>] args`):那一行后面的注释留着(账号那一行也是),
+/// 没有这一行加在表头下面,没有这一段加在最后;别的一个字不动。认不出的写法不改
+fn with_common_args(text: &str, fam: &str, args: &[String]) -> Result<String, String> {
+    let list = Value::Array(args.iter().cloned().map(Value::String).collect());
+    let new = crate::config::with_value(text, &format!("tools.{fam}"), "args", &list).ok_or(t!(
+        "config.toml 的写法认不出,没改(自己改那几行)",
+        "can't make out how config.toml is written; nothing changed (edit those lines yourself)"
+    ))?;
+    // with_value 是原地换掉那一行的:行数一样时,不一样的那行就是它,把原来那行的注释接上
+    let (old, got): (Vec<&str>, Vec<&str>) = (text.lines().collect(), new.lines().collect());
+    let Some(i) = (old.len() == got.len()).then(|| (0..old.len()).find(|&i| old[i] != got[i])).flatten() else { return Ok(new) };
+    let rest = old[i].split_once('=').map_or("", |(_, r)| r);
+    // `#` 在字符串里的不算:到它为止读得出一个值,后面的才是注释
+    let cut = rest.match_indices('#').map(|(j, _)| j).find(|&j| format!("x = {}", &rest[..j]).parse::<Table>().is_ok());
+    let Some(cut) = cut else { return Ok(new) };
+    let mut lines: Vec<String> = got.iter().map(|l| l.to_string()).collect();
+    lines[i].push_str(&rest[rest[..cut].trim_end().len()..]);
+    let out = lines.join("\n") + "\n";
+    Ok(if out.parse::<Table>().ok() == new.parse::<Table>().ok() { out } else { new })
+}
+
+/// 换这一家每个账号都带的启动参数(删之前的存成 config.toml.bak-aca)。回 false = 和原来一样,没写
+pub(crate) fn set_common_args_in(path: &Path, a: Agent, args: &[String]) -> Result<bool, String> {
+    let fam = fam(a).ok_or(t!("只有 Claude / Codex 的账号", "only Claude / Codex have accounts"))?;
+    let text = read(path).map_err(|e| tr!("读不了 config.toml:{e}", "can't read config.toml: {e}"))?;
+    if aca_core::config::parse(&text).tool(fam).map(|t| t.args).unwrap_or_default() == args {
+        return Ok(false);
+    }
+    let new = with_common_args(&text, fam, args)?;
+    if !write(path, &text, &new).map_err(|e| tr!("写 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
+        return Err(t!("config.toml 刚被改过,再存一次", "config.toml just changed; save again").into());
+    }
+    Ok(true)
 }
 
 /// 删掉的那个账号原来写的目录(家目录下的写成 ~/…;不换目录的是空的)
@@ -586,10 +750,66 @@ mod tests {
         let path = d.join("aca/config.toml");
         assert_eq!(
             add_in(&path, &home, Agent::Claude, "codex", "~/.cx").unwrap_err(),
-            "~/.cx 是 Codex 的配置目录(里面有 auth.json、config.toml…),不能登记成 Claude Code 的账号"
+            "~/.cx 是 Codex 的目录(里面有 auth.json、config.toml…),不能加成 Claude Code 的账号"
         );
         assert!(!path.exists() && add_in(&path, &home, Agent::Codex, "cx", "~/.cx").is_ok());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn launch_args_change_only_that_accounts_line() {
+        let args = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let old = "# 我的设置\n[accounts.claude]\nwork = \"~/.claude-work\" # 公司\nme = { home = \"~/.claude-me\", env = { X = \"1\" } }\n\n[accounts.codex]\nwork = \"~/.codex-work\"\n";
+        // 一行目录:写成带参数的那种,注释留着
+        let out = with_args(old, "claude", "work", &args(&["--model", "sonnet"])).unwrap();
+        assert_eq!(
+            out,
+            old.replace(
+                "work = \"~/.claude-work\" # 公司",
+                "work = { home = \"~/.claude-work\", args = [\"--model\", \"sonnet\"] } # 公司"
+            )
+        );
+        // 清空了:写回一行目录
+        assert_eq!(with_args(&out, "claude", "work", &[]).unwrap(), old);
+        // 本来就是一张小表的:加在后面,env 留着;清空后还是表
+        let out = with_args(old, "claude", "me", &args(&["a b"])).unwrap();
+        assert!(out.contains("me = { home = \"~/.claude-me\", env = { X = \"1\" }, args = [\"a b\"] }\n"), "{out}");
+        assert_eq!(with_args(&out, "claude", "me", &[]).unwrap(), old);
+        // 同名的另一家不受影响;和原来一样的不改
+        let out = with_args(old, "codex", "work", &args(&["--yolo"])).unwrap();
+        assert!(
+            out.contains("[accounts.codex]\nwork = { home = \"~/.codex-work\", args = [\"--yolo\"] }\n")
+                && out.contains("work = \"~/.claude-work\" # 公司")
+        );
+        assert_eq!(with_args(old, "codex", "work", &[]).unwrap(), old);
+        // 写成一张表的:改它的 args 那一行
+        let table = "[accounts.codex.labs]\nhome = \"~/.labs\"\n";
+        assert_eq!(
+            with_args(table, "codex", "labs", &args(&["-p", "x"])).unwrap(),
+            "[accounts.codex.labs]\nargs = [\"-p\", \"x\"]\nhome = \"~/.labs\"\n"
+        );
+        // 一个值占好几行、没这个账号、坏文件:不改
+        assert!(with_args("[accounts.codex]\nlabs = { home = \"~/.labs\", args = [\n\"a\"] }\n", "codex", "labs", &[]).is_err());
+        assert_eq!(with_args(old, "claude", "nobody", &[]).unwrap_err(), "没有这个账号:claude:nobody");
+        assert!(with_args("[accounts\n", "claude", "work", &[]).is_err());
+    }
+
+    #[test]
+    fn every_accounts_args_change_only_that_line_and_keep_its_comment() {
+        let args = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let old = "[tools.claude]\naccount = \"sub\"  # 默认\nargs = [\"--model\", \"opus\"]  # 每次都带 # 的\n\n[accounts.claude]\nsub = \"~/.claude-sub\"\n";
+        let out = with_common_args(old, "claude", &args(&["--effort", "a #b"])).unwrap();
+        assert_eq!(out, old.replace("args = [\"--model\", \"opus\"]", "args = [\"--effort\", \"a #b\"]"));
+        // 清空:留着空的那一行;注释在字符串里的不当注释
+        let out = with_common_args(&out, "claude", &[]).unwrap();
+        assert_eq!(out, old.replace("args = [\"--model\", \"opus\"]", "args = []"));
+        let quoted = "[tools.claude]\nargs = [\"#x\"]\n";
+        assert_eq!(with_common_args(quoted, "claude", &args(&["y"])).unwrap(), "[tools.claude]\nargs = [\"y\"]\n");
+        // 没这一行:加在表头下面;没这一段:加在最后
+        assert_eq!(with_common_args(old, "codex", &args(&["--search"])).unwrap(), format!("{old}\n[tools.codex]\nargs = [\"--search\"]\n"));
+        let out = with_common_args("[tools.codex]\nhook_trust = \"bypass\"\n", "codex", &args(&["--search"])).unwrap();
+        assert_eq!(out, "[tools.codex]\nargs = [\"--search\"]\nhook_trust = \"bypass\"\n");
+        assert!(with_common_args("[tools\n", "claude", &[]).is_err());
     }
 
     #[test]

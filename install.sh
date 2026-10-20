@@ -192,7 +192,8 @@ mkdir -p "$prefix/bin"
 cp "$built" "$dest.new.$$"
 chmod 755 "$dest.new.$$"
 mv -f "$dest.new.$$" "$dest"
-say "装好了:$dest($("$dest" --version))" "Installed: $dest ($("$dest" --version))"
+v=$("$dest" --version)
+say "装好了 $v:$dest" "Installed $v at $dest"
 
 # 装过 aca 的 tmux 设置(aca tmux install)的:那份照新的重写,开着的 tmux 也换上
 if [ -e "$HOME/.config/aca/tmux.conf" ] && [ -z "${ACA_HOME:-}" ]; then

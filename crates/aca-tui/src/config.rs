@@ -35,17 +35,17 @@ fn read() -> String {
 
 /// `^N` 起完名后 fzf 的第一行、Esc 回到输入框时填着的目录(`[new_group] default_path`)
 pub fn new_group_dir() -> String {
-    new_group_dir_in(&read())
+    new_group_dir_in(&read(), std::path::Path::new(&aca_core::paths::expand(NEW_GROUP_DIR)).is_dir())
 }
 
-/// 读不了 / 格式不对 / 没写都当没配
-fn new_group_dir_in(text: &str) -> String {
+/// 读不了 / 格式不对 / 没写都当没配。没配时 ~/workspace 在就是它,不在(新机器上多半没有)就是家目录
+fn new_group_dir_in(text: &str, workspace: bool) -> String {
     let t = text.parse::<toml::Table>().ok();
     t.as_ref()
         .and_then(|t| t.get("new_group")?.get("default_path")?.as_str())
         .map(str::trim)
         .filter(|d| !d.is_empty())
-        .unwrap_or(NEW_GROUP_DIR)
+        .unwrap_or(if workspace { NEW_GROUP_DIR } else { "~" })
         .to_string()
 }
 
@@ -97,11 +97,11 @@ fn problems_in(text: &str) -> Vec<String> {
 }
 
 /// 改一项:`[section] key = value`,别的内容、注释原样留着(见 `with_value`)。Err 是给底栏的一句话
+/// (没记下的大多也没换上:语言、输入法、启动参数都是记下了才换,不说「这次先用着」)
 pub fn set(section: &str, key: &str, value: Value) -> Result<(), String> {
     let path = path();
     let text = read();
-    let new = with_value(&text, section, key, &value)
-        .ok_or(t!("config.toml 格式不对,没记下(这次先用着)", "config.toml is malformed; not saved (in use for now)"))?;
+    let new = with_value(&text, section, key, &value).ok_or(t!("config.toml 格式不对,没记下", "config.toml is malformed; not saved"))?;
     crate::state::write_atomic(&path, &new).map_err(|e| tr!("没记下:{e}", "not saved: {e}"))
 }
 
@@ -152,12 +152,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_group_dir_defaults_to_workspace() {
-        assert_eq!(new_group_dir_in(""), "~/workspace");
-        assert_eq!(new_group_dir_in("[new_group]\ndefault_path = \" ~/code \"\n"), "~/code");
-        assert_eq!(new_group_dir_in("[new_group]\ndefault_path = \"\""), "~/workspace");
-        assert_eq!(new_group_dir_in("[new_group\nbroken"), "~/workspace");
-        assert_eq!(new_group_dir_in("default_path = \"/top-level/ignored\""), "~/workspace");
+    fn new_group_dir_defaults_to_workspace_or_home_without_one() {
+        assert_eq!(new_group_dir_in("", true), "~/workspace");
+        assert_eq!(new_group_dir_in("", false), "~");
+        assert_eq!(new_group_dir_in("[new_group]\ndefault_path = \" ~/code \"\n", false), "~/code");
+        assert_eq!(new_group_dir_in("[new_group]\ndefault_path = \"\"", true), "~/workspace");
+        assert_eq!(new_group_dir_in("[new_group\nbroken", true), "~/workspace");
+        assert_eq!(new_group_dir_in("default_path = \"/top-level/ignored\"", false), "~");
     }
 
     #[test]

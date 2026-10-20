@@ -374,7 +374,7 @@ fn idle_for(cfg: &Config, s: &Session, after: u64) -> Option<u64> {
         return None;
     }
     let now = paths::now();
-    let idle = now.saturating_sub(stirred(&p, &r, s.created, written(&r)));
+    let idle = now.saturating_sub(stirred(&p, &r, s.created, now));
     (idle >= after && !crate::schedule::pending(&r, now)).then_some(idle)
 }
 
@@ -386,24 +386,32 @@ fn compacting(r: &Run, now: u64) -> bool {
     r.compacting != 0 && now.saturating_sub(r.compacting) < COMPACT_LONGEST
 }
 
-/// 最后一次有动静的时刻,几样里最晚的:屏幕有输出(干活时转圈、计时每秒都在刷)、有人连进去 / 按过键、hook 报事、
-/// 这一轮开始 / 跑完、这次起来、登记,还有对话记录最后写入(`written`)。hook 一轮只报开头和结尾,
-/// 中间几个小时的「还在干活」全靠屏幕输出和记录写入
-fn stirred(p: &Pane, r: &Run, created: u64, written: u64) -> u64 {
-    [p.win_activity, p.activity, p.last_attached, r.ts, r.turn, r.done, r.started, created, written].into_iter().max().unwrap_or(0)
+/// hook 报过事的会话,屏幕有输出、对话记录写入离现在这么久以内才算动静(见 [`stirred`])
+const FRESH: u64 = 60;
+
+/// 最后一次有动静的时刻,几样里最晚的:有人连进去 / 按过键、这次起来、登记、hook 报的这一轮开始 / 跑完([`Run::hook_at`]),
+/// 子代理的记录最后写入(Claude;后台的子代理在主线程跑完之后还在写)。屏幕有输出、对话记录写入:hook 一个事都没报过的
+/// (shell、不报事的工具)只能看这两样;报过事的只认 [`FRESH`] 以内的 —— 一直在刷的多半在干活(hook 没报的一轮、
+/// 读屏幕没认出来的转圈),更早的那一下多半是闲着的 Claude 换了设置、窗口变了大小重画、往记录里补几行,算上它就一直停不下来。
+/// 只在 hook 说这一轮跑完了时用(见 [`idle_for`])
+fn stirred(p: &Pane, r: &Run, created: u64, now: u64) -> u64 {
+    let (main, subs) = written(r);
+    let screen = p.win_activity.max(main);
+    let screen = if r.hook_at() == 0 || now.saturating_sub(screen) < FRESH { screen } else { 0 };
+    [r.hook_at(), screen, p.activity, p.last_attached, r.started, created, subs].into_iter().max().unwrap_or(0)
 }
 
-/// 对话记录、它旁边 `subagents/` 里子代理的记录(Claude;后台的子代理在主线程跑完之后还在写)最后写入的时刻;没有是 0
-fn written(r: &Run) -> u64 {
+/// 对话记录、它旁边 `subagents/` 里子代理的记录(Claude)各自最后写入的时刻;没有是 0
+fn written(r: &Run) -> (u64, u64) {
     if r.transcript.is_empty() {
-        return 0;
+        return (0, 0);
     }
     let t = Path::new(&r.transcript);
     let at = |p: &Path| {
         p.metadata().and_then(|m| m.modified()).ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())
     };
     let subs = std::fs::read_dir(t.with_extension("").join("subagents")).into_iter().flatten().flatten().map(|e| at(&e.path()));
-    subs.chain([at(t)]).max().unwrap_or(0)
+    (at(t), subs.max().unwrap_or(0))
 }
 
 /// 在原地重启,接着原来的对话;`fresh` = 换一段新的
@@ -687,6 +695,8 @@ pub fn archive(store: &Store, key: &str, on: bool) -> Res<()> {
     store.set_archived(&s.id, if on { paths::now() } else { 0 })?;
     if on {
         event::emit("session.archived", &s.id, json!({}));
+    } else {
+        runtime::update(&s.id, |r| r.restored = paths::now());
     }
     Ok(())
 }
@@ -880,15 +890,17 @@ mod tests {
     }
 
     #[test]
-    fn the_last_stir_counts_screen_output_and_transcript_writes_not_only_hooks_and_keys() {
-        // 一轮跑了 4 小时:hook 只报了开头(1000),没人按过键(900);屏幕一直在刷(15000)、记录一直在写(15200)
-        let p = Pane { activity: 900, last_attached: 800, win_activity: 15_000, ..Default::default() };
-        let r = Run { ts: 1000, turn: 1000, ..Default::default() };
-        assert_eq!(stirred(&p, &r, 500, 15_200), 15_200);
-        assert_eq!(stirred(&p, &r, 500, 0), 15_000);
-        // 都不动了:最晚的那样
-        let p = Pane { activity: 900, win_activity: 1200, ..Default::default() };
-        assert_eq!(stirred(&p, &Run { ts: 1000, done: 1300, started: 100, ..Default::default() }, 500, 1100), 1300);
+    fn an_agent_that_reported_counts_from_its_hooks_not_from_an_old_redraw() {
+        // 700 开始、900 跑完,960 是闲了一会儿的提醒;之后没人碰过它(连进去 800、按键 850),15000 重画过一下
+        let p = Pane { activity: 850, last_attached: 800, win_activity: 15_000, ..Default::default() };
+        let done = Run { status: "done".into(), ts: 960, turn: 700, done: 900, started: 100, ..Default::default() };
+        assert_eq!(stirred(&p, &done, 500, 20_000), 900);
+        // 屏幕刚才还在刷:可能在干活(hook 没报的一轮),先算上
+        assert_eq!(stirred(&p, &done, 500, 15_030), 15_000);
+        // 有人连进去按过键:算
+        assert_eq!(stirred(&Pane { activity: 2000, ..p.clone() }, &done, 500, 20_000), 2000);
+        // hook 一个事都没报过(shell、不报事的工具):只能看屏幕,多久以前的都算
+        assert_eq!(stirred(&p, &Run { started: 100, ..Default::default() }, 500, 20_000), 15_000);
     }
 
     #[test]
@@ -902,21 +914,26 @@ mod tests {
     }
 
     #[test]
-    fn a_transcript_and_its_subagents_tell_when_it_last_wrote() {
+    fn a_transcript_counts_only_fresh_once_hooks_report_and_its_subagents_always() {
         let dir = std::env::temp_dir().join(format!("aca-written-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("c1/subagents")).unwrap();
         let t = dir.join("c1.jsonl");
         std::fs::write(&t, "{}\n").unwrap();
-        let old = std::time::SystemTime::now() - Duration::from_secs(7200);
-        std::fs::File::options().write(true).open(&t).unwrap().set_modified(old).unwrap();
-        let r = Run { transcript: t.to_string_lossy().into_owned(), ..Default::default() };
         let now = paths::now();
-        assert!((now - 7201..=now - 7199).contains(&written(&r)));
-        // 后台的子代理还在写
+        let transcript = t.to_string_lossy().into_owned();
+        let hooked = Run { status: "done".into(), ts: 1000, done: 1000, transcript: transcript.clone(), ..Default::default() };
+        let unhooked = Run { transcript, ..Default::default() };
+        let p = Pane::default();
+        // 闲着的 Claude 往记录里补了几行:报过事的过了一会儿就不算,没报过的一直算
+        assert!((now..=now + 1).contains(&written(&hooked).0));
+        assert!(stirred(&p, &hooked, 500, now) >= now);
+        assert_eq!(stirred(&p, &hooked, 500, now + 120), 1000);
+        assert!(stirred(&p, &unhooked, 500, now + 120) >= now);
+        // 后台的子代理主线程跑完之后还在写:一直算
         std::fs::write(dir.join("c1/subagents/agent-a1.jsonl"), "{}\n").unwrap();
-        assert!(written(&r) >= now);
-        assert_eq!(written(&Run::default()), 0);
+        assert!(stirred(&p, &hooked, 500, now + 120) >= now);
+        assert_eq!(written(&Run::default()), (0, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

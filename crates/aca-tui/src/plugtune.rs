@@ -1,11 +1,12 @@
 //! 插件详情:插件页右边那一栏(窄屏是下半截)。高亮的插件能改的分三段,都写进 plugins.toml;最后是它带了什么:
 //!
-//! - **设置**:一行一个,名字、现在的值(改过的标出来)、说明。⏎ 改(开关类空格切换),`-` 回到默认;
-//!   清单里标了 `secret` 的(webhook 地址、key)打码显示,改的时候从空的开始填
+//! - **设置**:一行一个,名字、现在的值(改过的标出来);高亮的那个,说明由插件页折行写全在详情下面(见 [`Detail::hint`])。
+//!   ⏎ 改(开关类空格开 / 关),`-` 回到默认;清单里标了 `secret` 的(webhook 地址、key)打码显示,改的时候从空的开始填
 //! - **给 agent 的工具**:✓ 给了 ○ 没给;清单写 `agent?` 的(会动你机器上东西的)标「要你点名」。空格切换
 //! - **插件菜单**(会话列表上按 `:` 出来的那个):它在菜单里的几项和键。⏎ 再按一个键换成它,⌫ 不要键,
 //!   `-` 回到清单的;没拿到的(别的插件先拿了)写在下面
 //!
+//! 改了要重启开着的会话才带上的(给 agent 的工具),这里不讲:插件页底下点名哪些会话要重启。
 //! 插件页上 ⏎ 进到这一栏(高亮落到这里),Esc 回列表。改动放到后台跑(`Job::Plugins`),做完和插件页一起重读。
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -72,7 +73,7 @@ pub struct Tune {
     pub settings: Vec<Set>,
     pub tools: Vec<Tool>,
     pub binds: Vec<Bind>,
-    /// 它带了什么、从哪来:(标签, 值)
+    /// 它给 agent 带了什么:(标签, 值)
     pub info: Vec<(String, String)>,
     /// 这个插件没拿到的键、写得不对的
     pub notes: Vec<String>,
@@ -142,11 +143,6 @@ pub fn load(id: &str) -> Tune {
     if !gives.is_empty() {
         let to = if want.agents.is_empty() { String::new() } else { tr!(",只给 {}", "; only for {}", want.agents.join(" ")) };
         info.push((t!("给 agent", "agents").to_string(), format!("{}{to}", gives.join(" · "))));
-    }
-    let mut on: Vec<&str> = m.events.iter().map(|h| h.on.as_str()).collect();
-    on.dedup();
-    if !on.is_empty() {
-        info.push((t!("事件", "events").to_string(), on.join(" ")));
     }
     let mut notes: Vec<String> = plugin::key_notes().into_iter().filter(|(p, _)| p == id).map(|(_, n)| n).collect();
     let missing = m.missing();
@@ -249,17 +245,29 @@ impl Detail {
         self.waiting || self.input.is_some()
     }
 
-    /// 一个设置显示成什么:开关写开 / 关,空的写「没填」
+    /// 一个设置显示成什么:开关写开 / 关,空的(空列表也算)写「没填」
     fn value(s: &Set) -> String {
         match s.switch {
             Some(true) => t!("开", "on").to_string(),
             Some(false) => t!("关", "off").to_string(),
-            None if s.shown.is_empty() => t!("没填", "empty").to_string(),
+            None if Self::empty(s) => t!("没填", "empty").to_string(),
             None => s.shown.clone(),
         }
     }
 
-    /// 设置那一段:名字、值对齐成两列,改过的标出来,说明跟在后面(窄了不写)
+    fn empty(s: &Set) -> bool {
+        s.switch.is_none() && (s.shown.is_empty() || s.shown == "[]")
+    }
+
+    /// 高亮的那个设置:(名字, 说明)。插件页把说明折行写全在详情下面(行里不写)
+    pub fn hint(&self) -> Option<(&str, &str)> {
+        match self.at() {
+            Some(At::Set(i)) => Some(&self.data.settings[i]).filter(|s| !s.desc.is_empty()).map(|s| (s.name.as_str(), s.desc.as_str())),
+            _ => None,
+        }
+    }
+
+    /// 设置那一段:名字、值对齐成两列,改过的标出来(说明不在行里,见 [`Detail::hint`])
     fn set_lines(&self, w: usize, focused: bool, out: &mut Vec<Line<'static>>, hl: &mut Option<usize>) {
         let name_w = self.data.settings.iter().map(|s| s.name.width()).max().unwrap_or(0).min(16);
         let val_w = self.data.settings.iter().map(|s| Self::value(s).width()).max().unwrap_or(0).clamp(4, 22);
@@ -291,22 +299,18 @@ impl Detail {
                     continue;
                 }
                 _ => {
-                    let v = kit::clip(&Self::value(s), val_w).trim_end().to_string();
-                    let pad = val_w.saturating_sub(v.width());
-                    let st = match (s.shown.is_empty() && s.switch.is_none(), s.changed) {
+                    let v = kit::clip(&Self::value(s), w.saturating_sub(name_w + 12)).trim_end().to_string();
+                    let st = match (Self::empty(s), s.changed) {
                         (true, _) => kit::dim(),
                         (false, true) => Style::new().add_modifier(Modifier::BOLD),
                         (false, false) => Style::new(),
                     };
+                    // 「改过」一列对齐在最长的值后面
+                    let pad = val_w.saturating_sub(v.width());
                     spans.push(Span::styled(v, st));
-                    spans.push(Span::raw(format!("{}  ", " ".repeat(pad))));
-                    // 「改过」一列:没改过的空着,宽度照显示宽度算(中文一个字占两格)
-                    let tag = t!("改过", "changed");
-                    let shown = if s.changed { tag.to_string() } else { " ".repeat(tag.width()) };
-                    spans.push(Span::styled(format!("{shown}  "), theme::accent()));
-                    let used: usize = spans.iter().map(|x| x.content.width()).sum();
-                    if w > 56 && used + 4 < w {
-                        spans.push(Span::styled(kit::clip(&s.desc, w - used - 1).trim_end().to_string(), kit::dim()));
+                    if s.changed {
+                        spans.push(Span::raw(" ".repeat(pad + 2)));
+                        spans.push(Span::styled(t!("改过", "changed"), theme::accent()));
                     }
                 }
             }
@@ -319,9 +323,8 @@ impl Detail {
         let right = if t.ask && !t.on { t!("要你点名", "only if allowed") } else { "" };
         let room = w.saturating_sub(right.width() + 8);
         let title = kit::clip(&t.title, room).trim_end().to_string();
-        let id = kit::clip(&format!("  {}", t.id), room.saturating_sub(title.width())).trim_end().to_string();
         let line = kit::spread(
-            vec![Span::raw("  "), Span::styled(mark, st), Span::raw(" "), Span::raw(title), Span::styled(id, kit::dim())],
+            vec![Span::raw("  "), Span::styled(mark, st), Span::raw(" "), Span::raw(title)],
             vec![Span::styled(right.to_string(), theme::warn())],
             w,
         );
@@ -330,7 +333,7 @@ impl Detail {
 
     fn bind_line(&self, b: &Bind, w: usize, on: bool) -> Line<'static> {
         if on && self.waiting {
-            let text = tr!("按一个键给「{}」,Esc 不换", "press a key for “{}”, Esc keeps it", b.title);
+            let text = tr!("按一个键给「{}」", "press a key for “{}”", b.title);
             let text = kit::clip(&text, w.saturating_sub(7)).trim_end().to_string();
             return pick(
                 vec![Span::raw("  "), Span::styled("?", kit::key_style()), Span::raw("  "), Span::styled(text, theme::accent())],
@@ -347,7 +350,6 @@ impl Detail {
             (Some(_), Some(d)) => tr!("你改的(原来 {d})", "yours (was {d})"),
             (Some(_), None) => t!("你加的", "added by you").to_string(),
             (None, Some(d)) if b.key != Some(d) => tr!("{d} 被别的插件拿了", "{d} taken by another plugin"),
-            (None, None) => t!("没有键", "no key").to_string(),
             (None, _) => String::new(),
         };
         let room = w.saturating_sub(right.width() + 8);
@@ -367,11 +369,7 @@ impl Detail {
             out.push(Line::raw(""));
         }
         if !d.tools.is_empty() {
-            out.push(heading(
-                t!("给 agent 的工具", "Tools for agents"),
-                t!("改了,开着的会话重启才带上", "running sessions pick changes up after a restart"),
-                w,
-            ));
+            out.push(heading(t!("给 agent 的工具", "Tools for agents"), "", w));
             let s = d.settings.len();
             for (i, t) in d.tools.iter().enumerate() {
                 let on = focused && self.sel == s + i;
@@ -383,12 +381,8 @@ impl Detail {
             out.push(Line::raw(""));
         }
         if !d.binds.is_empty() {
-            let note = if d.enabled {
-                t!("会话列表上按 : 打开,再按这里的键直接跑", "press : on the session list, then the key runs it")
-            } else {
-                t!("停着的插件不进菜单", "a paused plugin isn't in the menu")
-            };
-            out.push(heading(t!("插件菜单", "Plugin menu"), note, w));
+            let note = if d.enabled { "" } else { t!("关着时不在菜单里", "not in the menu while off") };
+            out.push(heading(t!(": 菜单里的键", "Keys in the : menu"), note, w));
             let s = d.settings.len() + d.tools.len();
             for (i, b) in d.binds.iter().enumerate() {
                 let on = focused && self.sel == s + i;
@@ -421,7 +415,7 @@ impl Detail {
         }
         match self.at() {
             Some(At::Set(i)) if self.data.settings[i].switch.is_some() => {
-                vec![(t!("空格", "space"), t!("切换", "toggle")), ("-", t!("默认", "default"))]
+                vec![(t!("空格", "space"), t!("开/关", "on/off")), ("-", t!("默认", "default"))]
             }
             Some(At::Set(_)) => vec![("⏎", t!("改", "edit")), ("-", t!("默认", "default"))],
             Some(At::Tool(_)) => vec![(t!("空格", "space"), t!("给/不给", "give/withhold"))],
@@ -440,30 +434,25 @@ impl Detail {
         let id = self.data.id.clone();
         if self.waiting {
             self.waiting = false;
-            match (k.code, self.at()) {
-                (KeyCode::Char(c), Some(At::Bind(i))) if !ctrl => {
-                    let b = self.data.binds[i].id.clone();
-                    self.job(Act::Key(id, b, Some(c.to_string())), fx);
-                }
-                _ => fx.say(t!("没换", "unchanged")),
+            // 别的键(Esc)= 不换,不用说
+            if let (KeyCode::Char(c), Some(At::Bind(i))) = (k.code, self.at())
+                && !ctrl
+            {
+                let b = self.data.binds[i].id.clone();
+                self.job(Act::Key(id, b, Some(c.to_string())), fx);
             }
             return Back::Stay;
         }
         if let Some(text) = &mut self.input {
             match k.code {
-                KeyCode::Esc => {
-                    self.input = None;
-                    fx.say(t!("没改", "unchanged"));
-                }
+                KeyCode::Esc => self.input = None,
                 KeyCode::Enter => {
                     let v = std::mem::take(text);
                     self.input = None;
                     if let Some(At::Set(i)) = self.at() {
                         let s = &self.data.settings[i];
                         // secret 的从空的开始填:什么都没填就是不改
-                        if s.secret && v.is_empty() {
-                            fx.say(t!("没改", "unchanged"));
-                        } else {
+                        if !(s.secret && v.is_empty()) {
                             self.job(Act::Setting(id, s.name.clone(), Some(v)), fx);
                         }
                     }
@@ -550,7 +539,7 @@ mod tests {
                 Bind { id: "tasks".into(), title: "任务".into(), key: Some('T'), default: Some('t'), mine: Some("T".into()) },
                 Bind { id: "mail".into(), title: "邮件".into(), key: None, default: Some('e'), mine: None },
             ],
-            info: vec![("事件".into(), "turn.done agent.waiting".into())],
+            info: vec![("给 agent".into(), "claude 的 skill / 斜杠命令".into())],
             notes: vec!["键 e 给了 x「邮件」,aca.discord「邮件」没拿到".into()],
             log: true,
             mine: None,
@@ -558,7 +547,12 @@ mod tests {
     }
 
     fn text(d: &Detail, w: usize, focused: bool) -> String {
-        d.body(w, focused).0.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        d.body(w, focused)
+            .0
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn press(d: &mut Detail, code: KeyCode) -> Fx {
@@ -579,24 +573,29 @@ mod tests {
         i18n::with(Lang::Zh, || {
             let d = Detail::new(fake("aca.discord"));
             let t = text(&d, 84, true);
-            // 设置:名字、值对齐,改过的标出来,开关写开 / 关,secret 打码;高亮那行行首一道竖条
-            assert!(t.contains("▌ url       ••••abcd  改过  webhook 地址"), "{t}");
-            assert!(t.contains("  workers   关") && t.contains("worker 也发"), "{t}");
-            assert!(
-                t.contains("给 agent 的工具  改了,开着的会话重启才带上") && t.contains("✓ 列出挂载  list") && t.contains("要你点名"),
-                "{t}"
-            );
-            // 插件菜单:说清楚是会话列表上按 : 出来的那个
-            assert!(t.contains("插件菜单  会话列表上按 : 打开,再按这里的键直接跑"), "{t}");
+            // 设置:名字、值对齐,改过的标出来,开关写开 / 关,secret 打码;高亮那行行首一道竖条。说明不在行里
+            assert!(t.contains("▌ url       ••••abcd  改过\n"), "{t}");
+            assert!(t.contains("  workers   关\n") && !t.contains("worker 也发"), "{t}");
+            // 高亮的那个设置:名字和说明交给插件页写在下面
+            assert_eq!(d.hint(), Some(("url", "webhook 地址")));
+            // 给 agent 的工具:只写标题,不写 id;要不要重启不在这里讲
+            assert!(t.contains("给 agent 的工具 ─") && t.contains("✓ 列出挂载\n") && t.contains("要你点名"), "{t}");
+            // 插件菜单:标题就说是 : 菜单里的键
+            assert!(t.contains(": 菜单里的键 ─"), "{t}");
             assert!(t.contains("m  挂载") && t.contains("你改的(原来 t)") && t.contains("e 被别的插件拿了"), "{t}");
-            assert!(t.contains("⚠ 键 e 给了") && t.contains("事件  turn.done agent.waiting"), "{t}");
+            assert!(t.contains("⚠ 键 e 给了") && t.contains("给 agent  claude 的 skill / 斜杠命令"), "{t}");
             assert_eq!(d.keys()[0], ("⏎", "改"));
             // 高亮不在这一栏:哪行都不标
             let (_, hl) = d.body(84, false);
             assert!(hl.is_none() && !text(&d, 84, false).contains('▌'));
-            // 窄屏(手机)不出界,说明不写
+            // 窄屏(手机)不出界
             assert!(d.body(40, true).0.iter().all(|l| l.width() <= 40), "{}", text(&d, 40, true));
-            assert!(!text(&d, 40, true).contains("webhook 地址"));
+            // 高亮落到工具、菜单键上:没有设置的说明
+            let mut d = d;
+            for _ in 0..3 {
+                press(&mut d, KeyCode::Char('j'));
+            }
+            assert_eq!(d.hint(), None);
         });
     }
 
@@ -651,7 +650,11 @@ mod tests {
             assert_eq!(job(press(&mut d, KeyCode::Char(' '))), Some(Act::Tool("aca.tailnet".into(), "add".into(), true)));
             press(&mut d, KeyCode::Char('j'));
             press(&mut d, KeyCode::Enter);
-            assert!(d.typing() && text(&d, 84, true).contains("按一个键给「挂载」,Esc 不换"));
+            assert!(d.typing() && text(&d, 84, true).contains("按一个键给「挂载」") && d.keys() == [("Esc", "不换")]);
+            // Esc:不换,也不用说
+            let fx = press(&mut d, KeyCode::Esc);
+            assert!(fx.job.is_none() && fx.flash.is_none() && !d.typing());
+            press(&mut d, KeyCode::Enter);
             assert_eq!(job(press(&mut d, KeyCode::Char('q'))), Some(Act::Key("aca.tailnet".into(), "mounts".into(), Some("q".into()))));
             assert_eq!(job(press(&mut d, KeyCode::Backspace)), Some(Act::Key("aca.tailnet".into(), "mounts".into(), Some(String::new()))));
             assert_eq!(job(press(&mut d, KeyCode::Char('-'))), Some(Act::Key("aca.tailnet".into(), "mounts".into(), None)));

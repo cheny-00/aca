@@ -802,8 +802,8 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
                 println!(
                     "{}",
                     tr!(
-                        "没有能直接接管的 tmux 会话(要没登记过、第一格里跑着认得出的 claude / codex)",
-                        "no tmux session to adopt as is (it must be unregistered, a recognizable claude / codex in the first pane)"
+                        "没有能直接接管的 tmux 会话(要没登记过、第一格里跑着认得出的 claude / codex / pi / opencode)",
+                        "no tmux session to adopt as is (it must be unregistered, a recognizable claude / codex / pi / opencode in the first pane)"
                     )
                 );
             } else {
@@ -1046,7 +1046,11 @@ fn run(mut a: Args) -> Res<i32> {
             };
         }
         "version" | "--version" | "-V" => {
-            println!("aca {}", env!("CARGO_PKG_VERSION"));
+            // 后面带上编的是哪一个提交(build.rs;没有 git 编的就没有)
+            match option_env!("ACA_COMMIT") {
+                Some(c) => println!("aca {} ({c})", env!("CARGO_PKG_VERSION")),
+                None => println!("aca {}", env!("CARGO_PKG_VERSION")),
+            }
             return Ok(0);
         }
         _ => {}

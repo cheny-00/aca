@@ -42,6 +42,7 @@ pub struct Pal {
     pub accent: Color,
     pub on_accent: Color,
     pub sel: Color,
+    pub pick: Color,
     pub fade: Color,
     pub shadow: Color,
     pub minor: Color,
@@ -57,6 +58,8 @@ pub struct Pal {
     pub hunk: Color,
     pub claude: Color,
     pub codex: Color,
+    pub pi: Color,
+    pub opencode: Color,
     pub total: Color,
     pub other: Color,
     pub track: Color,
@@ -86,7 +89,7 @@ pub struct Pal {
 }
 
 /// (分类, 名字, 用在哪, 那个字段)。`aca theme` 按这个顺序列,改颜色按名字找
-fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color); 29] {
+fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color); 32] {
     [
         (
             t!("界面", "Interface"),
@@ -99,6 +102,7 @@ fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color
         ),
         (t!("界面", "Interface"), "on_accent", t!("强调色底上的字", "text on the accent color"), &mut p.on_accent),
         (t!("界面", "Interface"), "sel", t!("选中项整块的底色", "background of the selected item"), &mut p.sel),
+        (t!("界面", "Interface"), "pick", t!("v 多选选上的那几行的底色", "background of the rows selected with v"), &mut p.pick),
         (t!("界面", "Interface"), "fade", t!("弹窗打开时底下那层的字", "text of the layer under an open popup"), &mut p.fade),
         (t!("界面", "Interface"), "shadow", t!("弹窗的阴影", "popup shadow"), &mut p.shadow),
         (
@@ -141,12 +145,19 @@ fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color
             ),
             &mut p.red,
         ),
-        (t!("状态", "State"), "green", t!("● 在跑;改动页加的行", "● running; added lines in diffs"), &mut p.green),
+        (
+            t!("状态", "State"),
+            "green",
+            t!("● 在跑;改动页加的行;v 多选选上的记号", "● running; added lines in diffs; the mark on rows selected with v"),
+            &mut p.green,
+        ),
         (t!("状态", "State"), "amber", t!("◐ 跑完了没看;额度 ≥ 70%", "◐ finished, unread; quota ≥ 70%"), &mut p.amber),
         (t!("状态", "State"), "muted", t!("○ 空闲 / ■ 没在跑", "○ idle / ■ not running"), &mut p.muted),
         (t!("状态", "State"), "hunk", t!("改动页里 @@ 那一行、改了名的文件", "the @@ line in diffs, renamed files"), &mut p.hunk),
         (t!("账号", "Accounts"), "claude", t!("列表里 Claude 的账号名", "Claude account names in the list"), &mut p.claude),
         (t!("账号", "Accounts"), "codex", t!("列表里 Codex 的账号名", "Codex account names in the list"), &mut p.codex),
+        (t!("账号", "Accounts"), "pi", t!("列表里 Pi 的账号名", "Pi account names in the list"), &mut p.pi),
+        (t!("账号", "Accounts"), "opencode", t!("列表里 OpenCode 的账号名", "OpenCode account names in the list"), &mut p.opencode),
         (
             t!("计费", "Billing"),
             "total",
@@ -194,6 +205,7 @@ const LIGHT: Pal = Pal {
     accent: Color::Rgb(0x88, 0x39, 0xEF),
     on_accent: Color::Rgb(0xFF, 0xFF, 0xFF),
     sel: Color::Rgb(0xE2, 0xD8, 0xF6),
+    pick: Color::Rgb(0xD4, 0xEC, 0xD0),
     fade: Color::Rgb(0xBC, 0xC0, 0xCC),
     shadow: Color::Rgb(0xC9, 0xCD, 0xD8),
     minor: Color::Rgb(0x6C, 0x6F, 0x85),
@@ -209,6 +221,8 @@ const LIGHT: Pal = Pal {
     hunk: Color::Cyan,
     claude: Color::Rgb(0xC2, 0x41, 0x0C),
     codex: Color::Rgb(0x25, 0x63, 0xEB),
+    pi: Color::Rgb(0x0F, 0x76, 0x6E),
+    opencode: Color::Rgb(0xBE, 0x18, 0x5D),
     series: &[
         Color::Rgb(0x59, 0x92, 0xE7),
         Color::Rgb(0xF0, 0x93, 0x62),
@@ -241,6 +255,7 @@ const DARK: Pal = Pal {
     accent: Color::Rgb(0xCB, 0xA6, 0xF7),
     on_accent: Color::Rgb(0x1E, 0x1E, 0x2E),
     sel: Color::Rgb(0x3B, 0x34, 0x52),
+    pick: Color::Rgb(0x2B, 0x45, 0x32),
     fade: Color::Rgb(0x58, 0x5B, 0x70),
     shadow: Color::Rgb(0x11, 0x11, 0x1B),
     minor: Color::Rgb(0xA6, 0xAD, 0xC8),
@@ -256,6 +271,8 @@ const DARK: Pal = Pal {
     hunk: Color::Cyan,
     claude: Color::Rgb(0xFA, 0xB3, 0x87),
     codex: Color::Rgb(0x89, 0xB4, 0xFA),
+    pi: Color::Rgb(0x94, 0xE2, 0xD5),
+    opencode: Color::Rgb(0xF4, 0x72, 0xB6),
     series: &[
         Color::Rgb(0x58, 0x8C, 0xDA),
         Color::Rgb(0xCA, 0x77, 0x4A),

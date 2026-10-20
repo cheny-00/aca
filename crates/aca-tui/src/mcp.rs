@@ -157,11 +157,9 @@ impl Overlay for View {
                 let gw_changed = self.rows.iter().any(|r| r.kind == Kind::Gateway && r.want != r.on);
                 if gw_changed {
                     // gateway 那组当场改:写这个会话的名单,在跑的 gateway 通知它重新拉工具列表
+                    // Claude 马上重新拉工具列表,Codex 要重启
                     match aca_core::gateway::set_off(&self.t.id, &gateway_off(&self.rows)) {
-                        Ok(()) => fx.say(t!(
-                            "gateway 那组改好了:Claude 马上换,Codex 重启后",
-                            "gateway servers changed for this session: Claude picks it up now, Codex after a restart"
-                        )),
+                        Ok(()) => fx.say(t!("改好了 · Codex 重启后生效", "changed · Codex picks it up after a restart")),
                         Err(e) => fx.say(e),
                     }
                 }
@@ -172,10 +170,7 @@ impl Overlay for View {
                 }
                 return Flow::Close;
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
-                fx.say(t!("MCP 没改", "MCPs unchanged"));
-                return Flow::Close;
-            }
+            KeyCode::Esc | KeyCode::Char('q') => return Flow::Close,
             _ => {}
         }
         Flow::Stay
@@ -222,8 +217,9 @@ fn gateway_rows(session: &str, cat: &[(String, String)]) -> Vec<Row> {
         .into_iter()
         .map(|(spec, off)| {
             let desc = match (&spec.plugin, spec.tools) {
-                (Some(id), _) => tr!("插件 {id} 的 MCP", "MCP of plugin {id}"),
-                (None, true) => t!("插件的能力(给 agent 的工具)", "plugin commands (tools for agents)").to_string(),
+                // 名字已经是从插件 id 来的,不再写一遍
+                (Some(_), _) => t!("插件带的", "from a plugin").to_string(),
+                (None, true) => t!("插件给 agent 的工具", "plugin tools for agents").to_string(),
                 (None, false) => {
                     cat.iter().find(|(n, _)| aca_core::plugin::mount::safe(n) == spec.name).map(|(_, d)| d.clone()).unwrap_or_default()
                 }

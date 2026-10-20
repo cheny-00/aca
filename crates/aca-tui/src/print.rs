@@ -81,12 +81,11 @@ fn state(s: State) -> (Style, &'static str) {
     let strong = |c| Style::new().fg(c).add_modifier(Modifier::BOLD);
     match s {
         State::Running => (strong(p.green), t!("在跑", "running")),
-        State::Ask => (strong(p.red), t!("在等你", "waiting for you")),
-        State::Unread => (strong(p.amber), t!("跑完没看", "finished, unread")),
+        State::Ask => (strong(p.red), t!("要你答", "needs you")),
+        State::Unread => (strong(p.amber), t!("没看", "unread")),
         State::Idle => (Style::new().fg(p.muted), t!("空闲", "idle")),
         State::Error => (strong(p.red), t!("出错", "error")),
-        State::Exited => (Style::new().fg(p.muted), t!("退出了(窗格还在)", "exited (pane kept)")),
-        State::Stopped => (Style::new().fg(p.muted), t!("没在跑", "not running")),
+        State::Exited | State::Stopped => (Style::new().fg(p.muted), t!("停了", "stopped")),
     }
 }
 
@@ -589,18 +588,18 @@ mod tests {
             page(&out),
             "work/app  2\n\
              \x20 ● 11111111  修登录                    claude:sub        5秒\n\
-             \x20 ◐ 22222222  a much longer title here  codex             1分 [pr #12]\n\
+             \x20 ◆ 22222222  a much longer title here  codex             1分 [pr #12]\n\
              \x20             └ Allow Bash(rm -rf)?\n\
              (没分组)  2\n\
              \x20 ■ 33333333  停着的                    claude:.claude-x  3天\n\
              \x20 ☾ 44444444  闲着停的                  claude:.claude-x  3天\n\
              \n\
-             4 个会话 · ◐ 1 在等你 · ● 1 在跑"
+             4 个会话 · ◆ 1 要你答 · ● 1 在跑"
         );
         let p = theme::pal();
         // 状态、账号的颜色和界面的列表一套;没在跑的标题淡一档
         assert_eq!(style_of(&out[1], "●").fg, Some(p.green));
-        assert_eq!(style_of(&out[2], "◐").fg, Some(p.red));
+        assert_eq!(style_of(&out[2], "◆").fg, Some(p.red));
         assert_eq!(style_of(&out[1], "sub").fg, Some(p.claude));
         assert_eq!(style_of(&out[2], "codex").fg, Some(p.codex));
         assert_eq!(style_of(&out[3], "Allow").fg, Some(p.red));
@@ -646,7 +645,7 @@ mod tests {
         assert_eq!(
             page(&out),
             "◐ 修登录\n\
-             \x20 状态  跑完没看 · 2分 没动\n\
+             \x20 状态  没看 · 2分 没动\n\
              \x20 id    887f90d1\n\
              \x20 账号  claude:sub\n\
              \x20 分组  work\n\

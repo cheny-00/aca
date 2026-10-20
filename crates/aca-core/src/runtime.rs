@@ -79,6 +79,10 @@ pub struct Run {
     /// 闲着被 aca 停掉的时刻([`crate::session::stop_idle`]):列表里画 ☾,和人停的 ■ 分开。再起、人再停一次就清掉
     #[serde(skip_serializing_if = "is_zero")]
     pub idle_stopped: u64,
+    /// 从回收站拿回来 / 取消归档的时刻([`crate::session::archive`]):停着的算多久没动也算它,
+    /// 拿回来的不会下一轮又被自动删(`[idle] remove_after`)
+    #[serde(skip_serializing_if = "is_zero")]
+    pub restored: u64,
     /// 开始压缩对话的时刻(Claude 的 PreCompact;手动 /compact、上下文满了、闲着快一小时它自己压的都报),压完就清掉。
     /// 闲着自己压的那种 hook 状态一直是「跑完」,靠它才知道正在压,不在这时停([`crate::session::stop_idle`])
     #[serde(skip_serializing_if = "is_zero")]
@@ -99,6 +103,17 @@ pub struct Move {
 }
 
 impl Run {
+    /// agent 最后真有动静的时刻(hook 一个事都没报过是 0):这一轮开始 / 跑完、aca 起它、开始问你。
+    /// 闲着的 Claude 换了设置、窗口变了大小也会重画、往对话记录里补几行,窗口的活动时间、记录的修改时间都会跟着变成「刚刚」;
+    /// 闲了一会儿的提醒(Notification)也不算动静。列表算多久没动、自动停都照它
+    pub fn hook_at(&self) -> u64 {
+        if self.ts == 0 {
+            return 0;
+        }
+        let asked = if self.status == "waiting" { self.ts } else { 0 };
+        [self.turn, self.done, self.started, asked].into_iter().max().unwrap_or(0)
+    }
+
     /// 还没过期的那些
     pub fn live_tokens(&self, now: u64) -> BTreeMap<String, String> {
         self.tokens.iter().filter(|(_, t)| t.until == 0 || t.until > now).map(|(k, t)| (k.clone(), t.value.clone())).collect()

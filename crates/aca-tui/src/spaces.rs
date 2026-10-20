@@ -97,11 +97,6 @@ impl Spaces {
         self.groups.get(&(profile.to_string(), group.to_string())).copied()
     }
 
-    /// 记在这个工作区的组
-    pub fn groups_in(&self, c: char) -> Vec<Group> {
-        self.groups.iter().filter(|(_, x)| **x == c).map(|(g, _)| g.clone()).collect()
-    }
-
     /// 只改内存(算「改完之后各在哪」用):Some = 记到那,None = 不记
     pub fn set(&mut self, key: &str, c: Option<char>) {
         match c {
@@ -235,7 +230,7 @@ mod tests {
         phone
             .assign(&[], &[(("default".into(), "fun/app".into()), Some('h')), (("default".into(), "life".into()), Some('l'))], &all)
             .unwrap();
-        assert_eq!(phone.groups_in('h'), [fun.clone(), ("default".into(), "fun/app".into())]);
+        assert_eq!((phone.group_of("default", "fun"), phone.group_of("default", "fun/app")), (Some('h'), Some('h')));
         desk.forget_groups(&|p, g| p == "default" && g.starts_with("fun")).unwrap();
         let s = Spaces::open(Some(path.clone()));
         assert_eq!(

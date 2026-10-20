@@ -275,7 +275,8 @@ fn plan_in(store: &Store, cfg: &Config, w: &World, target: &str, opts: &Opts) ->
     notes.extend(more);
     // 对话是自己给的 / agent-deck 记的那个:它的记录得另找(Claude 没有记录接不上)
     if s.conv != live.conv {
-        live.transcript = import::locate(cfg, agent.name(), &s.conv).map(|(_, t)| t.to_string_lossy().into_owned()).unwrap_or_default();
+        live.transcript =
+            import::locate(cfg, agent.name(), &s.conv, &s.account).map(|(_, t)| t.to_string_lossy().into_owned()).unwrap_or_default();
     }
     // id:agent-deck 起的沿用它那边的。登记表里已经有这条(整批搬过来、还停着):接到它上面,那一行不改
     let old = record.as_ref().and_then(|r| registered(store, &r.s.id));

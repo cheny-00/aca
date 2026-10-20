@@ -86,7 +86,7 @@ pub fn run(from: &Source, req: &NewReq, _to: Agent) -> Outcome {
     let text = render(from, &d, now, crate::usage::local_offset());
     let digest = match save(&from.sid, &text) {
         Ok(p) => p,
-        Err(e) => return Outcome::Failed(tr!("没交接:文字版写不了({e})", "not handed off: couldn't write the text version ({e})")),
+        Err(e) => return Outcome::Failed(tr!("没交接:{e}", "not handed off: {e}")),
     };
     let found = crate::workdir::find_in(&from.w, (!from.conf.is_empty()).then_some(from.conf.as_str()));
     let msg = prompt(from, &digest, text.lines().count(), &found);
@@ -96,11 +96,11 @@ pub fn run(from: &Source, req: &NewReq, _to: Agent) -> Outcome {
     };
     match send(&id, &msg) {
         Ok(()) => Outcome::Made { msg: t!("已交接", "handed off").into(), id },
-        Err(e) => Outcome::Handed {
-            msg: tr!("没发出去({e}),交接说明在它的便签里 · s 发送", "not sent ({e}); the handoff note is in its notepad · s sends it"),
-            id,
-            note: msg,
-        },
+        Err(e) => {
+            Outcome::Handed {
+                msg: tr!("没发出去:{e} · 说明在便签里,s 发送", "not sent: {e} · the note has it, s sends it"), id, note: msg
+            }
+        }
     }
 }
 

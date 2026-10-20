@@ -17,7 +17,7 @@
 //! mod = true                   # 起它时带上 aca 的 mod:订阅额度不靠状态栏(不写就不带;接口还早,见 agent/claude_mod.rs)
 //!
 //! [tools.ccx]                  # 自己起名字的工具:`aca new ccx`
-//! kind = "claude"              # 按内置的哪一家起、接 hook(claude / codex / shell)
+//! kind = "claude"              # 按内置的哪一家起、接 hook(claude / codex / pi / opencode / shell)
 //! cmd = ["claude"]             # 不写就是那一家的命令
 //! args = ["--model", "opus"]
 //! account = "personal"
@@ -34,8 +34,10 @@
 //!
 //! [idle]                       # 闲着的会话
 //! stop_after = "3h"            # 空闲这么久就停掉(agent 退出,窗格留着,列表里标 ☾;⏎ / aca start 接着原来的对话再起)。
-//!                              # 写成 30m、3h、1d、1h30m;不写 = 不自动停。aca 界面开着时每 5 分钟看一次;
+//!                              # 写成 30m、3h、1d、1h30m;never 或不写 = 不自动停。aca 界面开着时每 5 分钟看一次;
 //!                              # 这一轮没跑完的、有人连着的、有后台任务的等等不停(见 session::stop_idle)
+//! remove_after = "30d"         # 停着(■ ☾,连归档的)这么久没动就删掉,和 d 一样进回收站,1 天内 b 拿回来。
+//!                              # never 或不写 = 不删。置顶的、有便签的不删(见 aca-tui 的 `App::stale`)
 //!
 //! [keys]                       # aca 自己绑在 tmux 上的键(不用前缀,只在 aca 的会话里拦;不写进你的 tmux.conf)
 //! next = "C-M-n"               # 进下一个在等你的会话(`aca next`)。不写就是它;"" = 不绑
@@ -161,24 +163,42 @@ pub struct Config {
 pub struct Idle {
     /// 空闲这么久就停掉;原样留着,用的时候由 [`Idle::stop_after`] 认
     pub stop_after: Option<toml::Value>,
+    /// 停着这么久没动就删掉(进回收站);原样留着,用的时候由 [`Idle::remove_after`] 认
+    pub remove_after: Option<toml::Value>,
 }
 
 impl Idle {
     /// 空闲几秒就停;不自动停 = `Ok(None)`,写得认不出来 = Err 说为什么(这时也不停)
     pub fn stop_after(&self) -> Result<Option<u64>, String> {
-        match &self.stop_after {
-            None => Ok(None),
-            Some(toml::Value::String(s)) => span(s).map(|n| (n > 0).then_some(n)).ok_or_else(|| {
-                crate::tr!(
-                    "stop_after 写成 30m、3h、1d、1h30m 这样,不认 \"{s}\"",
-                    "write stop_after like 30m, 3h, 1d or 1h30m, not \"{s}\""
-                )
-            }),
-            Some(v) => Err(crate::tr!(
-                "stop_after 要写成带单位的字符串,比如 \"3h\",不认 {v}",
-                "stop_after takes a string with a unit, like \"3h\", not {v}"
-            )),
-        }
+        after("stop_after", "3h", &self.stop_after)
+    }
+
+    /// 停着几秒没动就删;不删 = `Ok(None)`,写得认不出来 = Err 说为什么(这时也不删)
+    pub fn remove_after(&self) -> Result<Option<u64>, String> {
+        after("remove_after", "30d", &self.remove_after)
+    }
+
+    /// 两样里第一处写错的
+    fn problem(&self) -> Option<String> {
+        self.stop_after().err().or_else(|| self.remove_after().err())
+    }
+}
+
+/// `[idle]` 里的一个时长:never、空的、0、不写 = 不做(None);eg 是错了时举的例子
+fn after(name: &str, eg: &str, v: &Option<toml::Value>) -> Result<Option<u64>, String> {
+    match v {
+        None => Ok(None),
+        Some(toml::Value::String(s)) if s.trim().eq_ignore_ascii_case("never") => Ok(None),
+        Some(toml::Value::String(s)) => span(s).map(|n| (n > 0).then_some(n)).ok_or_else(|| {
+            crate::tr!(
+                "{name} 写成 30m、3h、1d、1h30m 或 never 这样,不认 \"{s}\"",
+                "write {name} like 30m, 3h, 1d, 1h30m or never, not \"{s}\""
+            )
+        }),
+        Some(v) => Err(crate::tr!(
+            "{name} 要写成带单位的字符串,比如 \"{eg}\",不认 {v}",
+            "{name} takes a string with a unit, like \"{eg}\", not {v}"
+        )),
     }
 }
 
@@ -351,7 +371,7 @@ pub fn idle_problem() -> Option<String> {
 pub fn idle_problem_in(text: &str) -> Option<String> {
     let idle = toml::from_str::<toml::Value>(text).ok()?.get("idle")?.clone();
     match idle.try_into::<Idle>() {
-        Ok(i) => i.stop_after().err(),
+        Ok(i) => i.problem(),
         Err(e) => Some(e.to_string().trim().to_string()),
     }
 }
@@ -409,7 +429,7 @@ mod tests {
         );
         assert!(c.account("claude", "sub").unwrap().home.ends_with("/.claude-subscription"));
         assert!(c.account("claude", "nope").is_none());
-        assert_eq!(c.names(), ["claude", "codex", "shell", "ccx", "claude:sub"]);
+        assert_eq!(c.names(), ["claude", "codex", "pi", "opencode", "shell", "ccx", "claude:sub"]);
         // 写坏了不炸
         assert_eq!(parse("[accounts\nx"), Config::default());
     }
@@ -433,7 +453,7 @@ mod tests {
         assert_eq!((t.kind.as_str(), t.resume.len(), t.busy[0].as_str(), t.env["A"].as_str()), ("", 2, r"Working\.\.\.", "1"));
         // 内置的那几家写了别的项,kind 还是它自己
         assert_eq!((c.tool("claude").unwrap().kind.as_str(), c.tool("claude").unwrap().env["B"].as_str()), ("claude", "2"));
-        assert_eq!(c.names(), ["claude", "codex", "shell", "aider"]);
+        assert_eq!(c.names(), ["claude", "codex", "pi", "opencode", "shell", "aider"]);
     }
 
     #[test]
@@ -455,7 +475,7 @@ mod tests {
             (api.home.as_str(), api.env_file.as_str(), api.env["OPENAI_BASE_URL"].as_str()),
             ("", format!("{home}/k.env").as_str(), "https://x")
         );
-        assert_eq!(c.names(), ["claude", "codex", "shell", "codex:api", "codex:corp", "codex:labs"]);
+        assert_eq!(c.names(), ["claude", "codex", "pi", "opencode", "shell", "codex:api", "codex:corp", "codex:labs"]);
     }
 
     #[test]
@@ -506,5 +526,22 @@ mod tests {
         assert!(idle_problem_in("idle = 3\n").is_some());
         assert_eq!(idle_problem_in("[idle]\nstop_after = \"3h\"\n"), None);
         assert_eq!(idle_problem_in("[keys]\nnext = \"\"\n"), None);
+    }
+
+    #[test]
+    fn never_turns_either_one_off_and_remove_after_reads_like_stop_after() {
+        let idle = |text: &str| parse(&format!("[idle]\n{text}\n")).idle;
+        assert_eq!(idle("stop_after = \"never\"").stop_after(), Ok(None));
+        assert_eq!(idle("stop_after = \" Never \"").stop_after(), Ok(None));
+        assert_eq!(idle("remove_after = \"never\"").remove_after(), Ok(None));
+        assert_eq!(idle("").remove_after(), Ok(None));
+        assert_eq!(idle("remove_after = \"30d\"").remove_after(), Ok(Some(30 * 86400)));
+        assert_eq!(idle_problem_in("[idle]\nstop_after = \"never\"\nremove_after = \"never\"\n"), None);
+        // 写错的那一样说得出是哪个;另一样照用
+        let i = idle("stop_after = \"1d\"\nremove_after = \"一个月\"");
+        assert_eq!(i.stop_after(), Ok(Some(86400)));
+        assert!(i.remove_after().is_err());
+        assert!(idle_problem_in("[idle]\nremove_after = 30\n").is_some_and(|e| e.contains("remove_after") && e.contains("\"30d\"")));
+        assert!(idle_problem_in("[idle]\nremove_after = \"一个月\"\n").is_some_and(|e| e.contains("never")));
     }
 }

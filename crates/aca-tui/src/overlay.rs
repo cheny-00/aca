@@ -112,11 +112,16 @@ pub mod kit {
     pub use crate::ui::{button, clip, dim, esc_hint, key_style, keys_line, modal_title, spread};
 
     /// 高亮的那行:补满一行宽,铺上选中的底色
-    pub fn picked(mut line: Line<'static>, w: usize, on: bool) -> Line<'static> {
-        if on {
+    pub fn picked(line: Line<'static>, w: usize, on: bool) -> Line<'static> {
+        shaded(line, w, on.then(|| crate::theme::pal().sel))
+    }
+
+    /// 补满一行宽,铺上这个底色(None = 不铺)
+    pub fn shaded(mut line: Line<'static>, w: usize, bg: Option<ratatui::style::Color>) -> Line<'static> {
+        if let Some(bg) = bg {
             let pad = w.saturating_sub(line.width());
             line.spans.push(Span::raw(" ".repeat(pad)));
-            line = line.patch_style(Style::new().bg(crate::theme::pal().sel));
+            line = line.patch_style(Style::new().bg(bg));
         }
         line
     }

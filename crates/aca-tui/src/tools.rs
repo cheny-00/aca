@@ -25,7 +25,7 @@ pub struct Tool {
     pub account: String,
     /// 哪家,菜单里上色用
     pub agent: Agent,
-    /// 菜单里名字后面那句:账号的配置目录、工具的命令
+    /// 菜单里名字后面那句:自己起名的工具写它的命令;账号不写(菜单在那写哪家和额度)
     pub note: String,
     /// 用不了的原因(工具写的默认账号没登记),菜单里代替说明显示
     pub problem: Option<String>,
@@ -60,21 +60,6 @@ fn entry(cfg: &Config, name: String, tool: &str, account: &str, note: String) ->
     Tool { name, tool: tool.into(), account: account.into(), agent: agent_of_tool(cfg, tool), note, problem }
 }
 
-/// 账号那一层带了什么:配置目录;不换目录的写它带的是环境变量 / 参数
-fn account_note(a: &aca_core::config::Account) -> String {
-    if !a.home.is_empty() {
-        return crate::create::tilde(&a.home);
-    }
-    let mut parts = vec![];
-    if !a.env.is_empty() || !a.env_file.is_empty() {
-        parts.push(t!("环境变量", "env vars").to_string());
-    }
-    if !a.args.is_empty() {
-        parts.push(a.args.join(" "));
-    }
-    parts.join(" · ")
-}
-
 /// 自己起名的工具:哪一家、什么命令、带什么参数、用哪个账号
 fn tool_note(name: &str, t: &aca_core::config::Tool) -> String {
     let cmd = if !t.cmd.is_empty() {
@@ -93,16 +78,25 @@ fn tool_note(name: &str, t: &aca_core::config::Tool) -> String {
 }
 
 pub fn menu(cfg: &Config, lay: &Layout) -> Vec<Tool> {
+    // 测试里不看这台机器装了什么
+    menu_with(cfg, lay, if cfg!(test) { |_| false } else { crate::accounts::on_path })
+}
+
+/// `installed` 问一个程序装了没有(测试里换掉)
+fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Tool> {
     let mut out: Vec<Tool> = vec![];
-    // 登记的账号:先 Claude 再 Codex,各自按名字
-    for fam in ["claude", "codex"] {
+    // 登记的账号:照内置的先后(Claude、Codex、pi、opencode),各自按名字
+    for fam in aca_core::agent::kinds().filter(|k| *k != "shell") {
         let all = cfg.accounts.get(fam);
-        for (n, a) in all.into_iter().flatten() {
-            out.push(entry(cfg, n.clone(), fam, n, account_note(a)));
+        for n in all.into_iter().flat_map(|m| m.keys()) {
+            out.push(entry(cfg, n.clone(), fam, n, String::new()));
         }
-        // 哪家一个账号都没有:放它本身(用它自己默认的配置目录)
-        if all.is_none_or(|m| m.is_empty()) {
-            out.push(entry(cfg, fam.into(), fam, "", t!("它自己默认的配置目录", "its own default config directory").into()));
+        // 哪家一个账号都没有:放它本身(用它自己默认的配置目录)。Claude、Codex 总在;
+        // 后加的几家装了(或者 config.toml 里写了它那一段)才放,没装的人菜单里不多出用不了的几行
+        let prog = cfg.tool(fam).and_then(|t| t.cmd.first().cloned()).unwrap_or_else(|| fam.to_string());
+        let wanted = matches!(fam, "claude" | "codex") || cfg.tools.contains_key(fam) || installed(&prog);
+        if all.is_none_or(|m| m.is_empty()) && wanted {
+            out.push(entry(cfg, fam.into(), fam, "", String::new()));
         }
     }
     // 自己起名的工具
@@ -117,7 +111,7 @@ pub fn menu(cfg: &Config, lay: &Layout) -> Vec<Tool> {
         tool: "shell".into(),
         account: String::new(),
         agent: Agent::None,
-        note: t!("开个 shell,自己起", "open a shell, start it yourself").into(),
+        note: t!("只开终端", "just a terminal").into(),
         problem: None,
     };
     out.insert(0, shell);
@@ -139,14 +133,17 @@ mod tests {
         v.iter().map(|t| t.name.as_str()).collect()
     }
 
+    fn none(_: &str) -> bool {
+        false
+    }
+
     #[test]
     fn accounts_are_listed_then_named_tools_and_shell_comes_first() {
-        let v = menu(&cfg(), &Layout::default());
+        let v = menu_with(&cfg(), &Layout::default(), none);
         // 不换配置目录的账号(bed:只带环境变量)也在
         assert_eq!(names(&v), ["shell", "bed", "team", "alt", "aider", "bad", "mycx"]);
-        assert_eq!((v[1].spec(), v[1].note.as_str()), ("claude:bed".to_string(), "环境变量"));
-        assert_eq!((v[2].spec(), v[2].agent), ("claude:team".to_string(), Agent::Claude));
-        assert!(v[2].note.ends_with(".ct"), "{}", v[2].note);
+        assert_eq!(v[1].spec(), "claude:bed");
+        assert_eq!((v[2].spec(), v[2].agent, v[2].note.as_str()), ("claude:team".to_string(), Agent::Claude, ""));
         assert_eq!((v[3].spec(), v[3].agent), ("codex:alt".to_string(), Agent::Codex));
         // 自己起名的工具认 kind;声明式的算别家
         assert_eq!((v[6].spec(), v[6].agent, v[6].note.as_str()), ("mycx".to_string(), Agent::Codex, "codex · alt"));
@@ -159,13 +156,28 @@ mod tests {
     #[test]
     fn a_family_without_accounts_is_listed_as_itself() {
         let only = aca_core::config::parse("[accounts.claude]\nteam = \"~/.ct\"\n");
-        assert_eq!(names(&menu(&only, &Layout::default())), ["shell", "team", "codex"]);
-        assert_eq!(names(&menu(&Config::default(), &Layout::default())), ["shell", "claude", "codex"]);
+        assert_eq!(names(&menu_with(&only, &Layout::default(), none)), ["shell", "team", "codex"]);
+        assert_eq!(names(&menu_with(&Config::default(), &Layout::default(), none)), ["shell", "claude", "codex"]);
+    }
+
+    #[test]
+    fn pi_and_opencode_show_up_when_installed_configured_or_given_accounts() {
+        fn pi_only(p: &str) -> bool {
+            p == "pi"
+        }
+        assert_eq!(names(&menu_with(&Config::default(), &Layout::default(), pi_only)), ["shell", "claude", "codex", "pi"]);
+        let cfg = aca_core::config::parse("[accounts.pi]\nwork = \"~/.pi-work\"\n[tools.opencode]\nargs = [\"--agent\", \"plan\"]\n");
+        let v = menu_with(&cfg, &Layout::default(), none);
+        assert_eq!(names(&v), ["shell", "claude", "codex", "work", "opencode"]);
+        assert_eq!((v[3].spec(), v[3].agent, v[4].agent), ("pi:work".to_string(), Agent::Pi, Agent::Opencode));
+        // 自己定了命令的看那个命令装了没有
+        let wrapped = aca_core::config::parse("[tools.pi]\ncmd = [\"/opt/pi/bin/pi\"]\n");
+        assert_eq!(names(&menu_with(&wrapped, &Layout::default(), none)), ["shell", "claude", "codex", "pi"]);
     }
 
     #[test]
     fn the_layout_orders_and_hides() {
         let lay = Layout { menu: vec!["alt".into(), "mycx".into()], hide: vec!["aider".into(), "bad".into()] };
-        assert_eq!(names(&menu(&cfg(), &lay)), ["shell", "alt", "mycx", "bed", "team"]);
+        assert_eq!(names(&menu_with(&cfg(), &lay, none)), ["shell", "alt", "mycx", "bed", "team"]);
     }
 }

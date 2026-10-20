@@ -155,6 +155,11 @@ Fields aca doesn't know don't stop a link, but they are named in a warning (when
 the plugins page). Usually it's a typo, or a field that ended up under another table — in TOML, fields written after a
 header such as `[[keys]]` belong to that entry.
 
+**Two languages.** `name`, `description`, and every `title` and `desc` can also be written per language:
+`description_en = "…"`, `title_zh = "…"`. When the interface is in that language the suffixed one is shown; otherwise
+the plain one is (so always write the plain one). An older aca doesn't know the suffixes and keeps showing the plain
+one. aca's own plugins have Chinese in the plain fields and English in `_en`.
+
 `[agent] dir`: aca passes this directory when it starts an agent, for that launch only. It isn't installed into the
 agent's config directory and doesn't touch your settings. Once the plugin is disabled or removed, the agent doesn't get
 it at its next start (running ones need a restart). The directory is an ordinary Claude Code plugin
@@ -532,14 +537,14 @@ it's rewritten the next time an agent starts, on `sync`, or when the plugins pag
 
 | Plugin | What it gives |
 |---|---|
-| `aca.delegate` | `/aca:delegate` (a slash command in Claude — typing `/dele` completes to it; a skill in Codex): the lead plans, dispatches workers through aca, checks their work and reports; a worker's transient failures are continued automatically. Settings: `worker` (who to dispatch to, default `codex`), `language` (which language to answer you in; empty = yours), `say` (what to say for a worker), `max_continue`, `delay` |
+| `aca.delegate` | `/aca:delegate` (a slash command in Claude — typing `/dele` completes to it; a skill in Codex): the lead plans, dispatches workers through aca, checks their work and reports; a worker's transient failures are continued automatically. It also brings `/aca:spec`: one change from proposal to archive (`openspec/changes/<slug>/`), each task done through `/aca:delegate`, done only once verified live. Settings: `worker` (who to dispatch to, default `codex`), `language` (which language to answer you in; empty = yours), `say` (what to say for a worker), `max_continue`, `delay` |
 | `aca.core` | aca's core abilities as agent tools (for both agents): `sessions` to look at sessions, `dispatch` to dispatch a worker (under the caller, optionally on a worktree branch), `message` to pass a message, `wait` to wait (up to 240 seconds per call), `answer` to answer for it, `interrupt` to stop it. Only workers the caller dispatched itself can be answered for or stopped |
 | `aca.gateway` | the MCP gateway, see the next section |
 | `aca.remote` | remote tasks, entirely in the plugin's script (sh + jq + curl + ssh): runs a long task on another machine in the background; when it ends, the result arrives as a message in the inbox of the session that sent it. In the `:` menu: `r` sends one, `t` lists them (⏎ copies the command to read its log, `x` cancels, `r` collects now), and an entry to test the server; agents get two tools, `run` and `list`. Callbacks first land on a server that's always on ([jobhook](https://github.com/cheny-00/jobhook)); settings: `url`, `token`. A timer that collects every 5 minutes is on only while something is waiting |
 | `aca.tailnet` | tailnet mounts, entirely in the plugin's script (sh + jq; needs `jq`): `m` in the `:` menu is a list with one `tailscale serve` per row (and whether its target is listening); ⏎ copies the URL, `x` removes it (and says how to add it back), `a` mounts a local port, `p` turns publishing on or off (with tpub installed). Agents can list; mounting a port is `agent?`, given only when you opt in (`aca plugin allow aca.tailnet add`) |
-| `aca.bark` | pushes "finished", "waiting for you to confirm" and "error" to your phone with Bark (not while someone is attached to that session). Settings: `url` (the push URL), `workers` (push for dispatched workers too), `group`; an entry in the `:` menu sends a test push |
+| `aca.bark` | pushes "finished", "waiting for you to confirm" and "error" to your phone with Bark (not while someone is attached to that session). Settings: `url` (the push URL), `workers` (push for dispatched workers too), `group`; `aca plugin run aca.bark.test` sends a test push |
 | `aca.discord` | the same three things to a Discord channel (through a webhook; not while someone is attached to that session). Settings: `url` (the webhook URL), `mention` (the user id to @ when it's waiting for you), `workers`, `username`. Outgoing only; replying from Discord into the session isn't built yet |
-| `aca.notify` | the same three things as desktop notifications on this machine (not while you're attached to that session). Settings: `command` (a different notification command, with the title and body as its two arguments; when it's empty or fails, `osascript` on macOS and `notify-send` on Linux), `workers`, `attached` (notify even while attached); an entry in the `:` menu shows a test notification |
+| `aca.notify` | the same three things as desktop notifications on this machine (not while you're attached to that session). Settings: `command` (a different notification command, with the title and body as its two arguments; when it's empty or fails, `osascript` on macOS and `notify-send` on Linux), `workers`, `attached` (notify even while attached); `aca plugin run aca.notify.test` shows a test notification |
 | `aca.copy` | copies commands from a reply, entirely in the plugin's script (sh; needs `fzf`): press Ctrl+Alt+Y inside a session (a hotkey; `y` in the `:` menu) and it finds the code blocks and inline commands in the raw text of the last reply — a single one is copied right away, several pop up to pick by number; each command in a shell code block is listed on its own too. Copies to the tmux buffer, the outer terminal (OSC 52) and the local clipboard. Settings: `inline` (which inline `…` to include), `lines`, `copy` (a different copy command) |
 
 ## MCP gateway
@@ -669,7 +674,11 @@ sessions that started with something different from what they'd get now: restart
 `aca new -w` (setting `worker`, default `codex`; each in its own worktree), waits for them with `aca wait` (Claude in
 the background, Codex in the foreground with `--any`), checks the work itself and reports. When a dispatched worker's
 turn fails on a rate limit or overload, its event hook says something for it a little later (setting `say`, at most
-`max_continue` times, `delay` apart). Install it with `aca plugin install aca.delegate`.
+`max_continue` times, `delay` apart). The same plugin brings `/aca:spec` (a skill called spec in Codex): a change's
+proposal, design and tasks live in `openspec/changes/<slug>/`, each task goes through `/aca:delegate`, and the change is
+done once it is deployed, seen to have rolled and verified live, then archived; briefs, worker results and the verify log
+go in `doc/spec/<slug>/`. The repo's own checks, deploy route and live checks are written in its
+`.claude/spec-profile.md`. Install it with `aca plugin install aca.delegate`.
 
 ## Differences from herdr plugins
 

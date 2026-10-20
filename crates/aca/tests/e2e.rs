@@ -2423,7 +2423,9 @@ fn timers_run_when_due_follow_their_plugin_and_a_manual_one_switches_itself_off_
     assert_eq!(count("ticks"), 1);
     let log = sb.aca(&["plugin", "log", "t.timed"]);
     assert!(log.contains(" timer tick\ntick out"), "{log}");
-    assert!(sb.aca(&["plugin", "timer"]).contains("上次 0s 前 ✓"));
+    // 刚跑过:跨过整秒、机器忙一点就是 1s、2s 前
+    let ls = sb.aca(&["plugin", "timer"]);
+    assert!(["上次 0s 前 ✓", "上次 1s 前 ✓", "上次 2s 前 ✓"].iter().any(|s| ls.contains(s)), "{ls}");
     write(&sb.home.join("state/plugins/t.timed/fail"), "");
     sb.aca(&["plugin", "timer", "tick", "t.timed.tick"]);
     assert_eq!(rows()[0]["rc"], 3);
@@ -2936,11 +2938,11 @@ fn the_tmux_status_segment_counts_what_waits_for_you() {
     hook("UserPromptSubmit", ",\"prompt\":\"看看\"");
     assert_eq!(sb.aca(&["tmux-status"]), "");
     hook("PermissionRequest", ",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}");
-    assert_eq!(sb.aca(&["tmux-status"]), "#[fg=red reverse bold] ! 1 #[default]");
+    assert_eq!(sb.aca(&["tmux-status"]), "#[fg=red reverse bold] ◆ 1 #[default]");
     // 正看着它:不算
     assert_eq!(sb.aca(&["tmux-status", &id]), "");
     hook("Stop", ",\"last_assistant_message\":\"好了\",\"background_tasks\":[]");
-    assert_eq!(sb.aca(&["tmux-status"]), "#[fg=brightblack]● 1#[default]");
+    assert_eq!(sb.aca(&["tmux-status"]), "#[fg=brightblack]◐ 1#[default]");
     let events = sb.event_names().len();
     sb.aca(&["seen", &id]);
     assert_eq!(sb.aca(&["tmux-status"]), "");
@@ -3333,7 +3335,8 @@ fn a_plugins_hotkey_is_bound_in_tmux_while_the_plugin_is_on_and_yours_are_left_a
             .filter(|l| l.contains("--hotkey") && l.contains(" plugin pane "))
             .filter_map(|l| {
                 let mut w = l.split_once("-T")?.1.split_whitespace();
-                Some(format!("{}:{}", w.next()?, w.next()?))
+                // tmux 3.3a / 3.4 把 C-M-y 打成 M-C-y
+                Some(format!("{}:{}", w.next()?, w.next()?.replace("M-C-", "C-M-")))
             })
             .collect();
         v.sort();
@@ -3431,8 +3434,8 @@ fn the_next_key_takes_the_client_to_what_waits_and_the_status_bar_only_counts() 
     hook(&ask, &ask_pane, "PermissionRequest", ",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}");
     // 状态栏:种类和个数,在问的是红底的一块,跑完的是次要的字色;没有名字。你正看着的那个不算
     let bar = |id: &str| sb.aca(&["tmux-status", id]);
-    assert_eq!(bar(&here), "#[fg=red reverse bold] ! 1 #[default] #[fg=brightblack]● 1#[default]");
-    assert_eq!(bar(&ask), "#[fg=brightblack]● 1#[default]");
+    assert_eq!(bar(&here), "#[fg=red reverse bold] ◆ 1 #[default] #[fg=brightblack]◐ 1#[default]");
+    assert_eq!(bar(&ask), "#[fg=brightblack]◐ 1#[default]");
 
     // 键:建会话时就绑上了,三张键表;只在 aca 的会话里拦,别处键原样送进去
     let keys = |k: &str| sb.tmux(&["list-keys"]).lines().filter(|l| l.contains(" next --hotkey ") && l.contains(&format!(" {k} "))).count();
@@ -3460,7 +3463,7 @@ fn the_next_key_takes_the_client_to_what_waits_and_the_status_bar_only_counts() 
     // 再按:跑完没看的。进去过就算看过了
     press("C-M-n");
     assert!(sb.until(|| at() == done), "没进跑完的那个:{}", at());
-    assert!(sb.until(|| bar(&here) == "#[fg=red reverse bold] ! 1 #[default]"), "{}", bar(&here));
+    assert!(sb.until(|| bar(&here) == "#[fg=red reverse bold] ◆ 1 #[default]"), "{}", bar(&here));
     // 再按:没看过的没有了,还有一个在问,回到它;在它上面再按,一个都没有了,人不动、说一句
     press("C-M-n");
     assert!(sb.until(|| at() == ask), "没回到在问的那个:{}", at());
@@ -3491,6 +3494,24 @@ fn the_next_key_takes_the_client_to_what_waits_and_the_status_bar_only_counts() 
     assert!(out.contains("没绑键"), "{out}");
     assert_eq!(sb.tmux(&["list-keys"]).lines().filter(|l| l.contains(" next --hotkey ")).count(), 0);
     assert!(sb.aca(&["tmux"]).contains("没绑键"));
+}
+
+/// 只在屏幕上看得出在等你的(hook 没报:没信任 hook 的 Codex、启动时的确认框):列表里是 ◐,进下一个的键也要去得了
+#[test]
+fn the_next_key_also_goes_to_a_session_only_its_screen_says_is_waiting() {
+    let Some(sb) = Sandbox::new("next-screen") else { return };
+    sb.screen_tools();
+    let here = sb.aca(&["new", "fake", &sb.proj(), "-t", "我在这"]);
+    let w = sb.aca(&["new", "fcx", &sb.proj(), "-t", "门口"]);
+    let pane = sb.pane(&w);
+    sb.set_screen(
+        &w,
+        &pane,
+        "Folder access\n  /p/api\n  Trust this folder? Codex can read, edit, and run files here.\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit",
+    );
+    // 不在 tmux 里、没有终端:挑中的是它,只是连不上去
+    let o = sb.run(&["next", "--session", &here]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("进不去「门口」"), "{o:?}");
 }
 
 /// 从界面进一个会话,先路过刚离开的那个(进去之后 ^` 回得去):tmux 把路过记成连进去过,
@@ -3974,9 +3995,9 @@ fn restart_as_another_account_carries_the_conversation_over_and_back() {
 
 /// 界面开在一个 shell 底下(sh 不理挂断,和 kitty 里 zsh 底下开的一样),窗格整个关掉 = kitty 关了那个窗口。
 /// 以前:往没了的终端打印出错,出错时的善后再打印、再出错,程序被中止(134),什么也没留下(2026-10-14 那次)。
-/// 现在:正常退出(0),exit.log 记着终端没了;下次打开界面,底栏说一次
+/// 现在:正常退出(0),exit.log 记着终端没了;终端关掉是常事,下次打开界面不再提
 #[test]
-fn closing_the_terminal_under_the_interface_quits_quietly_and_says_so_next_time() {
+fn closing_the_terminal_under_the_interface_quits_quietly() {
     let Some(sb) = Sandbox::new("hangup") else { return };
     let status = sb.home.join("status");
     let script = sb.home.join("ui.sh");
@@ -4020,12 +4041,25 @@ fn closing_the_terminal_under_the_interface_quits_quietly_and_says_so_next_time(
     assert_eq!(codes(1), "0\n");
     let log = std::fs::read_to_string(ui.join("exit.log")).unwrap();
     assert!(log.contains("终端没了,界面跟着退出(终端)"), "{log}");
-    assert!(ui.join("last-exit").exists());
-
-    // 下次打开:底栏说一次,说完就删了
-    open("second", "随终端关掉退出了(终端)");
     assert!(!ui.join("last-exit").exists());
+
+    // 下次打开:底栏不提
+    open("second", "快捷键");
+    let screen = sb.tmux(&["capture-pane", "-p", "-t", "second"]);
+    assert!(!screen.contains("上次的界面"), "{screen}");
     sb.tmux(&["kill-pane", "-t", "second"]);
     assert_eq!(codes(2), "0\n0\n");
     assert_eq!(std::fs::read_to_string(ui.join("exit.log")).unwrap().matches("终端没了").count(), 2);
+}
+
+/// 打到管道里、对面先走了(`aca ls | head -1`、`aca help | less` 没翻完就退):不打 panic,141 退出(同被 SIGPIPE 带走的)
+#[test]
+fn printing_into_a_pipe_nobody_reads_any_more_exits_quietly() {
+    let Some(sb) = Sandbox::new("epipe") else { return };
+    // 读的那头先关掉:一写就是 EPIPE,不靠赶时间
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let o = sb.cmd().arg("help").stdout(writer).output().unwrap();
+    assert_eq!(o.status.code(), Some(141), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(o.stderr.is_empty(), "{}", String::from_utf8_lossy(&o.stderr));
 }
