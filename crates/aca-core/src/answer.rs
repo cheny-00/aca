@@ -19,11 +19,12 @@ use serde_json::json;
 
 use crate::agent::{self, Agent};
 use crate::config::Config;
+use crate::i18n::Tr;
 use crate::paths::Res;
 use crate::runtime::{self, Run};
 use crate::status::{self, State};
 use crate::store::{Session, Store};
-use crate::{event, tmux};
+use crate::{event, t, tmux, tr};
 
 /// 只在屏幕上认得出的框(启动时那几道关)
 #[derive(Clone, Debug, PartialEq)]
@@ -78,23 +79,38 @@ pub fn show(s: &Session, r: &Run, screen: &[String]) -> String {
     if r.ask_kind.is_empty()
         && let Some(g) = gate(screen)
     {
-        let mut out = format!("{} 在问:{}", s.id, g.title);
+        let mut out = tr!("{} 正在询问:{}", "{} is asking: {}", s.id, g.title);
         for (i, o) in g.opts.iter().enumerate() {
             out += &format!("\n  {} {o}", i + 1);
         }
-        return out + &format!("\n回答:aca answer {} <选项号>(启动时的关卡,只在屏幕上认得出)", s.id);
+        return out
+            + &tr!(
+                "\n回答:aca answer {} <选项号>(启动时的确认框,只能从屏幕识别)",
+                "\nanswer: aca answer {} <NUMBER> (a startup gate, seen only on screen)",
+                s.id
+            );
     }
-    let mut out = format!("{} 在问:{}", s.id, if r.ask.is_empty() { "(没说问的是什么)" } else { &r.ask });
+    let mut out = tr!(
+        "{} 正在询问:{}",
+        "{} is asking: {}",
+        s.id,
+        if r.ask.is_empty() { t!("(未提供问题内容)", "(no question given)") } else { &r.ask }
+    );
     match r.ask_kind.as_str() {
-        "choice" if r.ask_multi => out += "\n一次问了好几题(或者能多选),按一个数字答不了:去它的界面里答",
+        "choice" if r.ask_multi => {
+            out += t!(
+                "\n包含多个问题(或可多选),无法用一个数字回答:请在它的界面中回答",
+                "\nseveral questions (or multiple choice): one number can't answer it; answer in its own screen"
+            )
+        }
         "choice" => {
             for (i, o) in r.ask_opts.iter().enumerate() {
                 out += &format!("\n  {} {o}", i + 1);
             }
-            out += &format!("\n回答:aca answer {} <选项号>", s.id);
+            out += &tr!("\n回答:aca answer {} <选项号>", "\nanswer: aca answer {} <NUMBER>", s.id);
         }
-        "permission" => out += &format!("\n回答:aca answer {} yes|no", s.id),
-        _ => out += "\n看不出是哪种框:去它的界面里答",
+        "permission" => out += &tr!("\n回答:aca answer {} yes|no", "\nanswer: aca answer {} yes|no", s.id),
+        _ => out += t!("\n无法识别确认框类型:请在它的界面中回答", "\ncan't tell what kind of prompt this is; answer in its own screen"),
     }
     out
 }
@@ -117,26 +133,38 @@ fn may_answer(store: &Store, me: &str, target: &Session) -> bool {
 /// 要按的键和给人看的那一句
 fn keys_for(agent: &dyn Agent, r: &Run, reply: &str) -> Res<(&'static str, String)> {
     match r.ask_kind.as_str() {
-        "choice" if r.ask_multi => Err("一次问了好几题(或者能多选),按一个数字答不了:去它的界面里答".into()),
+        "choice" if r.ask_multi => Err(t!(
+            "包含多个问题(或可多选),无法用一个数字回答:请在它的界面中回答",
+            "several questions (or multiple choice): one number can't answer it; answer in its own screen"
+        )
+        .into()),
         "choice" => {
-            let n: usize = reply.parse().map_err(|_| "选择题写选项号:1、2 …".to_string())?;
+            let n: usize =
+                reply.parse().map_err(|_| t!("选择题请输入选项号:1、2 …", "a choice takes an option number: 1, 2 …").to_string())?;
             let most = if r.ask_opts.is_empty() { 9 } else { r.ask_opts.len().min(9) };
             if n == 0 || n > most {
-                return Err(format!("只有 {most} 个选项"));
+                return Err(tr!("只有 {most} 个选项", "there are only {most} options"));
             }
             const DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
             let label = r.ask_opts.get(n - 1).map(|o| format!("{n} {o}")).unwrap_or_else(|| n.to_string());
             Ok((DIGITS[n - 1], label))
         }
         "permission" => {
-            let (yes, no) = agent.permission_keys().ok_or("这一家的确认框还没试过怎么按:去它的界面里答")?;
+            let (yes, no) = agent.permission_keys().ok_or(t!(
+                "尚不支持该工具的确认框:请在它的界面中回答",
+                "this tool's prompts can't be answered yet; answer in its own screen"
+            ))?;
             match reply {
                 "yes" | "y" => Ok((yes, "yes".into())),
                 "no" | "n" => Ok((no, "no".into())),
-                _ => Err("权限框只回答 yes 或 no".into()),
+                _ => Err(t!("权限确认只能回答 yes 或 no", "a permission prompt takes only yes or no").into()),
             }
         }
-        _ => Err("看不出它在问哪种,不替它按:去它的界面里答".into()),
+        _ => Err(t!(
+            "无法识别询问类型,未代为回答:请在它的界面中回答",
+            "can't tell what it's asking; nothing answered: answer in its own screen"
+        )
+        .into()),
     }
 }
 
@@ -145,10 +173,14 @@ fn caller(store: &Store, s: &Session, what: &str) -> Res<Option<String>> {
     let me = std::env::var("ACA_SESSION_ID").ok().filter(|x| !x.is_empty());
     if let Some(me) = &me {
         if *me == s.id {
-            return Err(format!("不能替自己{what}"));
+            return Err(tr!("不能为自己{what}", "can't {what} yourself"));
         }
         if !may_answer(store, me, s) {
-            return Err(format!("{} 不是你派出去的:只能替自己派出去的会话{what}", s.id));
+            return Err(tr!(
+                "{} 不是你派出的会话:只能为自己派出的会话{what}",
+                "{} isn't a session you dispatched: you can only {what} the ones you dispatched",
+                s.id
+            ));
         }
     }
     Ok(me)
@@ -159,14 +191,22 @@ fn caller(store: &Store, s: &Session, what: &str) -> Res<Option<String>> {
 /// 停下以后它空着:要换个说法让它接着干用 `aca send`(打字进去马上开一轮)。Codex 被打断后排着的消息不自己开跑
 pub fn interrupt(store: &Store, cfg: &Config, key: &str) -> Res<String> {
     let s = store.get(key)?;
-    let me = caller(store, &s, "中止")?;
+    let me = caller(store, &s, t!("中止", "interrupt"))?;
     let (agent, _) = agent::of(cfg, &s)?;
-    let keys = agent.interrupt_keys().ok_or("这一家还没试过怎么中止:去它的界面里按")?;
-    let pane = tmux::find(&s.id).filter(|p| !p.dead).ok_or("会话没在跑")?;
+    let keys = agent
+        .interrupt_keys()
+        .ok_or(t!("尚不支持中止该工具:请在它的界面中操作", "this tool can't be interrupted yet; do it in its own screen"))?;
+    let pane = tmux::find(&s.id).filter(|p| !p.dead).ok_or(t!("会话未运行", "the session isn't running"))?;
     match status::one(cfg, &s, true).state {
         State::Running => {}
-        State::Ask => return Err("它在等确认,不是在跑:要拒绝用 aca answer <会话> no".into()),
-        _ => return Err("它没在跑一轮,不用中止".into()),
+        State::Ask => {
+            return Err(t!(
+                "它正在等待确认,未在运行:如需拒绝,用 aca answer <会话> no",
+                "it's waiting for a confirmation, not running: to refuse, aca answer <id> no"
+            )
+            .into());
+        }
+        _ => return Err(t!("它当前没有在运行的一轮,无需中止", "it has no running turn to interrupt").into()),
     }
     for (i, k) in keys.iter().enumerate() {
         if i > 0 {
@@ -182,17 +222,23 @@ pub fn interrupt(store: &Store, cfg: &Config, key: &str) -> Res<String> {
         });
         event::emit("turn.interrupted", &s.id, json!({ "by": me.unwrap_or_else(|| "you".into()) }));
     }
-    Ok(format!("中止了 {} 正在跑的这一轮", s.id))
+    Ok(tr!("已中止 {} 正在运行的这一轮", "interrupted the running turn of {}", s.id))
 }
+
+/// 按之前再看一眼,问的已经不是那一句了
+const CHANGED: Tr = Tr::new(
+    "询问内容已变化,未回答:请重新查看 aca answer <会话>",
+    "the question changed; nothing answered: look again with aca answer <id>",
+);
 
 /// 回答;返回给人看的那一句
 pub fn answer(store: &Store, cfg: &Config, key: &str, reply: &str) -> Res<String> {
     let s = store.get(key)?;
-    let me = caller(store, &s, "回答")?;
+    let me = caller(store, &s, t!("回答", "answer for"))?;
     let (agent, _) = agent::of(cfg, &s)?;
-    let pane = tmux::find(&s.id).filter(|p| !p.dead).ok_or("会话没在跑")?;
+    let pane = tmux::find(&s.id).filter(|p| !p.dead).ok_or(t!("会话未运行", "the session isn't running"))?;
     if status::one(cfg, &s, true).state != State::Ask {
-        return Err("它现在没在等确认".into());
+        return Err(t!("它当前未在等待确认", "it isn't waiting for a confirmation").into());
     }
     let r = runtime::load(&s.id);
     if r.ask_kind.is_empty()
@@ -204,7 +250,7 @@ pub fn answer(store: &Store, cfg: &Config, key: &str, reply: &str) -> Res<String
     // 按之前再看一眼:还在问同一句(和你同时按、框已经换了的,不按)
     let now = runtime::load(&s.id);
     if now.status != "waiting" || now.ask != r.ask || now.ask_kind != r.ask_kind {
-        return Err("它问的已经变了,没按:再看一眼 aca answer <会话>".into());
+        return Err(CHANGED.get().into());
     }
     tmux::keys(&pane.pane, &[key])?;
     box_gone(&*agent, &pane.pane);
@@ -216,7 +262,7 @@ pub fn answer(store: &Store, cfg: &Config, key: &str, reply: &str) -> Res<String
     });
     let by = me.unwrap_or_else(|| "you".into());
     event::emit("ask.answered", &s.id, json!({ "by": by, "answer": said, "ask": r.ask, "kind": r.ask_kind }));
-    Ok(format!("替 {} 答了:{said}", s.id))
+    Ok(tr!("已代 {} 回答:{said}", "answered for {}: {said}", s.id))
 }
 
 /// 按完之后等屏幕上那个框收起来,最多 1.5 秒:列表、`aca wait` 以屏幕为准,框还没重画掉的那一下还当它在问
@@ -231,19 +277,21 @@ fn box_gone(agent: &dyn Agent, pane: &str) {
 
 /// 启动时的关卡:状态看屏幕(没有 hook 报),按完不改 runtime,它过了关自己会变
 fn answer_gate(s: &Session, pane: &str, g: &Gate, reply: &str, me: Option<String>) -> Res<String> {
-    let n: usize = reply.parse().map_err(|_| "这是启动时的关卡,写选项号:1、2 …".to_string())?;
+    let n: usize = reply
+        .parse()
+        .map_err(|_| t!("这是启动时的确认框,请输入选项号:1、2 …", "this is a startup gate: give an option number: 1, 2 …").to_string())?;
     if n == 0 || n > g.opts.len() {
-        return Err(format!("只有 {} 个选项", g.opts.len()));
+        return Err(tr!("只有 {} 个选项", "there are only {} options", g.opts.len()));
     }
     // 按之前再抓一次:框换了(和你同时按了)就不按
     if gate(&tmux::capture(pane)).as_ref() != Some(g) {
-        return Err("它问的已经变了,没按:再看一眼 aca answer <会话>".into());
+        return Err(CHANGED.get().into());
     }
     tmux::keys(pane, &gate_keys(g, n))?;
     let said = format!("{n} {}", g.opts[n - 1]);
     let by = me.unwrap_or_else(|| "you".into());
     event::emit("ask.answered", &s.id, json!({ "by": by, "answer": said, "ask": g.title, "kind": "gate" }));
-    Ok(format!("替 {} 答了:{said}", s.id))
+    Ok(tr!("已代 {} 回答:{said}", "answered for {}: {said}", s.id))
 }
 
 #[cfg(test)]
@@ -259,7 +307,7 @@ mod tests {
         assert_eq!(keys_for(claude, &q, "2").unwrap(), ("2", "2 B".to_string()));
         assert!(keys_for(claude, &q, "3").unwrap_err().contains("只有 2 个"));
         assert!(keys_for(claude, &q, "B").is_err() && keys_for(claude, &q, "0").is_err());
-        assert!(keys_for(claude, &Run { ask_multi: true, ..q.clone() }, "1").unwrap_err().contains("界面里答"));
+        assert!(keys_for(claude, &Run { ask_multi: true, ..q.clone() }, "1").unwrap_err().contains("界面中回答"));
         // 权限框:Claude 同意按 1、拒绝按 Esc;Codex 同意按 y、拒绝按 Esc(0.163 上实测)
         let p = Run { ask: "Bash:touch x".into(), ask_kind: "permission".into(), ..Default::default() };
         assert_eq!(keys_for(claude, &p, "yes").unwrap().0, "1");
@@ -268,6 +316,21 @@ mod tests {
         assert_eq!((keys_for(codex, &p, "yes").unwrap().0, keys_for(codex, &p, "no").unwrap().0), ("y", "Escape"));
         // 只在屏幕上认出来的:不归这里(走 gate)
         assert!(keys_for(claude, &Run { ask: "Hooks need review".into(), ..Default::default() }, "1").is_err());
+    }
+
+    #[test]
+    fn what_it_says_back_follows_the_interface_language() {
+        use crate::i18n::{self, Lang};
+        let claude = agent::builtin("claude").unwrap();
+        let p = Run { ask: "Bash:touch x".into(), ask_kind: "permission".into(), ..Default::default() };
+        let q = Run { ask: "A or B?".into(), ask_kind: "choice".into(), ask_opts: vec!["A".into(), "B".into()], ..Default::default() };
+        let s = Session { id: "w1".into(), ..Default::default() };
+        assert_eq!(show(&s, &q, &[]), "w1 正在询问:A or B?\n  1 A\n  2 B\n回答:aca answer w1 <选项号>");
+        i18n::with(Lang::En, || {
+            assert_eq!(keys_for(claude, &p, "2").unwrap_err(), "a permission prompt takes only yes or no");
+            assert_eq!(keys_for(claude, &q, "3").unwrap_err(), "there are only 2 options");
+            assert_eq!(show(&s, &q, &[]), "w1 is asking: A or B?\n  1 A\n  2 B\nanswer: aca answer w1 <NUMBER>");
+        });
     }
 
     fn lines(s: &str) -> Vec<String> {
@@ -291,7 +354,7 @@ mod tests {
         let s = Session { id: "w1".into(), ..Default::default() };
         let said = show(&s, &Run::default(), &lines(review));
         assert!(
-            said.contains("w1 在问:Hooks need review")
+            said.contains("w1 正在询问:Hooks need review")
                 && said.contains("  2 Trust all and continue")
                 && said.contains("aca answer w1 <选项号>")
         );

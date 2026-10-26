@@ -10,7 +10,7 @@ use std::io::{IsTerminal, Write};
 use aca_core::config::Config;
 use aca_core::i18n::{Lang, lang};
 use aca_core::paths;
-use aca_core::runtime::Run;
+use aca_core::runtime::{Run, mark};
 use aca_core::status::{Row, State};
 use aca_core::store::{Group, Store};
 use aca_core::{t, tr};
@@ -80,12 +80,12 @@ fn state(s: State) -> (Style, &'static str) {
     let p = theme::pal();
     let strong = |c| Style::new().fg(c).add_modifier(Modifier::BOLD);
     match s {
-        State::Running => (strong(p.green), t!("在跑", "running")),
-        State::Ask => (strong(p.red), t!("要你答", "needs you")),
-        State::Unread => (strong(p.amber), t!("没看", "unread")),
+        State::Running => (strong(p.green), t!("运行中", "running")),
+        State::Ask => (strong(p.red), t!("等待回应", "needs you")),
+        State::Unread => (strong(p.amber), t!("未读", "unread")),
         State::Idle => (Style::new().fg(p.muted), t!("空闲", "idle")),
         State::Error => (strong(p.red), t!("出错", "error")),
-        State::Exited | State::Stopped => (Style::new().fg(p.muted), t!("停了", "stopped")),
+        State::Exited | State::Stopped => (Style::new().fg(p.muted), t!("已停止", "stopped")),
     }
 }
 
@@ -143,7 +143,7 @@ fn list(cfg: &Config, rows: &[Row], all: &[String], w: usize, now: u64) -> Vec<S
     if rows.is_empty() {
         return vec![vec![seg(
             t!(
-                "还没有会话。起一个:aca new <工具[:账号]> [目录];接管已经在跑的:aca adopt",
+                "暂无会话。新建:aca new <工具[:账号]> [目录];接管已在运行的会话:aca adopt",
                 "No sessions yet. Start one: aca new <TOOL[:ACCOUNT]> [DIR]; adopt running ones: aca adopt"
             ),
             theme::minor(),
@@ -151,7 +151,7 @@ fn list(cfg: &Config, rows: &[Row], all: &[String], w: usize, now: u64) -> Vec<S
     }
     let ids: Vec<(String, usize)> = rows.iter().map(|r| short(&r.id, all)).collect();
     let ages: Vec<String> = rows.iter().map(|r| age(now.saturating_sub(r.active))).collect();
-    let marks: Vec<String> = rows.iter().map(|r| r.tokens.iter().map(|(k, v)| format!(" [{k} {v}]")).collect()).collect();
+    let marks: Vec<String> = rows.iter().map(|r| r.tokens.iter().map(|(k, v)| format!(" {}", mark(k, v))).collect()).collect();
     let most = |it: &mut dyn Iterator<Item = usize>| it.max().unwrap_or(0);
     let idw = most(&mut ids.iter().map(|i| i.0.width()));
     let agew = most(&mut ages.iter().map(|a| a.width()));
@@ -170,7 +170,7 @@ fn list(cfg: &Config, rows: &[Row], all: &[String], w: usize, now: u64) -> Vec<S
     let mut group = None;
     for (i, r) in rows.iter().enumerate() {
         if group != Some(&r.group) {
-            let name = if r.group.is_empty() { t!("(没分组)", "(no group)") } else { &r.group };
+            let name = if r.group.is_empty() { t!("(未分组)", "(no group)") } else { &r.group };
             let n = rows.iter().filter(|x| x.group == r.group).count();
             out.push(vec![seg(name, bold()), seg(format!("  {n}"), theme::minor())]);
             group = Some(&r.group);
@@ -231,7 +231,7 @@ fn markdown(reply: &str, w: usize, color: bool) -> Vec<Styled> {
 /// `aca show <id>`:第一行状态和标题,下面一项一行,最后是排好的最后一条回复
 fn card(cfg: &Config, row: &Row, run: &Run, all: &[String], w: usize, now: u64, color: bool) -> Vec<Styled> {
     let (st, word) = state(row.state);
-    let word = if row.idle_stopped > 0 { t!("闲着被 aca 停了", "stopped by aca for idling") } else { word };
+    let word = if row.idle_stopped > 0 { t!("自动停止", "stopped by aca for idling") } else { word };
     let mut out = vec![vec![seg(row.glyph(), st), spaces(1), seg(trace::clean(&row.title), bold())]];
     // 名字那一栏:中文两个字(4 格)空两格;英文最长的 account 也空两格
     let col: usize = if lang() == Lang::En { 9 } else { 6 };
@@ -242,33 +242,30 @@ fn card(cfg: &Config, row: &Row, run: &Run, all: &[String], w: usize, now: u64, 
     };
     let none = |s: &str| vec![seg(s, theme::minor())];
     let since = match row.state {
-        State::Running if row.ran > 0 => tr!(" · 跑了 {}", " · running for {}", age(row.ran)),
-        _ if row.idle_stopped > 0 => tr!(" · {}前停的", " · {} ago", age(now.saturating_sub(row.idle_stopped))),
-        _ => tr!(" · {} 没动", " · quiet for {}", age(now.saturating_sub(row.active))),
+        State::Running if row.ran > 0 => tr!(" · 已运行 {}", " · running for {}", age(row.ran)),
+        _ if row.idle_stopped > 0 => tr!(" · {}前停止", " · {} ago", age(now.saturating_sub(row.idle_stopped))),
+        _ => tr!(" · {} 无活动", " · quiet for {}", age(now.saturating_sub(row.active))),
     };
     field(t!("状态", "state"), vec![seg(word, Style::new().fg(st.fg.unwrap_or_default())), seg(since, theme::minor())]);
     if !row.ask.is_empty() {
-        field(t!("在问", "asking"), vec![seg(trace::clean(&row.ask), Style::new().fg(theme::pal().red))]);
+        field(t!("提问", "asking"), vec![seg(trace::clean(&row.ask), Style::new().fg(theme::pal().red))]);
     }
     let (_, lit) = short(&row.id, all);
     field("id", id_cell(&(row.id.clone(), lit), 0));
     field(t!("账号", "account"), who(cfg, &row.tool, &row.account, false));
-    field(t!("分组", "group"), if row.group.is_empty() { none(t!("(没分组)", "(no group)")) } else { vec![text(row.group.as_str())] });
+    field(t!("分组", "group"), if row.group.is_empty() { none(t!("(未分组)", "(no group)")) } else { vec![text(row.group.as_str())] });
     field(t!("目录", "dir"), vec![text(create::tilde(&row.dir))]);
-    field(t!("对话", "conv"), if row.conv.is_empty() { none(t!("还没有", "none yet")) } else { vec![text(row.conv.as_str())] });
+    field(t!("对话", "conv"), if row.conv.is_empty() { none(t!("暂无", "none yet")) } else { vec![text(row.conv.as_str())] });
     field(
         "tmux",
         if row.tmux.is_empty() {
-            none(t!("没在跑", "not running"))
+            none(t!("未运行", "not running"))
         } else {
             vec![text(row.tmux.as_str()), seg(format!(" {}", row.pane), theme::minor())]
         },
     );
     if !row.tokens.is_empty() {
-        field(
-            t!("挂的", "tags"),
-            vec![seg(row.tokens.iter().map(|(k, v)| format!("[{k} {v}]")).collect::<Vec<_>>().join(" "), theme::minor())],
-        );
+        field(t!("标签", "tags"), vec![seg(row.tokens.iter().map(|(k, v)| mark(k, v)).collect::<Vec<_>>().join(" "), theme::minor())]);
     }
     if !run.last.is_empty() {
         out.push(vec![]);
@@ -590,11 +587,11 @@ mod tests {
              \x20 ● 11111111  修登录                    claude:sub        5秒\n\
              \x20 ◆ 22222222  a much longer title here  codex             1分 [pr #12]\n\
              \x20             └ Allow Bash(rm -rf)?\n\
-             (没分组)  2\n\
+             (未分组)  2\n\
              \x20 ■ 33333333  停着的                    claude:.claude-x  3天\n\
              \x20 ☾ 44444444  闲着停的                  claude:.claude-x  3天\n\
              \n\
-             4 个会话 · ◆ 1 要你答 · ● 1 在跑"
+             4 个会话 · ◆ 1 等待回应 · ● 1 运行中"
         );
         let p = theme::pal();
         // 状态、账号的颜色和界面的列表一套;没在跑的标题淡一档
@@ -645,7 +642,7 @@ mod tests {
         assert_eq!(
             page(&out),
             "◐ 修登录\n\
-             \x20 状态  没看 · 2分 没动\n\
+             \x20 状态  未读 · 2分 无活动\n\
              \x20 id    887f90d1\n\
              \x20 账号  claude:sub\n\
              \x20 分组  work\n\
@@ -672,7 +669,7 @@ mod tests {
         let out = card(&Config::default(), &r, &Run::default(), &[], 60, NOW, true);
         assert_eq!(
             page(&out),
-            "● t\n  状态  在跑 · 跑了 2分\n  在问  选哪个?\n  id    887f90d1\n  账号  shell\n  分组  (没分组)\n  目录  /work/app\n  对话  还没有\n  tmux  没在跑"
+            "● t\n  状态  运行中 · 已运行 2分\n  提问  选哪个?\n  id    887f90d1\n  账号  shell\n  分组  (未分组)\n  目录  /work/app\n  对话  暂无\n  tmux  未运行"
         );
     }
 

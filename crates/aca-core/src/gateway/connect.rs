@@ -5,7 +5,6 @@
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -59,15 +58,11 @@ pub fn reach() -> Res<UnixStream> {
     }
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir().join("gateway.log")).map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
-    Command::new(crate::agent::self_exe())
-        .args(["plugin", "gateway", "serve"])
-        .stdin(Stdio::null())
-        .stdout(log)
-        .stderr(err)
-        // 自成一组:起它的这个转接(和 agent)退了,它接着跑
-        .process_group(0)
-        .spawn()
-        .map_err(|e| tr!("起不来 gateway:{e}", "can't start the gateway: {e}"))?;
+    // 自成一组:起它的这个转接(和 agent)退了,它接着跑
+    crate::proc::detach(
+        Command::new(crate::agent::self_exe()).args(["plugin", "gateway", "serve"]).stdin(Stdio::null()).stdout(log).stderr(err),
+    )
+    .map_err(|e| tr!("无法启动 gateway:{e}", "can't start the gateway: {e}"))?;
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(10) {
         if let Ok(s) = UnixStream::connect(&sock) {
@@ -76,7 +71,7 @@ pub fn reach() -> Res<UnixStream> {
         std::thread::sleep(Duration::from_millis(50));
     }
     Err(t!(
-        "gateway 起了但一直没听上(看 state/gateway/gateway.log)",
+        "gateway 已启动但未开始监听(见 state/gateway/gateway.log)",
         "the gateway started but never listened (see state/gateway/gateway.log)"
     )
     .into())

@@ -24,8 +24,8 @@ const SECS: &[Sec] = &[
         &[
             ("↑↓ jk", "上下"),
             ("J K", "下一组 / 上一组"),
-            ("h l ← →", "往外 / 往里一层"),
-            ("数字", "按编号选"),
+            ("h l ← →", "返回上层 / 进入下层"),
+            ("数字", "按编号选择"),
             ("空格", "跳到会话 / 分组"),
             ("g G", "顶部 / 底部"),
             ("轻点", "选中，再点打开"),
@@ -35,8 +35,8 @@ const SECS: &[Sec] = &[
         "打开",
         &[
             ("⏎", "打开"),
-            ("E ⇧⏎", "带着便签打开"),
-            ("i", "下一个要看的"),
+            ("E ⇧⏎", "附带便签打开"),
+            ("i", "下一个待处理"),
             ("z x Z", "全屏输出 / 改动 / 记录"),
             ("t T y", "终端 / 新窗口 / yazi"),
         ],
@@ -45,27 +45,28 @@ const SECS: &[Sec] = &[
         "筛选",
         &[
             ("/", "搜索"),
-            ("w a *", "开着的 / 全部 / 换天数"),
-            ("! @ # & ^", "只看 ● ◆◐ ○ ✕ ■"),
-            ("%", "只看 ☾ 自动停的"),
-            ("Tab W", "分组列表 / 只看本组"),
-            ("{ } ⇧Tab", "上 / 下 / 刚才的分组"),
+            ("w a *", "未停止 / 全部 / 天数"),
+            ("F", "按状态筛选"),
+            ("Tab W", "分组列表 / 仅本组"),
+            ("{ } ⇧Tab", "上 / 下 / 上次的分组"),
             ("o O", "折叠 / 全部折叠"),
         ],
     ),
     (
         "会话",
         &[
-            ("N n ^N", "新建/选工具/新分组"),
-            ("e ^G s", "便签 / 编辑器写 / 发送"),
-            ("p u", "置顶 / 看过·没看"),
-            ("v V", "多选 / 连着去掉勾"),
-            ("r R D", "改名 / 重启 / 停止"),
-            ("m ⇧↑ ⇧↓", "挪分组 / 上下移"),
-            ("f H X A", "分叉/交接/换账号/接管"),
-            ("M P :", "MCP/插件/插件菜单"),
+            ("n ^N", "新建 / 新分组"),
+            ("N", "按当前配置新建"),
+            ("e ^G s", "便签 / 编辑器 / 发送"),
+            ("p u", "置顶 / 已读·未读"),
+            ("v V", "多选 / 连续取消"),
+            ("r R D", "重命名 / 重启 / 停止"),
+            ("m ⇧↑ ⇧↓", "移到分组 / 上移下移"),
+            ("f H", "分叉 / 交接"),
+            ("X A", "切换账号 / 接管"),
+            ("M P :", "MCP / 插件 / 命令"),
             ("d ^Z b", "删除 / 撤销 / 回收站"),
-            ("c B C", "复制回复 / 信息 / 挑选"),
+            ("c B C", "复制回复 / 信息 / 选取"),
         ],
     ),
     (
@@ -73,22 +74,22 @@ const SECS: &[Sec] = &[
         &[
             ("L $ ^S", "布局 / 计费 / 设置"),
             ("^R ^L", "刷新 / 重启 aca"),
-            ("? Esc", "快捷键 / 退出(或 q q)"),
-            ("q Q", "+键 切 / 送去工作区"),
-            ("[ ] `", "上 / 下 / 刚才的工作区"),
-            ("S", "工作区列表 · ^R 改名"),
+            ("? q q", "快捷键 / 退出"),
+            ("q Q", "+键 切换 / 移到工作区"),
+            ("[ ] `", "上 / 下 / 上次的工作区"),
+            ("S", "工作区列表 · ^R 重命名"),
         ],
     ),
-    ("tmux 里", &[("^Q 前缀 d", "回到 aca"), ("前缀 a ^\\", "弹出 / 关掉 aca"), ("^`", "回到上一个会话")]),
+    ("tmux 中", &[("^Q 前缀 d", "返回 aca"), ("前缀 a ^\\", "弹出 / 关闭 aca"), ("^`", "返回上一个会话")]),
     (
         "新建时",
         &[
             ("Tab", "补全"),
-            ("→ /", "选定"),
-            ("↓ ^F", "找目录"),
-            ("^W ^U", "删一级 / 清空"),
-            ("^T", "shell / 换回"),
-            ("+", "加账号(n 的菜单里)"),
+            ("→ /", "选择"),
+            ("↓ ^F", "查找目录"),
+            ("^W ^U", "删除一级 / 清空"),
+            ("^T", "shell / 切回"),
+            ("+", "添加账号(n 菜单中)"),
         ],
     ),
     (
@@ -100,7 +101,7 @@ const SECS: &[Sec] = &[
             ("g G", "顶部 / 底部"),
             ("J K", "切换会话"),
             ("Tab", "输出 ↔ 改动"),
-            ("n p m", "换文件 / 连同提交"),
+            ("n p m", "切换文件 / 连同提交"),
             ("e l", "编辑器 / lazygit"),
         ],
     ),
@@ -134,8 +135,7 @@ const SECS_EN: &[Sec] = &[
         &[
             ("/", "search"),
             ("w a *", "open / all / days"),
-            ("! @ # & ^", "only ● ◆◐ ○ ✕ ■"),
-            ("%", "only ☾ auto-stopped"),
+            ("F", "only one state"),
             ("Tab W", "groups / this group"),
             ("{ } ⇧Tab", "prev/next/last group"),
             ("o O", "fold / fold all"),
@@ -144,14 +144,16 @@ const SECS_EN: &[Sec] = &[
     (
         "Sessions",
         &[
-            ("N n ^N", "new/pick a tool/group"),
+            ("n ^N", "new / group"),
+            ("N", "new with current"),
             ("e ^G s", "note/editor/send"),
             ("p u", "pin / read-unread"),
             ("v V", "select / unselect"),
             ("r R D", "rename/restart/stop"),
             ("m ⇧↑ ⇧↓", "move / up / down"),
-            ("f H X A", "fork/handoff/account/adopt"),
-            ("M P :", "MCP/plugins/plugin menu"),
+            ("f H", "fork / hand off"),
+            ("X A", "account / adopt"),
+            ("M P :", "MCP / plugins / commands"),
             ("d ^Z b", "delete/undo/trash"),
             ("c B C", "copy reply/info/pick"),
         ],
@@ -161,7 +163,7 @@ const SECS_EN: &[Sec] = &[
         &[
             ("L $ ^S", "layout/bill/settings"),
             ("^R ^L", "refresh / restart"),
-            ("? Esc", "keys / quit (or q q)"),
+            ("? q q", "keys / quit"),
             ("q Q", "+key: go / send"),
             ("[ ] `", "prev/next/last space"),
             ("S", "spaces, ^R renames"),
@@ -291,12 +293,12 @@ fn block(sec: &Sec, key_w: usize, w: usize, hit: Option<&Hit>) -> (Vec<Line<'sta
 /// 图例:状态图标照列表里的颜色画,一行三个(窄了两个);再是账号的颜色
 fn legend(w: usize) -> Vec<Line<'static>> {
     let items: Vec<(Span<'static>, &str)> = [
-        (State::Ask, t!("要你答", "needs you")),
-        (State::Running, t!("在跑", "running")),
-        (State::Unread, t!("没看", "unread")),
+        (State::Ask, t!("等待回应", "needs you")),
+        (State::Running, t!("运行中", "running")),
+        (State::Unread, t!("未读", "unread")),
         (State::Idle, t!("空闲", "idle")),
         (State::Error, t!("出错", "error")),
-        (State::Exited, t!("停了", "stopped")),
+        (State::Exited, t!("已停止", "stopped")),
     ]
     .into_iter()
     .map(|(st, what)| {
@@ -304,7 +306,7 @@ fn legend(w: usize) -> Vec<Line<'static>> {
         (Span::styled(ic, sty), what)
     })
     .chain([
-        (Span::styled(aca_core::status::IDLE_STOPPED, Style::new().fg(theme::pal().muted)), t!("自动停", "auto-stopped")),
+        (Span::styled(aca_core::status::IDLE_STOPPED, Style::new().fg(theme::pal().muted)), t!("自动停止", "auto-stopped")),
         (Span::styled("◷", Style::new().fg(theme::pal().accent)), t!("有定时", "scheduled")),
         (Span::styled("✎", theme::warn()), t!("有便签", "has a note")),
         (Span::styled("★", theme::warn()), t!("置顶", "pinned")),
@@ -312,7 +314,7 @@ fn legend(w: usize) -> Vec<Line<'static>> {
     ])
     .collect();
     // 「图标 + 说明」一格的宽度:英文的说明长一些
-    let cell = if lang() == Lang::En { 16 } else { 11 };
+    let cell = if lang() == Lang::En { 16 } else { 13 };
     let per = (w / cell).clamp(1, 3);
     let mut out = vec![head(t!("图例", "Legend"))];
     for chunk in items.chunks(per) {
@@ -418,9 +420,9 @@ mod tests {
         assert!(desk.len() * 2 < phone.len(), "桌面分栏后矮得多:{} 对 {}", desk.len(), phone.len());
         // 桌面弹窗里三栏并排:第一行就有三个标题,一屏放得下
         assert_eq!(text(&desk[0]).split_whitespace().collect::<Vec<_>>(), ["导航", "会话", "新建时"], "{}", text(&desk[0]));
-        assert!(desk.len() <= 24, "{}", desk.len());
+        assert!(desk.len() <= 26, "{}", desk.len()); // 加上外框、标题也在 36 行的终端里放得下
         // 键单独上色(强调色),说明不上色;手机上说明不折行
-        let row = phone.iter().find(|l| text(l).contains("编辑器写")).unwrap();
+        let row = phone.iter().find(|l| text(l).contains("便签 / 编辑器 / 发送")).unwrap();
         assert_eq!(row.spans[0].content.trim(), "e ^G s");
         assert_eq!(row.spans[0].style.fg, Some(theme::pal().accent));
     }
@@ -446,27 +448,28 @@ mod tests {
         };
         let none = KeyModifiers::NONE;
         // 同一个键在不同界面里干不同的事:都亮
-        assert_eq!(lit(&key(KeyCode::Char('n'), none)), ["N n ^N 新建/选工具/新分组", "n p m 换文件 / 连同提交"]);
-        assert_eq!(lit(&key(KeyCode::Char('V'), KeyModifiers::SHIFT)), ["v V 多选 / 连着去掉勾"]);
+        assert_eq!(lit(&key(KeyCode::Char('n'), none)), ["n ^N 新建 / 新分组", "n p m 切换文件 / 连同提交"]);
+        assert_eq!(lit(&key(KeyCode::Char('N'), KeyModifiers::SHIFT)), ["N 按当前配置新建"]);
+        assert_eq!(lit(&key(KeyCode::Char('V'), KeyModifiers::SHIFT)), ["v V 多选 / 连续取消"]);
         assert_eq!(lit(&key(KeyCode::Char('L'), KeyModifiers::SHIFT)), ["L $ ^S 布局 / 计费 / 设置"]);
-        assert_eq!(lit(&key(KeyCode::Char('q'), none)), ["q Q +键 切 / 送去工作区"]);
-        assert_eq!(lit(&key(KeyCode::Char(']'), none)), ["[ ] ` 上 / 下 / 刚才的工作区"]);
-        assert_eq!(lit(&key(KeyCode::Char('`'), none)), ["[ ] ` 上 / 下 / 刚才的工作区"]);
-        assert_eq!(lit(&key(KeyCode::Char('^'), none)), ["! @ # & ^ 只看 ● ◆◐ ○ ✕ ■"]); // 不亮 ^N ^G 那些
-        assert_eq!(lit(&key(KeyCode::Char('%'), none)), ["% 只看 ☾ 自动停的"]);
-        assert_eq!(lit(&key(KeyCode::Char('h'), none)), ["h l ← → 往外 / 往里一层"]);
-        assert_eq!(lit(&key(KeyCode::Left, none)), ["h l ← → 往外 / 往里一层"]);
-        assert_eq!(lit(&key(KeyCode::Char('}'), none)), ["{ } ⇧Tab 上 / 下 / 刚才的分组"]);
-        assert_eq!(lit(&key(KeyCode::BackTab, KeyModifiers::SHIFT)), ["{ } ⇧Tab 上 / 下 / 刚才的分组"]);
-        assert_eq!(lit(&key(KeyCode::Tab, none)), ["Tab W 分组列表 / 只看本组", "Tab 补全", "Tab 输出 ↔ 改动"]);
-        assert_eq!(lit(&key(KeyCode::Enter, KeyModifiers::SHIFT)), ["E ⇧⏎ 带着便签打开"]);
-        assert_eq!(lit(&key(KeyCode::Char('g'), KeyModifiers::CONTROL)), ["e ^G s 便签 / 编辑器写 / 发送"]);
+        assert_eq!(lit(&key(KeyCode::Char('q'), none)), ["? q q 快捷键 / 退出", "q Q +键 切换 / 移到工作区"]);
+        assert_eq!(lit(&key(KeyCode::Char(']'), none)), ["[ ] ` 上 / 下 / 上次的工作区"]);
+        assert_eq!(lit(&key(KeyCode::Char('`'), none)), ["[ ] ` 上 / 下 / 上次的工作区"]);
+        assert_eq!(lit(&key(KeyCode::Char('F'), KeyModifiers::SHIFT)), ["F 按状态筛选"]);
+        assert!(lit(&key(KeyCode::Char('^'), none)).is_empty()); // 不亮 ^N ^G 那些
+        assert_eq!(lit(&key(KeyCode::Char('h'), none)), ["h l ← → 返回上层 / 进入下层"]);
+        assert_eq!(lit(&key(KeyCode::Left, none)), ["h l ← → 返回上层 / 进入下层"]);
+        assert_eq!(lit(&key(KeyCode::Char('}'), none)), ["{ } ⇧Tab 上 / 下 / 上次的分组"]);
+        assert_eq!(lit(&key(KeyCode::BackTab, KeyModifiers::SHIFT)), ["{ } ⇧Tab 上 / 下 / 上次的分组"]);
+        assert_eq!(lit(&key(KeyCode::Tab, none)), ["Tab W 分组列表 / 仅本组", "Tab 补全", "Tab 输出 ↔ 改动"]);
+        assert_eq!(lit(&key(KeyCode::Enter, KeyModifiers::SHIFT)), ["E ⇧⏎ 附带便签打开"]);
+        assert_eq!(lit(&key(KeyCode::Char('g'), KeyModifiers::CONTROL)), ["e ^G s 便签 / 编辑器 / 发送"]);
         assert_eq!(lit(&key(KeyCode::Char('7'), none)).len(), 1); // 数字那行
         // ^\\ 在普通终端里到手是 ^4
         let h = key(KeyCode::Char('4'), KeyModifiers::CONTROL);
-        assert_eq!((h.label.as_str(), lit(&h)), ("^\\", vec!["前缀 a ^\\ 弹出 / 关掉 aca".to_string()]));
+        assert_eq!((h.label.as_str(), lit(&h)), ("^\\", vec!["前缀 a ^\\ 弹出 / 关闭 aca".to_string()]));
         let h = key(KeyCode::Char(' '), KeyModifiers::CONTROL);
-        assert_eq!((h.label.as_str(), lit(&h)), ("^`", vec!["^` 回到上一个会话".to_string()]));
+        assert_eq!((h.label.as_str(), lit(&h)), ("^`", vec!["^` 返回上一个会话".to_string()]));
         assert!(lit(&key(KeyCode::Char('U'), none)).is_empty());
         // 亮的那行铺满这一栏的底色,键照样是强调色
         let (ls, at) = lines(40, Some(&key(KeyCode::Char('t'), none)));

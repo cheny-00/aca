@@ -42,14 +42,11 @@ impl Setting for TrustRow {
         }
         fx.say(if on {
             t!(
-                "新起、重启的会话:Claude / Codex 问「信不信任这个目录」时替你选信任",
+                "新建或重启的会话中,Claude / Codex 询问是否信任目录时将自动选择信任",
                 "new and restarted sessions: \"trust this folder?\" from Claude / Codex is answered for you"
             )
         } else {
-            t!(
-                "不替你答了:头一回进一个目录,会话停在那等你选",
-                "not answered for you any more: a session waits for you the first time in a folder"
-            )
+            t!("已关闭:首次进入目录时需要手动确认信任", "not answered for you any more: a session waits for you the first time in a folder")
         });
     }
 }

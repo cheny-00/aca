@@ -55,7 +55,7 @@ pub struct Source {
 pub fn source(s: &Session) -> Result<Source, String> {
     let w = Where::of(s);
     let conf = crate::mcp::home_of(s);
-    let log = crate::workdir::log_of(&w, &conf).ok_or(t!("找不到它的对话记录", "can't find its conversation record"))?;
+    let log = crate::workdir::log_of(&w, &conf).ok_or(t!("找不到对话记录", "can't find its conversation record"))?;
     let sid = match s.agent {
         Agent::Claude => log.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default(),
         _ => w.id.clone(),
@@ -80,13 +80,13 @@ pub fn source(s: &Session) -> Result<Source, String> {
 pub fn run(from: &Source, req: &NewReq, _to: Agent) -> Outcome {
     let d = match dialog(&from.log, from.agent) {
         Ok(d) => d,
-        Err(e) => return Outcome::Failed(tr!("没交接:{e}", "not handed off: {e}")),
+        Err(e) => return Outcome::Failed(tr!("交接失败:{e}", "not handed off: {e}")),
     };
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let text = render(from, &d, now, crate::usage::local_offset());
     let digest = match save(&from.sid, &text) {
         Ok(p) => p,
-        Err(e) => return Outcome::Failed(tr!("没交接:{e}", "not handed off: {e}")),
+        Err(e) => return Outcome::Failed(tr!("交接失败:{e}", "not handed off: {e}")),
     };
     let found = crate::workdir::find_in(&from.w, (!from.conf.is_empty()).then_some(from.conf.as_str()));
     let msg = prompt(from, &digest, text.lines().count(), &found);
@@ -96,11 +96,11 @@ pub fn run(from: &Source, req: &NewReq, _to: Agent) -> Outcome {
     };
     match send(&id, &msg) {
         Ok(()) => Outcome::Made { msg: t!("已交接", "handed off").into(), id },
-        Err(e) => {
-            Outcome::Handed {
-                msg: tr!("没发出去:{e} · 说明在便签里,s 发送", "not sent: {e} · the note has it, s sends it"), id, note: msg
-            }
-        }
+        Err(e) => Outcome::Handed {
+            msg: tr!("发送失败:{e} · 交接说明已存入便签,s 发送", "not sent: {e} · the note has it, s sends it"),
+            id,
+            note: msg,
+        },
     }
 }
 
@@ -271,14 +271,14 @@ fn dialog(log: &Path, agent: Agent) -> Result<Dialog, String> {
         }
     }
     if d.said.is_empty() {
-        return Err(t!("对话记录里还没有说过话", "nothing has been said in the conversation yet").into());
+        return Err(t!("对话记录为空", "nothing has been said in the conversation yet").into());
     }
     d.files.sort_by_key(|f| f.at);
     Ok(d)
 }
 
 fn each_line(p: &Path, mut f: impl FnMut(&Value)) -> Result<(), String> {
-    let file = std::fs::File::open(p).map_err(|e| tr!("读不了对话记录({e})", "can't read the conversation record ({e})"))?;
+    let file = std::fs::File::open(p).map_err(|e| tr!("无法读取对话记录({e})", "can't read the conversation record ({e})"))?;
     for line in BufReader::new(file).split(b'\n') {
         let Ok(line) = line else { break };
         if let Ok(v) = serde_json::from_slice::<Value>(&line) {
@@ -498,7 +498,7 @@ fn stamp(ts: i64, off: i64) -> String {
 
 /// 写进 ~/.local/state/aca/ui/handoff/<对话 id>.md(同一段对话再交接一次就覆盖成新的),顺手删 30 天前的
 fn save(sid: &str, text: &str) -> std::io::Result<PathBuf> {
-    let dir = crate::state::state_file("handoff").ok_or_else(|| std::io::Error::other(t!("没有 HOME", "no HOME")))?;
+    let dir = crate::state::state_file("handoff").ok_or_else(|| std::io::Error::other(t!("未设置 HOME", "no HOME")))?;
     let name = if sid.is_empty() || sid.contains(['/', '\\']) || sid.starts_with('.') { "dialog".to_string() } else { sid.to_string() };
     let path = dir.join(format!("{name}.md"));
     crate::state::write_atomic(&path, text)?;
@@ -661,8 +661,8 @@ mod tests {
         let root = scratch("empty");
         let log = root.join("s.jsonl");
         std::fs::write(&log, r#"{"type":"permission-mode"}"#).unwrap();
-        assert_eq!(dialog(&log, Agent::Claude).unwrap_err(), "对话记录里还没有说过话");
-        assert!(dialog(&root.join("nope.jsonl"), Agent::Claude).unwrap_err().starts_with("读不了对话记录"));
+        assert_eq!(dialog(&log, Agent::Claude).unwrap_err(), "对话记录为空");
+        assert!(dialog(&root.join("nope.jsonl"), Agent::Claude).unwrap_err().starts_with("无法读取对话记录"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

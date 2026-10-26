@@ -3,39 +3,39 @@ name = "Delegate"
 version = "0.5.0"
 api = 1
 needs = ["jq"]                   # 只有替 worker 续跑那段(continue.sh)要用
-description = "你开的 Claude(或 Codex)规划、派 worker 干活、自己验收、汇报(agent 里用 /aca:delegate)。worker 遇到限流 / 过载自动接着干。/aca:spec 把一个变更从提案带到归档,每条任务经 /aca:delegate 做"
-description_en = "The Claude (or Codex) you started plans, dispatches workers to do the work, checks the result itself and reports back (in the agent: /aca:delegate). A worker that hits a rate limit or overload is told to carry on automatically. /aca:spec carries one change from proposal to archive, each task done through /aca:delegate."
+description = "由你的 Claude / Codex 规划任务、派出 worker 执行、验收并汇报;遇到限流时自动继续"
+description_en = "Your Claude or Codex plans, dispatches workers, checks their work and reports; rate limits are ridden out automatically."
 
 # 可以在 plugins.toml 里改:[plugins."aca.delegate"] settings = { worker = "codex:work", max_continue = 3 }
 # 或者 aca plugin setting aca.delegate worker codex:work
 [settings.worker]
 default = "codex"
-desc = "派给谁:aca new 认的工具(:账号),比如 codex、codex:work、claude:work"
+desc = "派给谁:aca new 支持的工具(可带 :账号),例如 codex、codex:work、claude:work"
 desc_en = "Who gets the work: a tool that aca new accepts (with :account), such as codex, codex:work, claude:work."
 
 [settings.auto]
 default = true
-desc = "agent 自己能不能用 /aca:delegate:开 = 你说「用 delegate 派出去」它就走这份;关 = 只有你敲这个斜杠命令才算(只管 Claude,改了对新起、重启的会话生效)"
+desc = "agent 能否自行使用 /aca:delegate:开启 = 你说「用 delegate 派出去」时它就按这份执行;关闭 = 只有你输入这个斜杠命令时才使用(仅对 Claude 有效,修改后对新启动、重启的会话生效)"
 desc_en = "Whether the agent may use /aca:delegate on its own: on = when you say \"delegate this\" it follows it; off = only when you type the slash command yourself (Claude only; applies to sessions started or restarted after the change)."
 
 [settings.language]
 default = ""
-desc = "领头的回你、写报告和计划用哪种话(比如 简体中文);空 = 跟着你说的话"
+desc = "主导的会话回复你、编写报告和计划时使用的语言(例如 简体中文);留空 = 跟随你使用的语言"
 desc_en = "The language the lead answers you and writes reports and plans in (English, for example); empty = whatever you write in."
 
 [settings.say]
 default = "continue"
-desc = "worker 临时失败时替它说的那句"
+desc = "worker 临时失败时代为发送的内容"
 desc_en = "What is said to a worker, in your place, after a temporary failure."
 
 [settings.max_continue]
 default = 5
-desc = "worker 一轮因为限流 / 过载失败时,最多替它说几次「继续」"
+desc = "worker 的一轮因限流 / 过载失败时,最多代为发送几次「继续」"
 desc_en = "How many times at most to say \"carry on\" to a worker whose turn failed on a rate limit or overload."
 
 [settings.delay]
 default = 30
-desc = "第 n 次替它说之前等 n × 这么多秒"
+desc = "第 n 次代为发送前等待 n × 该秒数"
 desc_en = "Before the nth time, wait n × this many seconds."
 
 # /aca:delegate:aca 起 Claude 时带上(只对那一次启动;敲 /dele 补全就是它:Claude Code 的插件命令带插件名)。

@@ -4,7 +4,7 @@
 //! - `paths` `tmux` `store` `config` `runtime`:存东西和调 tmux 的地方
 //! - `agent/`:各家 agent 的适配(怎么起、hook、屏幕、标题),一家一个文件
 //! - `screen` `hook` `status`:状态怎么来
-//! - `session`:对会话的操作,界面和命令行共用;`adopt`:接管不是 aca 起的会话;`proc`:读进程(认 agent、认账号)
+//! - `session`:对会话的操作,界面和命令行共用;`adopt`:接管不是 aca 起的会话;`proc`:读进程(认 agent、认账号)、放到后台不等的子进程
 //! - `event` `plugin`:事件流和插件宿主
 //! - `i18n`:说哪种话(`tr!`),命令行和界面共用
 //! - `inbox` `answer`:会话之间递话(收件箱、门铃、排队、自动通知、`aca wait`),替在等确认的会话回答

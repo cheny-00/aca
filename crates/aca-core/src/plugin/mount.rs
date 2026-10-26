@@ -8,7 +8,9 @@
 //!   (Codex 没有自定义斜杠命令),`.mcp.json` 不放(MCP 走 `-c`);每个账号的 `CODEX_HOME/plugins/cache/aca` 链到
 //!   `codex-plugins`(只建一次,不改 config.toml),起的时候 `-c plugins.<名字>@aca.enabled=true` 只对这一次打开。
 //!   这靠的是 Codex 内部的缓存目录布局,不是公开的接口:那里已经有别的东西、建不了链接时只挂 MCP,原因记在
-//!   `plugin-logs/mount.log`。MCP 是 `-c mcp_servers.<名字>={…}`;它给 MCP 子进程的环境只有白名单,会话 id 得写在 `env` 里
+//!   `plugin-logs/mount.log`。MCP 也做成副本:一个服务一个只有 `.mcp.json` 的插件 `codex-plugins/mcp-<名字>/local/`,
+//!   一样按会话打开(见 [`codex_mcp_copy`],为什么不用 `-c mcp_servers` 也在那)。链接建不了时才是
+//!   `-c mcp_servers.<名字>={…}`;它给 MCP 子进程的环境只有白名单,会话 id 得写在 `env` 里
 //! - **pi / opencode**:只带 MCP,插件目录不带(skill、命令的格式还没对过)。pi 是 aca 的扩展起来时一个个 `registerMcpServer`
 //!   (那份清单的路径在 `ACA_PI_MCP` 里,见 agent/pi.rs);opencode 写进启动时叠上去的那份配置的 `mcp`(见 agent/opencode.rs)
 //! - 几家的插件 MCP 都是 `aca plugin mcp <插件 id>`:aca 切到插件目录、带上插件的环境(设置、会话)再换成它的命令
@@ -77,7 +79,7 @@ pub fn plan(kind: &str, tool: &str, account: &str, codex_home: Option<&Path>) ->
                 // gateway 开着:不是非得直接挂的,都归 gateway
                 (via, true) if via != "direct" => {}
                 ("gateway", false) => note(&tr!(
-                    "{}:它的 MCP 只挂到 gateway 上,gateway 没开,这回不挂",
+                    "{}:它的 MCP 只通过 gateway 提供,gateway 未开启,本次不挂载",
                     "{}: its MCP only goes through the gateway, which is off; not mounted",
                     e.id
                 )),
@@ -92,6 +94,23 @@ pub fn plan(kind: &str, tool: &str, account: &str, codex_home: Option<&Path>) ->
         }
     } else if tools {
         out.mcp.push((TOOLS_SERVER.into(), vec!["plugin".into(), "tools".into()]));
+    }
+    // Codex:MCP 服务也做成副本按会话打开;链不上、做不出来的照旧走 `-c`
+    if let Some(home) = codex_home
+        && !out.mcp.is_empty()
+        && *linked.get_or_insert_with(|| codex_link(home).map_err(|err| note(&err)).is_ok())
+    {
+        let aca = crate::agent::self_exe();
+        out.mcp.retain(|(name, args)| match codex_mcp_copy(name, &aca, args) {
+            Ok(p) => {
+                out.codex_plugins.push(p);
+                false
+            }
+            Err(err) => {
+                note(&format!("{name}:{err}"));
+                true
+            }
+        });
     }
     out
 }
@@ -162,24 +181,32 @@ pub fn codex_root() -> PathBuf {
     paths::data_dir().join("codex-plugins")
 }
 
-/// `CODEX_HOME/plugins/cache/aca` 链到 [`codex_root`]。已经链好了不动;那里有别的东西(别的目录、链到别处的)不碰,Err
+/// `CODEX_HOME/plugins/cache/aca` 链到 [`codex_root`]。已经链好了不动;那里有别的东西(别的目录、链到别处的)不碰,Err。
+/// 链到的地方已经没了的换掉:沙箱 `ACA_HOME` 配真 `CODEX_HOME` 的测试会留下这种,不换就一直退回 `-c mcp_servers`,Codex 起不了标题
 pub fn codex_link(home: &Path) -> Res<()> {
+    link_to(home, &codex_root())
+}
+
+fn link_to(home: &Path, target: &Path) -> Res<()> {
     let cache = home.join("plugins").join("cache");
     let link = cache.join("aca");
-    let target = codex_root();
     if link.symlink_metadata().is_ok() {
         return match std::fs::read_link(&link) {
             Ok(t) if t == target => Ok(()),
+            Ok(_) if !link.exists() => {
+                std::fs::remove_file(&link).map_err(|e| tr!("无法删除 {}:{e}", "can't remove {}: {e}", link.display()))?;
+                link_to(home, target)
+            }
             _ => Err(tr!(
-                "{} 已经有别的东西,不动它:Codex 这回只挂 MCP",
+                "{} 已被占用,未修改:Codex 本次只挂载 MCP",
                 "{} already holds something else; left alone: Codex only gets MCP this time",
                 link.display()
             )),
         };
     }
-    std::fs::create_dir_all(&cache).map_err(|e| tr!("建不了 {}:{e}", "can't create {}: {e}", cache.display()))?;
-    std::fs::create_dir_all(&target).map_err(|e| tr!("建不了 {}:{e}", "can't create {}: {e}", target.display()))?;
-    std::os::unix::fs::symlink(&target, &link).map_err(|e| tr!("链不上 {}:{e}", "can't link {}: {e}", link.display()))
+    std::fs::create_dir_all(&cache).map_err(|e| tr!("无法创建 {}:{e}", "can't create {}: {e}", cache.display()))?;
+    std::fs::create_dir_all(target).map_err(|e| tr!("无法创建 {}:{e}", "can't create {}: {e}", target.display()))?;
+    std::os::unix::fs::symlink(target, &link).map_err(|e| tr!("无法链接 {}:{e}", "can't link {}: {e}", link.display()))
 }
 
 /// 一个目录里的文件变没变:相对路径、大小、修改时间合起来的指纹
@@ -221,7 +248,7 @@ fn rebuilt(root: &Path, fp: &str, build: impl FnOnce(&Path) -> Res<()>) -> Res<P
     // 旧的先挪开再换上新的(rename 不能盖掉非空目录)
     let old = root.join(format!(".old-{}", paths::short_id()));
     let had = local.exists() && std::fs::rename(&local, &old).is_ok();
-    std::fs::rename(&tmp, &local).map_err(|err| tr!("放不上 {}:{err}", "can't put {} in place: {err}", local.display()))?;
+    std::fs::rename(&tmp, &local).map_err(|err| tr!("无法放置 {}:{err}", "can't put {} in place: {err}", local.display()))?;
     if had {
         let _ = std::fs::remove_dir_all(&old);
     }
@@ -282,7 +309,7 @@ fn lift_all(dir: &Path) -> Res<()> {
         if p.is_dir() {
             lift_all(&p)?;
         } else if p.extension().is_some_and(|x| x == "md") {
-            let text = std::fs::read_to_string(&p).map_err(|e| tr!("读不了 {}:{e}", "can't read {}: {e}", p.display()))?;
+            let text = std::fs::read_to_string(&p).map_err(|e| tr!("无法读取 {}:{e}", "can't read {}: {e}", p.display()))?;
             let lifted = lift(&text);
             if lifted != text {
                 write(&p, &lifted)?;
@@ -301,13 +328,13 @@ pub(crate) fn lift(text: &str) -> String {
 
 fn write(p: &Path, text: &str) -> Res<()> {
     std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
-    std::fs::write(p, text).map_err(|e| tr!("写不了 {}:{e}", "can't write {}: {e}", p.display()))
+    std::fs::write(p, text).map_err(|e| tr!("无法写入 {}:{e}", "can't write {}: {e}", p.display()))
 }
 
 /// 照抄一个目录(链接跟过去抄成真的文件:Codex 不认链接的清单),`skip` 里的名字不抄
 fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> Res<()> {
-    std::fs::create_dir_all(dst).map_err(|e| tr!("建不了 {}:{e}", "can't create {}: {e}", dst.display()))?;
-    let rd = std::fs::read_dir(src).map_err(|e| tr!("读不了 {}:{e}", "can't read {}: {e}", src.display()))?;
+    std::fs::create_dir_all(dst).map_err(|e| tr!("无法创建 {}:{e}", "can't create {}: {e}", dst.display()))?;
+    let rd = std::fs::read_dir(src).map_err(|e| tr!("无法读取 {}:{e}", "can't read {}: {e}", src.display()))?;
     for ent in rd.flatten() {
         let name = ent.file_name();
         if skip.iter().any(|s| name == *s) {
@@ -317,7 +344,7 @@ fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> Res<()> {
         match std::fs::metadata(&from) {
             Ok(md) if md.is_dir() => copy_tree(&from, &to, skip)?,
             Ok(_) => {
-                std::fs::copy(&from, &to).map_err(|e| tr!("抄不了 {}:{e}", "can't copy {}: {e}", from.display()))?;
+                std::fs::copy(&from, &to).map_err(|e| tr!("无法复制 {}:{e}", "can't copy {}: {e}", from.display()))?;
             }
             Err(_) => {}
         }
@@ -357,7 +384,36 @@ pub(crate) fn command_as_skill(name: &str, text: &str) -> String {
     format!("---\nname: {name}\ndescription: {desc}\n---\n{}", body.trim_start_matches('\n'))
 }
 
-/// Codex 那边一个 MCP 服务的 `-c` 值:`mcp_servers.<名字>={ command = …, args = […], env = {…} }`
+/// aca 起会话时放进 agent 环境里、MCP 服务要用的变量(Codex 的插件 MCP 照名字从它自己的环境转过去)
+pub const MCP_ENV: &[&str] = &["ACA_SESSION_ID", "ACA_TOOL", "ACA_BIN", "ACA_HOME", "ACA_TMUX_SOCKET"];
+
+/// 给 Codex 的一个 MCP 服务:只带 `.mcp.json` 的插件 `codex-plugins/mcp-<名字>/local/`,内容没变就不动。返回插件名。
+///
+/// 不用 `-c mcp_servers.<名字>={…}`:Codex(0.162、0.163)给对话起标题时另开一个线程,把所有 MCP 关掉的办法是请求里带
+/// `mcp_servers = { <名字> = { enabled = false }, … }`,它和命令行的 `-c` 合在同一层、按键整个换掉,`-c` 给的命令跟着没了,
+/// 那个线程报 `invalid transport in mcp_servers.<名字>` 起不来,对话就一直没有标题。插件带的 MCP 不记在 `mcp_servers` 里,
+/// 那个线程关掉插件就不碰它们。会话 id 这些每个会话不一样,不写进文件:`env_vars` 让 Codex 从自己的环境里转过去
+pub fn codex_mcp_copy(name: &str, aca: &str, args: &[String]) -> Res<String> {
+    let plugin = format!("mcp-{name}");
+    let mcp = codex_mcp_json(name, aca, args);
+    let mut h = DefaultHasher::new();
+    mcp.hash(&mut h);
+    rebuilt(&codex_root().join(&plugin), &format!("{:016x}", h.finish()), |tmp| {
+        write(&tmp.join(".mcp.json"), &mcp)?;
+        let manifest = serde_json::json!({ "name": plugin, "version": "0.0.0", "description": format!("aca: MCP {name}") });
+        write(&tmp.join(".codex-plugin").join("plugin.json"), &serde_json::to_string_pretty(&manifest).unwrap())
+    })?;
+    Ok(plugin)
+}
+
+/// [`codex_mcp_copy`] 那份 `.mcp.json`
+fn codex_mcp_json(name: &str, aca: &str, args: &[String]) -> String {
+    let server = serde_json::json!({ "type": "stdio", "command": aca, "args": args, "env_vars": MCP_ENV });
+    serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": { name: server } })).unwrap()
+}
+
+/// Codex 那边一个 MCP 服务的 `-c` 值:`mcp_servers.<名字>={ command = …, args = […], env = {…} }`。
+/// 只在做不成副本时用(会话起标题会失败,见 [`codex_mcp_copy`])
 pub fn codex_mcp_flag(name: &str, aca: &str, args: &[String], env: &[(String, String)]) -> String {
     let mut t = toml::Table::new();
     t.insert("command".into(), aca.into());
@@ -458,6 +514,11 @@ mod tests {
         assert_eq!(t["x"]["command"].as_str(), Some("/bin/aca"));
         assert_eq!(t["x"]["args"].as_array().unwrap().len(), 3);
         assert_eq!(t["x"]["env"]["ACA_SESSION_ID"].as_str(), Some("ab12"));
+        // 做成副本的不写会话 id,只写从 Codex 环境里转哪几个
+        let j: serde_json::Value = serde_json::from_str(&codex_mcp_json("aca-delegate", "/bin/aca", &args)).unwrap();
+        let s = &j["mcpServers"]["aca-delegate"];
+        assert_eq!((s["command"].as_str(), s["args"][2].as_str()), (Some("/bin/aca"), Some("aca.delegate")));
+        assert!(s["env_vars"].as_array().unwrap().iter().any(|v| v == "ACA_SESSION_ID") && s.get("env").is_none());
         let c: serde_json::Value =
             serde_json::from_str(&claude_mcp_config("/bin/aca", &[("aca".into(), vec!["plugin".into(), "tools".into()])])).unwrap();
         assert_eq!(c["mcpServers"]["aca"]["args"][1], "tools");
@@ -482,6 +543,19 @@ mod tests {
         write(&home.join("plugins/cache/aca/keep"), "mine").unwrap();
         assert!(codex_link(&home).is_err());
         assert!(home.join("plugins/cache/aca/keep").is_file());
+        // 链到别处、那里还在的:也不碰;那里已经没了的:换成自己的
+        let other = tmp.join("codex2");
+        let link = other.join("plugins/cache/aca");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let mine = tmp.join("mine");
+        std::os::unix::fs::symlink(&src, &link).unwrap();
+        assert!(link_to(&other, &mine).is_err());
+        assert_eq!(std::fs::read_link(&link).unwrap(), src);
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(tmp.join("gone"), &link).unwrap();
+        link_to(&other, &mine).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), mine);
+        assert!(mine.is_dir());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

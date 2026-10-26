@@ -77,7 +77,6 @@ fn signal(sig: &str, pids: &[u32]) {
 /// 不等它们退(一个不肯退的 MCP 就得干等):两秒后还在的 SIGKILL,交给一个脱离界面的 sh 去做 ——
 /// 弹窗里的界面进了会话就退了,等不到两秒。自己(界面开在要停的那格里)不杀
 pub fn kill_tree(root: u32) {
-    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     if root <= 1 {
         return;
@@ -87,13 +86,13 @@ pub fn kill_tree(root: u32) {
     signal("HUP", &pids);
     signal("TERM", &pids);
     let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
-    let _ = Command::new("sh")
-        .args(["-c", &format!("sleep 2; kill -9 {list} 2>/dev/null")])
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    let _ = aca_core::proc::detach(
+        Command::new("sh")
+            .args(["-c", &format!("sleep 2; kill -9 {list} 2>/dev/null")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
 }
 
 /// 等它变成停着的格子(进程退了 tmux 才标上),最多等 ms
@@ -108,7 +107,7 @@ fn wait_dead(pane: &str, ms: u64) {
 pub fn park(p: &Pane) -> Result<(), String> {
     let i = info(&p.id)?;
     if i.dead {
-        return Err(t!("已经停了", "already stopped").into());
+        return Err(t!("已停止", "already stopped").into());
     }
     run(&["set-option", "-p", "-t", &p.id, "remain-on-exit", "on"])?;
     kill_tree(i.pid);

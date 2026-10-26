@@ -124,24 +124,24 @@ impl Job {
     pub fn doing(&self) -> String {
         match self {
             Job::Restart { t, .. } => tr!("正在重启「{}」…", "restarting “{}”…", short(&t.title)),
-            Job::Rename { to, .. } => tr!("正在改名为「{}」…", "renaming to “{}”…", short(to)),
-            Job::Move { t, to, .. } => tr!("正在把「{}」挪到 {to}…", "moving “{}” to {to}…", short(&t.title)),
+            Job::Rename { to, .. } => tr!("正在重命名为「{}」…", "renaming to “{}”…", short(to)),
+            Job::Move { t, to, .. } => tr!("正在将「{}」移到 {to}…", "moving “{}” to {to}…", short(&t.title)),
             Job::Stop { t } => tr!("正在停止「{}」…", "stopping “{}”…", short(&t.title)),
             Job::Park { p, .. } => tr!("正在停止「{}」…", "stopping “{}”…", short(&p.label)),
             Job::Respawn { p, .. } => tr!("正在重启「{}」…", "restarting “{}”…", short(&p.label)),
-            Job::Send { t, .. } => tr!("正在发给「{}」…", "sending to “{}”…", short(&t.title)),
+            Job::Send { t, .. } => tr!("正在发送给「{}」…", "sending to “{}”…", short(&t.title)),
             Job::Fork { t, .. } => tr!("正在分叉「{}」…", "forking “{}”…", short(&t.title)),
-            Job::Mcp { t, .. } => tr!("正在改「{}」的 MCP…", "changing the MCPs of “{}”…", short(&t.title)),
+            Job::Mcp { t, .. } => tr!("正在修改「{}」的 MCP…", "changing the MCPs of “{}”…", short(&t.title)),
             Job::Remove { t, pane: Some(_) } => tr!("正在关闭「{}」…", "closing “{}”…", short(&t.title)),
             Job::Remove { t, pane: None } => tr!("正在删除「{}」…", "deleting “{}”…", short(&t.title)),
-            Job::Order { t, .. } => tr!("正在挪「{}」…", "moving “{}”…", short(&t.title)),
-            Job::GroupOrder { group, .. } => tr!("正在挪分组 {}…", "moving group {}…", short(group)),
+            Job::Order { t, .. } => tr!("正在移动「{}」…", "moving “{}”…", short(&t.title)),
+            Job::GroupOrder { group, .. } => tr!("正在移动分组 {}…", "moving group {}…", short(group)),
             Job::Handoff { t, .. } => tr!("正在交接「{}」…", "handing off “{}”…", short(&t.title)),
-            Job::Rehome { t, label, .. } => tr!("正在把「{}」换到 {label}…", "moving “{}” to {label}…", short(&t.title)),
+            Job::Rehome { t, label, .. } => tr!("正在将「{}」切换到 {label}…", "moving “{}” to {label}…", short(&t.title)),
             Job::Adopt { t, .. } => tr!("正在接管「{}」…", "adopting “{}”…", short(&t.title)),
             Job::Revive { t, .. } => tr!("正在撤销「{}」…", "undoing “{}”…", short(&t.title)),
             Job::Restore { item, .. } => tr!("正在恢复{}…", "restoring {}…", item.name()),
-            Job::Purge { item } => tr!("正在真删{}…", "deleting {} for good…", item.name()),
+            Job::Purge { item } => tr!("正在永久删除{}…", "deleting {} for good…", item.name()),
             Job::Group(a) => a.doing(),
             Job::Plugins(a) => a.doing(),
             Job::Many(jobs) => {
@@ -152,11 +152,11 @@ impl Job {
                     Some(Job::Restart { .. }) => tr!("正在重启 {n} 个…", "restarting {n}…"),
                     Some(Job::Revive { .. }) => tr!("正在撤销停止 {n} 个…", "undoing the stop of {n}…"),
                     Some(Job::Restore { .. }) => tr!("正在恢复 {n} 条…", "restoring {n}…"),
-                    Some(Job::Purge { .. }) => tr!("正在真删 {n} 条…", "deleting {n} for good…"),
+                    Some(Job::Purge { .. }) => tr!("正在永久删除 {n} 条…", "deleting {n} for good…"),
                     Some(Job::Move { to, .. }) if jobs.iter().all(|j| matches!(j, Job::Move { to: x, .. } if x == to)) => {
-                        tr!("正在把 {n} 个挪到 {to}…", "moving {n} to {to}…")
+                        tr!("正在将 {n} 个移到 {to}…", "moving {n} to {to}…")
                     }
-                    _ => tr!("正在挪 {n} 个…", "moving {n}…"),
+                    _ => tr!("正在移动 {n} 个…", "moving {n}…"),
                 }
             }
         }
@@ -179,7 +179,7 @@ pub fn many_msg(jobs: &[Job], outs: &[Outcome]) -> String {
     let n = bad.len();
     if ok == 0 {
         return match bad.first() {
-            Some(e) if n > 1 => tr!("{n} 个都没成:{e}", "none of the {n} worked: {e}"),
+            Some(e) if n > 1 => tr!("{n} 个均失败:{e}", "none of the {n} worked: {e}"),
             Some(e) => e.to_string(),
             None => String::new(),
         };
@@ -187,16 +187,16 @@ pub fn many_msg(jobs: &[Job], outs: &[Outcome]) -> String {
     let mut msg = match jobs.first() {
         Some(Job::Stop { .. }) => tr!("已停止 {ok} 个", "stopped {ok}"),
         Some(Job::Restart { .. }) => tr!("已重启 {ok} 个", "restarted {ok}"),
-        Some(Job::Revive { .. }) => tr!("已撤销停止:{ok} 个再启动了", "undid the stop: {ok} started again"),
+        Some(Job::Revive { .. }) => tr!("已撤销停止:{ok} 个已重新启动", "undid the stop: {ok} started again"),
         Some(Job::Restore { .. }) => tr!("已恢复 {ok} 条", "restored {ok}"),
-        Some(Job::Purge { .. }) => tr!("已真删 {ok} 条", "deleted {ok} for good"),
+        Some(Job::Purge { .. }) => tr!("已永久删除 {ok} 条", "deleted {ok} for good"),
         Some(Job::Move { to, .. }) if jobs.iter().all(|j| matches!(j, Job::Move { to: x, .. } if x == to)) => {
-            tr!("已把 {ok} 个挪到 {to}", "moved {ok} to {to}")
+            tr!("已将 {ok} 个移到 {to}", "moved {ok} to {to}")
         }
-        _ => tr!("已挪 {ok} 个", "moved {ok}"),
+        _ => tr!("已移动 {ok} 个", "moved {ok}"),
     };
     if let Some(e) = bad.first() {
-        msg += &tr!(" · {n} 个没成:{e}", " · {n} failed: {e}");
+        msg += &tr!(" · {n} 个失败:{e}", " · {n} failed: {e}");
     }
     msg
 }
@@ -223,7 +223,7 @@ pub fn run(job: &Job) -> Outcome {
         Job::Rename { t, to, unlock } => match session::rename(&store, &t.id, to) {
             Ok(_) if *unlock => match session::unlock(&store, &t.id) {
                 Ok(()) => Outcome::Done(tr!("已改名为「{}」", "renamed to “{}”", short(to))),
-                Err(e) => Outcome::Failed(tr!("改了名,解锁失败:{e}", "renamed, but unlocking failed: {e}")),
+                Err(e) => Outcome::Failed(tr!("已重命名,但解锁失败:{e}", "renamed, but unlocking failed: {e}")),
             },
             Ok(_) => Outcome::Done(tr!("已改名为「{}」", "renamed to “{}”", short(to))),
             Err(e) => Outcome::Failed(tr!("改名失败:{e}", "rename failed: {e}")),
@@ -236,12 +236,12 @@ pub fn run(job: &Job) -> Outcome {
             };
             match session::move_to(&store, &t.id, &path) {
                 Ok(_) => Outcome::Done(tr!(
-                    "已把「{}」挪到{} {path}",
+                    "已将「{}」移到{} {path}",
                     "moved “{}” to{} {path}",
                     short(&t.title),
                     if made { t!("新分组", " new group") } else { "" }
                 )),
-                Err(e) => Outcome::Failed(tr!("挪分组失败:{e}", "moving group failed: {e}")),
+                Err(e) => Outcome::Failed(tr!("移动分组失败:{e}", "moving group failed: {e}")),
             }
         }
         Job::Stop { t } => match session::stop(&store, &t.id) {
@@ -258,7 +258,7 @@ pub fn run(job: &Job) -> Outcome {
         },
         Job::Send { t, pane, text, .. } => match crate::data::send_into(pane, text) {
             Ok(()) => Outcome::Done(tr!("已发给「{}」", "sent to “{}”", short(&t.title))),
-            Err(e) => Outcome::Failed(tr!("没发出去:{e}", "not sent: {e}")),
+            Err(e) => Outcome::Failed(tr!("发送失败:{e}", "not sent: {e}")),
         },
         Job::Fork { t, title } => match session::fork(&store, &cfg, &t.id, title.as_deref().unwrap_or("")) {
             Ok(s) => Outcome::Made { msg: tr!("已分叉「{}」", "forked “{}”", short(&s.title)), id: s.id },
@@ -286,8 +286,8 @@ pub fn run(job: &Job) -> Outcome {
         Job::Rehome { t, to, label } => match session::rehome(&store, &cfg, &t.id, to) {
             Ok(r) => {
                 let mut msg = match r.copied {
-                    0 => tr!("已换到 {label}", "moved to {label}"),
-                    _ => tr!("已换到 {label} · 说「继续」接着干", "moved to {label} · say “continue” to carry on"),
+                    0 => tr!("已切换到 {label}", "moved to {label}"),
+                    _ => tr!("已切换到 {label} · 发送「继续」即可接着做", "moved to {label} · say “continue” to carry on"),
                 };
                 if !r.note.is_empty() {
                     msg = format!("{msg} · {}", r.note);
@@ -300,7 +300,7 @@ pub fn run(job: &Job) -> Outcome {
             // 进程没动过,还没带 aca 的 hook:重启一次才有「跑完没看」
             Ok((s, _)) => Outcome::Made {
                 msg: tr!(
-                    "已接管「{}」 · R 重启后才知道它跑完了",
+                    "已接管「{}」 · R 重启后才能识别任务完成",
                     "adopted “{}” · restart (R) so aca can tell when it finishes",
                     short(plan.title())
                 ),
@@ -309,15 +309,15 @@ pub fn run(job: &Job) -> Outcome {
             Err(e) => Outcome::Failed(tr!("接管失败:{e}", "adopt failed: {e}")),
         },
         Job::Revive { t } => match crate::create::start(&t.id) {
-            Ok(()) => Outcome::Done(tr!("已撤销停止:「{}」再启动了", "undid the stop: “{}” started again", short(&t.title))),
+            Ok(()) => Outcome::Done(tr!("已撤销停止:「{}」已重新启动", "undid the stop: “{}” started again", short(&t.title))),
             Err(e) => Outcome::Failed(tr!("撤销失败:{e}", "undo failed: {e}")),
         },
         Job::Restore { item, start } => restore(&store, item, start),
         Job::Purge { item } => {
             let n = crate::trash::drop_now(&store, item);
             match (item.group.is_empty(), n) {
-                (true, _) | (false, 0) => Outcome::Done(tr!("已真删{}", "deleted {} for good", item.name())),
-                _ => Outcome::Done(tr!("已真删{} 和里面 {n} 个会话", "deleted {} and its {n} sessions for good", item.name())),
+                (true, _) | (false, 0) => Outcome::Done(tr!("已永久删除{}", "deleted {} for good", item.name())),
+                _ => Outcome::Done(tr!("已永久删除{}及其中 {n} 个会话", "deleted {} and its {n} sessions for good", item.name())),
             }
         }
         Job::Group(a) => crate::groups::job(a),
@@ -362,7 +362,7 @@ fn remove_many(jobs: &[Job]) -> Outcome {
     let n = bad.len();
     if gone.is_empty() {
         return Outcome::Failed(match bad.first() {
-            Some(e) if n > 1 => tr!("{n} 个都没删掉:{e}", "none of the {n} were deleted: {e}"),
+            Some(e) if n > 1 => tr!("{n} 个均未删除:{e}", "none of the {n} were deleted: {e}"),
             Some(e) => tr!("删除失败:{e}", "delete failed: {e}"),
             None => t!("删除失败", "delete failed").to_string(),
         });
@@ -370,7 +370,7 @@ fn remove_many(jobs: &[Job]) -> Outcome {
     let item = crate::trash::Item::sessions(&ts[0].profile, gone);
     let mut msg = tr!("已删除{} · ^Z 撤销", "deleted {} · ^Z undoes", item.name());
     if let Some(e) = bad.first() {
-        msg += &tr!(" · {n} 个没删掉:{e}", " · {n} weren't deleted: {e}");
+        msg += &tr!(" · {n} 个未删除:{e}", " · {n} weren't deleted: {e}");
     }
     Outcome::Binned { msg, item: Box::new(item) }
 }
@@ -414,17 +414,17 @@ fn restore(store: &Store, item: &crate::trash::Item, start: &[String]) -> Outcom
     }
     let what = item.name();
     let mut msg = match (item.group.is_empty(), back) {
-        (true, 0) => return Outcome::Done(tr!("{what}已经真删了,恢复不了", "{what} is gone for good; can't restore")),
+        (true, 0) => return Outcome::Done(tr!("{what}已被永久删除,无法恢复", "{what} is gone for good; can't restore")),
         (true, _) | (false, 0) => tr!("已恢复{what}", "restored {what}"),
         (false, n) => tr!("已恢复{what} · {n} 个会话", "restored {what} · {n} sessions"),
     };
     // 分组、一起删的几个:有的期间真删了,照实说
     if lost > 0 && (!item.group.is_empty() || item.sessions.len() > 1) {
-        msg += &tr!(" · {lost} 个已经真删了", " · {lost} already gone for good");
+        msg += &tr!(" · {lost} 个已被永久删除", " · {lost} already gone for good");
     }
     // 登记已经回来了,只是没起来:算恢复了(再撤一次也还是起不来),照实说
     if let Some(e) = cold.first() {
-        msg += &tr!(" · 没启动起来:{e}", " · didn't start: {e}");
+        msg += &tr!(" · 启动失败:{e}", " · didn't start: {e}");
     }
     Outcome::Done(msg)
 }
@@ -448,17 +448,17 @@ fn order(store: &Store, t: &Target, by: &str, after: bool) -> Outcome {
     let run = || -> Result<(), String> {
         let (me, it) = (store.get(&t.id)?, store.get(by)?);
         if me.group != it.group {
-            return Err(t!("已经不在同一组了", "they're no longer in the same group").into());
+            return Err(t!("已不在同一分组", "they're no longer in the same group").into());
         }
         let mut all: Vec<_> = store.sessions(true)?.into_iter().filter(|s| s.group == me.group).collect();
         all.sort_by_key(|s| (s.order, s.created));
         let ids = moved(all.into_iter().map(|s| s.id).collect(), &me.id, &it.id, after)
-            .ok_or(t!("找不到要挪到的位置", "can't find where to move it"))?;
+            .ok_or(t!("找不到目标位置", "can't find where to move it"))?;
         renumber(&ids, |id, n| store.set_order(id, n))
     };
     match run() {
         Ok(()) => Outcome::Done(String::new()),
-        Err(e) => Outcome::Failed(tr!("挪位置失败:{e}", "moving failed: {e}")),
+        Err(e) => Outcome::Failed(tr!("移动失败:{e}", "moving failed: {e}")),
     }
 }
 
@@ -466,17 +466,17 @@ fn order(store: &Store, t: &Target, by: &str, after: bool) -> Outcome {
 /// 同级的整个重新编号;别的层级的编号不动(它们只和自己的同级比)。做成了不说话
 fn group_order(store: &Store, group: &str, by: &str, after: bool) -> Outcome {
     let Some(sibs) = crate::data::group_siblings(group) else {
-        return Outcome::Failed(tr!("挪分组失败:没有 {group} 这个分组", "moving group failed: no group {group}"));
+        return Outcome::Failed(tr!("移动分组失败:分组 {group} 不存在", "moving group failed: no group {group}"));
     };
     let Some(ids) = moved(sibs, group, by, after) else {
         return Outcome::Failed(tr!(
-            "挪分组失败:{by} 和 {group} 不是同一级的",
+            "移动分组失败:{by} 和 {group} 不在同一级",
             "moving group failed: {by} and {group} aren't on the same level"
         ));
     };
     match renumber(&ids, |g, n| store.group_order(g, n)) {
         Ok(()) => Outcome::Done(String::new()),
-        Err(e) => Outcome::Failed(tr!("挪分组失败:{e}", "moving group failed: {e}")),
+        Err(e) => Outcome::Failed(tr!("移动分组失败:{e}", "moving group failed: {e}")),
     }
 }
 
@@ -502,10 +502,10 @@ pub struct GroupRow {
 /// what:挪的是谁(见 `named`);here:它的目录(多选挪的几个不在同一个目录 = 空)
 pub fn pick_group(rows: &[GroupRow], what: &str, here: &str) -> Result<Option<String>, String> {
     let header = if here.is_empty() {
-        tr!("--header=挪{what}", "--header=move {what}")
+        tr!("--header=移动{what}", "--header=move {what}")
     } else {
         tr!(
-            "--header=挪{what} · 只换分组,目录不变:{}",
+            "--header=移动{what} · 只换分组,目录不变:{}",
             "--header=move {what} · only the group changes, it stays in {}",
             crate::create::tilde(here)
         )
@@ -516,7 +516,7 @@ pub fn pick_group(rows: &[GroupRow], what: &str, here: &str) -> Result<Option<St
         "--with-nth=2..",
         "--nth=1",
         "--accept-nth=1",
-        t!("--prompt=挪到 ", "--prompt=move to "),
+        t!("--prompt=移到 ", "--prompt=move to "),
         &header,
         "--bind=enter:accept-or-print-query",
     ];
@@ -553,12 +553,12 @@ mod tests {
         let ok = || Outcome::Done(String::new());
         let bad = |e: &str| Outcome::Failed(e.into());
         assert_eq!(many_msg(&stops, &[ok(), ok(), ok()]), "已停止 3 个");
-        assert_eq!(many_msg(&stops, &[ok(), bad("停止失败:x"), bad("停止失败:y")]), "已停止 1 个 · 2 个没成:停止失败:x");
-        assert_eq!(many_msg(&stops, &[bad("停止失败:x"), bad("停止失败:y"), bad("z")]), "3 个都没成:停止失败:x");
+        assert_eq!(many_msg(&stops, &[ok(), bad("停止失败:x"), bad("停止失败:y")]), "已停止 1 个 · 2 个失败:停止失败:x");
+        assert_eq!(many_msg(&stops, &[bad("停止失败:x"), bad("停止失败:y"), bad("z")]), "3 个均失败:停止失败:x");
         assert_eq!(many_msg(&stops[..1], &[bad("停止失败:x")]), "停止失败:x");
         let mv = |s: &str, to: &str| Job::Move { t: t(s), from: "f".into(), to: to.into(), groups: vec![] };
-        assert_eq!(many_msg(&[mv("a", "g"), mv("b", "g")], &[ok(), ok()]), "已把 2 个挪到 g");
-        assert_eq!(many_msg(&[mv("a", "g"), mv("b", "h")], &[ok(), ok()]), "已挪 2 个");
+        assert_eq!(many_msg(&[mv("a", "g"), mv("b", "g")], &[ok(), ok()]), "已将 2 个移到 g");
+        assert_eq!(many_msg(&[mv("a", "g"), mv("b", "h")], &[ok(), ok()]), "已移动 2 个");
         assert_eq!(Job::Many(stops.to_vec()).doing(), "正在停止 3 个…");
         assert_eq!(named("一个很长很长很长很长很长很长的标题", 3), "「一个很长很长很长很长很长很长的标…」等 3 个");
         assert_eq!(named("a", 1), "「a」");
@@ -623,6 +623,6 @@ mod tests {
         let got: Vec<(String, i64)> = ["c", "a", "b", "x"].iter().map(|id| (id.to_string(), store.get(id).unwrap().order)).collect();
         assert_eq!(got, [("c".to_string(), 1), ("a".to_string(), 2), ("b".to_string(), 3), ("x".to_string(), 1)]);
         // 不在同一组:不挪
-        assert_eq!(order(&store, &t, "x", false), Outcome::Failed("挪位置失败:已经不在同一组了".into()));
+        assert_eq!(order(&store, &t, "x", false), Outcome::Failed("移动失败:已不在同一分组".into()));
     }
 }

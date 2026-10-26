@@ -151,7 +151,7 @@ fn call(params: &Value) -> Value {
     let name = params["name"].as_str().unwrap_or("");
     let ctx = caller(params);
     let Some(mut o) = offered_for(&ctx).into_iter().find(|o| o.name() == name) else {
-        return text(tr!("没有 {name} 这个工具(插件停了、或者不给这个会话)", "no tool {name} (plugin off, or not for this session)"), true);
+        return text(tr!("没有工具 {name}(插件已关闭,或未提供给此会话)", "no tool {name} (plugin off, or not for this session)"), true);
     };
     // 自带的:刚升级了 aca 就先换成新写出来的那份
     if o.entry.source == super::first_party::SOURCE
@@ -187,11 +187,11 @@ pub(crate) fn check(a: &Action, given: &Value) -> Res<String> {
             _ => v.is_string(),
         };
         if !ok {
-            return Err(tr!("参数 {k} 要是 {ty}", "argument {k} must be {ty}"));
+            return Err(tr!("参数 {k} 应为 {ty}", "argument {k} must be {ty}"));
         }
     }
     if let Some(k) = a.args.keys().find(|k| !given.contains_key(*k) && a.arg(k).is_some_and(|(_, opt)| !opt)) {
-        return Err(tr!("{} 要给参数 {k}", "{} needs argument {k}", a.id));
+        return Err(tr!("{} 需要参数 {k}", "{} needs argument {k}", a.id));
     }
     let mut v = given.clone();
     for (k, val) in v.iter_mut() {
@@ -225,7 +225,7 @@ impl Fed {
             text.push_str(&self.err);
         }
         match self.late {
-            Some(secs) => tr!("{text}\n(过了 {secs} 秒还没完,停掉了)", "{text}\n(still running after {secs} s; stopped)"),
+            Some(secs) => tr!("{text}\n(超过 {secs} 秒未完成,已停止)", "{text}\n(still running after {secs} s; stopped)"),
             None => text,
         }
     }
@@ -241,7 +241,7 @@ pub(crate) fn run_fed(mut c: std::process::Command, limit: Duration, input: Opti
     if input.is_some() {
         c.stdin(Stdio::piped());
     }
-    let mut child = c.process_group(0).spawn().map_err(|e| tr!("起不来:{e}", "can't start: {e}"))?;
+    let mut child = c.process_group(0).spawn().map_err(|e| tr!("无法启动:{e}", "can't start: {e}"))?;
     if let (Some(text), Some(mut w)) = (input, child.stdin.take()) {
         // 另起一个线程写:它不读完也不会卡住这边(管道满了只卡那个线程)
         std::thread::spawn(move || {

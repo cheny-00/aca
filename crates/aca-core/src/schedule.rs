@@ -52,7 +52,9 @@ pub fn due(r: &Run, now: u64) -> Vec<Due> {
         // 这次起来之前就没再写过的,里面不会有这次定的
         let written = f.metadata().and_then(|m| m.modified()).ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok());
         if written.is_some_and(|w| w.as_secs() >= r.started) {
-            seen.merge(&scan(&f, now));
+            // 起的时候就有的那份:它那时的长度之前的内容里不会有这次定的,从那往后读
+            let from = if f == Path::new(&r.started_file) { r.started_len } else { 0 };
+            seen.merge(&scan(&f, from, now));
         }
     }
     seen.due(r.started, now, &|cron, at| next_fire(cron, at, &local, &at_local))
@@ -72,12 +74,14 @@ struct Scan {
 
 static SCANS: LazyLock<Mutex<HashMap<PathBuf, Scan>>> = LazyLock::new(Default::default);
 
-/// 一份记录里认出来的:读过的部分记着,只读后面新写的。两个线程同时读同一份也没事,各读各的,后放回去的留下
-fn scan(path: &Path, now: u64) -> Seen {
+/// 一份记录里认出来的:读过的部分记着,只读后面新写的;第一次读从 `from` 起(文件比它短 = 换过了,从头)。
+/// 两个线程同时读同一份也没事,各读各的,后放回去的留下
+fn scan(path: &Path, from: u64, now: u64) -> Seen {
     let Ok(meta) = path.metadata() else { return Seen::default() };
     let (ino, len) = (meta.ino(), meta.len());
     let kept = SCANS.lock().ok().and_then(|mut c| c.remove(path));
-    let mut s = kept.filter(|s| s.ino == ino && s.read <= len).unwrap_or(Scan { ino, read: 0, seen: Seen::default() });
+    let first = Scan { ino, read: if from <= len { from } else { 0 }, seen: Seen::default() };
+    let mut s = kept.filter(|s| s.ino == ino && s.read <= len).unwrap_or(first);
     if s.read < len {
         s.read += read(path, s.read, now, &mut s.seen);
     }
@@ -536,20 +540,20 @@ mod tests {
         let line = create("2026-10-15T08:00:00Z", "c1", "57 8 * * *", None);
         // 最后一行还没写完(没有换行):这回不算,也不记成读过
         std::fs::write(&f, format!("{{\"type\":\"user\"}}\n{}", &line[..40])).unwrap();
-        assert!(scan(&f, 0).creates.is_empty());
+        assert!(scan(&f, 0, 0).creates.is_empty());
         std::fs::write(&f, format!("{{\"type\":\"user\"}}\n{line}\n")).unwrap();
-        assert!(scan(&f, 0).creates.contains_key("c1"));
+        assert!(scan(&f, 0, 0).creates.contains_key("c1"));
         // 后面又写了一行:读到的是两样;读过的那部分不再读(改掉它也看不出来)
         let mut text = std::fs::read_to_string(&f).unwrap().replace("57 8", "58 8");
         text.push_str(&tool("2026-10-15T09:00:00Z", "ScheduleWakeup", r#"{"delaySeconds":600}"#));
         text.push('\n');
         std::fs::OpenOptions::new().write(true).open(&f).unwrap().write_all(text.as_bytes()).unwrap();
-        let s = scan(&f, 0);
+        let s = scan(&f, 0, 0);
         assert_eq!((s.creates["c1"].cron.as_str(), s.wake.as_ref().map(|w| w.0)), ("57 8 * * *", Some(t("2026-10-15T09:00:00Z"))));
         // 换了一份(变短了、inode 变了):从头读
         std::fs::remove_file(&f).unwrap();
         std::fs::write(&f, "{\"type\":\"user\"}\n").unwrap();
-        let s = scan(&f, 0);
+        let s = scan(&f, 0, 0);
         assert!(s.creates.is_empty() && s.wake.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -602,6 +606,27 @@ mod tests {
         // 这次起来之前就没再写过的记录不看
         assert!(!pending(&Run { started: now + 10, ..r.clone() }, now));
         assert!(!pending(&Run::default(), now));
+        // 起的时候记录已经有的那段里定的不算(上一个进程定的,它退了就没了):从记下的长度往后读,后面新写的照常认。
+        // 读过的偏移按文件记着(SCANS),所以每种情况各用一份文件
+        let before = format!("{}\n", create(&stamp(now - 60), "old", "57 8 * * *", None));
+        let run = |name: &str, file: &str, len: u64| {
+            std::fs::write(dir.join(name), &before).unwrap();
+            Run {
+                transcript: dir.join(name).to_string_lossy().into_owned(),
+                conv: name.trim_end_matches(".jsonl").into(),
+                started: now - 120,
+                started_file: dir.join(file).to_string_lossy().into_owned(),
+                started_len: len,
+                ..Default::default()
+            }
+        };
+        let r2 = run("c2.jsonl", "c2.jsonl", before.len() as u64);
+        assert!(!pending(&r2, now));
+        std::fs::write(dir.join("c2.jsonl"), format!("{before}{}\n", create(&stamp(now - 30), "new", "58 8 * * *", None))).unwrap();
+        assert!(pending(&r2, now));
+        // 记下的长度比文件还长 = 文件换过了,从头读;记的是别的文件(/clear 之后的新对话)的也不管它
+        assert!(pending(&run("c3.jsonl", "c3.jsonl", before.len() as u64 + 1), now));
+        assert!(pending(&run("c4.jsonl", "c9.jsonl", before.len() as u64), now));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

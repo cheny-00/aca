@@ -27,14 +27,9 @@ pub fn spawn(cfg: &Config, id: &str) {
     if !cfg.trust.folder {
         return;
     }
-    use std::os::unix::process::CommandExt;
-    let _ = Command::new(agent::self_exe())
-        .args(["trust-watch", id])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn();
+    let _ = crate::proc::detach(
+        Command::new(agent::self_exe()).args(["trust-watch", id]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()),
+    );
 }
 
 /// 这个会话现在停在「信不信任这个目录」上,而且 [`spawn`] 放的那个后手还在盯着:马上有人替你答,不算在等你。

@@ -63,6 +63,9 @@ pub struct GroupRec {
     /// 记在哪个工作区(界面的,见 spaces.rs)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space: Option<char>,
+    /// 它的便签(界面的,见 notes.rs)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
 
 /// 删掉的一个会话
@@ -264,10 +267,9 @@ fn legacy(old: &Path, bin: &mut Trash, store: &Store, alive: impl Fn(u32) -> boo
 
 /// 界面退出时:起一个 `aca ui --purge` 去真删到期的。放进自己的进程组、不接终端,弹窗关了 / 终端断了也照样删完
 pub fn purge_detached() {
-    use std::os::unix::process::CommandExt;
     let Some(me) = aca_core::agent::self_path() else { return };
     let _ =
-        Command::new(me).args(["ui", "--purge"]).process_group(0).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        aca_core::proc::detach(Command::new(me).args(["ui", "--purge"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()));
 }
 
 /// `b`:回收站。一行一条删掉的,新删的在上;`⏎` 拿回来(会话是停着的),`d` 再 `y` 现在就真删。
@@ -368,13 +370,13 @@ impl Page {
         let n = items.len();
         let m: usize = items.iter().map(Item::taken).sum();
         match items {
-            [i] if i.group.is_empty() || m == 0 => tr!("现在就真删{}？", "Delete {} for good now?", i.name()),
-            [i] => tr!("现在就真删{} 和里面 {m} 个会话？", "Delete {} and its {m} sessions for good now?", i.name()),
+            [i] if i.group.is_empty() || m == 0 => tr!("立即永久删除{}？", "Delete {} for good now?", i.name()),
+            [i] => tr!("立即永久删除{}及其中 {m} 个会话？", "Delete {} and its {m} sessions for good now?", i.name()),
             // 都是一条一个会话:不用再说几个会话
             _ if items.iter().all(|i| i.group.is_empty() && i.sessions.len() == 1) => {
-                tr!("现在就真删这 {n} 条？", "Delete these {n} for good now?")
+                tr!("立即永久删除这 {n} 条？", "Delete these {n} for good now?")
             }
-            _ => tr!("现在就真删这 {n} 条、一共 {m} 个会话？", "Delete these {n} for good now, {m} sessions in all?"),
+            _ => tr!("立即永久删除这 {n} 条(共 {m} 个会话)？", "Delete these {n} for good now, {m} sessions in all?"),
         }
     }
 }
@@ -398,14 +400,14 @@ impl Overlay for Page {
         let ranging = self.anchor.is_some();
         let at = if n > SHOWN { vec![Span::styled(format!("{}/{n}  ", self.sel + 1), kit::dim())] } else { vec![] };
         let esc = match () {
-            _ if self.armed => t!("不删", "keep"),
-            _ if ranging => t!("定下", "keep"),
-            _ if !self.marked.is_empty() => t!("全不选", "clear"),
+            _ if self.armed => t!("取消", "keep"),
+            _ if ranging => t!("确定", "keep"),
+            _ if !self.marked.is_empty() => t!("清空选择", "clear"),
             _ => t!("关闭", "close"),
         };
         let mut out = vec![kit::modal_title(t!("回收站", "Trash"), theme::accent(), [at, kit::esc_hint(esc)].concat(), w), Line::raw("")];
         if self.rows.is_empty() {
-            out.push(Line::styled(t!("空的", "empty"), kit::dim()));
+            out.push(Line::styled(t!("回收站为空", "empty"), kit::dim()));
         }
         // 高亮尽量在中间;选上的同主列表:行首一道绿「▌」、铺淡绿底
         let chosen: Vec<&str> = self.chosen().iter().map(|r| r.id.as_str()).collect();
@@ -424,10 +426,10 @@ impl Overlay for Page {
         if self.armed {
             out.extend(crate::ui::wrap_width(&self.warning(&self.targets()), w).into_iter().map(|l| Line::styled(l, theme::warn())));
             out.push(Line::raw(""));
-            out.push(kit::keys_line(&[("y", t!("真删", "delete")), ("Esc", t!("不删", "keep"))], vec![], w));
+            out.push(kit::keys_line(&[("y", t!("永久删除", "delete")), ("Esc", t!("取消", "keep"))], vec![], w));
             return out;
         }
-        let acts = [("⏎", t!("恢复", "restore")), ("d", t!("真删", "delete"))];
+        let acts = [("⏎", t!("恢复", "restore")), ("d", t!("删除", "delete"))];
         if !ranging && self.marked.is_empty() {
             out.push(kit::keys_line(&[acts[0], acts[1], ("v", t!("多选", "select"))], vec![], w));
             return out;
@@ -435,7 +437,7 @@ impl Overlay for Page {
         // 多选着:打头一块绿底写选上几条(同主列表的底栏)
         let count = tr!("已选 {}", "{} selected", chosen.len());
         let badge = match ranging {
-            true if self.unpick => kit::button(&format!("{} · {count}", t!("去掉勾", "unselect")), theme::pal().red),
+            true if self.unpick => kit::button(&format!("{} · {count}", t!("取消选中", "unselect")), theme::pal().red),
             true => kit::button(&format!("{} · {count}", t!("连选", "range")), theme::pal().green),
             false => kit::button(&count, theme::pal().green),
         };
@@ -447,8 +449,8 @@ impl Overlay for Page {
                 acts[0],
                 acts[1],
                 ("v", t!("连选", "range")),
-                ("V", t!("连着去掉勾", "range unselect")),
-                (t!("空格", "Space"), if on { t!("去掉勾", "unselect") } else { t!("勾上", "select") }),
+                ("V", t!("连续取消", "range unselect")),
+                (t!("空格", "Space"), if on { t!("取消选中", "unselect") } else { t!("选中", "select") }),
             ],
         };
         let used = unicode_width::UnicodeWidthStr::width(badge.content.as_ref()) + 1;
@@ -475,7 +477,7 @@ impl Overlay for Page {
                     fx.job = Some(batch(gone, |item| Job::Purge { item }));
                 }
                 KeyCode::Esc => {}
-                _ => fx.say(t!("没删", "not deleted")),
+                _ => fx.say(t!("未删除", "not deleted")),
             }
             return Flow::Stay;
         }
@@ -662,11 +664,11 @@ mod tests {
         assert!(rows[at("▾ fun")].contains("2 个会话") && rows[at("▾ fun")].ends_with("2 小时前"), "{rows:#?}");
         assert!(at("标题d") < at("▾ fun"));
         assert!(!rows.iter().any(|r| r.contains("标题e")), "{rows:#?}");
-        assert!(rows.iter().any(|r| r.contains("⏎ 恢复") && r.contains("d 真删")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("⏎ 恢复") && r.contains("d 删除")), "{rows:#?}");
         // 手机宽度不超宽
         assert!(text(&p, 36).iter().all(|r| unicode_width::UnicodeWidthStr::width(r.as_str()) <= 36));
         let empty = Page::new(Trash::default(), now);
-        assert!(text(&empty, 60).iter().any(|r| r == "空的"));
+        assert!(text(&empty, 60).iter().any(|r| r == "回收站为空"));
     }
 
     #[test]
@@ -681,7 +683,7 @@ mod tests {
         let rows = text(&p, 60);
         assert!(rows.iter().any(|r| r.contains("标题a、标题b、标题c") && r.contains("3 个会话")), "{rows:#?}");
         assert!(text(&p, 36).iter().any(|r| r.contains("3 个会话")), "{:#?}", text(&p, 36));
-        assert!(p.warning(std::slice::from_ref(&it)) == "现在就真删「标题a」等 3 个？");
+        assert!(p.warning(std::slice::from_ref(&it)) == "立即永久删除「标题a」等 3 个？");
     }
 
     #[test]
@@ -695,7 +697,7 @@ mod tests {
         press(&mut p, KeyCode::Down);
         let (_, fx) = press(&mut p, KeyCode::Char('d'));
         assert!(fx.job.is_none() && p.armed);
-        assert!(text(&p, 60).iter().any(|r| r == "现在就真删分组 fun 和里面 2 个会话？"), "{:#?}", text(&p, 60));
+        assert!(text(&p, 60).iter().any(|r| r == "立即永久删除分组 fun及其中 2 个会话？"), "{:#?}", text(&p, 60));
         let (flow, fx) = press(&mut p, KeyCode::Char('y'));
         assert_eq!(flow, Flow::Stay);
         assert!(matches!(fx.job, Some(Job::Purge { ref item }) if item.id == "1"));
@@ -708,7 +710,7 @@ mod tests {
         let (_, fx) = press(&mut p, KeyCode::Char('d'));
         assert!(fx.job.is_none());
         let (_, fx) = press(&mut p, KeyCode::Char('n'));
-        assert_eq!((fx.job.is_none(), fx.flash.as_deref()), (true, Some("没删")));
+        assert_eq!((fx.job.is_none(), fx.flash.as_deref()), (true, Some("未删除")));
         press(&mut p, KeyCode::Char('d'));
         let (flow, fx) = press(&mut p, KeyCode::Esc);
         assert_eq!((flow, fx.flash), (Flow::Stay, None));
@@ -744,19 +746,19 @@ mod tests {
     #[test]
     fn v_selects_like_the_list_and_esc_steps_back_one_level() {
         let mut p = four();
-        has(&p, &["⏎ 恢复", "d 真删", "v 多选", "Esc 关闭"]);
+        has(&p, &["⏎ 恢复", "d 删除", "v 多选", "Esc 关闭"]);
         // v 拉一段:选上的行首一道「▌」;连选着再按 v:没定下的这一段不要了,从这条重新起
         keys(&mut p, "vj");
         assert_eq!(chosen(&p), ["1", "2"]);
-        has(&p, &["连选 · 已选 2", "Esc 定下"]);
+        has(&p, &["连选 · 已选 2", "Esc 确定"]);
         assert_eq!(text(&p, 60).iter().filter(|r| r.starts_with('▌')).count(), 2);
         keys(&mut p, "v");
         assert_eq!(chosen(&p), ["2"]);
-        // Esc 定下;高亮在勾着的那条:空格是去掉,v 连选、V 连着去掉勾
+        // Esc 确定;高亮在勾着的那条:空格是去掉,v 连选、V 连着去掉勾
         keys(&mut p, "k");
         press(&mut p, KeyCode::Esc);
         assert_eq!(chosen(&p), ["1", "2"]);
-        has(&p, &["已选 2", "空格 去掉勾", "v 连选", "V 连着去掉勾", "Esc 全不选"]);
+        has(&p, &["已选 2", "空格 取消选中", "v 连选", "V 连续取消", "Esc 清空选择"]);
         // 手机宽度:放不下先丢空格,再丢 V(同主列表的底栏)
         let phone = text(&p, 40);
         assert!(phone.iter().any(|r| r.contains("v 连选") && !r.contains("V 连") && !r.contains("空格")), "{phone:#?}");
@@ -770,7 +772,7 @@ mod tests {
         press(&mut p, KeyCode::Esc);
         keys(&mut p, "Vk");
         assert_eq!(chosen(&p), ["1"]);
-        has(&p, &["去掉勾 · 已选 1"]);
+        has(&p, &["取消选中 · 已选 1"]);
         // 连选着再按 V / v:没定下的那段不要了,从这条起重新连那一种
         keys(&mut p, "V");
         assert_eq!(chosen(&p), ["1", "3"]);
@@ -785,7 +787,7 @@ mod tests {
         assert_eq!(press(&mut p, KeyCode::Esc).0, Flow::Stay);
         assert!(chosen(&p).is_empty());
         keys(&mut p, "V");
-        has(&p, &["去掉勾 · 已选 0"]);
+        has(&p, &["取消选中 · 已选 0"]);
         assert_eq!(press(&mut p, KeyCode::Esc).0, Flow::Stay);
         assert_eq!(press(&mut p, KeyCode::Esc).0, Flow::Close);
     }
@@ -814,8 +816,8 @@ mod tests {
         // 空格勾两条,d 问一句写几条,y 一起真删
         let mut p = four();
         keys(&mut p, "  d");
-        has(&p, &["现在就真删这 2 条？", "y 真删"]);
-        assert!(!text(&p, 60).iter().any(|r| r.contains("全不选")), "{:#?}", text(&p, 60));
+        has(&p, &["立即永久删除这 2 条？", "y 永久删除"]);
+        assert!(!text(&p, 60).iter().any(|r| r.contains("清空选择")), "{:#?}", text(&p, 60));
         let (_, fx) = press(&mut p, KeyCode::Char('y'));
         let Some(Job::Many(v)) = fx.job else { panic!() };
         assert!(matches!(&v[..], [Job::Purge { item: a }, Job::Purge { item: b }] if a.id == "1" && b.id == "2"));
@@ -826,6 +828,6 @@ mod tests {
         // 有分组的:写一共几个会话
         let mut p = page();
         keys(&mut p, "vjd");
-        has(&p, &["现在就真删这 2 条、一共 3 个会话？"]);
+        has(&p, &["立即永久删除这 2 条(共 3 个会话)？"]);
     }
 }

@@ -236,6 +236,15 @@ pub fn env_var(pid: u32, name: &str) -> Option<String> {
     }
 }
 
+/// 放到后台、不等它:自成一个进程组(起它的退了、终端断了它接着跑),三个口接哪儿调用的自己定。
+/// 它退了由一个线程收掉 —— 不收的话,开着好几天的界面底下每起 / 删一个会话就多挂一个僵尸,一直到界面退出
+pub fn detach(cmd: &mut Command) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut child = cmd.process_group(0).spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

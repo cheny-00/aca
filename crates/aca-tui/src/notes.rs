@@ -2,6 +2,7 @@
 //! (不发送),填完就删 —— 像 Claude Code 的 stash。
 //! 存在 ~/.local/state/aca/ui/notes(JSON)。
 //! 按会话的键记(登记的是它的 id,改名、重启都不变;普通 tmux 会话是会话名)。
+//! 分组也有一条(停在分组上 `e`):记这一组整体的想法,不填进哪个会话;组改名跟着改,删组时跟着进回收站。
 //! 和置顶一样,每次刷新都重读,改之前先重读,手机和桌面各开一个 aca 不会互相覆盖。
 
 use std::collections::BTreeMap;
@@ -23,6 +24,17 @@ pub struct Notes {
 /// 会话记在哪个键下
 pub fn key(s: &Session) -> String {
     if s.deck_id.is_empty() { format!("tmux:{}", s.name) } else { s.deck_id.clone() }
+}
+
+const GROUP: &str = "group:";
+
+/// 分组记在哪个键下(界面里 terms / glances 按分组记的也用它)。tmux 会话名里没有「:」,和会话的撞不上
+pub fn group_key(g: &str) -> String {
+    format!("{GROUP}{g}")
+}
+
+pub fn is_group_key(k: &str) -> bool {
+    k.starts_with(GROUP)
 }
 
 impl Notes {
@@ -59,6 +71,26 @@ impl Notes {
         } else {
             self.map.insert(key.to_string(), text.to_string());
         }
+        self.save()
+    }
+
+    /// 分组 from 改名成 to:它和子分组的便签跟过去(登记表那边改成了才调)
+    pub fn rename_group(&mut self, from: &str, to: &str) -> std::io::Result<()> {
+        let (from, to) = (from.trim_matches('/'), to.trim_matches('/'));
+        self.reload();
+        let olds: Vec<String> =
+            self.map.keys().filter(|k| k.strip_prefix(GROUP).is_some_and(|g| crate::groups::within(g, from))).cloned().collect();
+        if olds.is_empty() || from == to {
+            return Ok(());
+        }
+        let moved: Vec<(String, String)> = olds
+            .into_iter()
+            .filter_map(|k| {
+                let text = self.map.remove(&k)?;
+                Some((group_key(&crate::groups::renamed(&k[GROUP.len()..], from, to)?), text))
+            })
+            .collect();
+        self.map.extend(moved);
         self.save()
     }
 
@@ -100,7 +132,7 @@ pub fn edit_in_editor(text: &str) -> Result<String, String> {
         // 空的就给空文件,不然编辑器里开头多一个空行
         f.write_all(if text.is_empty() { String::new() } else { format!("{text}\n") }.as_bytes())
     };
-    write(&path).map_err(|e| tr!("临时文件写不了:{e}", "can't write the temp file: {e}"))?;
+    write(&path).map_err(|e| tr!("无法写入临时文件:{e}", "can't write the temp file: {e}"))?;
     let ed = editor();
     // 交给 sh:$EDITOR 可以带参数
     let st = Command::new("sh").arg("-c").arg(format!("{ed} \"$1\"")).arg("sh").arg(&path).status();
@@ -108,8 +140,8 @@ pub fn edit_in_editor(text: &str) -> Result<String, String> {
     let _ = std::fs::remove_file(&path);
     match st {
         Ok(s) if s.success() => got.map(|t| t.trim_matches('\n').to_string()).map_err(|e| e.to_string()),
-        Ok(_) => Err(tr!("{} 没正常退出,便签没改", "{} didn't exit cleanly; note unchanged", editor_name())),
-        Err(e) => Err(tr!("{} 起不来:{e}", "can't start {}: {e}", editor_name())),
+        Ok(_) => Err(tr!("{} 未正常退出,便签未修改", "{} didn't exit cleanly; note unchanged", editor_name())),
+        Err(e) => Err(tr!("无法启动 {}:{e}", "can't start {}: {e}", editor_name())),
     }
 }
 
@@ -132,5 +164,18 @@ mod tests {
         desk.set("a", "  \n").unwrap();
         assert!(Notes::open(Some(path.clone())).map.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_group_note_follows_the_group_and_its_subgroups_when_renamed() {
+        let mut n = Notes::default();
+        for (k, t) in [("fun", "整体"), ("fun/a", "子组"), ("funny", "别的组"), ("id-1", "会话的")] {
+            n.set(&if k.starts_with("id-") { k.to_string() } else { group_key(k) }, t).unwrap();
+        }
+        n.rename_group("fun", "play/fun").unwrap();
+        let groups: Vec<(&str, &str)> =
+            n.map.iter().filter(|(k, _)| is_group_key(k)).map(|(k, t)| (&k[GROUP.len()..], t.as_str())).collect();
+        assert_eq!(groups, [("funny", "别的组"), ("play/fun", "整体"), ("play/fun/a", "子组")]);
+        assert_eq!(n.get("id-1"), Some("会话的"));
     }
 }

@@ -103,8 +103,8 @@ pub fn build(
     for s in &catalog {
         let (what, cat) = match (&s.plugin, s.tools) {
             // 名字已经是从插件 id 来的,不再写一遍
-            (Some(_), _) => (t!("插件带的", "from a plugin").to_string(), false),
-            (None, true) => (t!("插件给 agent 的工具", "plugin tools for agents").to_string(), false),
+            (Some(_), _) => (t!("来自插件", "from a plugin").to_string(), false),
+            (None, true) => (t!("插件提供给 agent 的工具", "plugin tools for agents").to_string(), false),
             (None, false) => {
                 (mcps.iter().find(|m| aca_core::plugin::mount::safe(&m.0) == s.name).map(|m| m.1.clone()).unwrap_or_default(), true)
             }
@@ -164,19 +164,19 @@ impl Page {
         };
         let mut facts = vec![];
         if !r.served {
-            facts.push(t!("没收进", "not served").to_string());
+            facts.push(t!("未加入", "not served").to_string());
         } else {
             facts.push(match r.state.as_str() {
-                "ready" => tr!("在跑 · {} 个工具", "running · {} tools", r.tools),
-                "failed" => t!("崩了", "crashed").to_string(),
+                "ready" => tr!("运行中 · {} 个工具", "running · {} tools", r.tools),
+                "failed" => t!("已崩溃", "crashed").to_string(),
                 _ => t!("空闲", "idle").to_string(),
             });
             if r.calls > 0 {
-                facts.push(tr!("一天 {} 次 · {} 个会话", "{} calls/day · {} sessions", r.calls, r.users));
+                facts.push(tr!("每天 {} 次 · {} 个会话", "{} calls/day · {} sessions", r.calls, r.users));
             }
         }
         if r.per_session {
-            facts.push(t!("每会话一份", "per session").to_string());
+            facts.push(t!("每个会话独立", "per session").to_string());
         }
         let right = facts.join(" · ");
         let room = w.saturating_sub(right.width() + 6);
@@ -203,10 +203,10 @@ impl Overlay for Page {
         let wrap = |text: &str, st: Style| crate::ui::wrap_width(text, w).into_iter().map(move |l| Line::styled(l, st)).collect::<Vec<_>>();
         // 关着时新起的 agent 不经它、各自挂 MCP;没在跑是空闲,第一个 agent 连上来时自己起 —— 这些不上屏
         let head = match (self.info.on, self.info.running) {
-            (false, Some((n, _))) => tr!("关着 · 还连着 {n} 个", "off · {n} still connected"),
-            (false, None) => t!("关着", "off").to_string(),
-            (true, Some((n, _))) => tr!("开着 · 在跑 · {n} 个连接", "on · running · {n} connections"),
-            (true, None) => t!("开着 · 空闲", "on · idle").to_string(),
+            (false, Some((n, _))) => tr!("已关闭 · 仍有 {n} 个连接", "off · {n} still connected"),
+            (false, None) => t!("已关闭", "off").to_string(),
+            (true, Some((n, _))) => tr!("已开启 · 运行中 · {n} 个连接", "on · running · {n} connections"),
+            (true, None) => t!("已开启 · 空闲", "on · idle").to_string(),
         };
         let head_st = if self.info.on { kit::dim() } else { theme::warn() };
         let mut out = vec![
@@ -216,7 +216,7 @@ impl Overlay for Page {
         ];
         if self.info.rows.is_empty() {
             out.extend(wrap(
-                t!("还没有 MCP · 在 config.toml 里加 [mcps.<名字>]", "No MCPs yet · add [mcps.<name>] to config.toml"),
+                t!("暂无 MCP · 在 config.toml 中添加 [mcps.<名字>]", "No MCPs yet · add [mcps.<name>] to config.toml"),
                 kit::dim(),
             ));
         }
@@ -237,11 +237,11 @@ impl Overlay for Page {
         out.push(Line::raw(""));
         out.push(kit::keys_line(
             &[
-                ("o", if self.info.on { t!("关掉", "turn off") } else { t!("开", "turn on") }),
-                (t!("空格", "space"), t!("收进/移出", "serve/unserve")),
+                ("o", if self.info.on { t!("关闭", "turn off") } else { t!("开启", "turn on") }),
+                (t!("空格", "space"), t!("加入/移出", "serve/unserve")),
                 ("r R", t!("重启/全部", "restart/all")),
                 ("l", t!("日志", "log")),
-                ("s", t!("停进程", "stop process")),
+                ("s", t!("停止进程", "stop process")),
             ],
             vec![],
             w,
@@ -258,20 +258,20 @@ impl Overlay for Page {
             KeyCode::Char(' ') => match self.cur().cloned() {
                 Some(r) if r.catalog => {
                     match gateway::set_served(&r.name, !r.served) {
-                        Ok(()) if r.served => fx.say(tr!("{} 移出了 gateway", "took {} out of the gateway", r.name)),
-                        Ok(()) => fx.say(tr!("{} 收进了 gateway", "{} is served through the gateway now", r.name)),
+                        Ok(()) if r.served => fx.say(tr!("已将 {} 移出 gateway", "took {} out of the gateway", r.name)),
+                        Ok(()) => fx.say(tr!("已将 {} 加入 gateway", "{} is served through the gateway now", r.name)),
                         Err(e) => fx.say(e),
                     }
                     self.reload();
                 }
-                Some(_) => fx.say(t!("插件带的跟着插件开关", "a plugin's own goes on and off with the plugin")),
+                Some(_) => fx.say(t!("来自插件的项随插件开关", "a plugin's own goes on and off with the plugin")),
                 None => {}
             },
             KeyCode::Char(c @ ('r' | 'R')) => {
                 let name =
                     if c == 'r' { self.cur().map(|r| aca_core::plugin::mount::safe(&r.name)).unwrap_or_default() } else { String::new() };
                 match gateway::ctl(json!({ "cmd": "restart", "server": name })) {
-                    Ok(v) => fx.say(tr!("重启了 {} 个", "restarted {}", v["restarted"])),
+                    Ok(v) => fx.say(tr!("已重启 {} 个", "restarted {}", v["restarted"])),
                     Err(e) => fx.say(e),
                 }
                 self.reload();
@@ -282,7 +282,7 @@ impl Overlay for Page {
                     if log.exists() {
                         fx.external = Some(crate::ui::External::View { path: log.to_string_lossy().into_owned(), line: 1, temp: false });
                     } else {
-                        fx.say(tr!("{} 还没有日志", "{} has no log yet", r.name));
+                        fx.say(tr!("{} 暂无日志", "{} has no log yet", r.name));
                     }
                 }
             }
@@ -290,7 +290,7 @@ impl Overlay for Page {
             KeyCode::Char('o') => fx.job = Some(Job::Plugins(Act::Enable(gateway::PLUGIN.into(), !self.info.on))),
             KeyCode::Char('s') => {
                 match gateway::ctl(json!({ "cmd": "stop" })) {
-                    Ok(_) => fx.say(t!("停了 gateway 进程", "stopped the gateway process")),
+                    Ok(_) => fx.say(t!("已停止 gateway 进程", "stopped the gateway process")),
                     Err(e) => fx.say(e),
                 }
                 self.reload();
@@ -357,15 +357,15 @@ mod tests {
             let p = Page { load: Info::default, info, sel: 2 };
             let t: String = p.lines(100).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect();
             assert!(
-                t.contains("开着 · 在跑 · 2 个连接\n")
+                t.contains("已开启 · 运行中 · 2 个连接\n")
                     && t.contains("● web")
-                    && t.contains("在跑 · 3 个工具 · 一天 7 次 · 2 个会话 · 每会话一份"),
+                    && t.contains("运行中 · 3 个工具 · 每天 7 次 · 2 个会话 · 每个会话独立"),
                 "{t}"
             );
             // 空格做什么键栏里有,正文不再写
-            assert!(t.contains("✕ aca-delegate") && t.contains("○ github") && t.contains("没收进") && !t.contains("空格:"), "{t}");
+            assert!(t.contains("✕ aca-delegate") && t.contains("○ github") && t.contains("未加入") && !t.contains("空格:"), "{t}");
             // 插件带的不写插件 id;插件给 agent 的工具那个服务就这么叫
-            assert_eq!((info_what(&p, 0), info_what(&p, 1)), ("插件带的", "插件给 agent 的工具"));
+            assert_eq!((info_what(&p, 0), info_what(&p, 1)), ("来自插件", "插件提供给 agent 的工具"));
         });
     }
 
@@ -376,15 +376,15 @@ mod tests {
                 p.lines(100).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect()
             };
             let mut p = Page { load: Info::default, info: Info { on: true, ..Info::default() }, sel: 0 };
-            assert!(text(&p).contains("开着 · 空闲\n") && text(&p).contains("o 关掉"), "{}", text(&p));
+            assert!(text(&p).contains("已开启 · 空闲\n") && text(&p).contains("o 关闭"), "{}", text(&p));
             let mut fx = Fx::default();
             p.on_key(KeyEvent::from(KeyCode::Char('o')), &mut fx);
             assert_eq!(fx.job, Some(Job::Plugins(Act::Enable("aca.gateway".into(), false))));
             // 关了还连着的:说还连着几个
             p.info = Info { on: false, running: Some((2, 5)), rows: vec![] };
-            assert!(text(&p).contains("关着 · 还连着 2 个\n") && text(&p).contains("o 开"), "{}", text(&p));
+            assert!(text(&p).contains("已关闭 · 仍有 2 个连接\n") && text(&p).contains("o 开"), "{}", text(&p));
             p.info = Info { on: false, running: None, rows: vec![] };
-            assert!(text(&p).contains(" 关着\n"), "{}", text(&p));
+            assert!(text(&p).contains(" 已关闭\n"), "{}", text(&p));
             let mut fx = Fx::default();
             p.on_key(KeyEvent::from(KeyCode::Char('o')), &mut fx);
             assert_eq!(fx.job, Some(Job::Plugins(Act::Enable("aca.gateway".into(), true))));

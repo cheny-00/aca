@@ -49,13 +49,13 @@ type Stdio = (String, Vec<String>, BTreeMap<String, String>);
 /// 定义 → 怎么起;HTTP 的、没写命令的 Err
 fn stdio(def: &serde_json::Value) -> Result<Stdio, String> {
     if def.get("url").is_some() || matches!(def.get("type").and_then(|t| t.as_str()), Some("http" | "sse" | "streamable-http")) {
-        return Err(t!("HTTP 的,gateway 现在只接 stdio", "an HTTP server; the gateway takes stdio ones only").into());
+        return Err(t!("是 HTTP 服务,gateway 目前只支持 stdio", "an HTTP server; the gateway takes stdio ones only").into());
     }
-    let command = def.get("command").and_then(|c| c.as_str()).ok_or(t!("没写 command", "no command"))?.to_string();
+    let command = def.get("command").and_then(|c| c.as_str()).ok_or(t!("缺少 command", "no command"))?.to_string();
     // `./x`、`dir/x` 是相对那个账号自己的目录的(Codex 应用装的那种),gateway 里起不来;`npx` 这种按 PATH 找的没事
     if command.contains('/') && !command.starts_with('/') && !command.starts_with('~') {
         return Err(tr!(
-            "命令是相对路径({command}),跟着那个账号自己的目录走,gateway 里起不来",
+            "命令是相对路径({command}),依赖该账号自己的目录,无法在 gateway 中启动",
             "the command is a relative path ({command}), tied to that account's own directory; it can't run under the gateway"
         ));
     }
@@ -117,7 +117,7 @@ pub fn merge(seen: Vec<(String, Vec<(String, serde_json::Value)>)>, known: &[Str
                     let same = parsed.as_ref().is_ok_and(|(c, a, e)| (c, a, e) == (&f.command, &f.args, &f.env));
                     if f.problem.is_none() && !same {
                         f.problem =
-                            Some(t!("几个账号里写得不一样,先统一了再收", "accounts define it differently; make them agree first").into());
+                            Some(t!("各账号中的写法不一致,请统一后再导入", "accounts define it differently; make them agree first").into());
                     }
                 }
                 None => {
@@ -139,8 +139,7 @@ pub fn merge(seen: Vec<(String, Vec<(String, serde_json::Value)>)>, known: &[Str
 fn block(f: &Found) -> String {
     let key =
         if f.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') { f.name.clone() } else { format!("\"{}\"", f.name) };
-    let mut s =
-        tr!("\n# 从 {} 收进来的(aca plugin gateway import)\n", "\n# taken in from {} (aca plugin gateway import)\n", f.from.join(", "));
+    let mut s = tr!("\n# 从 {} 导入(aca plugin gateway import)\n", "\n# taken in from {} (aca plugin gateway import)\n", f.from.join(", "));
     s.push_str(&format!("[mcps.{key}]\ncommand = {}\n", toml::Value::String(f.command.clone())));
     if !f.args.is_empty() {
         s.push_str(&format!("args = {}\n", toml::Value::Array(f.args.iter().cloned().map(toml::Value::String).collect())));
@@ -156,7 +155,7 @@ fn block(f: &Found) -> String {
 pub fn apply(found: &[Found], only: &[String]) -> Res<Vec<String>> {
     let picked: Vec<&Found> = found.iter().filter(|f| f.problem.is_none() && (only.is_empty() || only.contains(&f.name))).collect();
     if let Some(n) = only.iter().find(|n| !found.iter().any(|f| &f.name == *n)) {
-        return Err(tr!("账号里没找到 {n}", "{n} isn't in any account"));
+        return Err(tr!("账号中找不到 {n}", "{n} isn't in any account"));
     }
     let file = paths::config_dir().join("config.toml");
     let mut text = std::fs::read_to_string(&file).unwrap_or_default();
@@ -167,8 +166,8 @@ pub fn apply(found: &[Found], only: &[String]) -> Res<Vec<String>> {
     if text != before {
         // 写之前确认整份还读得懂,读不懂就不写
         text.parse::<toml::Table>()
-            .map_err(|e| tr!("拼出来的 config.toml 读不懂,没写:{e}", "the new config.toml wouldn't parse; not written: {e}"))?;
-        paths::write_atomic(&file, &text).map_err(|e| tr!("写不了 {}:{e}", "can't write {}: {e}", file.display()))?;
+            .map_err(|e| tr!("生成的 config.toml 无法解析,未写入:{e}", "the new config.toml wouldn't parse; not written: {e}"))?;
+        paths::write_atomic(&file, &text).map_err(|e| tr!("无法写入 {}:{e}", "can't write {}: {e}", file.display()))?;
     }
     let mut done = vec![];
     for f in picked {

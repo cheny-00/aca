@@ -20,7 +20,7 @@ fi
 n=$(cat "$count" 2>/dev/null || echo 0)
 max="${ACA_DELEGATE_MAX_CONTINUE:-${ACA_SETTING_MAX_CONTINUE:-5}}"
 if [ "$n" -ge "$max" ]; then
-  echo "$id:已经替它续了 $n 次,不再续"
+  echo "$id:已代为发送 $n 次,达到上限,不再发送"
   exit 0
 fi
 n=$((n + 1))
@@ -31,9 +31,9 @@ sleep $((${ACA_DELEGATE_DELAY:-${ACA_SETTING_DELAY:-30}} * n))
 # 这期间有人接手了(派它的那个 send 过、你在里面打过字):不再插嘴
 state=$("$ACA_BIN" show "$id" --json | jq -r '.state // ""')
 if [ "$state" != "error" ]; then
-  echo "$id:现在是 $state,不用续了"
+  echo "$id:当前状态为 $state,无需再发送"
   exit 0
 fi
 say="${ACA_SETTING_SAY:-continue}"
-echo "$id:第 $n 次替它说「${say}」"
+echo "$id:第 $n 次代为发送「${say}」"
 "$ACA_BIN" send "$id" -m "$say"

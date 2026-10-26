@@ -90,9 +90,9 @@ The exit code says what happened, and the line it prints says the rest:
 |---|---|---|
 | 0 | the turn ended | `aca output <id>` is its final message. Done → Phase 3. A question or a stop short of done → answer with `aca send <id> -m '…'`, re-arm the wait |
 | 2 | it's waiting on a dialog | `aca answer <id>` shows the question and options. Inside the task's scope → `aca answer <id> <n | yes | no>`; otherwise ask the user. Re-arm |
-| 3, transient (临时的) | rate limit, overload, a dropped stream | This plugin tells it to carry on after 30 s, 60 s, … (up to 5 times; settings `delay`, `max_continue`). Re-arm with a delay: `sleep 90; aca wait <id>`. If it comes back failed again after that, tell the user — switching channel is their call |
-| 3, account (账号的) | quota, login, billing | Ask the user |
-| 3, fatal (再试也一样) | context blown, bad request, model not available | Tell the user; a fresh worker with a smaller brief, or another model |
+| 3, transient (临时错误) | rate limit, overload, a dropped stream | This plugin tells it to carry on after 30 s, 60 s, … (up to 5 times; settings `delay`, `max_continue`). Re-arm with a delay: `sleep 90; aca wait <id>`. If it comes back failed again after that, tell the user — switching channel is their call |
+| 3, account (账号问题) | quota, login, billing | Ask the user |
+| 3, fatal (重试无效) | context blown, bad request, model not available | Tell the user; a fresh worker with a smaller brief, or another model |
 | 4 | its process exited | `aca start <id>` resumes the same conversation. If it exits again, tell the user |
 
 ### Follow-ups

@@ -112,10 +112,10 @@ fn judge(report: &Value) -> Result<(), String> {
         return Err(msg.rsplit(": ").next().unwrap_or(msg).trim().to_string());
     }
     if report["success"] != true {
-        return Err(t!("它的 plugin validate 没说通过", "its plugin validate didn't say it passed").into());
+        return Err(t!("plugin validate 未通过", "its plugin validate didn't say it passed").into());
     }
     let hooked = list("notes").iter().filter_map(|n| n.as_str()).any(|n| n.contains("hooks:") && n.contains(EVENT));
-    hooked.then_some(()).ok_or_else(|| tr!("这一版没认出 {EVENT} 的 hook", "this version didn't recognize the {EVENT} hook"))
+    hooked.then_some(()).ok_or_else(|| tr!("此版本无法识别 {EVENT} hook", "this version didn't recognize the {EVENT} hook"))
 }
 
 /// 让这一版 Claude 验一遍。给它一个只放这次验证的配置目录:它一跑就往配置目录里写 `.claude.json`,不让它写到你的那几个里
@@ -130,7 +130,7 @@ fn validate(program: &str, dir: &Path) -> Result<(), String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| tr!("跑不了 {program}:{e}", "can't run {program}: {e}"))?;
+        .map_err(|e| tr!("无法运行 {program}:{e}", "can't run {program}: {e}"))?;
     let mut out = child.stdout.take().expect("piped");
     let reader = std::thread::spawn(move || {
         let mut text = String::new();
@@ -142,12 +142,12 @@ fn validate(program: &str, dir: &Path) -> Result<(), String> {
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(tr!("验的时候 {} 秒没回", "no answer within {} seconds while validating", TIMEOUT.as_secs()));
+            return Err(tr!("验证时 {} 秒内无响应", "no answer within {} seconds while validating", TIMEOUT.as_secs()));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     let report: Value = serde_json::from_str(&reader.join().unwrap_or_default())
-        .map_err(|_| t!("它的 plugin validate 没给出报告", "its plugin validate gave no report").to_string())?;
+        .map_err(|_| t!("plugin validate 未返回报告", "its plugin validate gave no report").to_string())?;
     judge(&report)
 }
 
@@ -210,7 +210,7 @@ fn offered(tool: &Tool) -> Option<(PathBuf, String)> {
         v
     });
     if verdict.ok && reconcile(&key, now) {
-        refuse(&key, t!("带着它的会话跑完了一轮,一次用量都没交来", "a session carrying it finished a turn without reporting any usage"));
+        refuse(&key, t!("带它的会话已完成一轮,但未收到任何用量", "a session carrying it finished a turn without reporting any usage"));
         return None;
     }
     verdict.ok.then_some((dir, key))
@@ -224,7 +224,7 @@ pub fn heard(id: &str, understood: bool) {
         let _ = paths::write_atomic(&mark("heard", id), &format!("{key}\n"));
     }
     if !understood {
-        refuse(&key, t!("它交来的用量认不出了(事件的形状变了)", "the usage it reports is no longer recognized (the event shape changed)"));
+        refuse(&key, t!("无法识别它上报的用量(事件格式已变)", "the usage it reports is no longer recognized (the event shape changed)"));
     }
 }
 

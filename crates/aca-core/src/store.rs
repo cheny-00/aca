@@ -101,7 +101,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
 impl Store {
     pub fn open() -> Res<Store> {
         let path = paths::db();
-        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| tr!("建不了 {}:{e}", "can't create {}: {e}", path.display()))?;
+        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| tr!("无法创建 {}:{e}", "can't create {}: {e}", path.display()))?;
         Store::at(Connection::open(&path).map_err(e)?)
     }
 
@@ -146,7 +146,7 @@ impl Store {
             Ok(v)
         };
         if key.is_empty() {
-            return Err(t!("要给会话 id", "missing a session id").into());
+            return Err(t!("需要会话 id", "missing a session id").into());
         }
         let mut hit = one(&format!("select {COLS} from sessions where id = ?1"), key)?;
         if hit.is_empty() {
@@ -156,9 +156,9 @@ impl Store {
             hit = one(&format!("select {COLS} from sessions where title = ?1 and archived_at = 0"), key)?;
         }
         match hit.len() {
-            0 => Err(tr!("没有 {key} 这个会话", "no session {key}")),
+            0 => Err(tr!("没有会话 {key}", "no session {key}")),
             1 => Ok(hit.remove(0)),
-            n => Err(tr!("{key} 对上了 {n} 个会话,写长一点", "{key} matches {n} sessions; type more of it")),
+            n => Err(tr!("{key} 匹配到 {n} 个会话,请写得更完整", "{key} matches {n} sessions; type more of it")),
         }
     }
 
@@ -192,7 +192,7 @@ impl Store {
 
     fn set(&self, id: &str, col: &str, v: &dyn rusqlite::ToSql) -> Res<()> {
         let n = self.conn.execute(&format!("update sessions set {col} = ?2 where id = ?1"), params![id, v]).map_err(e)?;
-        if n == 1 { Ok(()) } else { Err(tr!("没有 {id} 这个会话", "no session {id}")) }
+        if n == 1 { Ok(()) } else { Err(tr!("没有会话 {id}", "no session {id}")) }
     }
 
     pub fn set_title(&self, id: &str, title: &str, locked: bool) -> Res<()> {
@@ -296,7 +296,7 @@ impl Store {
 
     pub fn group_order(&self, path: &str, order: i64) -> Res<()> {
         let n = self.conn.execute("update groups set sort_order = ?2 where path = ?1", params![path, order]).map_err(e)?;
-        if n == 1 { Ok(()) } else { Err(tr!("没有 {path} 这个分组", "no group {path}")) }
+        if n == 1 { Ok(()) } else { Err(tr!("没有分组 {path}", "no group {path}")) }
     }
 
     /// 删分组:里面的会话(连下级分组的)挪到上一级
@@ -304,7 +304,7 @@ impl Store {
         let exists: Option<i64> =
             self.conn.query_row("select 1 from groups where path = ?1", [path], |r| r.get(0)).optional().map_err(e)?;
         if exists.is_none() {
-            return Err(tr!("没有 {path} 这个分组", "no group {path}"));
+            return Err(tr!("没有分组 {path}", "no group {path}"));
         }
         let up = path.rsplit_once('/').map_or("", |x| x.0);
         let sub = format!("{path}/%");
@@ -346,20 +346,20 @@ impl Store {
         let (from, to) = (from.trim_matches('/'), to.trim_matches('/'));
         let groups = self.groups()?;
         if !groups.iter().any(|g| g.path == from) {
-            return Err(tr!("没有 {from} 这个分组", "no group {from}"));
+            return Err(tr!("没有分组 {from}", "no group {from}"));
         }
         if to.is_empty() {
-            return Err(t!("新的分组名是空的", "the new group name is empty").into());
+            return Err(t!("新分组名为空", "the new group name is empty").into());
         }
         if to == from {
             return Ok(0);
         }
         if to.strip_prefix(from).is_some_and(|r| r.starts_with('/')) {
-            return Err(tr!("{from} 不能挪到它自己下面", "{from} can't move under itself"));
+            return Err(tr!("{from} 不能移到它自己下面", "{from} can't move under itself"));
         }
         // 大小写不同也算有了;只改大小写的(Work → work)不算撞
         if let Some(g) = groups.iter().find(|g| g.path.eq_ignore_ascii_case(to) && g.path != from) {
-            return Err(tr!("已经有 {} 这个分组了", "group {} already exists", g.path));
+            return Err(tr!("分组 {} 已存在", "group {} already exists", g.path));
         }
         // 它自己和「它/…」;不用 like:分组名里的 _ % 会被当成通配符
         let tx = self.conn.unchecked_transaction().map_err(e)?;
@@ -389,11 +389,11 @@ impl Store {
             if let Some(g) =
                 self.groups()?.iter().find(|g| g.path != path && !g.default_path.is_empty() && paths::real(&g.default_path) == real)
             {
-                return Err(tr!("{dir} 已经是分组 {} 的默认目录了", "{dir} is already the default directory of group {}", g.path));
+                return Err(tr!("{dir} 已是分组 {} 的默认目录", "{dir} is already the default directory of group {}", g.path));
             }
         }
         let n = self.conn.execute("update groups set default_path = ?2 where path = ?1", [path, dir]).map_err(e)?;
-        if n == 1 { Ok(()) } else { Err(tr!("没有 {path} 这个分组", "no group {path}")) }
+        if n == 1 { Ok(()) } else { Err(tr!("没有分组 {path}", "no group {path}")) }
     }
 }
 
@@ -437,7 +437,7 @@ pub fn group_by_dir(groups: &[(String, String)], dir: &str) -> Res<(String, bool
     let path = std::path::Path::new(dir);
     let leaf = name(path.file_name());
     if leaf.is_empty() {
-        return Err(tr!("{dir} 没有目录名,定不了分组名", "{dir} has no directory name to name a group after"));
+        return Err(tr!("{dir} 没有目录名,无法确定分组名", "{dir} has no directory name to name a group after"));
     }
     let parent = name(path.parent().and_then(|p| p.file_name()));
     let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
@@ -719,7 +719,7 @@ mod tests {
         assert_eq!(group("e5"), "fan");
         // 只改大小写可以;撞上已有的、挪到自己下面、没有这个组:不改
         assert_eq!(st.group_rename("fx", "FX").unwrap(), 1);
-        assert!(st.group_rename("fun", "Tools").unwrap_err().contains("已经有 tools"));
+        assert!(st.group_rename("fun", "Tools").unwrap_err().contains("分组 tools 已存在"));
         assert!(st.group_rename("tools", "tools/x").unwrap_err().contains("自己下面"));
         assert!(st.group_rename("nope", "x").is_err());
         assert!(st.group_rename("fun", "").is_err());

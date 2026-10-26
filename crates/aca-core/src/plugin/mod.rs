@@ -135,7 +135,7 @@ fn drop_user() {
 /// 登记表一变(装、删、开、停),tmux 上的热键跟着变:装上就绑,去掉就解
 fn save(v: &[Entry]) -> Res<()> {
     paths::write_atomic(&registry_file(), &serde_json::to_string_pretty(v).unwrap())
-        .map_err(|e| tr!("写不了 plugins.json:{e}", "can't write plugins.json: {e}"))?;
+        .map_err(|e| tr!("无法写入 plugins.json:{e}", "can't write plugins.json: {e}"))?;
     bind_hotkeys();
     Ok(())
 }
@@ -157,7 +157,7 @@ fn register(dir: &Path, source: Option<String>) -> Res<(Manifest, Vec<String>)> 
     let name = mount::safe(&m.id);
     if let Some(other) = reg.iter().find(|e| e.id != m.id && mount::safe(&e.id) == name) {
         return Err(tr!(
-            "{} 和已经链接的 {} 在 agent 那边是同一个名字({name}):改一个 id",
+            "{} 和已链接的 {} 在 agent 中同名({name}):请修改其中一个的 id",
             "{} and the linked {} get the same name on the agent side ({name}): change one id",
             m.id,
             other.id
@@ -194,7 +194,7 @@ fn register(dir: &Path, source: Option<String>) -> Res<(Manifest, Vec<String>)> 
     // 钩子的记录按清单里第几个记:清单换了就对不上了
     health::clear(&m.id);
     // 定时照新的清单对一遍(没写 manual 的插件开着就开)
-    warn.extend(timer::sync(&m.id).into_iter().map(|p| tr!("定时没办成:{p}", "timer not set up: {p}")));
+    warn.extend(timer::sync(&m.id).into_iter().map(|p| tr!("定时任务设置失败:{p}", "timer not set up: {p}")));
     Ok((m, warn))
 }
 
@@ -220,11 +220,11 @@ fn agent_parts(dir: &Path, m: &Manifest, warn: &mut Vec<String>) -> Res<BTreeMap
         let what = if old { format!("[agents.{agent}] plugin_dir") } else { "[agent] dir".to_string() };
         let d = dir.join(rel).canonicalize().map_err(|_| tr!("{what}「{rel}」不存在", "{what} “{rel}” doesn't exist"))?;
         if !d.starts_with(dir) || !d.is_dir() {
-            return Err(tr!("{what} 要是插件目录里的一个目录", "{what} has to be a directory inside the plugin"));
+            return Err(tr!("{what} 应为插件目录中的一个目录", "{what} has to be a directory inside the plugin"));
         }
         if !d.join(".claude-plugin").join("plugin.json").is_file() {
             warn.push(tr!(
-                "{} 里没有 .claude-plugin/plugin.json:Claude、Codex 可能认不出它是插件",
+                "{} 中没有 .claude-plugin/plugin.json:Claude、Codex 可能无法识别它是插件",
                 "{} has no .claude-plugin/plugin.json: Claude and Codex may not recognize it as a plugin",
                 d.display()
             ));
@@ -233,7 +233,7 @@ fn agent_parts(dir: &Path, m: &Manifest, warn: &mut Vec<String>) -> Res<BTreeMap
     }
     for agent in m.agents.keys().filter(|a| !AGENTS_WITH_PLUGINS.contains(&a.as_str())) {
         warn.push(tr!(
-            "{agent} 不认老写法的插件目录:[agents.{agent}] 不会带进去",
+            "{agent} 不支持旧写法的插件目录:不会加载 [agents.{agent}]",
             "{agent} ignores the old [agents.{agent}] form: not brought in"
         ));
     }
@@ -255,7 +255,7 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Res<String> {
     if let Some(d) = dir {
         c.arg("-C").arg(d);
     }
-    let o = c.args(args).stdin(Stdio::null()).output().map_err(|e| tr!("git 起不来:{e}", "can't run git: {e}"))?;
+    let o = c.args(args).stdin(Stdio::null()).output().map_err(|e| tr!("无法启动 git:{e}", "can't run git: {e}"))?;
     if o.status.success() {
         Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
     } else {
@@ -274,7 +274,7 @@ fn clone_in(src: &str, rev: Option<&str>, want: Option<&str>) -> Res<(Manifest, 
     let local = PathBuf::from(paths::expand(src));
     let url = if local.is_dir() { local.canonicalize().map_err(|e| e.to_string())?.to_string_lossy().into_owned() } else { git_url(src) };
     let root = installed_root();
-    std::fs::create_dir_all(&root).map_err(|e| tr!("建不了 {}:{e}", "can't create {}: {e}", root.display()))?;
+    std::fs::create_dir_all(&root).map_err(|e| tr!("无法创建 {}:{e}", "can't create {}: {e}", root.display()))?;
     let tmp = root.join(format!(".installing-{}", paths::short_id()));
     let placed = (|| {
         git(None, &["clone", "--quiet", &url, &tmp.to_string_lossy()])?;
@@ -283,11 +283,11 @@ fn clone_in(src: &str, rev: Option<&str>, want: Option<&str>) -> Res<(Manifest, 
         }
         let (m, _) = read_manifest(&tmp)?;
         if let Some(w) = want.filter(|w| *w != m.id) {
-            return Err(tr!("{src} 里的插件是 {},不是 plugins.toml 里写的 {w}", "{src} holds {}, not {w} as plugins.toml says", m.id));
+            return Err(tr!("{src} 中的插件是 {},不是 plugins.toml 中写的 {w}", "{src} holds {}, not {w} as plugins.toml says", m.id));
         }
         if let Some(e) = registry().into_iter().find(|e| e.id == m.id) {
             return Err(tr!(
-                "已经有 {} 了({}):要换成这个,先 aca plugin remove {}",
+                "已存在 {}({}):如需替换,先运行 aca plugin remove {}",
                 "{} is already there ({}): to replace it, aca plugin remove {} first",
                 m.id,
                 e.path,
@@ -296,9 +296,9 @@ fn clone_in(src: &str, rev: Option<&str>, want: Option<&str>) -> Res<(Manifest, 
         }
         let dest = root.join(&m.id);
         if dest.exists() {
-            return Err(tr!("{} 已经有了", "{} already exists", dest.display()));
+            return Err(tr!("{} 已存在", "{} already exists", dest.display()));
         }
-        std::fs::rename(&tmp, &dest).map_err(|e| tr!("挪不过去:{e}", "can't move it into place: {e}"))?;
+        std::fs::rename(&tmp, &dest).map_err(|e| tr!("无法移动:{e}", "can't move it into place: {e}"))?;
         Ok(dest)
     })();
     let dest = placed.inspect_err(|_| {
@@ -339,7 +339,7 @@ pub fn install(src: &str, rev: Option<&str>) -> Res<(Manifest, Vec<String>)> {
 fn install_bundled(id: &str) -> Res<(Manifest, Vec<String>)> {
     if let Some(e) = registry().into_iter().find(|e| e.id == id && e.source != first_party::SOURCE) {
         return Err(tr!(
-            "已经有 {id} 了({}):要换成 aca 自带的,先 aca plugin remove {id}",
+            "已存在 {id}({}):如需换成 aca 自带的版本,先运行 aca plugin remove {id}",
             "{id} is already there ({}): to use the one aca ships with, aca plugin remove {id} first",
             e.path
         ));
@@ -357,8 +357,8 @@ fn install_requires(m: &Manifest) -> Vec<String> {
     let mut out = vec![];
     for r in m.requires.iter().filter(|r| !have.contains(r)) {
         out.push(match install_bundled(r) {
-            Ok(_) => tr!("它要 {r},一起装上了", "it needs {r}; installed that too"),
-            Err(e) => tr!("它要 {r},但没装上:{e}", "it needs {r}, which didn't install: {e}"),
+            Ok(_) => tr!("它依赖 {r},已一并安装", "it needs {r}; installed that too"),
+            Err(e) => tr!("它依赖 {r},但安装失败:{e}", "it needs {r}, which didn't install: {e}"),
         });
     }
     out
@@ -366,25 +366,28 @@ fn install_requires(m: &Manifest) -> Vec<String> {
 
 /// `aca plugin update <id>`:git 装的拉新的(只快进;钉了版本的不动),再重新读一遍清单、记下新的提交。返回给人看的一句
 pub fn update(id: &str) -> Res<String> {
-    let e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有 {id} 这个插件", "no plugin {id}"))?;
+    let e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有插件 {id}", "no plugin {id}"))?;
     if e.source.is_empty() {
-        return Ok(tr!("{id}:链接的本地目录,不归 aca 更新", "{id}: a linked local directory; aca doesn't update it"));
+        return Ok(tr!("{id}:链接的本地目录,aca 不负责更新", "{id}: a linked local directory; aca doesn't update it"));
     }
     if e.source == user::SOURCE {
-        return Ok(tr!("{id}:你自己的(~/.config/aca/user/),不归 aca 更新", "{id}: your own (~/.config/aca/user/); aca doesn't update it"));
+        return Ok(tr!(
+            "{id}:你自己的插件(~/.config/aca/user/),aca 不负责更新",
+            "{id}: your own (~/.config/aca/user/); aca doesn't update it"
+        ));
     }
     if e.source == first_party::SOURCE {
         first_party::unpack(id)?;
         let (m, _) = reregister(Path::new(&e.path))?;
         return Ok(tr!(
-            "{id}:aca 自带的,跟着 aca 走,现在是 {}(升级 aca 就是升级它)",
+            "{id}:aca 自带,版本随 aca,当前为 {}(升级 aca 即可升级它)",
             "{id}: ships with aca and follows it; now {} (upgrading aca upgrades it)",
             m.version
         ));
     }
     if let Some((_, rev)) = e.source.rsplit_once('#') {
         return Ok(tr!(
-            "{id}:钉在 {rev},不更新(要换版本:改 plugins.toml 的 ref 再 aca plugin sync)",
+            "{id}:固定在 {rev},不更新(如需换版本:修改 plugins.toml 的 ref 后运行 aca plugin sync)",
             "{id}: pinned at {rev}, not updated (to change: edit ref in plugins.toml, then aca plugin sync)"
         ));
     }
@@ -395,7 +398,7 @@ pub fn update(id: &str) -> Res<String> {
     let (m, _) = register(dir, None)?;
     decl::lock(id, Some(&git(Some(dir), &["rev-parse", "HEAD"])?))?;
     Ok(if before == after {
-        tr!("{id}:已经是最新的({after})", "{id}: already up to date ({after})")
+        tr!("{id}:已是最新版本({after})", "{id}: already up to date ({after})")
     } else {
         tr!("{id}:{before} → {after}({} {})", "{id}: {before} → {after} ({} {})", m.name, m.version)
     })
@@ -432,17 +435,17 @@ fn drop_entry(e: &Entry) -> Res<String> {
     let id = &e.id;
     if !e.source.is_empty() && dir.starts_with(&root) {
         std::fs::remove_dir_all(dir)
-            .map_err(|err| tr!("取消了登记,但删不了 {}:{err}", "unregistered, but can't delete {}: {err}", dir.display()))?;
-        Ok(tr!("删了 {id}({})", "removed {id} ({})", dir.display()))
+            .map_err(|err| tr!("已取消登记,但无法删除 {}:{err}", "unregistered, but can't delete {}: {err}", dir.display()))?;
+        Ok(tr!("已删除 {id}({})", "removed {id} ({})", dir.display()))
     } else {
-        Ok(tr!("不再用 {id}:目录 {} 是链接来的,没动", "no longer using {id}: {} is a linked directory, left alone", dir.display()))
+        Ok(tr!("已移除 {id}:目录 {} 是链接的,未删除", "no longer using {id}: {} is a linked directory, left alone", dir.display()))
     }
 }
 
 /// `aca plugin remove <id>`:不再用它。git 装的连目录一起删;链接的本地目录是你的,不动。
 /// plugins.toml、plugins.lock 里也划掉;插件自己的配置、状态都留着
 pub fn remove(id: &str) -> Res<String> {
-    let e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有 {id} 这个插件", "no plugin {id}"))?;
+    let e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有插件 {id}", "no plugin {id}"))?;
     mine_stays(&e)?;
     let said = drop_entry(&e)?;
     decl::forget(id)?;
@@ -456,7 +459,7 @@ fn mine_stays(e: &Entry) -> Res<()> {
         return Ok(());
     }
     Err(tr!(
-        "{} 是你自己的:删掉 {} 就没了;想先停着:aca plugin disable {}",
+        "{} 是你自己的插件:删除 {} 后无法恢复;如只想关闭:aca plugin disable {}",
         "{} is your own: delete {} to drop it; to pause it: aca plugin disable {}",
         e.id,
         user::dir().join(MANIFEST).display(),
@@ -472,7 +475,7 @@ pub fn unlink(id: &str) -> Res<()> {
     let n = reg.len();
     reg.retain(|e| e.id != id);
     if reg.len() == n {
-        return Err(tr!("没有链接过 {id}", "{id} isn't linked"));
+        return Err(tr!("未链接插件 {id}", "{id} isn't linked"));
     }
     save(&reg)?;
     timer::drop_plugin(id);
@@ -483,7 +486,7 @@ pub fn unlink(id: &str) -> Res<()> {
 
 pub fn enable(id: &str, on: bool) -> Res<()> {
     let mut reg = registry();
-    reg.iter_mut().find(|e| e.id == id).ok_or_else(|| tr!("没有链接过 {id}", "{id} isn't linked"))?.enabled = on;
+    reg.iter_mut().find(|e| e.id == id).ok_or_else(|| tr!("未链接插件 {id}", "{id} isn't linked"))?.enabled = on;
     save(&reg)?;
     let _ = timer::sync(id);
     decl::set(id, "enabled", (!on).then_some(false.into()))
@@ -495,8 +498,10 @@ pub fn sync() -> Res<Vec<String>> {
     decl::ensure()?;
     let wants = decl::wants()?;
     let locked = decl::locked();
-    let mut said: Vec<String> =
-        first_party::refresh().into_iter().map(|id| tr!("{id}:换成这个 aca 自带的版本", "{id}: now the version this aca ships")).collect();
+    let mut said: Vec<String> = first_party::refresh()
+        .into_iter()
+        .map(|id| tr!("{id}:已换成当前 aca 自带的版本", "{id}: now the version this aca ships"))
+        .collect();
     for e in registry() {
         // 你自己的那份不写在 plugins.toml 里也在
         if !wants.contains_key(&e.id) && e.source != user::SOURCE {
@@ -531,19 +536,19 @@ fn sync_add(id: &str, w: &decl::Want, commit: Option<&str>) -> Res<Option<String
         if !w.on() {
             enable_quiet(id, false)?;
         }
-        return Ok(Some(tr!("装了 {id}(aca 自带的)", "installed {id} (ships with aca)")));
+        return Ok(Some(tr!("已安装 {id}(aca 自带)", "installed {id} (ships with aca)")));
     }
     if w.source.is_empty() {
-        return Err(t!("plugins.toml 里没写 source,装不了", "no source in plugins.toml; can't install").into());
+        return Err(t!("plugins.toml 中没有 source,无法安装", "no source in plugins.toml; can't install").into());
     }
     let local = PathBuf::from(paths::expand(&w.source));
     let r = if local.is_dir() && w.rev.is_empty() {
         let dir = plugin_dir(&w.source)?;
         let (m, _) = register(&dir, Some(String::new()))?;
         if m.id != id {
-            return Err(tr!("{} 里的插件是 {},不是 {id}", "{} holds {}, not {id}", w.source, m.id));
+            return Err(tr!("{} 中的插件是 {},不是 {id}", "{} holds {}, not {id}", w.source, m.id));
         }
-        tr!("链接了 {id}", "linked {id}")
+        tr!("已链接 {id}", "linked {id}")
     } else {
         let rev = (!w.rev.is_empty()).then_some(w.rev.as_str()).or(commit);
         let (_, _, c) = clone_in(&w.source, rev, Some(id))?;
@@ -564,7 +569,7 @@ fn sync_add(id: &str, w: &decl::Want, commit: Option<&str>) -> Res<Option<String
                 }
             }
         }
-        tr!("装了 {id}({})", "installed {id} ({})", &c[..c.len().min(7)])
+        tr!("已安装 {id}({})", "installed {id} ({})", &c[..c.len().min(7)])
     };
     if !w.on() {
         enable_quiet(id, false)?;
@@ -577,7 +582,7 @@ fn sync_one(e: &Entry, w: &decl::Want, commit: Option<&str>) -> Res<Option<Strin
     let mut said = vec![];
     if e.enabled != w.on() {
         enable_quiet(&e.id, w.on())?;
-        said.push(if w.on() { t!("开了", "switched on") } else { t!("停了", "paused") }.to_string());
+        said.push(if w.on() { t!("已开启", "switched on") } else { t!("已关闭", "paused") }.to_string());
     }
     let dir = Path::new(&e.path);
     if e.from_git() && w.rev.is_empty() {
@@ -589,7 +594,7 @@ fn sync_one(e: &Entry, w: &decl::Want, commit: Option<&str>) -> Res<Option<Strin
                 }
                 git(Some(dir), &["reset", "--quiet", "--hard", c])?;
                 register(dir, None)?;
-                said.push(tr!("切到 {}", "now at {}", &c[..c.len().min(7)]));
+                said.push(tr!("已切换到 {}", "now at {}", &c[..c.len().min(7)]));
             }
         } else {
             decl::lock(&e.id, Some(&git(Some(dir), &["rev-parse", "HEAD"])?))?;
@@ -637,7 +642,7 @@ impl SettingNow {
 
 /// 一个插件现在的设置(清单里的顺序)
 pub fn settings_of(id: &str) -> Res<Vec<SettingNow>> {
-    let e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有 {id} 这个插件", "no plugin {id}"))?;
+    let e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有插件 {id}", "no plugin {id}"))?;
     let (m, _) = read_manifest(Path::new(&e.path))?;
     let mine = decl::want(id).settings;
     let all = decl::settings(id, &m);
@@ -665,7 +670,7 @@ pub fn plain(v: &toml::Value) -> String {
 /// 改一个设置(写进 plugins.toml);None = 回到默认值。给的字照默认值的类型读(见 [`typed`])
 pub fn set_setting(id: &str, name: &str, value: Option<&str>) -> Res<()> {
     let all = settings_of(id)?;
-    let s = all.iter().find(|s| s.name == name).ok_or_else(|| tr!("{id} 没有 {name} 这个设置", "{id} has no setting {name}"))?;
+    let s = all.iter().find(|s| s.name == name).ok_or_else(|| tr!("{id} 没有设置项 {name}", "{id} has no setting {name}"))?;
     let mut table = decl::want(id).settings;
     match value {
         Some(v) => {
@@ -689,20 +694,20 @@ pub fn typed(v: &str, default: Option<&toml::Value>) -> Res<toml::Value> {
             Some(V::String(s)) if t.starts_with(['"', '\'']) => V::String(s),
             _ => V::String(v.to_string()),
         }),
-        Some(V::Integer(_)) => t.parse::<i64>().map(V::from).map_err(|_| tr!("要是整数(写的是 {t})", "takes an integer (got {t})")),
-        Some(V::Float(_)) => t.parse::<f64>().map(V::from).map_err(|_| tr!("要是数(写的是 {t})", "takes a number (got {t})")),
+        Some(V::Integer(_)) => t.parse::<i64>().map(V::from).map_err(|_| tr!("应为整数(当前为 {t})", "takes an integer (got {t})")),
+        Some(V::Float(_)) => t.parse::<f64>().map(V::from).map_err(|_| tr!("应为数字(当前为 {t})", "takes a number (got {t})")),
         Some(V::Boolean(_)) => match t {
             "true" | "yes" | "on" | "1" => Ok(V::Boolean(true)),
             "false" | "no" | "off" | "0" => Ok(V::Boolean(false)),
-            _ => Err(tr!("要是 true / false(写的是 {t})", "takes true / false (got {t})")),
+            _ => Err(tr!("应为 true / false(当前为 {t})", "takes true / false (got {t})")),
         },
         Some(V::Array(_)) => match toml_of(t) {
             Some(a @ V::Array(_)) => Ok(a),
-            _ => Err(tr!("要写成 TOML 的数组:[\"a\", \"b\"](写的是 {t})", "takes a TOML array: [\"a\", \"b\"] (got {t})")),
+            _ => Err(tr!("应为 TOML 数组:[\"a\", \"b\"](当前为 {t})", "takes a TOML array: [\"a\", \"b\"] (got {t})")),
         },
         Some(V::Table(_)) => match toml_of(t) {
             Some(x @ V::Table(_)) => Ok(x),
-            _ => Err(tr!("要写成 TOML 的表:{{ a = 1 }}(写的是 {t})", "takes a TOML table: {{ a = 1 }} (got {t})")),
+            _ => Err(tr!("应为 TOML 表:{{ a = 1 }}(当前为 {t})", "takes a TOML table: {{ a = 1 }} (got {t})")),
         },
         _ => Ok(toml_of(t).unwrap_or_else(|| V::String(v.to_string()))),
     }
@@ -722,15 +727,15 @@ pub fn drift() -> Vec<String> {
     for (id, w) in &wants {
         match reg.iter().find(|e| &e.id == id) {
             None if id == user::ID => {}
-            None => out.push(tr!("要装 {id}", "install {id}")),
+            None => out.push(tr!("将安装 {id}", "install {id}")),
             Some(e) if e.enabled != w.on() => {
-                out.push(if w.on() { tr!("要开 {id}", "switch on {id}") } else { tr!("要停 {id}", "pause {id}") })
+                out.push(if w.on() { tr!("将开启 {id}", "switch on {id}") } else { tr!("将关闭 {id}", "pause {id}") })
             }
             Some(_) => {}
         }
     }
     for e in reg.iter().filter(|e| !wants.contains_key(&e.id) && e.source != user::SOURCE) {
-        out.push(tr!("要删 {}", "remove {}", e.id));
+        out.push(tr!("将删除 {}", "remove {}", e.id));
     }
     out
 }
@@ -763,13 +768,13 @@ pub struct Context {
 }
 
 fn find(id: &str) -> Res<(Entry, Manifest)> {
-    let mut e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有链接过 {id}", "{id} isn't linked"))?;
+    let mut e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("未链接插件 {id}", "{id} isn't linked"))?;
     // 自带的:刚升级了 aca 就先换成新写出来的那份(老的可能还在调已经没了的命令)
     if e.source == first_party::SOURCE && first_party::refresh_one(id) {
         e = registry().into_iter().find(|e| e.id == id).unwrap_or(e);
     }
     if !e.enabled {
-        return Err(tr!("{id} 关着(aca plugin enable {id})", "{id} is off (aca plugin enable {id})"));
+        return Err(tr!("{id} 已关闭(aca plugin enable {id})", "{id} is off (aca plugin enable {id})"));
     }
     let (m, _) = read_manifest(Path::new(&e.path))?;
     Ok((e, m))
@@ -855,7 +860,7 @@ fn env(e: &Entry, m: &Manifest, ctx: &Context, extra: &[(&str, &str)]) -> Vec<(S
 
 /// `插件 id.动作 id` → (插件 id, 动作 id):插件 id 里可以有点,动作 id 里没有
 fn split_qualified(q: &str) -> Res<(&str, &str)> {
-    q.rsplit_once('.').ok_or_else(|| tr!("动作要写成 插件.动作:{q}", "an action is written PLUGIN.ACTION: {q}"))
+    q.rsplit_once('.').ok_or_else(|| tr!("能力应写为 插件.能力:{q}", "an action is written PLUGIN.ACTION: {q}"))
 }
 
 /// 调的时候给的参数(`名字=值`)照清单里的类型变成 JSON;少了必须给的、多了没声明的、类型不对的都说
@@ -867,11 +872,11 @@ pub fn args_json(a: &Action, given: &[(String, String)]) -> Res<serde_json::Map<
             return Err(tr!("{} 没有参数 {k}", "{} has no argument {k}", a.id));
         };
         let val = match ty {
-            "int" => v.parse::<i64>().map(serde_json::Value::from).map_err(|_| tr!("{k} 要是整数", "{k} takes an integer"))?,
+            "int" => v.parse::<i64>().map(serde_json::Value::from).map_err(|_| tr!("{k} 应为整数", "{k} takes an integer"))?,
             "bool" => match v.as_str() {
                 "true" | "yes" | "1" => true.into(),
                 "false" | "no" | "0" => false.into(),
-                _ => return Err(tr!("{k} 要是 true / false", "{k} takes true / false")),
+                _ => return Err(tr!("{k} 应为 true / false", "{k} takes true / false")),
             },
             "path" => paths::expand(v).into(),
             _ => v.clone().into(),
@@ -879,7 +884,7 @@ pub fn args_json(a: &Action, given: &[(String, String)]) -> Res<serde_json::Map<
         out.insert(k.clone(), val);
     }
     if let Some(k) = a.args.keys().find(|k| !out.contains_key(*k) && a.arg(k).is_some_and(|(_, opt)| !opt)) {
-        return Err(tr!("{} 要给参数 {k}", "{} needs argument {k}", a.id));
+        return Err(tr!("{} 需要参数 {k}", "{} needs argument {k}", a.id));
     }
     Ok(out)
 }
@@ -888,18 +893,18 @@ pub fn args_json(a: &Action, given: &[(String, String)]) -> Res<serde_json::Map<
 pub fn invoke(qualified: &str, ctx: &Context, given: &[(String, String)]) -> Res<i32> {
     let (pid, aid) = split_qualified(qualified)?;
     let (e, m) = find(pid)?;
-    let a = m.actions.iter().find(|a| a.id == aid).ok_or_else(|| tr!("{pid} 没有 {aid} 这个动作", "{pid} has no action {aid}"))?;
+    let a = m.actions.iter().find(|a| a.id == aid).ok_or_else(|| tr!("{pid} 没有动作 {aid}", "{pid} has no action {aid}"))?;
     let to = match ctx.source.as_str() {
         "cli" => "cli",
         "agent" => "agent",
         _ => "menu",
     };
     if !a.exposed(to) {
-        return Err(tr!("{pid}.{aid} 没露给 {to}(清单的 expose)", "{pid}.{aid} isn't exposed to {to} (expose in the manifest)"));
+        return Err(tr!("{pid}.{aid} 未提供给 {to}(见清单的 expose)", "{pid}.{aid} isn't exposed to {to} (expose in the manifest)"));
     }
     let args = serde_json::Value::Object(args_json(a, given)?).to_string();
     let mut c = command(&e, &m, &a.command, ctx, &command_ids(aid, &args), &a.cwd);
-    let started = |err: std::io::Error| tr!("{} 起不来:{err}", "can't start {}: {err}", a.command[0]);
+    let started = |err: std::io::Error| tr!("无法启动 {}:{err}", "can't start {}: {err}", a.command[0]);
     let st = if a.input.is_empty() {
         c.status().map_err(started)?
     } else {
@@ -1033,7 +1038,7 @@ pub struct ViewRow {
 
 impl ViewRows {
     pub fn parse(out: &str) -> Res<ViewRows> {
-        serde_json::from_str(out.trim()).map_err(|e| tr!("列表读不懂:{e}", "can't parse the list: {e}"))
+        serde_json::from_str(out.trim()).map_err(|e| tr!("无法解析列表:{e}", "can't parse the list: {e}"))
     }
 
     /// 给人看的几行(`aca plugin view`)
@@ -1136,7 +1141,7 @@ fn hotkeys_in(reg: Vec<Entry>) -> (Vec<HotkeyItem>, Vec<(String, String)>) {
             notes.push((
                 e.id.clone(),
                 tr!(
-                    "plugins.toml 里 {} 的 hotkeys 写了 {t},它没有这个窗格(热键只开窗格)",
+                    "plugins.toml 中 {} 的 hotkeys 写了 {t},但它没有这个窗格(热键只能打开窗格)",
                     "plugins.toml gives {} a hotkey for {t}, which isn't one of its panes (hotkeys open panes only)",
                     e.id
                 ),
@@ -1193,7 +1198,7 @@ pub fn bind_hotkeys() -> Vec<(String, String)> {
         notes.push((
             OWN_KEYS.to_string(),
             tr!(
-                "键 {k} 你在 tmux 里绑了别的,没动它:「进下一个在等你的」没绑上(换一个:aca tmux key next <键>)",
+                "键 {k} 已在 tmux 中绑定了其他操作,未修改:「下一个待处理」未绑定(换一个键:aca tmux key next <键>)",
                 "key {k} is bound to something else in your tmux and was left alone: “go to the next one waiting” isn't bound (pick another: aca tmux key next <key>)"
             ),
         ));
@@ -1202,7 +1207,7 @@ pub fn bind_hotkeys() -> Vec<(String, String)> {
         (
             h.plugin.clone(),
             tr!(
-                "键 {} 是 aca 自己的(进下一个在等你的):{}「{}」没绑上(换一个:aca plugin hotkey {} {} <键>)",
+                "键 {} 已被 aca 占用(下一个待处理):{}「{}」未绑定(换一个键:aca plugin hotkey {} {} <键>)",
                 "key {} is aca's own (go to the next one waiting): {} “{}” isn't bound (pick another: aca plugin hotkey {} {} <key>)",
                 h.key,
                 h.plugin,
@@ -1219,7 +1224,7 @@ pub fn bind_hotkeys() -> Vec<(String, String)> {
             (
                 h.plugin.clone(),
                 tr!(
-                    "键 {} 你在 tmux 里绑了别的,没动它:{}「{}」没绑上(换一个:aca plugin hotkey {} {} <键>)",
+                    "键 {} 已在 tmux 中绑定了其他操作,未修改:{}「{}」未绑定(换一个键:aca plugin hotkey {} {} <键>)",
                     "key {} is bound to something else in your tmux and was left alone: {} “{}” isn't bound (pick another: aca plugin hotkey {} {} <key>)",
                     h.key,
                     h.plugin,
@@ -1314,7 +1319,7 @@ fn menu_and_notes() -> (Vec<MenuItem>, Vec<(String, String)>) {
             notes.push((
                 e.id.clone(),
                 tr!(
-                    "plugins.toml 里 {} 的 keys 写了 {t},它没有这个(: 菜单里的能力、窗格、视图才有键)",
+                    "plugins.toml 中 {} 的 keys 写了 {t},但它没有这一项(只有 : 菜单中的能力、窗格、视图能设键)",
                     "plugins.toml gives {} a key for {t}, which it doesn't have (only : menu commands, panes and views take keys)",
                     e.id
                 ),
@@ -1352,7 +1357,7 @@ pub fn capture(qualified: &str, ctx: &Context, given: &[(String, String)]) -> Re
         let a = m.actions.iter().find(|a| a.id == xid).ok_or_else(|| tr!("{pid} 没有 {xid}", "{pid} has no {xid}"))?;
         let from_view = m.views.iter().any(|v| v.keys.iter().any(|k| k.run == xid));
         if !a.exposed("menu") && !from_view {
-            return Err(tr!("{pid}.{xid} 没露给界面(清单的 expose)", "{pid}.{xid} isn't exposed to the menu (expose in the manifest)"));
+            return Err(tr!("{pid}.{xid} 未提供给界面(见清单的 expose)", "{pid}.{xid} isn't exposed to the menu (expose in the manifest)"));
         }
         let args = serde_json::Value::Object(args_json(a, given)?).to_string();
         (command(&e, &m, &a.command, ctx, &command_ids(xid, &args), &a.cwd), &a.input)
@@ -1391,7 +1396,7 @@ pub fn exec_mcp(id: &str) -> Res<i32> {
     let spec = m.agent.mcp.as_ref().ok_or_else(|| tr!("{id} 没有 [agent.mcp]", "{id} has no [agent.mcp]"))?;
     let ctx = agent_context();
     let err = command(&e, &m, &spec.command, &ctx, &[], "").exec();
-    Err(tr!("{} 起不来:{err}", "can't start {}: {err}", spec.command[0]))
+    Err(tr!("无法启动 {}:{err}", "can't start {}: {err}", spec.command[0]))
 }
 
 /// agent 那头调过来的(MCP):会话是它环境里的 `ACA_SESSION_ID`
@@ -1419,7 +1424,7 @@ fn size(v: &Option<toml::Value>, default: &str) -> String {
 /// 人不在 tmux 里(手机上直接 ssh 进来跑的界面)就在当前终端前台跑,效果一样是「盖一层、关了回来」
 pub fn open_pane(plugin: &str, pane: &str, placement: Option<&str>, client: Option<&str>, ctx: &Context) -> Res<i32> {
     let (e, m) = find(plugin)?;
-    let p = m.panes.iter().find(|p| p.id == pane).ok_or_else(|| tr!("{plugin} 没有 {pane} 这个窗格", "{plugin} has no pane {pane}"))?;
+    let p = m.panes.iter().find(|p| p.id == pane).ok_or_else(|| tr!("{plugin} 没有窗格 {pane}", "{plugin} has no pane {pane}"))?;
     let placement = placement.filter(|s| !s.is_empty()).unwrap_or(if p.placement.is_empty() { "popup" } else { &p.placement });
     // 窗格是交互的程序,标准输入是终端:会话的内容写进一个文件(一个窗格一个,下次开时盖掉)
     let input_file = if p.input.is_empty() {
@@ -1427,7 +1432,7 @@ pub fn open_pane(plugin: &str, pane: &str, placement: Option<&str>, client: Opti
     } else {
         let f = paths::state_dir().join("plugin-input").join(format!("{plugin}.{pane}.txt"));
         let _ = std::fs::create_dir_all(f.parent().unwrap());
-        std::fs::write(&f, input_text(&p.input, ctx)).map_err(|err| tr!("写不了 {}:{err}", "can't write {}: {err}", f.display()))?;
+        std::fs::write(&f, input_text(&p.input, ctx)).map_err(|err| tr!("无法写入 {}:{err}", "can't write {}: {err}", f.display()))?;
         f.to_string_lossy().into_owned()
     };
     let mut extra = vec![("ACA_PLUGIN_ENTRYPOINT_ID", pane)];
@@ -1438,7 +1443,7 @@ pub fn open_pane(plugin: &str, pane: &str, placement: Option<&str>, client: Opti
     if placement == "popup" && !in_tmux {
         let st = command(&e, &m, &p.command, ctx, &extra, &p.cwd)
             .status()
-            .map_err(|err| tr!("{} 起不来:{err}", "can't start {}: {err}", p.command[0]))?;
+            .map_err(|err| tr!("无法启动 {}:{err}", "can't start {}: {err}", p.command[0]))?;
         return Ok(st.code().unwrap_or(1));
     }
     let title = if p.title.is_empty() { &m.name } else { &p.title };
@@ -1457,9 +1462,9 @@ pub fn open_pane(plugin: &str, pane: &str, placement: Option<&str>, client: Opti
         }
         "window" if !ctx.tmux.is_empty() => vec!["new-window".into(), "-n".into(), title.clone(), "-t".into(), format!("{}:", ctx.tmux)],
         "split" | "window" => {
-            return Err(t!("这个窗格要开在一个在跑的会话里(--session)", "this pane has to open in a running session (--session)").into());
+            return Err(t!("此窗格需要在运行中的会话里打开(--session)", "this pane has to open in a running session (--session)").into());
         }
-        other => return Err(tr!("不认识的 placement:{other}", "unknown placement: {other}")),
+        other => return Err(tr!("无法识别的 placement:{other}", "unknown placement: {other}")),
     };
     args.extend([if placement == "popup" { "-d" } else { "-c" }.to_string(), workdir(&e, &p.cwd, ctx)]);
     for (k, v) in env(&e, &m, ctx, &extra) {
@@ -1467,8 +1472,11 @@ pub fn open_pane(plugin: &str, pane: &str, placement: Option<&str>, client: Opti
     }
     args.push(crate::tmux::arg(&program(&e, &p.command[0]).to_string_lossy()));
     args.extend(p.command[1..].iter().map(|a| crate::tmux::arg(a)));
-    let st =
-        crate::tmux::cmd().args(&args).stdin(Stdio::inherit()).status().map_err(|err| tr!("tmux 起不来:{err}", "can't run tmux: {err}"))?;
+    let st = crate::tmux::cmd()
+        .args(&args)
+        .stdin(Stdio::inherit())
+        .status()
+        .map_err(|err| tr!("无法启动 tmux:{err}", "can't run tmux: {err}"))?;
     Ok(st.code().unwrap_or(1))
 }
 
@@ -1525,12 +1533,12 @@ pub fn dispatch(event: &str, session: &str, line: &str) {
             ];
             argv.extend(h.command[1..].iter().cloned());
             // 三个口都接走、自成一组:调用它的 hook 退出后它接着跑,也不会让 agent 那头的管道一直开着
-            let _ = command(e, &m, &argv, &ctx, &[("ACA_PLUGIN_EVENT", event), ("ACA_PLUGIN_EVENT_JSON", line)], "")
-                .stdin(Stdio::null())
-                .stdout(out)
-                .stderr(err)
-                .process_group(0)
-                .spawn();
+            let _ = crate::proc::detach(
+                command(e, &m, &argv, &ctx, &[("ACA_PLUGIN_EVENT", event), ("ACA_PLUGIN_EVENT_JSON", line)], "")
+                    .stdin(Stdio::null())
+                    .stdout(out)
+                    .stderr(err),
+            );
         }
     }
 }
@@ -1617,7 +1625,7 @@ command = ["sh", "board.sh"]
     fn a_manifest_declares_actions_events_and_panes() {
         let (m, warn) = parse(OK).unwrap();
         assert_eq!((m.id.as_str(), m.actions.len(), m.events.len(), m.panes.len()), ("example.notify", 1, 2, 1));
-        assert_eq!(warn, ["没有 turn.finished 这个事件"]);
+        assert_eq!(warn, ["没有事件 turn.finished"]);
         assert_eq!(
             (size(&m.panes[0].width, "50%"), size(&m.panes[0].height, "50%"), size(&None, "50%")),
             ("80%".into(), "20".into(), "50%".into())
@@ -1629,14 +1637,14 @@ command = ["sh", "board.sh"]
         let bad = |t: &str| parse(t).unwrap_err();
         assert!(bad("name = \"x\"\nversion = \"1\"").contains("id"));
         assert!(bad("id = \"a b\"\nname = \"x\"\nversion = \"1\"").contains("id"));
-        assert!(bad("id = \"a\"\nname = \"x\"\nversion = \"1\"\n[[actions]]\nid = \"x.y\"\ncommand = [\"true\"]").contains("不能有点"));
+        assert!(bad("id = \"a\"\nname = \"x\"\nversion = \"1\"\n[[actions]]\nid = \"x.y\"\ncommand = [\"true\"]").contains("不能含点"));
         assert!(bad("id = \"a\"\nname = \"x\"\nversion = \"1\"\n[[actions]]\nid = \"x\"").contains("command"));
         assert!(
             bad("id = \"a\"\nname = \"x\"\nversion = \"1\"\n[[panes]]\nid = \"x\"\nplacement = \"tab\"\ncommand = [\"true\"]")
                 .contains("placement")
         );
         assert!(bad("id = \"a\"\nname = \"x\"\nversion = \"1\"\nmin_aca_version = \"99.0.0\"").contains("99.0.0"));
-        assert!(bad("id = ").contains("读不懂"));
+        assert!(bad("id = ").contains("无法解析"));
     }
 
     #[test]

@@ -88,6 +88,8 @@ pub struct Session {
     pub pinned: bool,
     /// 有便签(`e` 写的,回车进去时填进输入框)。采集时恒为 false,由界面按便签文件标上
     pub noted: bool,
+    /// 所在的分组有便签(分组标题、折叠行上标 ✎)。采集时恒为 false,由界面按便签文件标上
+    pub group_noted: bool,
     /// 在哪个工作区(见 spaces.rs)。采集时恒为 1,由界面按工作区文件标上
     pub space: char,
     /// 项目目录(登记的,没有就用窗格当前目录),新建会话开在这里
@@ -387,7 +389,7 @@ fn leave_mode(target: &str) -> Result<(), &'static str> {
     if in_mode() {
         let _ = tmux_cmd().args(["copy-mode", "-q", "-t", target]).status();
         if in_mode() {
-            return Err(t!("窗格停在 tmux 模式里", "the pane is in a tmux mode"));
+            return Err(t!("窗格处于 tmux 模式中", "the pane is in a tmux mode"));
         }
     }
     Ok(())
@@ -1047,6 +1049,7 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
                 screen,
                 pinned: false,
                 noted: false,
+                group_noted: false,
                 space: crate::spaces::HOME,
                 dir: p.path.clone(),
                 profile: String::new(),
@@ -1117,6 +1120,7 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             screen,
             pinned: false,
             noted: false,
+            group_noted: false,
             space: crate::spaces::HOME,
             info: copy_info(&dir, &conv),
             dir,
@@ -1184,6 +1188,7 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             screen,
             pinned: false,
             noted: false,
+            group_noted: false,
             space: crate::spaces::HOME,
             dir: p.path.clone(),
             deck_id: String::new(),
@@ -1224,6 +1229,7 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             screen: vec![],
             pinned: false,
             noted: false,
+            group_noted: false,
             space: crate::spaces::HOME,
             dir: s.dir.clone(),
             profile: REGISTERED.into(),
@@ -1281,6 +1287,7 @@ pub fn blank_row(group: &str, rank: usize) -> Session {
         screen: vec![],
         pinned: false,
         noted: false,
+        group_noted: false,
         space: crate::spaces::HOME,
         dir: String::new(),
         profile: REGISTERED.into(),
@@ -1432,6 +1439,7 @@ pub(crate) mod tests {
             screen: vec![],
             pinned: false,
             noted: false,
+            group_noted: false,
             space: crate::spaces::HOME,
             dir: String::new(),
             profile: String::new(),

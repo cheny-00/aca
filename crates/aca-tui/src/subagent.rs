@@ -202,7 +202,7 @@ fn head_lines(text: &str, max: usize, out: &mut Vec<String>) {
     out.extend(lines.iter().take(max).map(|l| format!("  {l}")));
     if lines.len() > max {
         let more = lines.len() - max;
-        out.push(paint(&aca_core::tr!("  … 另 {more} 行", "  … {more} more lines"), crate::ui::dim()));
+        out.push(paint(&aca_core::tr!("  … 还有 {more} 行", "  … {more} more lines"), crate::ui::dim()));
     }
 }
 
@@ -220,7 +220,7 @@ fn screen(t: &Trace, phase: Phase, task: &str) -> (Vec<String>, bool) {
             .map(|c| crate::trace::said(t, c).1.join("\n\n"))
             .unwrap_or_default();
         if !reply.trim().is_empty() {
-            head.push(paint(t!("交回来的", "Its report"), bold));
+            head.push(paint(t!("返回的结果", "Its report"), bold));
             head_lines(&reply, REPLY_LINES, &mut head);
             head.push(String::new());
         }
@@ -232,7 +232,7 @@ fn screen(t: &Trace, phase: Phase, task: &str) -> (Vec<String>, bool) {
         let (who, said) = crate::trace::asked(t, turn);
         let said = if who.is_empty() { task } else { said.as_str() };
         if !said.trim().is_empty() {
-            out.push(paint(t!("派给它的", "Its task"), bold));
+            out.push(paint(t!("分配的任务", "Its task"), bold));
             head_lines(said, TASK_LINES, &mut out);
             out.push(String::new());
         }
@@ -415,9 +415,9 @@ mod tests {
         // 预览:派给它的话、一步一行,在跑的那步标着
         let a = got.iter().find(|a| a.running()).unwrap();
         let plain: Vec<String> = a.screen.iter().map(|l| crate::ansi::strip(l)).collect();
-        assert_eq!(plain[..2], ["派给它的", "  找出所有 width( 的调用"], "{plain:#?}");
+        assert_eq!(plain[..2], ["分配的任务", "  找出所有 width( 的调用"], "{plain:#?}");
         assert!(plain.iter().any(|l| l.contains("Bash")), "{plain:#?}");
-        assert!(!a.reported && !plain.iter().any(|l| l == "交回来的"));
+        assert!(!a.reported && !plain.iter().any(|l| l == "返回的结果"));
         // 写完了、通知到了、开了新的一轮:那一轮里没起子代理,列表空了
         std::fs::write(&a1, &full).unwrap();
         let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
@@ -446,8 +446,8 @@ mod tests {
         assert_eq!(got.iter().map(|a| a.depth).collect::<Vec<_>>(), [0, 1, 0]);
         // 跑完的:它交回来的话排最前(预览从头露),后面才是派给它的话和那几步
         let plain: Vec<String> = got[0].screen.iter().map(|l| crate::ansi::strip(l)).collect();
-        assert_eq!(plain[..2], ["交回来的", "  找到 4 处:"], "{plain:#?}");
-        let k = plain.iter().position(|l| l == "派给它的").expect("后面还有派给它的话");
+        assert_eq!(plain[..2], ["返回的结果", "  找到 4 处:"], "{plain:#?}");
+        let k = plain.iter().position(|l| l == "分配的任务").expect("后面还有派给它的话");
         assert!(got[0].reported && k > 2 && plain[k + 1].contains("找出所有 width( 的调用"), "{plain:#?}");
         assert!(plain[k..].iter().any(|l| l.contains("Bash")), "{plain:#?}");
         assert!(got[0].tools >= 1 && got[0].dur > 0);
@@ -467,9 +467,9 @@ mod tests {
         );
         let plain = |a: &Subagent| a.screen.iter().map(|l| crate::ansi::strip(l)).collect::<Vec<_>>();
         let (k1, k2) = (plain(&got[0]), plain(&got[1]));
-        assert_eq!(k1[..2], ["派给它的", "  看看 b.rs 里的断言"], "{k1:#?}");
+        assert_eq!(k1[..2], ["分配的任务", "  看看 b.rs 里的断言"], "{k1:#?}");
         assert!(k1.iter().any(|l| l.starts_with("● ") && l.contains("rg -n assert src/b.rs")), "{k1:#?}");
-        let at = k2.iter().position(|l| l == "交回来的").expect("跑完的写它交回来的话");
+        let at = k2.iter().position(|l| l == "返回的结果").expect("跑完的写它交回来的话");
         assert_eq!(k2[at + 1], "  最近一次提交改了 b.rs", "{k2:#?}");
         // Codex 进程没了:子线程不会再写完
         assert!(list(&t, false, false, now).iter().all(|a| !a.running()));

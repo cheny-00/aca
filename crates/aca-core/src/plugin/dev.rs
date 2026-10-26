@@ -118,11 +118,11 @@ echo "${ACA_SETTING_GREETING:-hello}! the last reply of session ${ACA_SESSION_ID
 pub fn scaffold(dir: &str, id: Option<&str>) -> Res<String> {
     let dir = PathBuf::from(paths::expand(dir));
     if dir.read_dir().is_ok_and(|mut d| d.next().is_some()) {
-        return Err(tr!("{} 里已经有东西了:换一个空目录", "{} isn't empty: pick an empty directory", dir.display()));
+        return Err(tr!("{} 不是空目录:请换一个空目录", "{} isn't empty: pick an empty directory", dir.display()));
     }
     let id = id.map_or_else(|| id_from(&dir), String::from);
     if !super::manifest::id_ok(&id, true) {
-        return Err(tr!("id「{id}」不行(字母、数字、. : _ -)", "id “{id}” is invalid (letters, digits, . : _ -)"));
+        return Err(tr!("id「{id}」无效(只能用字母、数字、. : _ -)", "id “{id}” is invalid (letters, digits, . : _ -)"));
     }
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| id.clone());
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}:{e}", dir.display()))?;
@@ -152,19 +152,19 @@ fn program_problem(dir: &Path, argv: &[String], cwd: &str) -> Option<String> {
     let prog = argv.first()?;
     if prog.starts_with("./") || prog.starts_with("../") {
         let p = dir.join(prog);
-        return (!p.is_file()).then(|| tr!("{prog} 在插件目录里没有", "{prog} isn't in the plugin directory"));
+        return (!p.is_file()).then(|| tr!("插件目录中没有 {prog}", "{prog} isn't in the plugin directory"));
     }
     if prog.contains('/') {
         return (!Path::new(prog).is_file()).then(|| tr!("{prog} 不存在", "{prog} doesn't exist"));
     }
     let on_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).any(|d| d.join(prog).is_file());
     if !on_path {
-        return Some(tr!("{prog} 不在 PATH 里", "{prog} isn't on PATH"));
+        return Some(tr!("PATH 中找不到 {prog}", "{prog} isn't on PATH"));
     }
     // 在会话的目录里跑的,脚本相对哪儿说不准:不查
     let script = argv.get(1).filter(|a| INTERPRETERS.contains(&prog.as_str()) && !a.starts_with('-') && cwd != "session")?;
     let p = if Path::new(script).is_absolute() { PathBuf::from(script) } else { dir.join(script) };
-    (!p.is_file()).then(|| tr!("{script} 在插件目录里没有", "{script} isn't in the plugin directory"))
+    (!p.is_file()).then(|| tr!("插件目录中没有 {script}", "{script} isn't in the plugin directory"))
 }
 
 /// 查一个插件:给目录(或者清单的路径),或者链接过的 id
@@ -176,12 +176,12 @@ pub fn check(target: &str) -> Res<Report> {
     } else {
         let e = registry().into_iter().find(|e| e.id == target);
         PathBuf::from(
-            e.ok_or_else(|| tr!("{target} 既不是目录,也不是链接过的插件", "{target} is neither a directory nor a linked plugin"))?.path,
+            e.ok_or_else(|| tr!("{target} 既不是目录,也不是已链接的插件", "{target} is neither a directory nor a linked plugin"))?.path,
         )
     };
     let mut r = Report { dir: dir.clone(), ..Default::default() };
     if !dir.join(MANIFEST).is_file() {
-        r.errors.push(tr!("{} 里没有 {MANIFEST}", "{} has no {MANIFEST}", dir.display()));
+        r.errors.push(tr!("{} 中没有 {MANIFEST}", "{} has no {MANIFEST}", dir.display()));
         return Ok(r);
     }
     let (m, warn) = match super::read_manifest(&dir) {
@@ -235,14 +235,14 @@ pub struct Ran {
 /// `only` = 只跑这个插件的;`fields` 是事件自己的字段(`kind=transient`)
 pub fn emit(event: &str, ctx: &Context, fields: serde_json::Map<String, Value>, only: Option<&str>) -> Res<Vec<Ran>> {
     if !crate::event::KNOWN.contains(&event) {
-        return Err(tr!("没有 {event} 这个事件:{}", "no event {event}; there are: {}", crate::event::KNOWN.join(" ")));
+        return Err(tr!("没有事件 {event}:{}", "no event {event}; there are: {}", crate::event::KNOWN.join(" ")));
     }
     let reg = registry();
     if let Some(id) = only {
         match reg.iter().find(|e| e.id == id) {
-            None => return Err(tr!("没有链接过 {id}", "{id} isn't linked")),
+            None => return Err(tr!("未链接插件 {id}", "{id} isn't linked")),
             Some(e) if !e.enabled => {
-                return Err(tr!("{id} 停着:先 aca plugin enable {id}", "{id} is paused: aca plugin enable {id} first"));
+                return Err(tr!("{id} 已关闭:先运行 aca plugin enable {id}", "{id} is paused: aca plugin enable {id} first"));
             }
             Some(_) => {}
         }
@@ -265,7 +265,7 @@ pub fn emit(event: &str, ctx: &Context, fields: serde_json::Map<String, Value>, 
             let o = super::command(e, &m, &h.command, ctx, &[("ACA_PLUGIN_EVENT", event), ("ACA_PLUGIN_EVENT_JSON", &line)], "")
                 .stdin(Stdio::null())
                 .output()
-                .map_err(|err| tr!("{} 起不来:{err}", "can't start {}: {err}", h.command[0]))?;
+                .map_err(|err| tr!("无法启动 {}:{err}", "can't start {}: {err}", h.command[0]))?;
             let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
             ran.push(Ran { plugin: e.id.clone(), command: h.command.join(" "), code: o.status.code(), out });
         }

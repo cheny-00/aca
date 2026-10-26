@@ -224,7 +224,9 @@ fn one_time_code(w: &str) -> bool {
 impl Drop for Term {
     // shell 是会话首进程:它一死,前台还在跑的命令收到 SIGHUP
     fn drop(&mut self) {
+        // kill 先发 SIGHUP、等一会儿还在才 SIGKILL,后一种它不收:收掉,不然留个僵尸
         let _ = self.child.kill();
+        let _ = self.child.wait();
         if let Some(c) = &self.link {
             let _ = std::fs::remove_file(&c.file);
         }

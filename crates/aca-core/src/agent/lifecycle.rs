@@ -176,7 +176,7 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
             // 原话在 last_assistant_message 里的(Claude),error 只是类型
             let said = v["last_assistant_message"].as_str().filter(|t| !t.trim().is_empty());
             let kind = v["error"].as_str().unwrap_or("");
-            r.error = clip(said.or(v["error"].as_str()).or(v["message"].as_str()).unwrap_or(t!("这一轮失败了", "this turn failed")), 400);
+            r.error = clip(said.or(v["error"].as_str()).or(v["message"].as_str()).unwrap_or(t!("本轮失败", "this turn failed")), 400);
             r.clear_ask();
             r.error_kind = match v["error_kind"].as_str() {
                 Some(k) => k.to_string(),

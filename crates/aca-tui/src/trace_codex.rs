@@ -818,7 +818,7 @@ fn fn_head(name: &str, ns: Option<&str>, args: &Value, cwd: &str) -> (String, St
             let chars = s("chars").unwrap_or("");
             (
                 "stdin",
-                format!("#{id} {}", if chars.trim().is_empty() { t!("等输出", "waiting for output").to_string() } else { one(chars) }),
+                format!("#{id} {}", if chars.trim().is_empty() { t!("等待输出", "waiting for output").to_string() } else { one(chars) }),
             )
         }
         "update_plan" => {
@@ -1916,7 +1916,7 @@ pub(crate) mod tests {
         let rolled: Vec<bool> = turns.iter().map(|&r| t.nodes[r].rolled).collect();
         assert_eq!(rolled, [false, true, true, false]);
         assert_eq!(turns.iter().map(|&r| t.turn_no(r)).collect::<Vec<_>>(), [Some(1), None, None, Some(2)]);
-        assert_eq!(crate::trace::where_of(&t, turns[1]), "回退掉的");
+        assert_eq!(crate::trace::where_of(&t, turns[1]), "已回退");
         let (n, _, s) = t.total(false, 0);
         let bill: f64 = crate::usage::tests::codex_seen(&p)
             .into_iter()
@@ -1925,7 +1925,7 @@ pub(crate) mod tests {
         assert_eq!((n, s.calls), (2, 4));
         assert!((s.cost - bill).abs() < 1e-12);
         let c = crate::trace::chat(&t, turns[1], false, 0);
-        assert!(crate::ansi::plain(&c.foot.body).starts_with("↶ 回退掉了 · "));
+        assert!(crate::ansi::plain(&c.foot.body).starts_with("↶ 已回退 · "));
     }
 
     #[test]

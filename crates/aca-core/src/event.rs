@@ -33,6 +33,7 @@ pub const KNOWN: &[&str] = &[
     "message.delivered",
     "message.throttled",
     "ask.answered",
+    "limits.changed",
 ];
 
 /// 每个事件自己带的字段(公共的 `ts` `event` `session` 不算)。这是插件接口的一部分(docs/plugins.md「事件」那张表照它写,
@@ -58,6 +59,7 @@ pub const FIELDS: &[(&str, &[&str])] = &[
     ("message.delivered", &["id", "how"]),
     ("message.throttled", &["from", "count", "secs"]),
     ("ask.answered", &["by", "answer", "ask", "kind"]),
+    ("limits.changed", &["tool", "name", "dir", "wins"]),
 ];
 
 /// 这个事件自己的字段(没有这个事件 = 空)

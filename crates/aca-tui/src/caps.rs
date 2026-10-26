@@ -1,8 +1,8 @@
-//! `:` 插件菜单:开着的插件露给界面的命令(清单的 `[[commands]]`,界面上就叫命令;给 agent 的叫「给 agent 的工具」)、
-//! 窗格、视图(见 `aca_core::plugin::menu`),按高亮的那行挑在这里有意义的。诊断用的(试一下、测连通)不进这里,
-//! 清单里只露给 cli。
+//! `:` 命令面板:aca 自己的动作(acts.rs 那张表,挑中 = 在主列表上按了那个键)和开着的插件露给界面的命令(清单的
+//! `[[commands]]`,界面上就叫命令;给 agent 的叫「给 agent 的工具」)、窗格、视图(见 `aca_core::plugin::menu`),按高亮的那行
+//! 挑在这里有意义的。诊断用的(试一下、测连通)不进这里,清单里只露给 cli。
 //!
-//! - ↑↓ 挑,⏎ 跑;清单 `[[keys]]` 给它绑了键的,直接按那个键;`/` 打字筛
+//! - ↑↓ 挑,⏎ 做;行首的键直接按(aca 的就是主列表上那个键;清单 `[[keys]]` 给插件绑的键只在这里按,和 aca 的撞了归插件);`/` 打字筛
 //! - 能力有参数的先弹一张表单(`Form`);跑完输出短的写在底栏,长的放进全屏阅读页
 //! - 视图:输出放进全屏阅读页,`r` 重跑。列表视图(`rows = true`)开成一页 [`List`]:一行一条,
 //!   停在哪行按清单 `[[views.keys]]` 的键(复制一个字段、带着这一行跑这个插件的一个能力),跑完写在下面、列表重读
@@ -90,21 +90,61 @@ fn start(req: Req, fx: &mut Fx) {
         fx.external = Some(crate::ui::External::Plugin(req));
         return;
     }
-    fx.say(tr!("正在跑 {}…", "running {}…", req.title()));
+    fx.say(tr!("正在运行 {}…", "running {}…", req.title()));
     fx.plugin = Some(req);
 }
 
-fn kind_word(k: ItemKind) -> &'static str {
-    match k {
-        ItemKind::Command => "",
-        ItemKind::Pane => t!("窗格", "pane"),
-        ItemKind::View => t!("视图", "view"),
+/// 面板里的一行:aca 自己的动作(acts.rs),或插件给的。插件在 `:` 里绑的键和 aca 的撞了,键归插件,aca 那行不画键(shadowed)
+enum Entry {
+    Act(&'static crate::acts::Act, bool),
+    Plugin(MenuItem),
+}
+
+impl Entry {
+    /// 行首的键;没有就空着
+    fn key(&self) -> String {
+        match self {
+            Entry::Act(a, false) => a.key.to_string(),
+            Entry::Act(_, true) => String::new(),
+            Entry::Plugin(it) => it.key.map_or(String::new(), |k| k.to_string()),
+        }
+    }
+
+    /// 叫什么(插件的有参数加 …)
+    fn title(&self) -> String {
+        match self {
+            Entry::Act(a, _) => a.name().to_string(),
+            Entry::Plugin(it) => format!("{}{}", it.title, if it.args.is_empty() { "" } else { "…" }),
+        }
+    }
+
+    /// 右边:谁的
+    fn from(&self) -> String {
+        match self {
+            Entry::Act(..) => "aca".to_string(),
+            Entry::Plugin(it) => it.plugin_name.clone(),
+        }
+    }
+
+    fn matches(&self, f: &str) -> bool {
+        match self {
+            Entry::Act(a, _) => [a.key, a.name()].iter().any(|s| s.to_lowercase().contains(f)),
+            Entry::Plugin(it) => [&it.title, &it.plugin_name, &it.id, &it.plugin].iter().any(|s| s.to_lowercase().contains(f)),
+        }
+    }
+
+    /// 按下的是它的直达键
+    fn hit(&self, k: KeyEvent) -> bool {
+        match self {
+            Entry::Act(a, shadowed) => !shadowed && a.hit(k),
+            Entry::Plugin(it) => !k.modifiers.contains(KeyModifiers::CONTROL) && it.key.is_some_and(|c| k.code == KeyCode::Char(c)),
+        }
     }
 }
 
 /// `:` 那一层
 pub struct Menu {
-    items: Vec<MenuItem>,
+    items: Vec<Entry>,
     target: Target,
     sel: usize,
     /// `/` 之后在输的筛选词
@@ -112,40 +152,47 @@ pub struct Menu {
 }
 
 impl Menu {
-    /// `all` = 开着的插件给菜单的全部;只留在这种行上有意义的
+    /// `all` = 开着的插件给菜单的全部;只留在这种行上有意义的,后面接 aca 自己在这种行上能做的
     pub fn new(all: Vec<MenuItem>, target: Target) -> Menu {
-        let items = all.into_iter().filter(|i| i.fits(target.on)).collect();
+        let mut items: Vec<Entry> = all.into_iter().filter(|i| i.fits(target.on)).map(Entry::Plugin).collect();
+        let bound: Vec<char> = items.iter().filter_map(|e| if let Entry::Plugin(it) = e { it.key } else { None }).collect();
+        items.extend(
+            crate::acts::ACTS
+                .iter()
+                .filter(|a| a.fits(target.on))
+                .map(|a| Entry::Act(a, a.key.chars().count() == 1 && a.key.chars().any(|c| bound.contains(&c)))),
+        );
         Menu { items, target, sel: 0, filter: None }
+    }
+
+    #[cfg(test)]
+    fn plugin_ids(&self) -> Vec<&str> {
+        self.items.iter().filter_map(|e| if let Entry::Plugin(it) = e { Some(it.id.as_str()) } else { None }).collect()
     }
 
     /// 筛过的(下标)
     fn shown(&self) -> Vec<usize> {
         let f = self.filter.as_deref().unwrap_or("").to_lowercase();
-        (0..self.items.len())
-            .filter(|&i| {
-                let it = &self.items[i];
-                f.is_empty() || [&it.title, &it.plugin_name, &it.id, &it.plugin].iter().any(|s| s.to_lowercase().contains(&f))
-            })
-            .collect()
+        (0..self.items.len()).filter(|&i| f.is_empty() || self.items[i].matches(&f)).collect()
     }
 
     fn pick(&self, i: usize, fx: &mut Fx) -> Flow {
-        let it = self.items[i].clone();
-        if it.kind == ItemKind::Command && !it.args.is_empty() {
-            fx.open = Some(Box::new(Form::new(it, self.target.clone())));
-        } else {
-            start(Req { item: it, session: self.target.session.clone(), ..Default::default() }, fx);
+        match &self.items[i] {
+            Entry::Act(a, _) => fx.key = a.event(),
+            Entry::Plugin(it) if it.kind == ItemKind::Command && !it.args.is_empty() => {
+                fx.open = Some(Box::new(Form::new(it.clone(), self.target.clone())));
+            }
+            Entry::Plugin(it) => start(Req { item: it.clone(), session: self.target.session.clone(), ..Default::default() }, fx),
         }
         Flow::Close
     }
 
-    fn row(&self, it: &MenuItem, w: usize) -> Line<'static> {
-        let key = it.key.map_or("  ".to_string(), |k| format!("{k} "));
-        let kind = kind_word(it.kind);
-        let right = if kind.is_empty() { it.plugin_name.clone() } else { format!("{kind} · {}", it.plugin_name) };
+    fn row(&self, it: &Entry, w: usize) -> Line<'static> {
+        let key = format!("{:<3}", it.key());
+        // 右边只写是谁的:aca 自己的,或哪个插件的(窗格 / 视图 / 命令是实现上的分法,按下去都是「跑它」)
+        let right = it.from();
         let right_w = right.width();
-        let dots = if it.args.is_empty() { "" } else { "…" };
-        let title = kit::clip(&format!("{}{dots}", it.title), w.saturating_sub(right_w + 6)).trim_end().to_string();
+        let title = kit::clip(&it.title(), w.saturating_sub(right_w + 7)).trim_end().to_string();
         kit::spread(
             vec![Span::raw(" "), Span::styled(key, kit::key_style()), Span::styled(title, Style::new().add_modifier(Modifier::BOLD))],
             vec![Span::styled(right, kit::dim())],
@@ -162,16 +209,14 @@ impl Overlay for Menu {
     fn lines(&self, w: usize) -> Vec<Line<'static>> {
         let wrap = |text: &str, st: Style| crate::ui::wrap_width(text, w).into_iter().map(move |l| Line::styled(l, st)).collect::<Vec<_>>();
         let on = match self.target.on {
-            "session" => tr!("插件菜单 · 对「{}」", "Plugin menu · for “{}”", self.target.label),
-            "group" => tr!("插件菜单 · 对分组 {}", "Plugin menu · for group {}", self.target.label),
-            _ => t!("插件菜单", "Plugin menu").to_string(),
+            "session" => tr!("命令 · 对「{}」", "Commands · for “{}”", self.target.label),
+            "group" => tr!("命令 · 对分组 {}", "Commands · for group {}", self.target.label),
+            _ => t!("命令", "Commands").to_string(),
         };
         let mut out = vec![kit::modal_title(&on, theme::accent(), kit::esc_hint(t!("关闭", "close")), w), Line::raw("")];
         let shown = self.shown();
-        if self.items.is_empty() {
-            out.extend(wrap(t!("还没有插件命令 · P 装插件", "No plugin commands yet · P installs plugins"), kit::dim()));
-        } else if shown.is_empty() {
-            out.extend(wrap(t!("没有对得上的", "nothing matches"), kit::dim()));
+        if shown.is_empty() {
+            out.extend(wrap(t!("无匹配项", "nothing matches"), kit::dim()));
         }
         let at = shown.iter().position(|&i| i == self.sel).unwrap_or(0);
         let from = at.saturating_sub(SHOWN / 2).min(shown.len().saturating_sub(SHOWN));
@@ -180,10 +225,10 @@ impl Overlay for Menu {
         }
         out.push(Line::raw(""));
         if let Some(f) = &self.filter {
-            out.push(Line::from(vec![Span::styled(t!("筛 > ", "filter > "), theme::accent()), Span::raw(f.clone()), Span::raw("▏")]));
-            out.push(kit::keys_line(&[("⏎", t!("跑", "run")), ("Esc", t!("不筛了", "stop filtering"))], vec![], w));
+            out.push(Line::from(vec![Span::styled(t!("筛选 > ", "filter > "), theme::accent()), Span::raw(f.clone()), Span::raw("▏")]));
+            out.push(kit::keys_line(&[("⏎", t!("执行", "run")), ("Esc", t!("清除筛选", "stop filtering"))], vec![], w));
         } else {
-            out.push(kit::keys_line(&[("↑↓", t!("挑", "pick")), ("⏎", t!("跑", "run")), ("/", t!("筛", "filter"))], vec![], w));
+            out.push(kit::keys_line(&[("↑↓", t!("选择", "pick")), ("⏎", t!("执行", "run")), ("/", t!("筛选", "filter"))], vec![], w));
         }
         out
     }
@@ -215,23 +260,23 @@ impl Overlay for Menu {
             return Flow::Stay;
         }
         match k.code {
-            KeyCode::Esc | KeyCode::Char('q') if !self.items.iter().any(|i| i.key == Some('q')) => return Flow::Close,
             KeyCode::Esc => return Flow::Close,
+            KeyCode::Char('q') if !self.items.iter().any(|i| i.hit(k)) => return Flow::Close,
             KeyCode::Enter => return at.map_or(Flow::Stay, |_| self.pick(self.sel, fx)),
             KeyCode::Up => self.sel = step(-1).unwrap_or(0),
             KeyCode::Down => self.sel = step(1).unwrap_or(0),
-            KeyCode::Char('/') => self.filter = Some(String::new()),
-            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(i) = self.items.iter().position(|i| i.key == Some(c)) {
+            KeyCode::Char('/') if !k.modifiers.contains(KeyModifiers::CONTROL) => self.filter = Some(String::new()),
+            _ => {
+                // 直达键:插件绑的、aca 的;j k 没人用,挪高亮
+                if let Some(i) = self.items.iter().position(|i| i.hit(k)) {
                     return self.pick(i, fx);
                 }
-                match c {
-                    'j' => self.sel = step(1).unwrap_or(0),
-                    'k' => self.sel = step(-1).unwrap_or(0),
+                match k.code {
+                    KeyCode::Char('j') => self.sel = step(1).unwrap_or(0),
+                    KeyCode::Char('k') => self.sel = step(-1).unwrap_or(0),
                     _ => {}
                 }
             }
-            _ => {}
         }
         Flow::Stay
     }
@@ -278,12 +323,12 @@ impl Form {
             let v = v.trim();
             if v.is_empty() {
                 if !opt {
-                    return Err(tr!("{name} 要填", "{name} is required"));
+                    return Err(tr!("{name} 为必填项", "{name} is required"));
                 }
                 continue;
             }
             if ty == "int" && v.parse::<i64>().is_err() {
-                return Err(tr!("{name} 要是整数", "{name} takes an integer"));
+                return Err(tr!("{name} 必须是整数", "{name} takes an integer"));
             }
             out.push((name.clone(), v.to_string()));
         }
@@ -302,7 +347,7 @@ impl Overlay for Form {
 
     fn lines(&self, w: usize) -> Vec<Line<'static>> {
         let title = format!("{} · {}", self.item.plugin_name, self.item.title);
-        let mut out = vec![kit::modal_title(&title, theme::accent(), kit::esc_hint(t!("不跑了", "cancel")), w), Line::raw("")];
+        let mut out = vec![kit::modal_title(&title, theme::accent(), kit::esc_hint(t!("取消", "cancel")), w), Line::raw("")];
         for (i, ((name, ty, opt), v)) in self.item.args.iter().zip(&self.vals).enumerate() {
             let on = i == self.at;
             // 类型写人话(字符串不写),可以不填的标出来
@@ -312,14 +357,14 @@ impl Overlay for Form {
                 "bool" => t!("空格 开/关", "space: on/off"),
                 _ => "",
             };
-            let hint: Vec<&str> = [kind, if *opt { t!("可不填", "optional") } else { "" }].into_iter().filter(|x| !x.is_empty()).collect();
+            let hint: Vec<&str> = [kind, if *opt { t!("选填", "optional") } else { "" }].into_iter().filter(|x| !x.is_empty()).collect();
             let hint = if hint.is_empty() { String::new() } else { format!("({})", hint.join(t!(",", ", "))) };
             out.push(Line::from(vec![
                 Span::styled(format!(" {name} "), if on { theme::accent() } else { Style::new().add_modifier(Modifier::BOLD) }),
                 Span::styled(hint, kit::dim()),
             ]));
             let shown = match (ty.as_str(), v.as_str()) {
-                ("bool", "") => t!("不给", "not given").to_string(),
+                ("bool", "") => t!("未设置", "not given").to_string(),
                 ("bool", "true") => t!("开", "on").to_string(),
                 ("bool", "false") => t!("关", "off").to_string(),
                 _ => v.clone(),
@@ -333,8 +378,8 @@ impl Overlay for Form {
             out.push(Line::styled(format!(" {e}"), theme::warn()));
         }
         let last = self.at + 1 >= self.vals.len();
-        let enter = if last { t!("跑", "run") } else { t!("下一项", "next") };
-        out.push(kit::keys_line(&[("⏎", enter), ("Tab ⇧Tab", t!("换一项", "move")), ("^U", t!("清空", "clear"))], vec![], w));
+        let enter = if last { t!("运行", "run") } else { t!("下一项", "next") };
+        out.push(kit::keys_line(&[("⏎", enter), ("Tab ⇧Tab", t!("切换项", "move")), ("^U", t!("清空", "clear"))], vec![], w));
         out
     }
 
@@ -488,7 +533,7 @@ impl Overlay for List {
         }
         out.push(Line::raw(""));
         if self.list.rows.is_empty() && self.err.is_none() {
-            out.extend(wrap(if self.list.empty.is_empty() { t!("空的", "empty") } else { &self.list.empty }, kit::dim()));
+            out.extend(wrap(if self.list.empty.is_empty() { t!("无内容", "empty") } else { &self.list.empty }, kit::dim()));
         }
         let from = self.sel.saturating_sub(LIST_SHOWN / 2).min(n.saturating_sub(LIST_SHOWN));
         for (i, r) in self.list.rows.iter().enumerate().skip(from).take(LIST_SHOWN) {
@@ -520,7 +565,7 @@ impl Overlay for List {
             .map(|a| (if a.key == "enter" { "⏎".to_string() } else { a.key.clone() }, a.title.clone()))
             .collect();
         if self.act("r").is_none() {
-            keys.push(("r".into(), t!("重读", "reload").into()));
+            keys.push(("r".into(), t!("重新读取", "reload").into()));
         }
         let keys: Vec<(&str, &str)> = keys.iter().map(|(k, t)| (k.as_str(), t.as_str())).collect();
         out.push(kit::keys_line(&keys, vec![], w));
@@ -545,14 +590,14 @@ impl Overlay for List {
         }
         let Some(a) = self.act(&name).cloned() else {
             if name == "r" {
-                fx.say(tr!("正在重读 {}…", "reloading {}…", self.req.title()));
+                fx.say(tr!("正在重新读取 {}…", "reloading {}…", self.req.title()));
                 fx.plugin = Some(self.reload_req());
             }
             return Flow::Stay;
         };
         let Some(given) = self.usable(&a) else {
             if self.cur().is_some() || !a.row {
-                fx.say(tr!("这一行上按不了:{}", "not on this row: {}", a.title));
+                fx.say(tr!("此行不支持:{}", "not on this row: {}", a.title));
             }
             return Flow::Stay;
         };
@@ -599,14 +644,14 @@ impl Overlay for List {
                 let same = was.and_then(|id| self.list.rows.iter().position(|r| r.id == id));
                 self.sel = same.unwrap_or(self.sel).min(self.list.rows.len().saturating_sub(1));
             }
-            Err(e) => self.err = Some(if e.is_empty() { t!("出错了,没说为什么", "failed without saying why").into() } else { e }),
+            Err(e) => self.err = Some(if e.is_empty() { t!("出错,原因未知", "failed without saying why").into() } else { e }),
         }
     }
 
     fn said(&mut self, ok: bool, out: &str) {
         self.said = out.trim().lines().take(SAID_MAX).map(String::from).collect();
         if self.said.is_empty() {
-            self.said = vec![if ok { t!("跑完了", "done") } else { t!("出错了", "failed") }.into()];
+            self.said = vec![if ok { t!("已完成", "done") } else { t!("出错", "failed") }.into()];
         }
         self.said_ok = ok;
     }
@@ -647,7 +692,15 @@ mod tests {
             item("ci", ItemKind::View, Some('c'), &[], &[]),
         ];
         let mut m = Menu::new(all, on_session());
-        assert_eq!(m.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["stat", "ci"]);
+        assert_eq!(m.plugin_ids(), ["stat", "ci"]);
+        // 后面接 aca 自己的动作;插件绑了 c,aca 的「复制回复」那行不画键,c 归插件
+        let t = text(&m, 70);
+        assert!(t.contains("n  新建") && t.contains("aca"), "{t}");
+        let shadowed = m.items.iter().find(|e| matches!(e, Entry::Act(a, _) if a.key == "c")).unwrap();
+        assert!(shadowed.key().is_empty() && shadowed.title() == "复制回复" && !shadowed.hit(key(KeyCode::Char('c'))));
+        let mut fx = Fx::default();
+        assert_eq!(m.on_key(key(KeyCode::Char('f')), &mut fx), Flow::Close);
+        assert_eq!(fx.key, Some(key(KeyCode::Char('f'))));
         let mut fx = Fx::default();
         assert_eq!(m.on_key(key(KeyCode::Char('c')), &mut fx), Flow::Close);
         let req = fx.plugin.expect("跑起来了");
@@ -678,7 +731,7 @@ mod tests {
         let mut f = Form::new(it, on_session());
         // 类型写人话,字符串不写;bool 写开 / 关
         let t = text(&f, 70);
-        assert!(t.contains(" host\n") && t.contains(" n (整数,可不填)") && t.contains(" dry (空格 开/关,可不填)"), "{t}");
+        assert!(t.contains(" host\n") && t.contains(" n (整数,选填)") && t.contains(" dry (空格 开/关,选填)"), "{t}");
         assert!(!t.contains("string") && !t.contains("int") && !t.contains("bool"), "{t}");
         let mut fx = Fx::default();
         // 必填的没填:不跑
@@ -705,9 +758,22 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_menu_says_where_plugins_come_from() {
+    fn without_plugins_the_panel_still_lists_acas_own_actions_for_the_row() {
         let t = text(&Menu::new(vec![], on_session()), 70);
-        assert!(t.contains("还没有插件命令 · P 装插件") && !t.contains("[["), "{t}");
+        assert!(t.contains("命令 · 对「主线」") && t.contains("n  新建") && t.contains("⏎ 执行"), "{t}");
+        // 分组行上只剩在分组上能做的:删除在,分叉不在
+        let t = text(&Menu::new(vec![], Target { on: "group", session: String::new(), label: "组".into() }), 70);
+        assert!(t.contains("命令 · 对分组 组") && t.contains("d  删除") && !t.contains("分叉"), "{t}");
+        // / 筛:打键也找得到;挑中 = 主列表上按了那个键
+        let mut m = Menu::new(vec![], on_session());
+        let mut fx = Fx::default();
+        m.on_key(key(KeyCode::Char('/')), &mut fx);
+        for c in "^n".chars() {
+            m.on_key(key(KeyCode::Char(c)), &mut fx);
+        }
+        assert_eq!(m.shown().len(), 1);
+        assert_eq!(m.on_key(key(KeyCode::Enter), &mut fx), Flow::Close);
+        assert_eq!(fx.key, Some(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)));
     }
 
     /// 挂载那样的一个列表视图:⏎ 复制地址、x 撤(按两次)、a 挂端口(要填)、p 开关发布(列表上的字段)
@@ -755,7 +821,7 @@ mod tests {
         assert!(t.starts_with("PX · mounts 标题") && t.contains("mac.ts.net\n发布 关着\n"), "{t}");
         assert!(t.contains("✕ :443 / → 127.0.0.1:8420") && t.contains("没在听") && t.contains("https://mac.ts.net/"), "{t}");
         assert!(t.contains("⏎ 复制地址") && t.contains("x 撤掉") && t.contains("a 挂一个本机端口") && t.contains("p 开关发布"), "{t}");
-        assert!(t.contains("r 重读"), "{t}");
+        assert!(t.contains("r 重新读取"), "{t}");
         // 前台那行:没有 drop,x 不列;手机宽度不出界
         let mut l = l;
         press(&mut l, KeyCode::Char('j'));
@@ -763,14 +829,14 @@ mod tests {
         assert!(t.contains("前台挂的撤不了") && !t.contains("x 撤掉"), "{t}");
         assert!(l.lines(40).iter().all(|x| x.width() <= 40));
         let (fx, _) = press(&mut l, KeyCode::Char('x'));
-        assert!(fx.plugin.is_none() && fx.flash.unwrap().contains("这一行上按不了:撤掉"));
+        assert!(fx.plugin.is_none() && fx.flash.unwrap().contains("此行不支持:撤掉"));
         // 没装 tpub(列表上没有 publish_to):p 不列
         let bare = List::new(mounts(), true, &OUT.replace(r#""fields":{"publish_to":"on"},"#, ""));
         assert!(!text(&bare, 80).contains("p 开关发布"));
         // 空的:写它说的那句;跑失败 / 读不懂:写出来
         assert!(text(&List::new(mounts(), true, r#"{"empty":"没有挂载"}"#), 80).contains("没有挂载"));
         assert!(text(&List::new(mounts(), false, "tailscale isn't installed"), 80).contains("tailscale isn't installed"));
-        assert!(text(&List::new(mounts(), true, "oops"), 80).contains("列表读不懂"));
+        assert!(text(&List::new(mounts(), true, "oops"), 80).contains("无法解析列表"));
     }
 
     #[test]

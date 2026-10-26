@@ -35,7 +35,7 @@ die() {
   exit 1
 }
 
-command -v jq >/dev/null 2>&1 || die "$(t 'aca.remote 要用 jq,PATH 里没有(macOS 15 以上自带 /usr/bin/jq;别的用包管理器装:brew / apt / dnf install jq)' 'aca.remote needs jq, which is not on PATH (macOS 15+ ships /usr/bin/jq; otherwise install it with your package manager: brew / apt / dnf install jq)')"
+command -v jq >/dev/null 2>&1 || die "$(t 'aca.remote 需要 jq,但 PATH 中找不到(macOS 15 及以上自带 /usr/bin/jq;其他系统请用包管理器安装:brew / apt / dnf install jq)' 'aca.remote needs jq, which is not on PATH (macOS 15+ ships /usr/bin/jq; otherwise install it with your package manager: brew / apt / dnf install jq)')"
 
 D="${ACA_PLUGIN_STATE_DIR:?}/tasks"
 mkdir -p "$D" || exit 1
@@ -66,10 +66,10 @@ TOKEN=${ACA_SETTING_TOKEN:-}
 # 还没配 / 配得不对:为什么(配好了是空的)。地址要原样写进远端的脚本和 curl 的配置:只认普通的 http(s) 地址
 unset_why() {
   if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
-    t '还没配 server:插件页(P)里 aca.remote 的设置填 url 和 token(或者 aca plugin setting aca.remote url https://…)' \
+    t '尚未配置 server:在插件页(P)中为 aca.remote 填写 url 和 token(或运行 aca plugin setting aca.remote url https://…)' \
       "no server set up yet: fill in url and token in aca.remote's settings on the plugins page (P), or aca plugin setting aca.remote url https://…"
   elif ! printf '%s' "$URL" | grep -Eq '^https?://[A-Za-z0-9._:/-]+$'; then
-    t "url 不像个地址:$URL" "url doesn't look like an address: $URL"
+    t "url 不是有效的地址:$URL" "url doesn't look like an address: $URL"
   fi
 }
 
@@ -103,7 +103,7 @@ http() {
     if [ -n "${3-}" ]; then printf 'header = "Content-Type: application/json"\ndata-binary = %s\n' "$(cq "$3")"; fi
   } | curl -sS --connect-timeout 8 -m 15 --retry 2 --retry-all-errors --retry-delay 1 -w '\n%{http_code}' -K - >"$TMP/http" 2>"$TMP/http.err"
   if [ $? != 0 ]; then
-    NET=$(t '连不上 server:' "can't reach the server: ")$(grep -v '^[[:space:]]*$' "$TMP/http.err" | head -n 1 | sed 's/^curl: //')
+    NET=$(t '无法连接 server:' "can't reach the server: ")$(grep -v '^[[:space:]]*$' "$TMP/http.err" | head -n 1 | sed 's/^curl: //')
     return 1
   fi
   CODE=$(tail -n 1 "$TMP/http")
@@ -111,7 +111,7 @@ http() {
   case $CODE in
     [0-9][0-9][0-9]) ;;
     *)
-      NET=$(t 'server 回的不像 HTTP' "the server's reply doesn't look like HTTP")
+      NET=$(t 'server 的回复不像 HTTP' "the server's reply doesn't look like HTTP")
       return 1
       ;;
   esac
@@ -162,14 +162,14 @@ def what:
   elif .note != "" then t("「\(.note)」"; "“\(.note)”")
   else t("任务 \(.id | short)"; "task \(.id | short)") end;
 def took: if .ended then " · " + (.ended - .created | span) else "" end;
-def ended_how: if .rc == 0 then t("跑完了"; "finished") elif .rc != null then t("退出码 \(.rc)"; "exit code \(.rc)") else t("结束了"; "ended") end;
+def ended_how: if .rc == 0 then t("已完成"; "finished") elif .rc != null then t("退出码 \(.rc)"; "exit code \(.rc)") else t("已结束"; "ended") end;
 def status:
-  if .state == "waiting" then t("在等 · 已经 "; "waiting · for ") + ($now - .created | span)
-  elif .state == "lost" then t("失联 · 过了 \(.within | span) 没回调"; "lost · no callback within \(.within | span)")
-  elif .state == "done" then ended_how + took + t(" · 还没发进会话"; " · not sent into the session yet")
-  elif .state == "sent" then ended_how + took + t(" · 发给会话了"; " · sent to the session")
-  elif .ended then ended_how + took + t(" · 没送达:"; " · not delivered: ") + .why
-  else t("不等了:"; "no longer waiting: ") + .why end;
+  if .state == "waiting" then t("等待中 · 已等 "; "waiting · for ") + ($now - .created | span)
+  elif .state == "lost" then t("失联 · 超过 \(.within | span) 未回调"; "lost · no callback within \(.within | span)")
+  elif .state == "done" then ended_how + took + t(" · 尚未发送到会话"; " · not sent into the session yet")
+  elif .state == "sent" then ended_how + took + t(" · 已发送到会话"; " · sent to the session")
+  elif .ended then ended_how + took + t(" · 未送达:"; " · not delivered: ") + .why
+  else t("不再等待:"; "no longer waiting: ") + .why end;
 # 日志末尾:最多 20 行、2000 字节(从后往前留);单独一行就超了的只留它的结尾
 def tail_of: (sub("\\s+$"; "") | split("\n")) as $l
   | (reduce ($l | reverse | .[0:20])[] as $x ({k: [], b: 0, stop: false};
@@ -193,21 +193,21 @@ def lost_msg:
 def pad($w): if length > $w then .[0:$w - 1] + "…" elif length < $w then . + (" " * ($w - length)) else . end;
 def summary:
   length as $n
-  | [[map(select(.state == "waiting")) | length, t("在等"; "waiting")],
+  | [[map(select(.state == "waiting")) | length, t("等待中"; "waiting")],
    [map(select(.state == "lost")) | length, t("失联"; "lost")],
-   [map(select(.state == "done")) | length, t("还没发进会话"; "not sent in yet")],
-   [map(select(.state == "kept" and .ended != null)) | length, t("没送达"; "not delivered")]]
+   [map(select(.state == "done")) | length, t("尚未发送到会话"; "not sent in yet")],
+   [map(select(.state == "kept" and .ended != null)) | length, t("未送达"; "not delivered")]]
   | map(select(.[0] > 0) | t("\(.[0]) 个\(.[1])"; "\(.[0]) \(.[1])")) as $parts
-  | if ($parts | length) > 0 then $parts | join(" · ") else t("没有在等的 · 最近了结 \($n) 个"; "none waiting · recently settled: \($n)") end;
+  | if ($parts | length) > 0 then $parts | join(" · ") else t("没有等待中的任务 · 最近结束 \($n) 个"; "none waiting · recently settled: \($n)") end;
 def row($hw): {
   id: .id,
   mark: (if .state == "waiting" then "●" elif .state == "lost" then "?" elif .rc == 0 then "✓" elif .rc != null then "✕" else "·" end),
   tone: (if .state == "waiting" then "ok" elif .state == "lost" then "warn" elif .rc == 0 then "ok" elif .rc != null then "bad" else "dim" end),
   text: "\(.host | pad($hw))  \(if .note == "" then (.id | short) else .note end)",
   right: status,
-  detail: (["\(what) · id \(.id | short) · " + (if .session == "" then t("不在会话里登记的"; "registered outside a session")
+  detail: (["\(what) · id \(.id | short) · " + (if .session == "" then t("不是在会话中登记的"; "registered outside a session")
               else (if .title == "" then .session else .title end) as $s | t("会话「\($s)」"; "session “\($s)”") end)]
-    + (if .state == "done" and .why != "" then [t("上次没发进去:"; "last time it wasn't sent in: ") + .why] else [] end)
+    + (if .state == "done" and .why != "" then [t("上次未能发送:"; "last time it wasn't sent in: ") + .why] else [] end)
     + (.tail | tail_of | split("\n") | map(select(. != "")) | .[-6:])),
   fields: (if .log != "" and .host != "" then {log_cmd: "ssh \(.host) tail -n 50 \(.log)"} else {} end)
 };
@@ -216,8 +216,8 @@ def rows($unset; $timer_off):
   | ([$all[].host | length] | max // 0 | if . > 12 then 12 else . end) as $hw
   | {
       head: (if ($all | length) == 0 then "" else $all | summary end),
-      warn: ([$unset, (if $timer_off then t("定时没开着:按 r 现在取一次"; "the timer is off: press r to fetch once now") else "" end)] | map(select(. != "")) | join("\n")),
-      empty: t("没有远端任务。会话上按 : 再按 r 派一个(agent 用 run 工具),结束时结果会发回那个会话";
+      warn: ([$unset, (if $timer_off then t("定时任务未开启:按 r 立即获取一次"; "the timer is off: press r to fetch once now") else "" end)] | map(select(. != "")) | join("\n")),
+      empty: t("暂无远端任务。在会话上按 : 再按 r 派出一个(agent 使用 run 工具),结束时结果会发回该会话";
                "No remote tasks. Send one with : then r on a session (agents use the run tool); the result comes back to that session when it ends"),
       rows: [$all[] | row($hw)]
     };
@@ -247,14 +247,14 @@ scheduled() { "$ACA_BIN" plugin timer --json 2>/dev/null | jq -r --arg id "$SELF
 
 alone() {
   [ -n "${ACA_SESSION_ID:-}" ] && return
-  printf '\n%s' "$(t '不在 aca 的会话里:结束时只有 server 的 Bark 通知,结果在列表里看。' "Not inside an aca session: when it ends there's only the server's Bark notification; see the result in the list.")"
+  printf '\n%s' "$(t '不在 aca 的会话中:结束时只有 server 的 Bark 通知,结果请在列表中查看。' "Not inside an aca session: when it ends there's only the server's Bark notification; see the result in the list.")"
 }
 
 # 登记一个 id:server 上记下,本机记下它是哪个会话的,开上定时。$ID 是它
 register() {
   host=$(trim "$1") note=$(trim "$2") within=$3
   ID=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-  [ ${#ID} -ge 16 ] || die "$(t '生成不了 id' "can't generate an id")"
+  [ ${#ID} -ge 16 ] || die "$(t '无法生成 id' "can't generate an id")"
   # 会话的标题只是给列表看的,问不到不耽误
   title=
   [ -n "${ACA_SESSION_ID:-}" ] && title=$("$ACA_BIN" show "$ACA_SESSION_ID" --json 2>/dev/null | jq -r '.title // empty' 2>/dev/null)
@@ -262,17 +262,17 @@ register() {
   http PUT "/h/$ID" "$body" || die "$NET"
   case $CODE in
     200) ;;
-    401) die "$(t 'server 不认这个口令(设置里的 token)' "the server doesn't accept this token (the token setting)")" ;;
-    *) die "$(t "server 没登记上($CODE):" "the server didn't register it ($CODE): ")$(said)" ;;
+    401) die "$(t 'server 不接受这个口令(设置中的 token)' "the server doesn't accept this token (the token setting)")" ;;
+    *) die "$(t "server 未能登记($CODE):" "the server didn't register it ($CODE): ")$(said)" ;;
   esac
   jq -n --arg id "$ID" --arg note "$note" --arg host "$host" --argjson created "$NOW" --argjson within "$within" \
     --arg session "${ACA_SESSION_ID:-}" --arg title "$title" \
     '{id: $id, note: $note, host: $host, created: $created, within: $within, session: $session, title: $title,
       log: "", state: "waiting", rc: null, ended: null, tail: "", told_lost: false, why: "", closed: 0}' >"$D/$ID.json.tmp" &&
-    mv "$D/$ID.json.tmp" "$D/$ID.json" || die "$(t '记不下来' "can't record it")"
+    mv "$D/$ID.json.tmp" "$D/$ID.json" || die "$(t '无法记录' "can't record it")"
   # 定时没开上不算登记失败:结果还在 server 上,手动取得到
-  timer on || printf '%s%s%s\n' "$(t '! 定时没开上:' '! the timer did not turn on: ')" "$(head -n 1 "$TMP/timer.err")" \
-    "$(t '(结果要手动取:aca plugin run aca.remote.collect)' ' (fetch the result by hand: aca plugin run aca.remote.collect)')" >&2
+  timer on || printf '%s%s%s\n' "$(t '! 定时任务未能开启:' '! the timer did not turn on: ')" "$(head -n 1 "$TMP/timer.err")" \
+    "$(t '(需要手动获取结果:aca plugin run aca.remote.collect)' ' (fetch the result by hand: aca plugin run aca.remote.collect)')" >&2
 }
 
 # 不要了:还在等的先在 server 上删掉,再删本机的
@@ -285,7 +285,7 @@ forget() {
         return 1
       }
       [ "$CODE" = 200 ] || {
-        printf '%s%s\n' "$(t "server 上没删掉($CODE):" "not deleted on the server ($CODE): ")" "$(said)" >&2
+        printf '%s%s\n' "$(t "server 上未删除($CODE):" "not deleted on the server ($CODE): ")" "$(said)" >&2
         return 1
       }
       ;;
@@ -302,8 +302,8 @@ launch_script() {
   cat <<EOF
 umask 077
 d="\$HOME/.aca-hooks"
-mkdir -p "\$d" || { echo "建不了 \$d"; exit 1; }
-command -v curl >/dev/null 2>&1 || { echo "这台机器没有 curl,回调发不出去"; exit 3; }
+mkdir -p "\$d" || { echo "无法创建 \$d"; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "这台机器没有 curl,无法发送回调"; exit 3; }
 cat > "\$d/$id.cmd" <<'$end'
 $cmd
 $end
@@ -336,28 +336,28 @@ EOF
 }
 
 within_arg() {
-  secs_of "${ACA_ARG_WITHIN:-24h}" || die "$(t "within 看不懂:${ACA_ARG_WITHIN:-}(写成 90m / 6h / 2d,0 = 不限)" "can't read within ${ACA_ARG_WITHIN:-} (write 90m / 6h / 2d; 0 = none)")"
+  secs_of "${ACA_ARG_WITHIN:-24h}" || die "$(t "无法识别 within:${ACA_ARG_WITHIN:-}(应写成 90m / 6h / 2d,0 = 不限)" "can't read within ${ACA_ARG_WITHIN:-} (write 90m / 6h / 2d; 0 = none)")"
 }
 
 cmd_run() {
   need_conf
   host=$(trim "${ACA_ARG_HOST:-}")
-  [ -n "$host" ] || die "$(t '没给机器(host)' 'no host given')"
+  [ -n "$host" ] || die "$(t '未指定机器(host)' 'no host given')"
   cmd=${ACA_ARG_COMMAND:-}
-  [ -n "$(trim "$cmd")" ] || die "$(t '没给要跑的命令' 'no command to run')"
+  [ -n "$(trim "$cmd")" ] || die "$(t '未指定要运行的命令' 'no command to run')"
   within=$(within_arg) || exit 1
   register "$host" "${ACA_ARG_NOTE:-}" "$within"
   launch_script "$ID" "$URL" "$cmd" >"$TMP/launch.sh"
   limited 40 "$TMP/launch.sh" ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$host" 'sh -s' >"$TMP/ssh.out" 2>"$TMP/ssh.err"
   if ! grep -q ACA_STARTED "$TMP/ssh.out"; then
     if [ -e "$TMP/late" ]; then
-      e=$(t 'ssh 等了 40 秒没回话' "ssh didn't answer within 40 seconds")
+      e=$(t 'ssh 在 40 秒内无响应' "ssh didn't answer within 40 seconds")
     else
       e=$(cat "$TMP/ssh.out" "$TMP/ssh.err" | grep -v '^[[:space:]]*$' | head -n 1)
     fi
     # 没跑起来:把刚登记的撤掉
     forget "$ID" 2>/dev/null
-    die "$(t "没在 $host 上跑起来:" "didn't start on $host: ")$e"
+    die "$(t "无法在 $host 上启动:" "didn't start on $host: ")$e"
   fi
   log="~/.aca-hooks/$ID.log"
   upd "$ID" --arg log "$log" '.log = $log'
@@ -374,20 +374,20 @@ cmd_new() {
   within=$(within_arg) || exit 1
   register "${ACA_ARG_HOST:-}" "${ACA_ARG_NOTE:-}" "$within"
   echo "id $ID"
-  t '任务结束时跑这一行($? 换成任务的退出码,-d 后面是想带回来的话,比如日志最后几行):' \
+  t '任务结束时运行这一行($? 替换为任务的退出码,-d 后面是要带回的内容,例如日志最后几行):' \
     'Run this line when the task ends ($? becomes the task'"'"'s exit code; after -d goes what to bring back, like the last lines of the log):'
   echo
   printf '%s\n' "curl -fsS -m 30 --retry 5 --retry-delay 60 -X POST -d \"\$(tail -n 20 $(t 日志文件 LOGFILE))\" '$URL/h/$ID?rc='\$?"
-  t '结果会作为一条消息发进这个会话,不用等。' 'The result is sent into this session as a message; no need to wait.'
+  t '结果会作为一条消息发送到这个会话,无需等待。' 'The result is sent into this session as a message; no need to wait.'
   alone
   echo
 }
 
 cmd_list() {
   tasks | jq -r --arg L "$L" --argjson now "$NOW" "$DEFS"'
-    if length == 0 then t("没有远端任务"; "no remote tasks") else map("\(.id | short)  \(what)  \(status)") | join("\n") end'
+    if length == 0 then t("暂无远端任务"; "no remote tasks") else map("\(.id | short)  \(what)  \(status)") | join("\n") end'
   if [ "$(open_count)" != 0 ] && ! scheduled; then
-    t '定时没开着:现在取一次用 aca plugin run aca.remote.collect' "the timer is off: fetch once now with aca plugin run aca.remote.collect"
+    t '定时任务未开启:如需立即获取一次,运行 aca plugin run aca.remote.collect' "the timer is off: fetch once now with aca plugin run aca.remote.collect"
     echo
   fi
 }
@@ -400,7 +400,7 @@ cmd_rows() {
 
 cmd_rm() {
   p=${ACA_ARG_ID:-}
-  case $p in '' | *[!0-9a-f]*) die "$(t "没有 $p 开头的 id" "no id starts with $p")" ;; esac
+  case $p in '' | *[!0-9a-f]*) die "$(t "没有以 $p 开头的 id" "no id starts with $p")" ;; esac
   n=0
   for f in "$D/$p"*.json; do
     [ -e "$f" ] || continue
@@ -408,13 +408,13 @@ cmd_rm() {
     hit=$(basename "$f" .json)
   done
   case $n in
-    0) die "$(t "没有 $p 开头的 id" "no id starts with $p")" ;;
+    0) die "$(t "没有以 $p 开头的 id" "no id starts with $p")" ;;
     1) ;;
-    *) die "$(t "$p 开头的有 $n 个,多写几位" "$n ids start with $p; type a few more characters")" ;;
+    *) die "$(t "以 $p 开头的 id 有 $n 个,请多输入几位" "$n ids start with $p; type a few more characters")" ;;
   esac
   what=$(q "$D/$hit.json" what)
   forget "$hit" || exit 1
-  t "已撤 $what" "removed $what"
+  t "已撤销 $what" "removed $what"
   echo
 }
 
@@ -445,7 +445,7 @@ pull() {
     jq -c --arg id "$id" '[.hooks[]? | select(.id == $id)][0] // empty' "$TMP/hooks.json" >"$TMP/r"
     if [ ! -s "$TMP/r" ]; then
       # server 上没有它了(在别处取走 / 删掉了,或者 server 的数据没了)
-      upd "$id" --arg why "$(t 'server 上没有这个 id 了' 'the server no longer has this id')" '.state = "kept" | .why = $why'
+      upd "$id" --arg why "$(t 'server 上已没有这个 id' 'the server no longer has this id')" '.state = "kept" | .why = $why'
       continue
     fi
     case $(jq -r .state "$TMP/r") in
@@ -470,12 +470,12 @@ deliver() {
   s=$(jq -r .session "$df")
   what=$(q "$df" what)
   if [ -z "$s" ]; then
-    why=$(t '登记时不在会话里' 'not registered from inside a session')
+    why=$(t '登记时不在会话中' 'not registered from inside a session')
   else
     q "$df" done_msg >"$TMP/msg"
     if send "$s" "$TMP/msg"; then
       upd "$1" '.state = "sent" | .why = ""'
-      report "$(t "$what:发给会话了" "$what: sent to the session")"
+      report "$(t "$what:已发送到会话" "$what: sent to the session")"
       return
     fi
     why=$(grep -v '^[[:space:]]*$' "$TMP/msg.err" | head -n 1)
@@ -486,16 +486,16 @@ deliver() {
         return
       fi
     else
-      why=$(t '会话已经不在了' 'the session is gone')
+      why=$(t '会话已不存在' 'the session is gone')
     fi
   fi
   upd "$1" --arg why "$why" '.state = "kept" | .why = $why'
-  report "$(t "$what:结束了,没送达($why)" "$what: ended, not delivered ($why)")"
+  report "$(t "$what:已结束,未送达($why)" "$what: ended, not delivered ($why)")"
 }
 
 cmd_collect() {
   if ! lock; then
-    t '另一个正在取,这次不取' 'another fetch is running; skipping this time'
+    t '另一次获取正在进行,本次跳过' 'another fetch is running; skipping this time'
     echo
     exit 0
   fi
@@ -507,8 +507,8 @@ cmd_collect() {
       if http GET /hooks; then
         case $CODE in
           200) pull ;;
-          401) offline=$(t 'server 不认这个口令(设置里的 token)' "the server doesn't accept this token (the token setting)") ;;
-          *) offline=$(t "server 回了 $CODE:" "the server replied $CODE: ")$(said) ;;
+          401) offline=$(t 'server 不接受这个口令(设置中的 token)' "the server doesn't accept this token (the token setting)") ;;
+          *) offline=$(t "server 返回了 $CODE:" "the server replied $CODE: ")$(said) ;;
         esac
       else
         offline=$NET
@@ -532,7 +532,7 @@ cmd_collect() {
           report "$(q "$f" what)$(t ':失联' ': lost')"
         elif [ "$NOW" -gt $(($(jq -r '.created + .within' "$f") + LOST_KEEP)) ]; then
           http DELETE "/h/$id" >/dev/null 2>&1
-          upd "$id" --arg why "$(t '一直没回调' 'never called back')" '.state = "kept" | .why = $why'
+          upd "$id" --arg why "$(t '始终未回调' 'never called back')" '.state = "kept" | .why = $why'
         fi
         ;;
     esac
@@ -545,22 +545,22 @@ cmd_collect() {
   LOCKED=
   settle_timer
   if [ ! -s "$TMP/report" ] && [ -z "$offline" ]; then
-    t '取过了,没有新的' 'fetched, nothing new'
+    t '已获取,没有新结果' 'fetched, nothing new'
     echo
     return
   fi
   cat "$TMP/report"
   # 定时跑的时候断网是常事:说一句,不算失败
-  [ -z "$offline" ] || printf '%s%s\n' "$(t '这次没取到:' 'nothing fetched this time: ')" "$offline"
+  [ -z "$offline" ] || printf '%s%s\n' "$(t '本次未获取到:' 'nothing fetched this time: ')" "$offline"
 }
 
 # 先问 /ping(不要口令,新的 jobhook 报出名字和版本),再拿管理口令列一次它那边还没取走的:连得上、口令对才算成
 cmd_check() {
   need_conf
-  not_it=$(t '这个地址后面是 jobhook 吗' 'is jobhook behind this address?')
-  odd=$(t '连上了,可回的不像 jobhook:' "connected, but the reply doesn't look like jobhook: ")$not_it
+  not_it=$(t '这个地址指向的是 jobhook 吗' 'is jobhook behind this address?')
+  odd=$(t '已连接,但回复不像 jobhook:' "connected, but the reply doesn't look like jobhook: ")$not_it
   http GET /ping || die "$NET"
-  [ "$CODE" = 200 ] || die "$(t "连上了,可它回的是 $CODE:" "connected, but it replied $CODE: ")$not_it"
+  [ "$CODE" = 200 ] || die "$(t "已连接,但返回了 $CODE:" "connected, but it replied $CODE: ")$not_it"
   jq -e '.ok == true' "$TMP/body" >/dev/null 2>&1 || die "$odd"
   ver=$(jq -r 'select(.service == "jobhook") | .version // empty' "$TMP/body" 2>/dev/null)
   http GET /hooks || die "$NET"
@@ -568,15 +568,15 @@ cmd_check() {
     200)
       n=$(jq -er '.hooks | length' "$TMP/body" 2>/dev/null) || die "$odd"
       if [ "$n" = 0 ]; then
-        t '连上了,口令也对' 'connected, and the token is right'
+        t '已连接,口令正确' 'connected, and the token is right'
       else
-        t "连上了,口令也对 · server 上有 $n 个还没取走" "connected, and the token is right · $n waiting on the server"
+        t "已连接,口令正确 · server 上有 $n 个尚未取走" "connected, and the token is right · $n waiting on the server"
       fi
       [ -z "$ver" ] || printf ' · jobhook %s' "$ver"
       echo
       ;;
-    401) die "$(t '连上了,可口令不对:要和 server 的 JOBHOOK_TOKEN 一样' 'connected, but the token is wrong: it must match the server'"'"'s JOBHOOK_TOKEN')" ;;
-    *) die "$(t "连上了,可它回的是 $CODE:" "connected, but it replied $CODE: ")$not_it" ;;
+    401) die "$(t '已连接,但口令不正确:应与 server 的 JOBHOOK_TOKEN 相同' 'connected, but the token is wrong: it must match the server'"'"'s JOBHOOK_TOKEN')" ;;
+    *) die "$(t "已连接,但返回了 $CODE:" "connected, but it replied $CODE: ")$not_it" ;;
   esac
 }
 

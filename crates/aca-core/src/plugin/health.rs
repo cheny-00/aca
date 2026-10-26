@@ -59,7 +59,7 @@ pub(crate) fn clear(plugin: &str) {
 
 fn exit_text(code: i32) -> String {
     match code {
-        127 => tr!("起不来(退出码 127:命令没找到)", "didn't start (exit code 127: command not found)"),
+        127 => tr!("无法启动(退出码 127:找不到命令)", "didn't start (exit code 127: command not found)"),
         c => tr!("退出码 {c}", "exit code {c}"),
     }
 }
@@ -138,7 +138,7 @@ fn stopped(plugin: &str, status: &serde_json::Value, now: u64) -> Vec<Problem> {
                 plugin: plugin.into(),
                 what,
                 detail: tr!(
-                    "连着失败停下了:{err}(aca plugin gateway restart {name})",
+                    "连续失败,已停止:{err}(aca plugin gateway restart {name})",
                     "failed repeatedly and stopped: {err} (aca plugin gateway restart {name})"
                 ),
                 at: now,
@@ -156,7 +156,7 @@ mod tests {
         crate::i18n::with(crate::i18n::Lang::Zh, || {
             let p = Problem { plugin: "aca.bark".into(), what: "钩子 turn.done".into(), detail: exit_text(3), at: 1000 };
             assert_eq!(p.text(1300), "钩子 turn.done 退出码 3 · 5m 前");
-            assert!(exit_text(127).contains("命令没找到"));
+            assert!(exit_text(127).contains("找不到命令"));
         });
     }
 

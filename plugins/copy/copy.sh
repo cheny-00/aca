@@ -14,7 +14,7 @@ mode=${1:-}
 case "$mode" in
   pick | list) ;;
   *)
-    say "不认识的用法:$mode" "unknown usage: $mode"
+    say "无法识别的用法:$mode" "unknown usage: $mode"
     exit 2
     ;;
 esac
@@ -39,7 +39,7 @@ src="$tmp/reply"
 if [ -n "${ACA_INPUT_FILE:-}" ]; then cat "$ACA_INPUT_FILE" > "$src" 2>/dev/null; else cat > "$src"; fi
 if ! grep -q '[^[:space:]]' "$src"; then
   if [ -z "${ACA_SESSION_ID:-}" ]; then
-    tell "$(say "这一格不是 aca 的会话" "this pane isn't an aca session")"
+    tell "$(say "当前窗格不是 aca 的会话" "this pane isn't an aca session")"
   else
     tell "$(say "这个会话还没有回复" "this session has no reply yet")"
   fi
@@ -161,10 +161,10 @@ END { if (fence != "") print "" > (dir "/open") }
 { grep '^[bl]' "$tmp/found"; grep '^i' "$tmp/found"; } > "$tmp/index"
 n=$(wc -l < "$tmp/index" | tr -d ' ')
 cut_note=""
-[ -f "$tmp/open" ] && cut_note=$(say "最后一个代码块没收尾(回复被截断了),没算进来" "the last code block is cut off (the reply was truncated) and left out")
+[ -f "$tmp/open" ] && cut_note=$(say "最后一个代码块不完整(回复被截断),已忽略" "the last code block is cut off (the reply was truncated) and left out")
 
 if [ "$n" -eq 0 ]; then
-  tell "$(say "最后一条回复里没有可复制的:没有代码块,也没有带空格的行内代码" "nothing to copy in the last reply: no code blocks, no inline code with spaces")${cut_note:+ · $cut_note}"
+  tell "$(say "最后一条回复中没有可复制的内容:没有代码块,也没有含空格的行内代码" "nothing to copy in the last reply: no code blocks, no inline code with spaces")${cut_note:+ · $cut_note}"
   exit 1
 fi
 
@@ -193,7 +193,7 @@ choose() {
   fi
   if ! command -v fzf >/dev/null 2>&1; then
     rows 0 >&2
-    printf '%s' "$(say "第几条(回车不复制):" "which one (Enter to skip): ")" >&2
+    printf '%s' "$(say "输入编号(回车取消):" "which one (Enter to skip): ")" >&2
     read -r k
     echo "$k"
     return
@@ -206,9 +206,9 @@ choose() {
   done
   # 你自己没配颜色的话用终端那 16 色:浅色深色的主题都看得清
   case "${FZF_DEFAULT_OPTS:-}" in *--color*) color="" ;; *) color="--color=16" ;; esac
-  header=$(say "数字键 / ⏎ 复制 · Esc 不复制" "digit / Enter copies · Esc cancels")
+  header=$(say "数字键 / ⏎ 复制 · Esc 取消" "digit / Enter copies · Esc cancels")
   rows 1 | fzf --ansi --delimiter='\t' --with-nth=2.. --layout=reverse --no-multi --cycle --info=hidden $color \
-    --prompt="$(say "筛 " "filter ")" --header="$header${cut_note:+ · $cut_note}" \
+    --prompt="$(say "筛选 " "filter ")" --header="$header${cut_note:+ · $cut_note}" \
     --preview="cat '$tmp'/\$(sed -n {1}p '$tmp/index' | cut -f2)" --preview-window='down,50%,wrap' \
     --bind="$keys" | cut -f1
 }
@@ -243,6 +243,6 @@ lines=$(printf '%s' "$row" | cut -f3)
 if copy "$file"; then
   tell "$(say "已复制:" "copied: ")$first"
 else
-  tell "$(say "复制不了:" "couldn't copy: ")$first"
+  tell "$(say "无法复制:" "couldn't copy: ")$first"
   exit 1
 fi

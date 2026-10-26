@@ -184,16 +184,23 @@ all.
 | | Claude | Codex |
 |---|---|---|
 | Plugin directory (skills, commands) | `--plugin-dir <dir>`; while the `[agent] auto` setting is on, the directory is a copy under `~/.local/share/aca/claude-plugins/<name>/local/` | aca puts a copy Codex understands in `~/.local/share/aca/codex-plugins/<name>/local/` (slash commands become skills: Codex has no custom slash commands); each account's `CODEX_HOME/plugins/cache/aca` links there (created once; config.toml isn't changed); launched with `-c plugins.<name>@aca.enabled=true` |
-| The plugin's MCP server | written into an `--mcp-config` file (in `~/.local/state/aca/hooks/mcp-*.json`) | `-c mcp_servers.aca-<name>={…}`, with the session id in `env` (Codex only passes allowlisted variables to MCP processes) |
-| Commands exposed to agents | the MCP server `aca` (`aca plugin tools`); tool names are `mcp__aca__<plugin>__<command>` | the same server, `-c mcp_servers.aca={…}` |
+| The plugin's MCP server | written into an `--mcp-config` file (in `~/.local/state/aca/hooks/mcp-*.json`) | a copy holding only a `.mcp.json`, `~/.local/share/aca/codex-plugins/mcp-aca-<name>/local/`, launched with `-c plugins.mcp-aca-<name>@aca.enabled=true`; the session id comes from Codex's own environment through `env_vars` (Codex only passes allowlisted variables to MCP processes) |
+| Commands exposed to agents | the MCP server `aca` (`aca plugin tools`); tool names are `mcp__aca__<plugin>__<command>` | the same server and tool names, as the copy `mcp-aca` |
 
 - `<name>` is the plugin id with dots changed to `-` (`aca.delegate` → `aca-delegate`).
 - For both agents, a plugin's MCP server runs as `aca plugin mcp <plugin id>`: aca changes to the plugin directory,
   adds the plugin's environment (settings, `ACA_SESSION_ID`) and then runs `[agent.mcp] command` in its place.
 - The Codex route depends on Codex's internal plugin cache layout, which is not a public interface. If something else is
-  already at `CODEX_HOME/plugins/cache/aca`, aca leaves it alone and only attaches the MCP server that time; the reason
-  goes to `~/.local/state/aca/plugin-logs/mount.log`. Codex has no "only enters the context when typed" for skills:
+  already at `CODEX_HOME/plugins/cache/aca`, aca leaves it alone (only a link whose target no longer exists is
+  replaced) and only attaches the MCP servers that time, as
+  `-c mcp_servers.<name>={…}` with the session id in `env`; the reason goes to
+  `~/.local/state/aca/plugin-logs/mount.log`. Codex has no "only enters the context when typed" for skills:
   a skill's name and description are always in its skill list.
+- Why MCP servers go to Codex as plugin copies and not as `-c mcp_servers.<name>={…}`: to title a conversation, Codex
+  (0.162, 0.163) starts a hidden thread with every MCP server turned off, and it does that by replacing the whole
+  `mcp_servers` table in the same layer as `-c`. A server given with `-c` loses its command there, the thread fails
+  (`invalid transport in mcp_servers.<name>`) and the conversation never gets a title. Servers from plugins aren't in
+  `mcp_servers`, so that thread leaves them alone.
 - After changing a plugin, enabling or disabling it, or changing `agents` in plugins.toml, running sessions need a
   restart to see it (Codex reads plugins and tools only at launch).
 
@@ -324,7 +331,7 @@ tools or keys, write `[plugins.user]` as usual. `aca plugin remove user` can't r
   listed on that row, and pressing it says it can't be used there. Keys that need a second press warn first. After a key
   runs, its output is shown under the list (for example, how to add back what you just removed) and the list reloads;
   `r` reloads (unless the plugin took `r`).
-- **Text on a row**: text set with `aca meta set` follows the title in the list, in grey, as `[name value]`.
+- **Text on a row**: text set with `aca meta set` follows the title in the list, in grey, as `[name value]`; a name starting with `_` shows only the value (for an icon or a number that speaks for itself).
 
 ### Output of a list view
 
@@ -332,7 +339,7 @@ tools or keys, write `[plugins.user]` as usual. `aca plugin remove user` can't r
 {
   "head": "mac.tail.ts.net\npublishing off",     // grey text above the list (can be several lines)
   "warn": "tailscale isn't logged in",           // something to notice (in the warning color)
-  "empty": "nothing mounted",                    // shown when there are no rows
+  "empty": "no mounts",                          // shown when there are no rows
   "fields": { "publish_to": "on" },              // what keys with row = false read
   "rows": [
     { "id": "https:443/", "mark": "●", "tone": "ok", "text": ":443 / → localhost:3000", "right": "listening",
@@ -397,7 +404,8 @@ One JSON object per line. Common fields: `ts` (milliseconds), `event`, `session`
 | `message.sent` | `id` (of this message) `from` `kind` (msg / notice) `what` (what a notice is about; null for other messages) `wake` `text` | a message was put in this session's inbox (`aca msg`, or a notice sent automatically by a worker it dispatched) |
 | `message.delivered` | `id` `how` (bell / queue / type / wait) | that message reached it |
 | `message.throttled` | `from` `count` `secs` | one session sent messages too often; later ones are stored without waking it |
-| `ask.answered` | `by` (who answered for it; `you` = from outside) `answer` `ask` `kind` (choice / permission; a dispatch gate is `gate`) | `aca answer` answered a confirmation for it |
+| `ask.answered` | `by` (who answered for it; `you` = from outside) `answer` `ask` `kind` (choice / permission; a confirmation shown at startup is `gate`) | `aca answer` answered a confirmation for it |
+| `limits.changed` | `tool` (claude / codex) `name` (the registered account name, else the directory's name without its dot) `dir` (the account's directory) `wins` (every window of that account: `label` 5h / 7d / Fable …, `used` percent, `resets` and `at` (when the number is from) in seconds) | an account's subscription quota moved: never on a refresh that brings the same numbers. Claude's come through the status line, Codex's when one of its turns ends. `session` is the session that reported it, empty when it wasn't started by aca; `aca limits --json` gives all accounts at once |
 
 Every event is in `~/.local/state/aca/events.jsonl`; `aca events -f` keeps reading it.
 
@@ -465,7 +473,7 @@ records (the manifest may have changed, so the numbering may not line up). So th
 ```
 
 `meta set` is how a plugin puts things in the list: names are 1–32 letters, digits, `_` or `-`; values are cut to 80
-characters; with `--ttl` it disappears on its own. `aca ls` shows it as `[name value]`; in `--json` it's under `tokens`.
+characters; with `--ttl` it disappears on its own. `aca ls` shows it as `[name value]` (only the value for a name starting with `_`); in `--json` it's under `tokens`.
 
 ## The contract (api 1)
 
@@ -532,8 +540,8 @@ They live in the repository's [`plugins/`](../plugins), are compiled into aca an
 default. `aca plugin install aca.<name>` needs no path, and a bare `[plugins."aca.core"]` (with no source) in
 plugins.toml also installs on another machine with `sync`. Installing means aca writes the compiled-in files to
 `~/.local/share/aca/first-party/<name>/` and registers them. That copy belongs to aca: when an aca upgrade changes it,
-it's rewritten the next time an agent starts, on `sync`, or when the plugins page opens (the plugins page and
-`aca plugin ls` label these "ships with aca").
+it's rewritten the next time an agent starts, on `sync`, or when the plugins page opens (the plugins page labels
+these "built-in", `aca plugin ls` "ships with aca").
 
 | Plugin | What it gives |
 |---|---|
@@ -584,7 +592,7 @@ aca plugin gateway import [--apply]  # list the MCP servers set up in individual
 ```
 
 - **In the interface**: on the plugins page (`P`), press `m` on the gateway's row to go in: one row per server
-  (running / not started / crashed, how many tools, calls in the last day, how many sessions use it); space moves a
+  (running / idle / crashed, how many tools, calls in the last day, how many sessions use it); space moves a
   `[mcps.*]` in or out, `r` restarts, `l` shows the log, `s` stops. The top of the `M` page lists the servers this
   session can see through the gateway; space turns one off or on for this session only (Claude switches at once, Codex
   after a restart). A `[mcps.*]` moved into the gateway is no longer offered a second time under "project".

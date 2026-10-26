@@ -371,7 +371,7 @@ mod tests {
         };
         for (file, docs, from, to) in [
             ("plugins.md", include_str!("../../../docs/plugins.md"), "**JSON that aca prints**", "**Names**"),
-            ("plugins.zh-CN.md", include_str!("../../../docs/plugins.zh-CN.md"), "**aca 打出来的 JSON**", "**名字**"),
+            ("plugins.zh-CN.md", include_str!("../../../docs/plugins.zh-CN.md"), "**aca 输出的 JSON**", "**命名**"),
         ] {
             let at = docs.find(from).unwrap_or_else(|| panic!("{file} 里没有 {from}"));
             let part = &docs[at..at + docs[at..].find(to).unwrap()];

@@ -2,8 +2,8 @@ id = "aca.tailnet"
 name = "Tailnet mounts"
 version = "0.3.0"
 api = 1
-description = "tailscale serve 把本机的什么挂在 tailnet 上:一行一条(目标在不在听),复制地址、撤掉、把本机一个端口挂出去;装了 tpub 还能开关发布。只管 tailnet 里的,不开公网"
-description_en = "What tailscale serve exposes from this machine on the tailnet: one row each (with whether its target is listening); copy the address, take it down, or serve a local port; with tpub installed, switch publishing on and off. Tailnet only, never the public internet."
+description = "查看 tailscale serve 的挂载:复制地址、撤销挂载、挂载本机端口;仅限 tailnet 内"
+description_en = "What tailscale serve exposes: copy an address, take one down, serve a port; tailnet only."
 
 # 整个功能在 tailnet.sh 里(sh + jq,问 tailscale / netstat / tpub),aca 里没有挂载的代码:写插件可以照着它来。
 # 露给界面(插件菜单里的「挂载」,键 m)和 agent:列出来随便用;挂端口是 agent?,你点了名才给
@@ -27,7 +27,7 @@ copy = "{url}"
 
 [[views.keys]]
 key = "x"
-title = "撤掉"
+title = "撤销"
 title_en = "Take it down"
 run = "drop"
 args = { target = "{drop}" }
@@ -35,14 +35,14 @@ confirm = true
 
 [[views.keys]]
 key = "a"
-title = "挂一个本机端口"
+title = "挂载本机端口"
 title_en = "Serve a local port"
 run = "add"
 row = false
 
 [[views.keys]]
 key = "p"
-title = "开关发布"
+title = "开启 / 关闭发布"
 title_en = "Publish on / off"
 run = "publish"
 args = { to = "{publish_to}" }
@@ -58,7 +58,7 @@ command = ["sh", "tailnet.sh", "list"]
 
 [[commands]]
 id = "add"
-title = "把本机端口挂到 tailnet"
+title = "把本机端口挂载到 tailnet"
 title_en = "Serve a local port on the tailnet"
 desc = "Mount a local port on this machine's tailnet (tailscale serve over HTTPS, same port number on the tailnet, never public) so the user can open a dev server you started from their phone or another machine. Prints the address. port: the local port."
 args = { port = "int" }
@@ -67,7 +67,7 @@ command = ["sh", "tailnet.sh", "add"]
 
 [[commands]]
 id = "drop"
-title = "撤掉一条挂载"
+title = "撤销一条挂载"
 title_en = "Take down a mount"
 args = { target = "string" }
 expose = ["cli"]
@@ -75,7 +75,7 @@ command = ["sh", "tailnet.sh", "drop"]
 
 [[commands]]
 id = "publish"
-title = "开 / 关发布(tpub)"
+title = "开启 / 关闭发布(tpub)"
 title_en = "Publishing on / off (tpub)"
 args = { to = "string" }
 expose = ["cli"]

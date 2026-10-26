@@ -22,6 +22,10 @@
 //! 上面两条路都只有 5h、7d,按模型分的周额度(Fable)只有 Claude 自己的 `/usage` 有。所以还有第三条:
 //! 一个账号有会话报来新数、离上次问过了 [`ASK_EVERY`],就在后台起 `aca limits --ask` 问 Claude 自己(见 [`ask`]),
 //! 记在 `ask-<账号>.json`,时间也是问的那一刻。
+//!
+//! 给外面的程序(比如菜单栏)用的两样,都不联网、不轮询:`aca limits --json` 打一份现在的(每个账号合好的,
+//! Codex 的读它最近的对话记录,见 [`usage::codex_now`]);数动了往事件流里写一条 `limits.changed`(见 [`announce`]),
+//! 订了它的不用隔一会儿来问一次。Codex 不过状态栏,它一轮跑完时 hook 起一个 `aca limits --codex` 看一眼。
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -40,7 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::Agent;
 use crate::overlay::{Fx, Setting};
-use crate::usage::{Quota, Source, Win, parse_ts};
+use crate::usage::{self, Quota, Source, Win, parse_ts};
 
 /// 一个会话记下的
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -66,6 +70,12 @@ pub fn dir() -> Option<PathBuf> {
 /// `aca limits [-- 命令…]`:记下这次 statusLine 交来的额度,再把原样的输入交给后面的命令,
 /// 它的输出和退出码照转。自己这边出什么错都不吭声:状态栏命令一报错,Claude Code 就把状态栏画成空的
 pub fn run(args: &[String]) -> i32 {
+    // 这两条没有输入:不读标准输入(在终端里敲 --json 时读它就卡住了)
+    match args.first().map(String::as_str) {
+        Some("--json") => return print_json(),
+        Some("--codex") => return codex_turn(),
+        _ => {}
+    }
     let mut payload = vec![];
     let _ = std::io::stdin().read_to_end(&mut payload);
     if args.first().is_some_and(|a| a == "--ask") {
@@ -140,6 +150,9 @@ pub fn record(payload: &[u8], dir: &Path, now: i64) {
     let transcript = p.transcript_path.map(PathBuf::from);
     let acct = account_dir(transcript.as_deref());
     let moved = update(&dir.join(format!("{sid}.json")), got, &acct, transcript.as_deref(), now, false);
+    if moved {
+        announce(dir, &acct);
+    }
     ask_if_due(dir, &acct, moved, now);
 }
 
@@ -171,6 +184,9 @@ fn from_mod(payload: &[u8]) -> i32 {
     if let (Some(got), Some(d)) = (got, dir()) {
         let (acct, now) = (account_dir(None), now());
         let moved = update(&d.join(format!("mod-{id}.json")), got, &acct, None, now, true);
+        if moved {
+            announce(&d, &acct);
+        }
         ask_if_due(&d, &acct, moved, now);
     }
     0
@@ -193,7 +209,6 @@ fn ask_files(dir: &Path, acct: &str) -> (PathBuf, PathBuf) {
 /// 就在后台起一个 `aca limits --ask`。这里只看锁文件的修改时间,几十个会话一起刷新也不多花什么;
 /// 一起起了好几个的,真去问的只有一个(见 [`ask`])
 fn ask_if_due(dir: &Path, acct: &str, moved: bool, now: i64) {
-    use std::os::unix::process::CommandExt;
     let (_, lock) = ask_files(dir, acct);
     let last = std::fs::metadata(&lock).and_then(|m| m.modified()).ok();
     let age = last.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| now - d.as_secs() as i64);
@@ -202,13 +217,13 @@ fn ask_if_due(dir: &Path, acct: &str, moved: bool, now: i64) {
         return;
     }
     // 自己一个进程组、不接管道:状态栏的命令等的是它自己的输出,不等这个
-    let _ = Command::new(aca_core::agent::self_exe())
-        .args(["limits", "--ask", acct])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn();
+    let _ = aca_core::proc::detach(
+        Command::new(aca_core::agent::self_exe())
+            .args(["limits", "--ask", acct])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
 }
 
 /// age = 上次问到现在几秒,没问过是 None
@@ -237,8 +252,10 @@ fn ask(acct: &str) -> i32 {
     let _ = std::fs::write(&lock, now.to_string());
     let cfg = aca_core::config::load();
     let Some(spec) = spec_of(&cfg, acct) else { return 0 };
-    if let Some(got) = asked(&cfg, &spec) {
-        update(&file, got, acct, None, self::now(), true);
+    if let Some(got) = asked(&cfg, &spec)
+        && update(&file, got, acct, None, self::now(), true)
+    {
+        announce(&dir, acct);
     }
     0
 }
@@ -320,7 +337,7 @@ fn usage_of(out: &[u8]) -> Option<Vec<Got>> {
 pub fn mod_note(cfg: &aca_core::config::Config) -> String {
     let on = cfg.names().iter().filter_map(|n| cfg.tool(n.split(':').next()?)).any(|t| t.kind == "claude" && t.mods);
     match on.then(aca_core::agent::claude_mod::verdict).flatten() {
-        Some(v) if !v.ok => t!("额度可能不是最新的", "quotas may be out of date").into(),
+        Some(v) if !v.ok => t!("额度可能不是最新数据", "quotas may be out of date").into(),
         _ => String::new(),
     }
 }
@@ -357,13 +374,13 @@ impl ModRow {
         // 自己包了一层命令:不知道里面跑的是哪一版 Claude,不带
         if !tool.cmd.is_empty() {
             return Some((
-                t!("自定义了命令", "custom command").into(),
-                t!("自定义了命令,mod 不生效", "a custom command is set; the mod has no effect").into(),
+                t!("已自定义命令", "custom command").into(),
+                t!("已自定义命令,mod 不生效", "a custom command is set; the mod has no effect").into(),
             ));
         }
         match (self.io.verdict)() {
             Some(v) if !v.ok => {
-                Some((format!("Claude {}", v.build), tr!("Claude {} 不带 mod:{}", "Claude {} won't load the mod: {}", v.build, v.why)))
+                Some((format!("Claude {}", v.build), tr!("Claude {} 未加载 mod:{}", "Claude {} won't load the mod: {}", v.build, v.why)))
             }
             _ => None,
         }
@@ -405,7 +422,7 @@ impl Setting for ModRow {
         // 开着的会话不动,新起、重启的才跟着变
         fx.say(match self.not_carried(&tool) {
             Some((_, why)) if on => why,
-            _ => t!("存了,新会话生效", "saved; new sessions use it").into(),
+            _ => t!("已保存,新会话生效", "saved; new sessions use it").into(),
         });
     }
 }
@@ -520,12 +537,21 @@ pub fn quota_for(dir: &Path, srcs: &[Source], transcript: Option<&Path>, now: i6
     quotas(dir, srcs, now).into_iter().find(|q| q.who == who)
 }
 
-/// 面板用:每个账号每个窗口取时间最新的那份(一样新的取重置更晚、用得更多的)。
+/// 一个账号合好的那份
+struct Merged {
+    /// 账号名(同计费)
+    who: String,
+    /// 账号目录(记下它的会话报的)
+    dir: String,
+    wins: Vec<RWin>,
+}
+
+/// 每个账号每个窗口取时间最新的那份(一样新的取重置更晚、用得更多的),按账号名排。
 /// 账号名跟计费的一样(按账号目录对上 srcs);顺带删掉八天没动的会话文件
-pub fn quotas(dir: &Path, srcs: &[Source], now: i64) -> Vec<Quota> {
+fn merged(dir: &Path, srcs: &[Source]) -> Vec<Merged> {
     let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
     let names = names(srcs);
-    let mut best: HashMap<String, HashMap<String, RWin>> = HashMap::new();
+    let mut best: HashMap<String, (String, HashMap<String, RWin>)> = HashMap::new();
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().is_none_or(|x| x != "json") {
@@ -537,7 +563,7 @@ pub fn quotas(dir: &Path, srcs: &[Source], now: i64) -> Vec<Quota> {
             continue;
         }
         let Some(rec) = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<Rec>(&b).ok()) else { continue };
-        let wins = best.entry(who_of(&names, &rec.dir)).or_default();
+        let (_, wins) = best.entry(who_of(&names, &rec.dir)).or_insert_with(|| (rec.dir.clone(), HashMap::new()));
         for w in rec.wins {
             let newer = |o: &RWin| (w.at, w.resets, w.used) > (o.at, o.resets, o.used);
             if wins.get(&w.label).is_none_or(newer) {
@@ -545,23 +571,140 @@ pub fn quotas(dir: &Path, srcs: &[Source], now: i64) -> Vec<Quota> {
             }
         }
     }
-    let mut out: Vec<Quota> = best
+    let mut out: Vec<Merged> = best
         .into_iter()
-        .map(|(who, m)| {
-            let mut ws: Vec<RWin> = m.into_values().collect();
-            ws.sort_by_key(|w| order(&w.label));
-            Quota {
-                agent: Agent::Claude,
-                who,
-                plan: String::new(),
-                updated: ws.iter().map(|w| w.at).max().unwrap_or(0).min(now),
-                wins: ws.into_iter().map(|w| Win { label: w.label, used: w.used, resets: w.resets }).collect(),
-                note: String::new(),
-            }
+        .map(|(who, (dir, m))| {
+            let mut wins: Vec<RWin> = m.into_values().collect();
+            wins.sort_by_key(|w| order(&w.label));
+            Merged { who, dir, wins }
         })
         .collect();
     out.sort_by(|a, b| a.who.cmp(&b.who));
     out
+}
+
+/// 面板用:每个账号合好的那份(见 [`merged`])
+pub fn quotas(dir: &Path, srcs: &[Source], now: i64) -> Vec<Quota> {
+    merged(dir, srcs)
+        .into_iter()
+        .map(|m| Quota {
+            agent: Agent::Claude,
+            who: m.who,
+            plan: String::new(),
+            updated: m.wins.iter().map(|w| w.at).max().unwrap_or(0).min(now),
+            wins: m.wins.into_iter().map(|w| Win { label: w.label, used: w.used, resets: w.resets }).collect(),
+            note: String::new(),
+        })
+        .collect()
+}
+
+// ---------- 给外面的程序:--json 和 limits.changed ----------
+
+/// 一个账号在 `--json` / `limits.changed` 里的样子:`{"tool", "name", "dir", "wins": [{"label", "used", "resets", "at"}]}`
+fn account_json(tool: &str, name: &str, dir: &str, wins: &[RWin]) -> serde_json::Value {
+    let wins: Vec<serde_json::Value> =
+        wins.iter().map(|w| serde_json::json!({ "label": w.label, "used": w.used, "resets": w.resets, "at": w.at })).collect();
+    serde_json::json!({ "tool": tool, "name": name, "dir": dir, "wins": wins })
+}
+
+/// Codex 一个账号的那份 → 窗口(同一条记录里的,时间都是它记下的那一刻)
+fn codex_wins(q: &Quota) -> Vec<RWin> {
+    q.wins.iter().map(|w| RWin { label: w.label.clone(), used: w.used, resets: w.resets, at: q.updated }).collect()
+}
+
+/// Codex 每个订阅账号现在的额度:各读最近几份对话记录的尾巴(`usage::codex_now`,不扫整个目录),
+/// 用 API key 登录的不要(`usage::subscribed`)。(账号目录, 那份)
+fn codex_all(accounts: &[(Agent, String, String)], home: &str) -> Vec<(PathBuf, Quota)> {
+    usage::sources(accounts, home)
+        .into_iter()
+        .filter(|s| s.agent == Agent::Codex)
+        .filter_map(|s| {
+            let q = usage::codex_now(&s)?;
+            Some((s.dir, usage::subscribed(vec![q], accounts, home).pop()?))
+        })
+        .collect()
+}
+
+/// `aca limits --json`:现在每个账号的额度,一个 JSON 打在标准输出(`{"now", "accounts": […]}`)。
+/// Claude 的是记下的那些合好的(同计费面板),Codex 的读它最近的对话记录。没记到过的账号不列
+fn print_json() -> i32 {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let accounts = crate::data::accounts(&aca_core::config::load());
+    let srcs = usage::sources(&accounts, &home);
+    let mut out: Vec<serde_json::Value> = vec![];
+    if let Some(d) = dir() {
+        out.extend(merged(&d, &srcs).iter().map(|m| account_json("claude", &m.who, &m.dir, &m.wins)));
+    }
+    for (dir, q) in codex_all(&accounts, &home) {
+        out.push(account_json("codex", &q.who, &dir.to_string_lossy(), &codex_wins(&q)));
+    }
+    println!("{}", serde_json::json!({ "now": now(), "accounts": out }));
+    0
+}
+
+/// 一个账号上回发出去的数记在哪:`seen-<哈希>.last`(不是 .json,合的时候不会当成会话的)
+fn seen_file(dir: &Path, tool: &str, acct: &str) -> PathBuf {
+    let mut h = DefaultHasher::new();
+    tool.hash(&mut h);
+    std::fs::canonicalize(acct).unwrap_or_else(|_| PathBuf::from(acct)).hash(&mut h);
+    dir.join(format!("seen-{:016x}.last", h.finish()))
+}
+
+/// 这个账号的数跟上回发出去的比:每个窗口的名字、用了多少、什么时候重置(时间不算:数没动只是又报了一次)。
+/// 变了就记下这回的、返回 true
+fn differs(dir: &Path, tool: &str, acct: &str, wins: &[RWin]) -> bool {
+    let key: String = wins.iter().map(|w| format!("{} {} {}\n", w.label, w.used, w.resets.unwrap_or(0))).collect();
+    let file = seen_file(dir, tool, acct);
+    if std::fs::read_to_string(&file).is_ok_and(|old| old == key) {
+        return false;
+    }
+    let _ = crate::state::write_atomic(&file, &key);
+    true
+}
+
+/// Claude 一个账号刚记了一次、某个会话的数动了:合好的那份要是跟上回发出去的不一样,返回 `limits.changed` 的字段。
+/// 会话自己的数动了不一定是账号的数动了(闲着的老会话头一回报它手里的旧数,合的时候输给新的)
+fn changed(dir: &Path, srcs: &[Source], acct: &str) -> Option<serde_json::Value> {
+    let who = who_of(&names(srcs), acct);
+    let m = merged(dir, srcs).into_iter().find(|m| m.who == who)?;
+    differs(dir, "claude", acct, &m.wins).then(|| account_json("claude", &m.who, &m.dir, &m.wins))
+}
+
+/// 事件是哪个会话报的:aca 起的会话环境里有 `ACA_SESSION_ID`,状态栏、mod、hook 起的子进程都带着;别的是空的
+fn reporter() -> String {
+    std::env::var("ACA_SESSION_ID").ok().filter(|id| plain(id)).unwrap_or_default()
+}
+
+/// 记完一次、这个会话的数动了(状态栏每 10 秒刷新一次,数没动的根本走不到这里):账号合好的那份也变了,
+/// 往事件流写一条 `limits.changed`。同 hook:出什么错都不吭声
+fn announce(dir: &Path, acct: &str) {
+    // 测试里写的是假账号,别发到真的事件流里
+    if cfg!(test) {
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let srcs = usage::sources(&crate::data::accounts(&aca_core::config::load()), &home);
+    if let Some(data) = changed(dir, &srcs, acct) {
+        aca_core::event::emit("limits.changed", &reporter(), data);
+    }
+}
+
+/// `aca limits --codex`:Codex 一轮跑完时 hook 在后台起的(Codex 不过状态栏)。各个 Codex 账号的数跟上回发出去的比,
+/// 变了的发 `limits.changed`。同 hook:永远退出 0、一个字不写
+fn codex_turn() -> i32 {
+    let Some(dir) = dir() else { return 0 };
+    // 这一轮最后那条用量(带着额度)是 Codex 在后台写的,等它落盘
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let home = std::env::var("HOME").unwrap_or_default();
+    let accounts = crate::data::accounts(&aca_core::config::load());
+    let _ = std::fs::create_dir_all(&dir);
+    for (acct, q) in codex_all(&accounts, &home) {
+        let (acct, wins) = (acct.to_string_lossy(), codex_wins(&q));
+        if differs(&dir, "codex", &acct, &wins) {
+            aca_core::event::emit("limits.changed", &reporter(), account_json("codex", &q.who, &acct, &wins));
+        }
+    }
+    0
 }
 
 #[cfg(test)]
@@ -737,7 +880,7 @@ mod tests {
         };
         assert_eq!((row.key(), row.mark(), shown(&row).as_str()), ('m', "", "关"));
         // 开:还没起过 Claude,没验过 —— 只写开
-        assert_eq!(enter(&row), "存了,新会话生效");
+        assert_eq!(enter(&row), "已保存,新会话生效");
         assert_eq!(WROTE.with(|w| w.borrow_mut().drain(..).collect::<Vec<_>>()), ["[tools.claude] mod = true"]);
         assert_eq!(shown(&row), "开");
         // 这一版验过了,带得上:还是只写开
@@ -747,16 +890,101 @@ mod tests {
         // 这一版不带:行上标出来;关了再开,底栏说为什么
         VERDICT.with(|v| *v.borrow_mut() = verdict(false, "它交来的用量认不出了"));
         assert_eq!((shown(&row).as_str(), row.value()[1].style), ("开 · 不生效(Claude 2.1.295)", crate::theme::warn()));
-        assert_eq!(enter(&row), "存了,新会话生效");
+        assert_eq!(enter(&row), "已保存,新会话生效");
         assert_eq!(shown(&row), "关");
-        assert_eq!(enter(&row), "Claude 2.1.295 不带 mod:它交来的用量认不出了");
+        assert_eq!(enter(&row), "Claude 2.1.295 未加载 mod:它交来的用量认不出了");
         assert_eq!(
             WROTE.with(|w| w.borrow_mut().drain(..).collect::<Vec<_>>()),
             ["[tools.claude] mod = false", "[tools.claude] mod = true"]
         );
         // 工具自己包了一层命令:哪一版都不带
         TOOL.with(|t| t.borrow_mut().cmd = vec!["wrap.sh".into()]);
-        assert_eq!(shown(&row), "开 · 不生效(自定义了命令)");
+        assert_eq!(shown(&row), "开 · 不生效(已自定义命令)");
+    }
+
+    #[test]
+    fn limits_changed_goes_out_only_when_the_accounts_merged_numbers_move() {
+        let root = std::env::temp_dir().join(format!("aca-limits-changed-{}", std::process::id()));
+        let acct = root.join(".claude-sub");
+        let proj = acct.join("projects/-x");
+        std::fs::create_dir_all(&proj).unwrap();
+        let store = root.join("limits");
+        let (fresh, idle) = (proj.join("a.jsonl"), proj.join("b.jsonl"));
+        let t = |s: &str| parse_ts(s);
+        std::fs::write(&fresh, reply("2026-10-26T01:00:00Z")).unwrap();
+        std::fs::write(&idle, reply("2026-10-25T20:00:00Z")).unwrap();
+        let srcs = vec![Source { agent: Agent::Claude, who: "sub".into(), dir: acct.clone() }];
+        let acct_s = acct.to_string_lossy().into_owned();
+        let used = |v: &serde_json::Value| v["wins"].as_array().unwrap().iter().map(|w| w["used"].as_f64().unwrap()).collect::<Vec<_>>();
+
+        // 头一回:发,带着账号名、目录、每个窗口的数和时间
+        record(&payload("a", &fresh, 7.0, 48.0), &store, t("2026-10-26T01:00:05Z"));
+        let first = changed(&store, &srcs, &acct_s).unwrap();
+        assert_eq!(
+            (first["tool"].as_str(), first["name"].as_str(), first["dir"].as_str()),
+            (Some("claude"), Some("sub"), Some(acct_s.as_str()))
+        );
+        assert_eq!(used(&first), vec![7.0, 48.0]);
+        assert_eq!((first["wins"][0]["label"].as_str(), first["wins"][0]["resets"].as_i64()), (Some("5h"), Some(5000)));
+        assert_eq!(first["wins"][0]["at"].as_i64(), Some(t("2026-10-26T01:00:00Z")));
+        // 同样的数又报一次:不发
+        assert_eq!(changed(&store, &srcs, &acct_s), None);
+        // 闲着的老会话头一回报它手里的旧数:它自己的数动了,账号合好的没动 —— 不发
+        record(&payload("b", &idle, 3.0, 40.0), &store, t("2026-10-26T01:01:00Z"));
+        assert_eq!(changed(&store, &srcs, &acct_s), None);
+        // 真动了:发新的
+        record(&payload("a", &fresh, 9.0, 48.0), &store, t("2026-10-26T01:10:00Z"));
+        assert_eq!(changed(&store, &srcs, &acct_s).map(|v| used(&v)), Some(vec![9.0, 48.0]));
+        // 记上回发了什么的文件不是 .json:合的时候不会被当成一个会话
+        let q = quotas(&store, &srcs, t("2026-10-26T01:10:00Z"));
+        let seen = std::fs::read_dir(&store).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".last")).count();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!((q.len(), seen), (1, 1));
+    }
+
+    #[test]
+    fn codex_quotas_come_from_the_tail_of_its_latest_record_and_go_out_once_per_change() {
+        let home = std::env::temp_dir().join(format!("aca-limits-codex-{}", std::process::id()));
+        let day = home.join(".codex/sessions/2026/10/26");
+        std::fs::create_dir_all(&day).unwrap();
+        let rate = |used: f64, ts: &str| {
+            format!(
+                r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":{used},"window_minutes":300,"resets_at":1793000000}},"secondary":{{"used_percent":5.0,"window_minutes":10080,"resets_at":1793500000}},"plan_type":"plus"}}}}}}"#
+            ) + "\n"
+        };
+        let file = day.join("rollout-2026-10-26T01-00-00-a.jsonl");
+        std::fs::write(&file, rate(30.0, "2026-10-26T01:00:00Z") + &rate(33.0, "2026-10-26T01:05:00Z")).unwrap();
+        let h = home.to_string_lossy().into_owned();
+        // 没登记的默认目录:名字是目录名去掉点;两个窗口都是最后那条的数和时间
+        let got = codex_all(&[], &h);
+        assert_eq!(got.len(), 1);
+        let (dir, q) = &got[0];
+        let v = account_json("codex", &q.who, &dir.to_string_lossy(), &codex_wins(q));
+        let wins: Vec<(&str, f64, i64, i64)> = v["wins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| (w["label"].as_str().unwrap(), w["used"].as_f64().unwrap(), w["resets"].as_i64().unwrap(), w["at"].as_i64().unwrap()))
+            .collect();
+        let at = parse_ts("2026-10-26T01:05:00Z");
+        assert_eq!((v["tool"].as_str(), v["name"].as_str()), (Some("codex"), Some("codex")));
+        assert_eq!(wins, vec![("5h", 33.0, 1793000000, at), ("7d", 5.0, 1793500000, at)]);
+        // 一轮跑完数没变:不发;变了:发一次
+        let store = home.join("limits");
+        std::fs::create_dir_all(&store).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        assert!(differs(&store, "codex", &d, &codex_wins(q)));
+        assert!(!differs(&store, "codex", &d, &codex_wins(q)));
+        std::fs::write(&file, rate(33.0, "2026-10-26T01:05:00Z") + &rate(41.0, "2026-10-26T01:20:00Z")).unwrap();
+        let (_, q2) = codex_all(&[], &h).pop().unwrap();
+        assert!(differs(&store, "codex", &d, &codex_wins(&q2)));
+        // 同一个目录,Claude 和 Codex 记的是两份
+        assert!(differs(&store, "claude", &d, &codex_wins(&q2)));
+        // 用 API key 登录的:没有订阅额度,不列
+        std::fs::write(home.join(".codex/auth.json"), r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-x"}"#).unwrap();
+        let none = codex_all(&[], &h);
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]

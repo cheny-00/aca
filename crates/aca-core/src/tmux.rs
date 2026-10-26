@@ -22,7 +22,7 @@ pub fn cmd() -> Command {
 
 /// 跑一条,成了给标准输出,不成给 tmux 说的那句
 pub fn run<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Res<String> {
-    let o = cmd().args(args).output().map_err(|e| tr!("tmux 起不来:{e}", "can't run tmux: {e}"))?;
+    let o = cmd().args(args).output().map_err(|e| tr!("无法启动 tmux:{e}", "can't run tmux: {e}"))?;
     if o.status.success() {
         Ok(String::from_utf8_lossy(&o.stdout).into_owned())
     } else {
@@ -299,7 +299,7 @@ pub fn paste(pane: &str, text: &str) -> Res<()> {
     if in_mode() {
         let _ = run(&["copy-mode", "-q", "-t", pane]);
         if in_mode() {
-            return Err(t!("窗格停在 tmux 模式里", "the pane is in a tmux mode").into());
+            return Err(t!("窗格处于 tmux 模式", "the pane is in a tmux mode").into());
         }
     }
     let buf = format!("aca-{}", std::process::id());

@@ -81,6 +81,8 @@ pub struct Fx {
     pub copy: Option<String>,
     /// 跑一个插件的能力 / 视图 / 窗格(见 caps.rs):在后台跑,不占 `job`
     pub plugin: Option<crate::caps::Req>,
+    /// 这层关了之后,当作在主列表上按了这个键(`:` 面板里挑的 aca 动作)
+    pub key: Option<KeyEvent>,
 }
 
 impl Fx {

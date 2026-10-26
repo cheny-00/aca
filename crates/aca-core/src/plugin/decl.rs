@@ -87,7 +87,9 @@ pub fn wants() -> Res<BTreeMap<String, Want>> {
 }
 
 fn parse_decl(text: &str) -> Res<BTreeMap<String, Want>> {
-    toml::from_str::<File>(text).map(|f| f.plugins).map_err(|e| tr!("plugins.toml 读不懂:{}", "can't parse plugins.toml: {}", e.message()))
+    toml::from_str::<File>(text)
+        .map(|f| f.plugins)
+        .map_err(|e| tr!("无法解析 plugins.toml:{}", "can't parse plugins.toml: {}", e.message()))
 }
 
 /// 一个插件在 plugins.toml 里的那一段;没写 / 文件坏了 = 默认的(开着、全给、没有设置)
@@ -258,7 +260,7 @@ const HEADER: &str = "\
 
 /// 只有自己能读:插件的设置里有口令(webhook 地址、server 的 token)
 fn write_decl(text: &str) -> Res<()> {
-    paths::write_private(&decl_file(), text).map_err(|e| tr!("写不了 plugins.toml:{e}", "can't write plugins.toml: {e}"))
+    paths::write_private(&decl_file(), text).map_err(|e| tr!("无法写入 plugins.toml:{e}", "can't write plugins.toml: {e}"))
 }
 
 /// 还没有 plugins.toml:照登记表写一份(之前用 link / install 装的那些)
@@ -342,8 +344,12 @@ pub fn lock(id: &str, commit: Option<&str>) -> Res<()> {
         None => all.remove(id),
     };
     let l = Lock { plugins: all.into_iter().map(|(k, commit)| (k, Locked { commit })).collect() };
-    let text = format!("# aca plugin sync 照这里的提交装;aca plugin update 会改它。不用手改\n{}", toml::to_string(&l).unwrap_or_default());
-    paths::write_atomic(&lock_file(), &text).map_err(|e| tr!("写不了 plugins.lock:{e}", "can't write plugins.lock: {e}"))
+    let text = tr!(
+        "# aca plugin sync 按这里记录的提交安装;aca plugin update 会更新它。无需手动修改\n{}",
+        "# aca plugin sync installs the commits recorded here; aca plugin update updates them. No need to edit by hand\n{}",
+        toml::to_string(&l).unwrap_or_default()
+    );
+    paths::write_atomic(&lock_file(), &text).map_err(|e| tr!("无法写入 plugins.lock:{e}", "can't write plugins.lock: {e}"))
 }
 
 #[cfg(test)]

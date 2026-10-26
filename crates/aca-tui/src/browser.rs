@@ -99,7 +99,7 @@ impl Pick {
     fn with(title: &str, link: Link, far: bool, browsers: Vec<Item>, open: fn(&How, &str) -> Result<(), String>) -> Pick {
         let mut items = vec![Item { label: t!("复制链接", "copy the link").into(), how: How::Copy }];
         if let Some(code) = &link.code {
-            items.push(Item { label: tr!("复制一次性码 {code}", "copy the one-time code {code}"), how: How::CopyCode });
+            items.push(Item { label: tr!("复制验证码 {code}", "copy the one-time code {code}"), how: How::CopyCode });
         }
         items.extend(browsers);
         Pick { title: title.to_string(), link, far, items, sel: 0, open }
@@ -113,7 +113,7 @@ impl Pick {
             how => {
                 return match (self.open)(how, &self.link.url) {
                     Ok(()) => {
-                        fx.say(tr!("已在 {} 打开 · 登完回终端", "opened in {} · log in, then back to the terminal", it.label));
+                        fx.say(tr!("已在 {} 打开 · 登录后返回终端", "opened in {} · log in, then back to the terminal", it.label));
                         Flow::Close
                     }
                     Err(e) => {
@@ -132,11 +132,16 @@ impl Pick {
     fn hint(&self) -> Option<&'static str> {
         if self.link.code.is_some() {
             return Some(t!(
-                "哪台设备都行:打开链接登录,再输入上面的码(15 分钟内有效)",
+                "可在任意设备上打开链接登录,并输入上方验证码(15 分钟内有效)",
                 "any device: open the link, log in, enter the code above (15 minutes)"
             ));
         }
-        self.far.then(|| t!("到别的设备上打开链接登录,网页给的码贴回下面的终端", "open the link on another device, log in, paste the page's code below"))
+        self.far.then(|| {
+            t!(
+                "在其他设备上打开链接登录,将网页上的验证码粘贴到下方终端",
+                "open the link on another device, log in, paste the page's code below"
+            )
+        })
     }
 }
 
@@ -341,7 +346,7 @@ fn launch(how: &How, url: &str) -> Result<(), String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| tr!("开不了({}):{e}", "couldn't open it ({}): {e}", argv[0]))?;
+        .map_err(|e| tr!("无法打开({}):{e}", "couldn't open it ({}): {e}", argv[0]))?;
     std::thread::spawn(move || child.wait());
     Ok(())
 }
@@ -349,8 +354,8 @@ fn launch(how: &How, url: &str) -> Result<(), String> {
 fn wait(cmd: &mut Command) -> Result<(), String> {
     match cmd.output() {
         Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(tr!("开不了:{}", "couldn't open it: {}", String::from_utf8_lossy(&o.stderr).trim())),
-        Err(e) => Err(tr!("开不了:{e}", "couldn't open it: {e}")),
+        Ok(o) => Err(tr!("无法打开:{}", "couldn't open it: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Err(tr!("无法打开:{e}", "couldn't open it: {e}")),
     }
 }
 
@@ -370,15 +375,15 @@ impl Overlay for Pick {
 
     fn lines(&self, w: usize) -> Vec<Line<'static>> {
         let title = if self.far {
-            t!("在手机 / 别的电脑上登录", "Log in on your phone / another computer")
+            t!("在手机或其他电脑上登录", "Log in on your phone / another computer")
         } else {
-            t!("登录链接怎么开?", "How to open the login link?")
+            t!("如何打开登录链接?", "How to open the login link?")
         };
-        let mut out = vec![kit::modal_title(title, theme::accent(), kit::esc_hint(t!("先不开", "not now")), w), Line::raw("")];
+        let mut out = vec![kit::modal_title(title, theme::accent(), kit::esc_hint(t!("暂不打开", "not now")), w), Line::raw("")];
         out.push(Line::styled(kit::clip(&self.title, w).trim_end().to_string(), kit::dim()));
         out.push(Line::styled(kit::clip(&short(&self.link.url), w).trim_end().to_string(), kit::dim()));
         if let Some(code) = &self.link.code {
-            out.push(Line::from(vec![Span::raw(t!("一次性码  ", "one-time code  ")), Span::styled(code.clone(), kit::key_style())]));
+            out.push(Line::from(vec![Span::raw(t!("验证码  ", "one-time code  ")), Span::styled(code.clone(), kit::key_style())]));
         }
         if let Some(h) = self.hint() {
             out.extend(crate::setup::fold(h, w).into_iter().map(|l| Line::styled(l, kit::dim())));
@@ -394,7 +399,7 @@ impl Overlay for Pick {
             out.push(kit::picked(line, w, i == self.sel));
         }
         out.push(Line::raw(""));
-        out.push(kit::keys_line(&[("⏎", t!("选定", "select"))], vec![], w));
+        out.push(kit::keys_line(&[("⏎", t!("选择", "select"))], vec![], w));
         out
     }
 
@@ -402,7 +407,7 @@ impl Overlay for Pick {
         let n = self.items.len();
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                fx.say(t!("没开 · 链接还在登录终端里", "not opened · the link is still in the login terminal"));
+                fx.say(t!("未打开 · 链接仍在登录终端中", "not opened · the link is still in the login terminal"));
                 Flow::Close
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -438,7 +443,7 @@ mod tests {
     /// 开 Zen 会失败,别的都开得了
     fn fake(how: &How, _: &str) -> Result<(), String> {
         match how {
-            How::App(p) if p.contains("Zen") => Err("开不了:Zen 坏了".into()),
+            How::App(p) if p.contains("Zen") => Err("无法打开:Zen 坏了".into()),
             _ => Ok(()),
         }
     }
@@ -474,7 +479,7 @@ mod tests {
         shows(
             &rows,
             &[
-                "登录链接怎么开?",
+                "如何打开登录链接?",
                 "登录 Claude Code · ding",
                 "claude.com/cai/oauth/authorize?…",
                 "1  复制链接",
@@ -503,19 +508,19 @@ mod tests {
         assert_eq!((f, fx.copy.as_deref()), (Flow::Close, Some(URL)));
         let mut p = pick();
         let (f, fx) = press(&mut p, KeyCode::Char('3'));
-        assert_eq!((f, fx.flash.as_deref()), (Flow::Close, Some("已在 Safari 打开 · 登完回终端")));
+        assert_eq!((f, fx.flash.as_deref()), (Flow::Close, Some("已在 Safari 打开 · 登录后返回终端")));
         // 开不了:说为什么,表留着
         let (f, fx) = press(&mut p, KeyCode::Char('4'));
-        assert_eq!((f, fx.flash.as_deref()), (Flow::Stay, Some("开不了:Zen 坏了")));
+        assert_eq!((f, fx.flash.as_deref()), (Flow::Stay, Some("无法打开:Zen 坏了")));
         // ↓ 回车 = 第二个
         let mut p = pick();
         press(&mut p, KeyCode::Down);
-        assert_eq!(press(&mut p, KeyCode::Enter).1.flash.as_deref(), Some("已在 Google Chrome(默认) 打开 · 登完回终端"));
+        assert_eq!(press(&mut p, KeyCode::Enter).1.flash.as_deref(), Some("已在 Google Chrome(默认) 打开 · 登录后返回终端"));
         assert_eq!(press(&mut pick(), KeyCode::Char('c')).1.copy.as_deref(), Some(URL));
         // 没有的号:不动
         assert_eq!(press(&mut pick(), KeyCode::Char('9')).0, Flow::Stay);
         let (f, fx) = press(&mut pick(), KeyCode::Esc);
-        assert!(f == Flow::Close && fx.flash.is_some_and(|m| m.contains("链接还在登录终端里")) && fx.copy.is_none());
+        assert!(f == Flow::Close && fx.flash.is_some_and(|m| m.contains("链接仍在登录终端中")) && fx.copy.is_none());
     }
 
     #[test]
@@ -523,12 +528,12 @@ mod tests {
         // Claude 远程:要贴码的链接,只有复制
         let p = Pick::with("登录 Claude Code · ding", link(URL, None), true, vec![], fake);
         let rows = text(&p, 60);
-        shows(&rows, &["在手机 / 别的电脑上登录", "1  复制链接", "网页给的码贴回下面的终端"]);
+        shows(&rows, &["在手机或其他电脑上登录", "1  复制链接", "将网页上的验证码粘贴到下方终端"]);
         assert_eq!(p.items.len(), 1);
         // Codex 设备码:码写在表上,链接和码都能复制,复制了一样表还留着
         let mut p = Pick::with("登录 Codex · px", link("https://auth.openai.com/codex/device", Some("AB12-CD3EF")), true, vec![], fake);
         let rows = text(&p, 60);
-        shows(&rows, &["auth.openai.com/codex/device", "一次性码  AB12-CD3EF", "1  复制链接", "2  复制一次性码 AB12-CD3EF", "15 分钟内有效"]);
+        shows(&rows, &["auth.openai.com/codex/device", "验证码  AB12-CD3EF", "1  复制链接", "2  复制验证码 AB12-CD3EF", "15 分钟内有效"]);
         let (f, fx) = press(&mut p, KeyCode::Char('2'));
         assert_eq!((f, fx.copy.as_deref()), (Flow::Stay, Some("AB12-CD3EF")));
         let (f, fx) = press(&mut p, KeyCode::Enter);

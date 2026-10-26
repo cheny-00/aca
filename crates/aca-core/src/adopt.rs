@@ -93,7 +93,7 @@ fn registered(store: &Store, id: &str) -> Option<Session> {
 /// 「接管哪个」→ (tmux 会话号, 指名的那一格)。认:`%窗格号`、`$会话号`、会话名、会话名里的一段(只对上一个时)
 fn locate<'a>(panes: &'a [Pane], target: &str) -> Res<(&'a str, Option<&'a Pane>)> {
     if target.starts_with('%') {
-        let p = panes.iter().find(|p| p.pane == target).ok_or_else(|| tr!("tmux 里没有 {target} 这一格", "no pane {target} in tmux"))?;
+        let p = panes.iter().find(|p| p.pane == target).ok_or_else(|| tr!("tmux 中没有窗格 {target}", "no pane {target} in tmux"))?;
         return Ok((&p.sid, Some(p)));
     }
     let exact = panes.iter().find(|p| p.sid == target || p.session == target);
@@ -104,12 +104,12 @@ fn locate<'a>(panes: &'a [Pane], target: &str) -> Res<(&'a str, Option<&'a Pane>
     hits.dedup_by_key(|p| p.sid.as_str());
     match hits.as_slice() {
         [] => Err(tr!(
-            "tmux 里没有 {target} 这个会话(aca adopt 不带参数列出能接管的)",
+            "tmux 中没有会话 {target}(不带参数运行 aca adopt 可列出能接管的会话)",
             "no tmux session {target} (aca adopt with no arguments lists what can be adopted)"
         )),
         [one] => Ok((&one.sid, None)),
         many => Err(tr!(
-            "{target} 对上了 {} 个会话:{},写长一点",
+            "{target} 匹配到 {} 个会话:{},请写得更完整",
             "{target} matches {} sessions: {}; type more of it",
             many.len(),
             many.iter().map(|p| p.session.as_str()).collect::<Vec<_>>().join(t!("、", ", "))
@@ -192,7 +192,7 @@ fn draft(
     if conv.is_none() && tool != "shell" {
         notes.push(
             t!(
-                "没认出它现在是哪段对话:重启会是新的一段。知道 id 的话接管时加 --conv <id>",
+                "无法识别当前对话,重启后将开始新对话。如果知道对话 id,接管时加 --conv <id>",
                 "couldn't tell which conversation it's in: a restart starts a new one. If you know the id, adopt with --conv <id>"
             )
             .into(),
@@ -203,7 +203,7 @@ fn draft(
         (None, Some(found)) => without_known(found.clone(), known_args),
         (None, None) => {
             if extra_argv {
-                notes.push(t!("它命令行里的参数没照搬(里面有一段话,分不清哪些是参数);要每次启动都带的,接管时写在 -- 后面", "its command-line arguments weren't copied (they contain a message, so it can't tell which are arguments); for arguments on every start, put them after -- when adopting").into());
+                notes.push(t!("未沿用它的命令行参数(其中有一段文字,无法区分哪些是参数);需要每次启动都带的参数,接管时写在 -- 后面", "its command-line arguments weren't copied (they contain a message, so it can't tell which are arguments); for arguments on every start, put them after -- when adopting").into());
             }
             vec![]
         }
@@ -232,16 +232,16 @@ fn plan_in(store: &Store, cfg: &Config, w: &World, target: &str, opts: &Opts) ->
     let (sid, named) = locate(&w.panes, target)?;
     let all = panes_of(&w.panes, sid);
     if let Some(p) = all.iter().find(|p| !p.id.is_empty() && registered(store, &p.id).is_some()) {
-        return Err(tr!("「{}」已经是 aca 的会话了({})", "“{}” is already an aca session ({})", p.session, p.id));
+        return Err(tr!("「{}」已是 aca 会话({})", "“{}” is already an aca session ({})", p.session, p.id));
     }
     // agent 在哪一格:指名的那格;没指名就是头一个认得出 agent 的,都认不出就是第一格
     let found = |p: &Pane| if p.dead { None } else { proc::agent_at(&w.kids, p.pid) };
     let pane = named
         .or_else(|| all.iter().copied().find(|p| found(p).is_some()))
         .or(all.first().copied())
-        .ok_or(t!("这个会话里没有窗格", "this session has no panes"))?;
+        .ok_or(t!("该会话中没有窗格", "this session has no panes"))?;
     if pane.dead {
-        return Err(tr!("{} 那一格的程序已经退了,没有可以接管的", "the program in pane {} has exited; nothing to adopt", pane.pane));
+        return Err(tr!("窗格 {} 中的程序已退出,无法接管", "the program in pane {} has exited; nothing to adopt", pane.pane));
     }
     let running = found(pane);
     let mut notes = vec![];
@@ -251,7 +251,7 @@ fn plan_in(store: &Store, cfg: &Config, w: &World, target: &str, opts: &Opts) ->
         None => (running.map_or("shell", |r| r.0).to_string(), None),
     };
     if opts.spec.is_empty() && running.is_none() {
-        notes.push(t!("没认出里面跑的是哪家 agent,登记成了 shell;是别的话放手(aca release)再接管,加 --as 工具[:账号]", "couldn't tell which agent runs inside, so it's registered as a shell; if it's something else, let go (aca release) and adopt again with --as TOOL[:ACCOUNT]").into());
+        notes.push(t!("无法识别其中运行的 agent,已登记为 shell;如果不对,先移出 aca(aca release)再接管,并加上 --as 工具[:账号]", "couldn't tell which agent runs inside, so it's registered as a shell; if it's something else, let go (aca release) and adopt again with --as TOOL[:ACCOUNT]").into());
     }
     let (agent, def) = agent::resolve(cfg, &tool)?;
     let pid = running.map_or(pane.pid, |r| r.1);
@@ -299,15 +299,15 @@ fn plan_in(store: &Store, cfg: &Config, w: &World, target: &str, opts: &Opts) ->
     }
     if let Some(r) = &record {
         notes.push(tr!(
-            "agent-deck 那边还登记着它,接管后在那边会显示成停了:别在那边再启动(会对同一段对话再起一个),用不着了就删掉:agent-deck -p {} remove {}", "agent-deck still has it registered and will show it as stopped: don't start it there again (that would start a second copy of the same conversation); once you don't need it, remove it: agent-deck -p {} remove {}",
+            "agent-deck 中仍登记着它,接管后在 agent-deck 中会显示为已停止:不要在 agent-deck 中再次启动(会为同一对话再启动一个),不再需要时可删除:agent-deck -p {} remove {}", "agent-deck still has it registered and will show it as stopped: don't start it there again (that would start a second copy of the same conversation); once you don't need it, remove it: agent-deck -p {} remove {}",
             r.profile, r.s.id
         ));
     }
     if tool != "shell" && hooked.is_none() {
         notes.push(
             match import::agent_deck_hook(&s.id) {
-                Some(_) => t!("重启之前「跑完没看」借 agent-deck 的 hook 记的;重启一次(aca restart,接着原来的对话)就带上 aca 自己的 hook 了", "until a restart, “finished, unread” comes from agent-deck's hooks; restart once (aca restart, the conversation continues) and it carries aca's own hooks"),
-                None => t!("重启之前状态只靠读屏幕(没有「跑完没看」);重启一次(aca restart,接着原来的对话)就带上 hook 了", "until a restart, state comes only from reading the screen (no “finished, unread”); restart once (aca restart, the conversation continues) and it carries the hooks"),
+                Some(_) => t!("重启前「未读」由 agent-deck 的 hook 记录;重启一次(aca restart,继续原对话)后改用 aca 自己的 hook", "until a restart, “finished, unread” comes from agent-deck's hooks; restart once (aca restart, the conversation continues) and it carries aca's own hooks"),
+                None => t!("重启前状态只能通过读取屏幕判断(没有「未读」);重启一次(aca restart,继续原对话)后即可使用 hook", "until a restart, state comes only from reading the screen (no “finished, unread”); restart once (aca restart, the conversation continues) and it carries the hooks"),
             }
             .into(),
         );
@@ -380,7 +380,7 @@ pub fn apply(store: &Store, p: &Plan) -> Res<(Session, String)> {
         }
         a.extend(opt.iter().map(|x| x.to_string()));
     }
-    tmux::run(&a).map_err(|e| tr!("tmux 上记不了:{e}", "can't mark it in tmux: {e}"))?;
+    tmux::run(&a).map_err(|e| tr!("无法在 tmux 中记录:{e}", "can't mark it in tmux: {e}"))?;
     tmux::bind_detach();
     if !p.known
         && let Err(e) = by_dir(store, &mut s).and_then(|()| store.insert(&s))
@@ -532,7 +532,7 @@ mod tests {
         let (s, notes) = draft(&mine, "claude", "sub".into(), &Live::default(), &known, true, None, &Opts::default());
         assert_eq!((s.title.as_str(), s.title_locked, s.group.as_str(), s.conv.as_str()), ("修登录", true, "", ""));
         // 没认出对话、参数没敢搬:都说一声
-        assert!(notes.iter().any(|n| n.contains("--conv")) && notes.iter().any(|n| n.contains("没照搬")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("--conv")) && notes.iter().any(|n| n.contains("未沿用")), "{notes:?}");
         for machine in ["0", "agentdeck_iron-dune_92cb"] {
             let (s, _) = draft(&pane("$3", machine, "%3", 1), "claude", String::new(), &quiet, &known, false, None, &Opts::default());
             assert_eq!((s.title.as_str(), s.title_locked), (machine, false));

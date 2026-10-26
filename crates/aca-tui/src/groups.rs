@@ -41,11 +41,12 @@ pub fn renamed(g: &str, from: &str, to: &str) -> Option<String> {
 }
 
 /// 改分组的路径(`aca group rename`、分组上 `r`):登记表里的组和会话,连界面记着组名的
-/// (工作区里记的组、视图里在看的组和折起来的)一起改。返回挪了几个会话
+/// (工作区里记的组、视图里在看的组和折起来的、便签)一起改。返回挪了几个会话
 pub fn rename_all(store: &Store, from: &str, to: &str) -> Res<usize> {
     let n = store.group_rename(from, to)?;
-    // 界面记的没改上不算失败:最多是这个组回到默认的工作区、折着的展开
+    // 界面记的没改上不算失败:最多是这个组回到默认的工作区、折着的展开、便签留在原来的名字下
     let _ = crate::spaces::Spaces::open(crate::spaces::Spaces::default_path()).rename_group(crate::data::REGISTERED, from, to);
+    let _ = crate::notes::Notes::open(crate::notes::Notes::default_path()).rename_group(from, to);
     if let Some(p) = crate::state::state_file("view") {
         let mut v = crate::state::View::load(&p);
         if v.rename_group(from, to) {
@@ -70,9 +71,9 @@ impl Act {
     /// 跑的时候底栏显示的
     pub fn doing(&self) -> String {
         match self {
-            Act::Create { group } => tr!("正在建分组 {group}…", "creating group {group}…"),
-            Act::Delete { group, .. } => tr!("正在删分组 {group}…", "deleting group {group}…"),
-            Act::Edit { group, .. } => tr!("正在改分组 {group}…", "changing group {group}…"),
+            Act::Create { group } => tr!("正在创建分组 {group}…", "creating group {group}…"),
+            Act::Delete { group, .. } => tr!("正在删除分组 {group}…", "deleting group {group}…"),
+            Act::Edit { group, .. } => tr!("正在修改分组 {group}…", "changing group {group}…"),
         }
     }
 
@@ -106,7 +107,7 @@ pub fn job(a: &Act) -> Outcome {
         // 建好了不另说(新建会话的框正开着);没建成照实说
         Act::Create { group } => match Store::open().and_then(|s| s.group_create(group, "")) {
             Ok(()) => Outcome::Done(String::new()),
-            Err(e) => Outcome::Failed(tr!("建分组失败:{e}", "creating the group failed: {e}")),
+            Err(e) => Outcome::Failed(tr!("创建分组失败:{e}", "creating the group failed: {e}")),
         },
     }
 }
@@ -114,7 +115,7 @@ pub fn job(a: &Act) -> Outcome {
 /// 删分组:先把要删的照原样记成回收站的一条,再归档会话(各等各的进程退干净,一起等),都停下了才删分组的登记。
 /// 有没停下的:分组留着,那几个不算进这一条(它们还在组里列着),照实说
 fn delete(profile: &str, group: &str) -> Outcome {
-    let failed = |e: String| Outcome::Failed(tr!("删分组失败:{e}", "deleting the group failed: {e}"));
+    let failed = |e: String| Outcome::Failed(tr!("删除分组失败:{e}", "deleting the group failed: {e}"));
     let store = match Store::open() {
         Ok(s) => s,
         Err(e) => return failed(e),
@@ -124,10 +125,10 @@ fn delete(profile: &str, group: &str) -> Outcome {
         .unwrap_or_default()
         .into_iter()
         .filter(|g| within(&g.path, group))
-        .map(|g| GroupRec { path: g.path, order: g.order, dir: g.default_path, space: None })
+        .map(|g| GroupRec { path: g.path, order: g.order, dir: g.default_path, space: None, note: String::new() })
         .collect();
     if groups.is_empty() {
-        return Outcome::Done(tr!("分组 {group} 本来就没有了", "group {group} was already gone"));
+        return Outcome::Done(tr!("分组 {group} 已不存在", "group {group} was already gone"));
     }
     let sessions = match store.sessions(true) {
         Ok(v) => v.into_iter().filter(|s| within(&s.group, group)).collect::<Vec<_>>(),
@@ -162,7 +163,7 @@ fn delete(profile: &str, group: &str) -> Outcome {
     };
     if let Some((_, e)) = stuck.first() {
         item.groups.clear();
-        let msg = tr!("{} 个会话没删掉,分组留着:{e}", "{} sessions weren't deleted, the group stays: {e}", stuck.len());
+        let msg = tr!("{} 个会话未能删除,分组已保留:{e}", "{} sessions weren't deleted, the group stays: {e}", stuck.len());
         return if item.sessions.is_empty() { Outcome::Failed(msg) } else { Outcome::Binned { msg, item: Box::new(item) } };
     }
     if let Err(e) = store.group_drop(group) {
@@ -181,7 +182,7 @@ fn delete(profile: &str, group: &str) -> Outcome {
 fn edit(group: &str, to: &str, dir: Option<&str>) -> Outcome {
     let store = match Store::open() {
         Ok(s) => s,
-        Err(e) => return Outcome::Failed(tr!("改分组失败:{e}", "changing the group failed: {e}")),
+        Err(e) => return Outcome::Failed(tr!("修改分组失败:{e}", "changing the group failed: {e}")),
     };
     if let Some(d) = dir.filter(|d| !d.is_empty())
         && let Some(g) =
@@ -190,7 +191,7 @@ fn edit(group: &str, to: &str, dir: Option<&str>) -> Outcome {
             })
     {
         return Outcome::Failed(tr!(
-            "没改:{} 已经是分组 {} 的默认目录了",
+            "未修改:{} 已是分组 {} 的默认目录",
             "unchanged: {} is already the default directory of group {}",
             crate::create::tilde(d),
             g.path
@@ -199,19 +200,19 @@ fn edit(group: &str, to: &str, dir: Option<&str>) -> Outcome {
     let mut said = vec![];
     if to != group {
         if let Err(e) = rename_all(&store, group, to) {
-            return Outcome::Failed(tr!("改分组名失败:{e}", "renaming the group failed: {e}"));
+            return Outcome::Failed(tr!("重命名分组失败:{e}", "renaming the group failed: {e}"));
         }
-        said.push(tr!("分组 {group} 改名为 {to}", "group {group} renamed to {to}"));
+        said.push(tr!("分组 {group} 已重命名为 {to}", "group {group} renamed to {to}"));
     }
     if let Some(d) = dir {
         if let Err(e) = store.group_set_dir(to, d) {
             return Outcome::Failed(tr!(
-                "{}默认目录没改上:{e}",
+                "{}默认目录修改失败:{e}",
                 "{}default directory not changed: {e}",
-                if said.is_empty() { "" } else { t!("改了名,", "renamed, ") }
+                if said.is_empty() { "" } else { t!("已重命名,", "renamed, ") }
             ));
         }
-        let d = if d.is_empty() { t!("不记了", "forgotten").to_string() } else { crate::create::tilde(d) };
+        let d = if d.is_empty() { t!("已清除", "forgotten").to_string() } else { crate::create::tilde(d) };
         said.push(if said.is_empty() {
             tr!("分组 {to} 的默认目录:{d}", "default directory of group {to}: {d}")
         } else {
@@ -255,7 +256,7 @@ mod tests {
         let a = Act::Delete { profile: "default".into(), group: "fun/app".into() };
         assert!(a.covers("default", "fun/app") && a.covers("default", "fun/app/old"));
         assert!(!a.covers("default", "fun") && !a.covers("default", "fun/apple") && !a.covers("firm", "fun/app"));
-        assert_eq!(a.doing(), "正在删分组 fun/app…");
+        assert_eq!(a.doing(), "正在删除分组 fun/app…");
         // 撤销走回收站(见 trash.rs),不是反过来做一遍
         assert_eq!(a.undo(), None);
     }
@@ -270,7 +271,7 @@ mod tests {
         let a = Act::Edit { profile: "default".into(), group: "a".into(), to: "b/a".into(), dir: Some(("/x".into(), String::new())) };
         let back = Act::Edit { profile: "default".into(), group: "b/a".into(), to: "a".into(), dir: Some((String::new(), "/x".into())) };
         assert_eq!(a.undo(), Some(back));
-        assert_eq!(a.doing(), "正在改分组 a…");
+        assert_eq!(a.doing(), "正在修改分组 a…");
         assert!(!a.covers("default", "a"));
     }
 

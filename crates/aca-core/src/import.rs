@@ -143,9 +143,9 @@ fn read(db: &Path, cfg: &Config, live: &[String]) -> rusqlite::Result<(Groups, V
             let kind = cfg.tool(&s.tool).map(|t| t.kind);
             let located = kind.as_deref().and_then(|k| locate(cfg, k, &s.conv, &s.account));
             let skip = match &kind {
-                None => Some(tr!("config.toml 里没有 {} 这个工具", "no tool {} in config.toml", s.tool)),
+                None => Some(tr!("config.toml 中没有工具 {}", "no tool {} in config.toml", s.tool)),
                 Some(k) if !s.account.is_empty() && located.is_none() && cfg.account(k, &s.account).is_none() => {
-                    Some(tr!("[accounts.{k}] 里没有 {}", "no {} under [accounts.{k}]", s.account))
+                    Some(tr!("[accounts.{k}] 中没有 {}", "no {} under [accounts.{k}]", s.account))
                 }
                 _ => None,
             };
@@ -185,10 +185,10 @@ pub fn agent_deck(store: &Store, cfg: &Config, apply: bool, all: bool) -> Res<()
         for f in found {
             let why = match (&f.skip, store.get(&f.s.id).is_ok(), f.alive && !all) {
                 (Some(w), _, _) => Some(w.clone()),
-                (_, true, _) => Some(t!("已经搬过了", "already imported").into()),
+                (_, true, _) => Some(t!("已导入", "already imported").into()),
                 (_, _, true) => Some(
                     t!(
-                        "那边还在跑:先停掉,或者不停它直接接过来(aca adopt)",
+                        "在 agent-deck 中仍在运行:先停止,或直接接管(aca adopt)",
                         "still running there: stop it first, or take it over without stopping (aca adopt)"
                     )
                     .into(),
@@ -198,13 +198,13 @@ pub fn agent_deck(store: &Store, cfg: &Config, apply: bool, all: bool) -> Res<()
             let who = if f.s.account.is_empty() { f.s.tool.clone() } else { format!("{}:{}", f.s.tool, f.s.account) };
             let mark = match (&why, f.s.archived > 0) {
                 (Some(_), _) => t!("跳过", "skip"),
-                (None, true) => t!("搬(归档的)", "import (archived)"),
-                (None, false) => t!("搬", "import"),
+                (None, true) => t!("导入(已归档)", "import (archived)"),
+                (None, false) => t!("导入", "import"),
             };
             println!(
                 "  {mark}  {}  {who}  {}{}",
                 f.s.title,
-                if f.s.group.is_empty() { t!("(没分组)", "(no group)") } else { &f.s.group },
+                if f.s.group.is_empty() { t!("(未分组)", "(no group)") } else { &f.s.group },
                 why.as_ref().map(|w| format!("  — {w}")).unwrap_or_default()
             );
             if why.is_some() {
@@ -226,14 +226,14 @@ pub fn agent_deck(store: &Store, cfg: &Config, apply: bool, all: bool) -> Res<()
         true => println!(
             "{}",
             tr!(
-                "搬了 {took} 个,跳过 {left} 个。它们现在是停着的:aca start <id> 接着对话起来",
+                "已导入 {took} 个,跳过 {left} 个。它们目前已停止:aca start <id> 可继续对话",
                 "imported {took}, skipped {left}. They're stopped now: aca start <id> resumes the conversation"
             )
         ),
         false => println!(
             "{}",
             tr!(
-                "会搬 {took} 个,跳过 {left} 个。这只是列出来看;加 --apply 才写进 {}",
+                "将导入 {took} 个,跳过 {left} 个。以上仅为预览;加 --apply 才会写入 {}",
                 "would import {took}, skip {left}. This only lists them; add --apply to write into {}",
                 paths::db().display()
             )

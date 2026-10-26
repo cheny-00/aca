@@ -58,11 +58,11 @@ pub fn serve() -> Res<i32> {
     // 留下来的 socket 文件:连不上就是没人在听,删掉重建
     if sock.exists() {
         if UnixStream::connect(&sock).is_ok() {
-            return Err(tr!("gateway 已经在跑({})", "the gateway is already running ({})", sock.display()));
+            return Err(tr!("gateway 已在运行({})", "the gateway is already running ({})", sock.display()));
         }
         let _ = std::fs::remove_file(&sock);
     }
-    let listener = UnixListener::bind(&sock).map_err(|e| tr!("听不了 {}:{e}", "can't listen on {}: {e}", sock.display()))?;
+    let listener = UnixListener::bind(&sock).map_err(|e| tr!("无法监听 {}:{e}", "can't listen on {}: {e}", sock.display()))?;
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
@@ -306,7 +306,7 @@ impl Gw {
             found = client.names.lock().unwrap().get(&name).cloned();
         }
         let Some((down, orig)) = found else {
-            let msg = tr!("没有 {name} 这个工具", "no tool {name}");
+            let msg = tr!("没有工具 {name}", "no tool {name}");
             return client
                 .send(&json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": msg }], "isError": true } }));
         };

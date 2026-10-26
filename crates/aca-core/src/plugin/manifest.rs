@@ -233,13 +233,13 @@ pub fn hotkey_ok(k: &str) -> Res<()> {
     let chord = last.len() == 1 && last.chars().all(fits);
     if !f && !chord {
         return Err(tr!(
-            "热键要写成 tmux 的键名,带 Ctrl / Alt(C-]、M-y、C-M-y)或者 F1–F12:「{k}」",
+            "热键应写为带 Ctrl / Alt 的 tmux 键名(C-]、M-y、C-M-y)或 F1–F12:「{k}」",
             "a hotkey is a tmux key name with Ctrl / Alt (C-], M-y, C-M-y) or F1–F12: “{k}”"
         ));
     }
     if HOTKEYS_TAKEN.contains(&k.replacen("C-M-", "C-", 1).as_str()) {
         return Err(tr!(
-            "{k} 不能当热键(aca 自己的,或者终端里另有意思)",
+            "{k} 不能用作热键(已被 aca 占用,或在终端中另有含义)",
             "{k} can't be a hotkey (aca's own, or it means something to the terminal)"
         ));
     }
@@ -360,11 +360,11 @@ impl Manifest {
         match (tools, ask) {
             (0, 0) => {}
             (n, 0) => agent.push(tr!("{n} 个工具", "{n} tools")),
-            (0, k) => agent.push(tr!("{k} 个工具(要你点名才给)", "{k} tools (only if you allow them)")),
-            (n, k) => agent.push(tr!("{} 个工具({k} 个要你点名才给)", "{} tools ({k} only if you allow them)", n + k)),
+            (0, k) => agent.push(tr!("{k} 个工具(需明确允许)", "{k} tools (only if you allow them)")),
+            (n, k) => agent.push(tr!("{} 个工具({k} 个需明确允许)", "{} tools ({k} only if you allow them)", n + k)),
         }
         if !agent.is_empty() {
-            out.push(tr!("给 agent:{}", "for agents: {}", agent.join(" · ")));
+            out.push(tr!("提供给 agent:{}", "for agents: {}", agent.join(" · ")));
         }
         let mut human = vec![];
         let menu = self.actions.iter().filter(|a| a.exposed("menu")).count();
@@ -378,7 +378,7 @@ impl Manifest {
             human.push(tr!("{} 个视图", "{} views", self.views.len()));
         }
         if !human.is_empty() {
-            out.push(tr!("插件菜单:{}(会话列表上按 :)", "plugin menu: {} (press : on the session list)", human.join(" · ")));
+            out.push(tr!("插件菜单:{}(在会话列表按 :)", "plugin menu: {} (press : on the session list)", human.join(" · ")));
         }
         if !self.timers.is_empty() {
             let each: Vec<String> = self
@@ -387,7 +387,7 @@ impl Manifest {
                 .map(|x| {
                     let every = super::timer::span(x.secs());
                     if x.manual {
-                        tr!("{} 每 {every}(有活才开)", "{} every {every} (on when there's work)", x.run)
+                        tr!("{} 每 {every}(有任务时开启)", "{} every {every} (on when there's work)", x.run)
                     } else {
                         tr!("{} 每 {every}", "{} every {every}", x.run)
                     }
@@ -405,7 +405,7 @@ impl Manifest {
                 })
                 .collect();
             out.push(tr!(
-                "热键:{}(在会话里面直接按;换键:aca plugin hotkey)",
+                "热键:{}(在会话中直接按;更改:aca plugin hotkey)",
                 "hotkeys: {} (press inside a session; to change: aca plugin hotkey)",
                 keys.join(" · ")
             ));
@@ -413,11 +413,11 @@ impl Manifest {
         if !self.events.is_empty() {
             let mut on: Vec<&str> = self.events.iter().map(|h| h.on.as_str()).collect();
             on.dedup();
-            out.push(tr!("订了事件:{}", "subscribes to: {}", on.join(" ")));
+            out.push(tr!("订阅事件:{}", "subscribes to: {}", on.join(" ")));
         }
         if !self.settings.is_empty() {
             let names: Vec<&str> = self.settings.keys().map(String::as_str).collect();
-            out.push(tr!("设置:{}(装了在插件页里改)", "settings: {} (change them on the plugins page)", names.join(" ")));
+            out.push(tr!("设置:{}(安装后在插件页修改)", "settings: {} (change them on the plugins page)", names.join(" ")));
         }
         out
     }
@@ -438,7 +438,7 @@ fn found(prog: &str) -> bool {
 /// 缺了的程序,一句话(装的时候、插件页、`aca plugin check` 说)
 pub fn missing_note(missing: &[String]) -> String {
     tr!(
-        "要用到 {},这台机器上没有(PATH 里找不到):装上它才能用",
+        "需要 {},但本机未安装(PATH 中找不到):安装后才能使用",
         "needs {}, which isn't on this machine (not on PATH): install it first",
         missing.join(t!("、", ", "))
     )
@@ -450,21 +450,21 @@ pub(crate) fn id_ok(id: &str, dots: bool) -> bool {
 
 /// 读清单并检查;第二个是提醒(不拦着链接的小问题)
 pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
-    let unreadable = |e: toml::de::Error| tr!("清单读不懂:{}", "can't parse the manifest: {}", e.message());
+    let unreadable = |e: toml::de::Error| tr!("无法解析清单:{}", "can't parse the manifest: {}", e.message());
     let mut t: toml::Table = text.parse().map_err(unreadable)?;
     localize(&mut t);
     let mut m: Manifest = toml::Value::Table(t).try_into().map_err(unreadable)?;
     if !id_ok(&m.id, true) {
-        return Err(t!("清单要有 id(字母、数字、. : _ -)", "the manifest needs an id (letters, digits, . : _ -)").into());
+        return Err(t!("清单需要 id(字母、数字、. : _ -)", "the manifest needs an id (letters, digits, . : _ -)").into());
     }
     if m.name.is_empty() || m.version.is_empty() {
-        return Err(t!("清单要有 name 和 version", "the manifest needs name and version").into());
+        return Err(t!("清单需要 name 和 version", "the manifest needs name and version").into());
     }
     match m.api {
         Some(0) => return Err(t!("api 从 1 开始", "api starts at 1").into()),
         Some(n) if n > API => {
             return Err(tr!(
-                "这个插件照插件接口第 {n} 版写的,这个 aca 只认到第 {API} 版:先升级 aca",
+                "此插件使用插件接口第 {n} 版,当前 aca 只支持到第 {API} 版:请先升级 aca",
                 "this plugin is written for plugin API {n}; this aca supports up to {API}: upgrade aca"
             ));
         }
@@ -472,7 +472,7 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     }
     if !m.min_aca_version.is_empty() && newer(&m.min_aca_version, env!("CARGO_PKG_VERSION")) {
         return Err(tr!(
-            "这个插件要 aca {} 以上,现在是 {}",
+            "此插件需要 aca {} 或更高版本,当前为 {}",
             "this plugin needs aca {} or later; this is {}",
             m.min_aca_version,
             env!("CARGO_PKG_VERSION")
@@ -495,20 +495,23 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     {
         if !id_ok(id, false) {
             return Err(tr!(
-                "{what}的 id「{id}」不行(字母、数字、: _ -,不能有点)",
+                "{what}的 id「{id}」无效(只能用字母、数字、: _ -,不能含点)",
                 "{what} id “{id}” is invalid (letters, digits, : _ -, no dots)"
             ));
         }
         // 能力、窗格、视图共用一套 id:键、命令行都只拿 id 找
         if let Some(first) = seen.insert(id.clone(), what) {
             return Err(if first == what {
-                tr!("{what} {id} 写了两遍", "{what} {id} is defined twice")
+                tr!("{what} {id} 重复", "{what} {id} is defined twice")
             } else {
-                tr!("{first}和{what}都叫 {id}:能力、窗格、视图的 id 不能重", "a {first} and a {what} are both called {id}: ids are shared")
+                tr!(
+                    "{first}和{what}都叫 {id}:能力、窗格、视图的 id 不能重复",
+                    "a {first} and a {what} are both called {id}: ids are shared"
+                )
             });
         }
         if command.is_empty() {
-            return Err(tr!("{what} {id} 没写 command", "{what} {id} has no command"));
+            return Err(tr!("{what} {id} 缺少 command", "{what} {id} has no command"));
         }
     }
     let mut warn: Vec<String> = text
@@ -516,22 +519,24 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
         .map(|t| unknown_keys(&t))
         .unwrap_or_default()
         .into_iter()
-        .map(|k| tr!("清单里不认识 {k}:拼错了,还是写到了别的表底下?", "unknown key {k} in the manifest: a typo, or under the wrong table?"))
+        .map(|k| {
+            tr!("清单中有无法识别的 {k}:是否拼错,或写到了其他表下?", "unknown key {k} in the manifest: a typo, or under the wrong table?")
+        })
         .collect();
     for a in &m.actions {
         if let Some(e) = a.expose.iter().find(|e| !EXPOSE.contains(&e.as_str())) {
             return Err(tr!(
-                "动作 {} 的 expose 写了 {e},只认 menu / cli / agent / agent?",
+                "动作 {} 的 expose 值 {e} 无效,只能为 menu / cli / agent / agent?",
                 "action {} exposes {e}; only menu / cli / agent / agent?",
                 a.id
             ));
         }
         if a.exposed("agent") && a.agent_opt_in() {
-            return Err(tr!("动作 {} 的 expose 里 agent 和 agent? 只能写一个", "action {}: expose takes agent or agent?, not both", a.id));
+            return Err(tr!("动作 {} 的 expose 中 agent 和 agent? 只能写一个", "action {}: expose takes agent or agent?, not both", a.id));
         }
         if (a.exposed("agent") || a.agent_opt_in()) && (a.id.contains(':') || a.id.contains("__")) {
             return Err(tr!(
-                "动作 {} 给 agent 用:id 里不能有 : 或 __(要拿它拼 MCP 工具名)",
+                "动作 {} 提供给 agent:id 中不能含 : 或 __(会用它组成 MCP 工具名)",
                 "action {} is for agents: its id can't contain : or __ (it becomes part of an MCP tool name)",
                 a.id
             ));
@@ -539,11 +544,11 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
         let mut vars = std::collections::HashMap::new();
         for (name, ty) in &a.args {
             if !id_ok(name, false) {
-                return Err(tr!("动作 {} 的参数名「{name}」不行", "action {} has an invalid argument name “{name}”", a.id));
+                return Err(tr!("动作 {} 的参数名「{name}」无效", "action {} has an invalid argument name “{name}”", a.id));
             }
             if let Some(other) = vars.insert(var("ACA_ARG_", name), name) {
                 return Err(tr!(
-                    "动作 {} 的参数 {other} 和 {name} 交给命令时都叫 {}",
+                    "动作 {} 的参数 {other} 和 {name} 传给命令时都叫 {}",
                     "action {}: arguments {other} and {name} both become {}",
                     a.id,
                     var("ACA_ARG_", name)
@@ -551,7 +556,7 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
             }
             if !ARG_TYPES.contains(&ty.trim_end_matches('?')) {
                 return Err(tr!(
-                    "动作 {} 的参数 {name} 是 {ty},只认 string / path / int / bool(后面可以带 ?)",
+                    "动作 {} 的参数 {name} 类型为 {ty},只能为 string / path / int / bool(可加 ?)",
                     "action {} argument {name} is {ty}; only string / path / int / bool (optionally with ?)",
                     a.id
                 ));
@@ -559,7 +564,7 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
         }
         if (a.exposed("agent") || a.agent_opt_in()) && a.title.is_empty() && a.desc.is_empty() {
             warn.push(tr!(
-                "动作 {} 给 agent 用,但没写 title / desc:agent 不知道什么时候该调它",
+                "动作 {} 提供给 agent,但缺少 title / desc:agent 无法判断何时调用它",
                 "action {} is exposed to agents without a title / desc: they won't know when to use it",
                 a.id
             ));
@@ -567,14 +572,14 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     }
     for h in &m.events {
         if h.command.is_empty() {
-            return Err(tr!("事件 {} 没写 command", "event {} has no command", h.on));
+            return Err(tr!("事件 {} 缺少 command", "event {} has no command", h.on));
         }
         if !crate::event::KNOWN.iter().any(|k| crate::event::matches(&h.on, k)) {
-            warn.push(tr!("没有 {} 这个事件", "no event {}", h.on));
+            warn.push(tr!("没有事件 {}", "no event {}", h.on));
         }
         if let Some((k, _)) = h.cond.iter().find(|(_, v)| !plain(v)) {
             return Err(tr!(
-                "事件 {} 的 if 里 {k} 只能写字、数、true / false,或者它们的数组",
+                "事件 {} 的 if 中 {k} 只能为字符串、数字、true / false 或它们的数组",
                 "event {}: if.{k} takes text, a number, true / false, or an array of those",
                 h.on
             ));
@@ -583,7 +588,7 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     for p in &m.panes {
         if !matches!(p.placement.as_str(), "" | "popup" | "split" | "window") {
             return Err(tr!(
-                "窗格 {} 的 placement 写的是 {},只认 popup / split / window",
+                "窗格 {} 的 placement 值 {} 无效,只能为 popup / split / window",
                 "pane {} has placement {}; only popup / split / window",
                 p.id,
                 p.placement
@@ -594,7 +599,7 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     for (id, cs) in contexts.chain(m.views.iter().map(|v| (&v.id, &v.contexts))) {
         if let Some(c) = cs.iter().find(|c| !CONTEXTS.contains(&c.as_str())) {
             return Err(tr!(
-                "{id} 的 contexts 写了 {c},只认 session / group / global",
+                "{id} 的 contexts 值 {c} 无效,只能为 session / group / global",
                 "{id} has context {c}; only session / group / global"
             ));
         }
@@ -608,39 +613,34 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     for (id, input, cwd) in io {
         if !input.is_empty() && !INPUTS.contains(&input.as_str()) {
             return Err(tr!(
-                "{id} 的 input 写的是 {input},只认 reply / screen / scrollback",
+                "{id} 的 input 值 {input} 无效,只能为 reply / screen / scrollback",
                 "{id} has input {input}; only reply / screen / scrollback"
             ));
         }
         if !matches!(cwd.as_str(), "" | "plugin" | "session") {
-            return Err(tr!("{id} 的 cwd 写的是 {cwd},只认 plugin / session", "{id} has cwd {cwd}; only plugin / session"));
+            return Err(tr!("{id} 的 cwd 值 {cwd} 无效,只能为 plugin / session", "{id} has cwd {cwd}; only plugin / session"));
         }
     }
     for v in &m.views {
         if !v.rows && !v.keys.is_empty() {
-            return Err(tr!("视图 {} 写了 keys,可它不是列表(rows = true)", "view {} has keys but isn't a list (rows = true)", v.id));
+            return Err(tr!("视图 {} 写了 keys,但它不是列表(需 rows = true)", "view {} has keys but isn't a list (rows = true)", v.id));
         }
         let mut taken = std::collections::HashSet::new();
         for k in &v.keys {
             let one = k.key.chars().count() == 1 && !k.key.trim().is_empty();
             if !(one || k.key == "enter") {
-                return Err(tr!(
-                    "视图 {} 的键要是一个字符或者 enter:「{}」",
-                    "view {}: a key is one character or enter: “{}”",
-                    v.id,
-                    k.key
-                ));
+                return Err(tr!("视图 {} 的键应为单个字符或 enter:「{}」", "view {}: a key is one character or enter: “{}”", v.id, k.key));
             }
             if ROW_KEYS_TAKEN.contains(&k.key.as_str()) {
-                return Err(tr!("视图 {} 的键 {} 是界面自己用的", "view {}: key {} is taken by the interface", v.id, k.key));
+                return Err(tr!("视图 {} 的键 {} 已被界面占用", "view {}: key {} is taken by the interface", v.id, k.key));
             }
             if !taken.insert(&k.key) {
-                return Err(tr!("视图 {} 的键 {} 写了两遍", "view {}: key {} is bound twice", v.id, k.key));
+                return Err(tr!("视图 {} 的键 {} 重复", "view {}: key {} is bound twice", v.id, k.key));
             }
             match (k.run.is_empty(), k.copy.is_empty()) {
                 (true, true) | (false, false) => {
                     return Err(tr!(
-                        "视图 {} 的键 {} 要写 run / copy 其中一样",
+                        "视图 {} 的键 {} 需要写 run / copy 其中之一",
                         "view {}: key {} needs exactly one of run / copy",
                         v.id,
                         k.key
@@ -649,7 +649,7 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
                 (false, true) => {
                     let Some(a) = m.actions.iter().find(|a| a.id == k.run) else {
                         return Err(tr!(
-                            "视图 {} 的键 {} 要跑的 {} 不是这个插件的能力",
+                            "视图 {} 的键 {} 要运行的 {} 不是此插件的能力",
                             "view {}: key {} runs {}, which isn't a command of this plugin",
                             v.id,
                             k.key,
@@ -667,18 +667,18 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     let mut keys = std::collections::HashSet::new();
     for k in &m.keys {
         if k.key.chars().count() != 1 || k.key.trim().is_empty() {
-            return Err(tr!("[[keys]] 的 key 要是一个字符:「{}」", "a [[keys]] key is one character: “{}”", k.key));
+            return Err(tr!("[[keys]] 的 key 应为单个字符:「{}」", "a [[keys]] key is one character: “{}”", k.key));
         }
         if MENU_KEYS_TAKEN.contains(&k.key.as_str()) {
-            return Err(tr!("键 {} 是 : 菜单自己用的(筛)", "key {} is taken by the : menu (filter)", k.key));
+            return Err(tr!("键 {} 已被 : 菜单占用(用于筛选)", "key {} is taken by the : menu (filter)", k.key));
         }
         if !keys.insert(&k.key) {
-            return Err(tr!("键 {} 写了两遍", "key {} is bound twice", k.key));
+            return Err(tr!("键 {} 重复", "key {} is bound twice", k.key));
         }
         let menu = m.actions.iter().any(|a| a.id == k.run && a.exposed("menu"));
         if !menu && !m.panes.iter().any(|p| p.id == k.run) && !m.views.iter().any(|v| v.id == k.run) {
             return Err(tr!(
-                "键 {} 要跑的 {} 不是这个插件里露给菜单的能力、窗格或视图",
+                "键 {} 要运行的 {} 不是此插件在菜单中提供的能力、窗格或视图",
                 "key {} runs {}, which isn't a menu command, pane or view of this plugin",
                 k.key,
                 k.run
@@ -688,18 +688,18 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     let mut runs = std::collections::HashSet::new();
     for t in &m.timers {
         let Some(a) = m.actions.iter().find(|a| a.id == t.run) else {
-            return Err(tr!("定时要跑的 {} 不是这个插件的能力", "a timer runs {}, which isn't a command of this plugin", t.run));
+            return Err(tr!("定时任务要运行的 {} 不是此插件的能力", "a timer runs {}, which isn't a command of this plugin", t.run));
         };
         if let Some(k) = a.args.keys().find(|k| a.arg(k).is_some_and(|(_, opt)| !opt)) {
             return Err(tr!(
-                "定时跑 {} 时没人给参数,可它的参数 {k} 是必填的",
+                "定时运行 {} 时无法提供参数,但它的参数 {k} 是必填的",
                 "a timer runs {} with no arguments, but its argument {k} is required",
                 t.run
             ));
         }
         if !a.input.is_empty() || (!a.contexts.is_empty() && !a.contexts.iter().any(|c| c == "global")) {
             return Err(tr!(
-                "定时跑 {} 的时候没有会话:它不能写 input,contexts 里要有 global(或者不写)",
+                "定时运行 {} 时没有会话:它不能写 input,contexts 中需包含 global(或省略 contexts)",
                 "a timer runs {} with no session: it can't have input, and its contexts need global (or none)",
                 t.run
             ));
@@ -707,33 +707,33 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
         match super::timer::parse_every(&t.every) {
             None => {
                 return Err(tr!(
-                    "定时 {} 的 every 看不懂:「{}」(写成 30s / 10m / 2h / 1d)",
+                    "无法识别定时任务 {} 的 every:「{}」(应写为 30s / 10m / 2h / 1d)",
                     "timer {}: can't read every “{}” (write 30s / 10m / 2h / 1d)",
                     t.run,
                     t.every
                 ));
             }
             Some(s) if s < super::timer::MIN_EVERY => {
-                return Err(tr!("定时 {} 最短隔 1m", "timer {}: every is at least 1m", t.run));
+                return Err(tr!("定时任务 {} 的间隔至少为 1m", "timer {}: every is at least 1m", t.run));
             }
             Some(_) => {}
         }
         if !runs.insert(&t.run) {
-            return Err(tr!("定时 {} 写了两遍", "timer {} is defined twice", t.run));
+            return Err(tr!("定时任务 {} 重复", "timer {} is defined twice", t.run));
         }
     }
     let mut hot = std::collections::HashSet::new();
     for k in &m.hotkeys {
         hotkey_ok(&k.key)?;
         if !hot.insert(&k.key) {
-            return Err(tr!("热键 {} 写了两遍", "hotkey {} is bound twice", k.key));
+            return Err(tr!("热键 {} 重复", "hotkey {} is bound twice", k.key));
         }
         if m.hotkeys.iter().any(|o| o.run == k.run && o.key != k.key) {
-            return Err(tr!("窗格 {} 写了两个热键(一个窗格一个)", "pane {} has two hotkeys (one per pane)", k.run));
+            return Err(tr!("窗格 {} 设了两个热键(每个窗格只能有一个)", "pane {} has two hotkeys (one per pane)", k.run));
         }
         if !m.panes.iter().any(|p| p.id == k.run) {
             return Err(tr!(
-                "热键 {} 要开的 {} 不是这个插件里的窗格(热键只开窗格)",
+                "热键 {} 要打开的 {} 不是此插件的窗格(热键只能打开窗格)",
                 "hotkey {} opens {}, which isn't a pane of this plugin (hotkeys open panes only)",
                 k.key,
                 k.run
@@ -742,53 +742,53 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     }
     if let Some(r) = m.requires.iter().find(|r| !super::first_party::known(r)) {
         return Err(tr!(
-            "requires 只能写第一方插件(aca.core 这种),{r} 不是",
+            "requires 只能写第一方插件(如 aca.core),{r} 不是",
             "requires takes first-party plugins only (like aca.core); {r} isn't one"
         ));
     }
     if m.needs.iter().any(|n| n.split('|').any(|p| p.trim().is_empty())) {
-        return Err(t!("needs 里有空的程序名", "needs has an empty program name").into());
+        return Err(t!("needs 中有空的程序名", "needs has an empty program name").into());
     }
     if let Some(k) = m.settings.keys().find(|k| !id_ok(k, false)) {
-        return Err(tr!("设置名「{k}」不行(字母、数字、: _ -)", "setting name “{k}” is invalid (letters, digits, : _ -)"));
+        return Err(tr!("设置名「{k}」无效(只能用字母、数字、: _ -)", "setting name “{k}” is invalid (letters, digits, : _ -)"));
     }
     let mut vars = std::collections::HashMap::new();
     for k in m.settings.keys() {
         if let Some(other) = vars.insert(var("ACA_SETTING_", k), k) {
-            return Err(tr!("设置 {other} 和 {k} 交给命令时都叫 {}", "settings {other} and {k} both become {}", var("ACA_SETTING_", k)));
+            return Err(tr!("设置 {other} 和 {k} 传给命令时都叫 {}", "settings {other} and {k} both become {}", var("ACA_SETTING_", k)));
         }
     }
     if let Some(a) = m.agent.targets.iter().find(|a| !AGENTS.contains(&a.as_str())) {
-        return Err(tr!("[agent] for 写了 {a},只认 claude / codex", "[agent] for has {a}; only claude / codex"));
+        return Err(tr!("[agent] for 值 {a} 无效,只能为 claude / codex", "[agent] for has {a}; only claude / codex"));
     }
     if !m.agent.auto.is_empty() {
         let auto = &m.agent.auto;
         if m.agent.dir.is_empty() {
             return Err(
-                t!("[agent] auto 管的是 dir 里的命令:没写 dir", "[agent] auto is about the commands in dir: there is no dir").into()
+                t!("[agent] auto 控制的是 dir 中的命令:缺少 dir", "[agent] auto is about the commands in dir: there is no dir").into()
             );
         }
         if !m.settings.get(auto).is_some_and(|s| matches!(s.default, Some(toml::Value::Boolean(_)))) {
             return Err(tr!(
-                "[agent] auto 写的是 {auto}:要是 [settings] 里一个默认值是 true / false 的设置",
+                "[agent] auto 值 {auto} 无效:应为 [settings] 中默认值为 true / false 的设置",
                 "[agent] auto is {auto}: it has to name a setting in [settings] whose default is true / false"
             ));
         }
     }
     if let Some(mcp) = &m.agent.mcp {
         if mcp.command.is_empty() {
-            return Err(t!("[agent.mcp] 没写 command", "[agent.mcp] has no command").into());
+            return Err(t!("[agent.mcp] 缺少 command", "[agent.mcp] has no command").into());
         }
         if !matches!(mcp.via.as_str(), "" | "auto" | "direct" | "gateway") {
             return Err(tr!(
-                "[agent.mcp] via 写的是 {},只认 auto / direct / gateway",
+                "[agent.mcp] via 值 {} 无效,只能为 auto / direct / gateway",
                 "[agent.mcp] via is {}; only auto / direct / gateway",
                 mcp.via
             ));
         }
         if !matches!(mcp.scope.as_str(), "" | "shared" | "session") {
             return Err(tr!(
-                "[agent.mcp] scope 写的是 {},只认 shared / session",
+                "[agent.mcp] scope 值 {} 无效,只能为 shared / session",
                 "[agent.mcp] scope is {}; only shared / session",
                 mcp.scope
             ));
@@ -908,7 +908,7 @@ pub(crate) fn newer(a: &str, b: &str) -> bool {
 
 pub fn read_manifest(dir: &Path) -> Res<(Manifest, Vec<String>)> {
     let f = dir.join(MANIFEST);
-    let text = std::fs::read_to_string(&f).map_err(|e| tr!("读不了 {}:{e}", "can't read {}: {e}", f.display()))?;
+    let text = std::fs::read_to_string(&f).map_err(|e| tr!("无法读取 {}:{e}", "can't read {}: {e}", f.display()))?;
     if super::user::is_dir(dir) { parse_user(&text) } else { parse(&text) }
 }
 
@@ -945,10 +945,10 @@ fn localize(t: &mut toml::Table) {
 /// 你自己的那份(`~/.config/aca/user/`,见 [`super::user`]):id 总是 `user`,name、version 可以不写
 pub fn parse_user(text: &str) -> Res<(Manifest, Vec<String>)> {
     let mut t: toml::Table =
-        text.parse().map_err(|e: toml::de::Error| tr!("清单读不懂:{}", "can't parse the manifest: {}", e.message()))?;
+        text.parse().map_err(|e: toml::de::Error| tr!("无法解析清单:{}", "can't parse the manifest: {}", e.message()))?;
     let mut warn = vec![];
     if let Some(id) = t.get("id").and_then(toml::Value::as_str).filter(|id| *id != super::user::ID) {
-        warn.push(tr!("你的插件 id 总是 {},写的 {id} 不算", "your own plugin's id is always {}; {id} is ignored", super::user::ID));
+        warn.push(tr!("你的插件 id 固定为 {},写的 {id} 无效", "your own plugin's id is always {}; {id} is ignored", super::user::ID));
     }
     t.insert("id".into(), super::user::ID.into());
     t.entry("name").or_insert_with(|| t!("你的", "yours").into());
@@ -1072,7 +1072,7 @@ scope = "session"
         assert!(view("[[views.keys]]\nkey = \"x\"\nrun = \"nope\"").contains("nope"));
         assert!(view("[[views.keys]]\nkey = \"x\"\nrun = \"rm\"\nargs = { who = \"{id}\" }").contains("who"));
         assert!(view("[[views.keys]]\nkey = \"x\"").contains("run / copy"));
-        assert!(view("[[views.keys]]\nkey = \"j\"\ncopy = \"{id}\"").contains("界面自己用"));
+        assert!(view("[[views.keys]]\nkey = \"j\"\ncopy = \"{id}\"").contains("已被界面占用"));
         assert!(view("[[views.keys]]\nkey = \"xy\"\ncopy = \"{id}\"").contains("enter"));
         assert!(bad("[[views]]\nid = \"v\"\ncommand = [\"true\"]\n[[views.keys]]\nkey = \"x\"\ncopy = \"{id}\"").contains("rows"));
         let (m, _) = parse("id = \"a\"\nname = \"x\"\nversion = \"1\"\n[[commands]]\nid = \"rm\"\nargs = { id = \"string\" }\ncommand = [\"true\"]\n[[views]]\nid = \"v\"\nrows = true\ncommand = [\"true\"]\n[[views.keys]]\nkey = \"enter\"\ncopy = \"{url}\"\n[[views.keys]]\nkey = \"a\"\nrun = \"rm\"\nrow = false").unwrap();
@@ -1100,7 +1100,7 @@ scope = "session"
         assert!(!add.exposed("agent") && add.agent_opt_in());
         assert_eq!((add.input.as_str(), add.cwd.as_str()), ("reply", "session"));
         crate::i18n::with(crate::i18n::Lang::Zh, || {
-            assert!(m.brings().iter().any(|l| l.contains("2 个工具(1 个要你点名才给)")), "{:?}", m.brings());
+            assert!(m.brings().iter().any(|l| l.contains("2 个工具(1 个需明确允许)")), "{:?}", m.brings());
         });
     }
 
@@ -1152,11 +1152,11 @@ scope = "session"
         assert!(with("C-M-c", "pick").unwrap_err().contains("C-M-c"));
         // 只开窗格;一个键、一个窗格都只能写一遍
         let cmd = format!("{BASE}[[commands]]\nid = \"go\"\ncommand = [\"true\"]\n[[hotkeys]]\nkey = \"C-]\"\nrun = \"go\"\n");
-        assert!(parse(&cmd).unwrap_err().contains("只开窗格"));
+        assert!(parse(&cmd).unwrap_err().contains("只能打开窗格"));
         let twice = |a: &str, b: &str| {
             parse(&format!("{BASE}{pane}[[hotkeys]]\nkey = \"{a}\"\nrun = \"pick\"\n[[hotkeys]]\nkey = \"{b}\"\nrun = \"pick\"\n"))
         };
-        assert!(twice("C-]", "C-]").unwrap_err().contains("两遍"));
+        assert!(twice("C-]", "C-]").unwrap_err().contains("重复"));
         assert!(twice("C-]", "M-y").unwrap_err().contains("两个热键"));
     }
 
@@ -1177,7 +1177,7 @@ scope = "session"
              [[keys]]\nkey = \"g\"\nrun = \"go\"\nrequires = [\"aca.core\"]\n"
         );
         let (_, warn) = parse(&text).unwrap();
-        let named: Vec<&str> = warn.iter().filter_map(|w| w.strip_prefix("清单里不认识 ")?.split(':').next()).collect();
+        let named: Vec<&str> = warn.iter().filter_map(|w| w.strip_prefix("清单中有无法识别的 ")?.split(':').next()).collect();
         assert_eq!(
             named,
             ["descripton", "commands[1].titel", "keys[1].requires", "views[1].keys[1].confrim", "settings.n.secrt", "agent.mcp.vai"],
@@ -1211,18 +1211,18 @@ scope = "session"
         assert!(warn.is_empty(), "{warn:?}");
         assert_eq!((m.timers[0].secs(), m.timers[0].manual), (300, true));
         crate::i18n::with(crate::i18n::Lang::Zh, || {
-            assert!(m.brings().iter().any(|l| l == "定时:go 每 5m(有活才开)"), "{:?}", m.brings());
+            assert!(m.brings().iter().any(|l| l == "定时:go 每 5m(有任务时开启)"), "{:?}", m.brings());
             let err = |cmd: &str, timer: &str| parse(&with(cmd, timer)).unwrap_err();
             assert!(err("args = { n = \"int\" }\n", "every = \"5m\"\n").contains("参数 n 是必填的"));
             assert!(parse(&with("args = { n = \"int?\" }\n", "every = \"5m\"\n")).is_ok());
             assert!(err("contexts = [\"session\"]\n", "every = \"5m\"\n").contains("没有会话"));
             assert!(parse(&with("contexts = [\"session\", \"global\"]\n", "every = \"5m\"\n")).is_ok());
             assert!(err("input = \"reply\"\n", "every = \"5m\"\n").contains("没有会话"));
-            assert!(err("", "every = \"30s\"\n").contains("最短隔 1m"));
-            assert!(err("", "every = \"often\"\n").contains("看不懂"));
-            assert!(err("", "every = \"5m\"\n[[timers]]\nrun = \"go\"\nevery = \"1h\"\n").contains("写了两遍"));
+            assert!(err("", "every = \"30s\"\n").contains("至少为 1m"));
+            assert!(err("", "every = \"often\"\n").contains("无法识别"));
+            assert!(err("", "every = \"5m\"\n[[timers]]\nrun = \"go\"\nevery = \"1h\"\n").contains("重复"));
             let nothing = format!("{BASE}[[timers]]\nrun = \"gone\"\nevery = \"5m\"\n");
-            assert!(parse(&nothing).unwrap_err().contains("不是这个插件的能力"));
+            assert!(parse(&nothing).unwrap_err().contains("不是此插件的能力"));
             // 写错的字段照样点名
             assert!(parse(&with("", "every = \"5m\"\nevry = 1\n")).unwrap().1.iter().any(|w| w.contains("timers[1].evry")));
         });

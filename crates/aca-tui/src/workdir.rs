@@ -176,9 +176,9 @@ pub fn find_in(w: &Where, conf: Option<&str>) -> Found {
         _ => None,
     };
     let here = if w.agent == Agent::Codex {
-        t!("Codex 现在在这", "Codex is here now")
+        t!("Codex 当前目录", "Codex is here now")
     } else {
-        t!("Claude 现在在这", "Claude is here now")
+        t!("Claude 当前目录", "Claude is here now")
     };
     if let Some(log) = log {
         let (cwd, edited) = read_log(&log, w.agent);
@@ -188,7 +188,9 @@ pub fn find_in(w: &Where, conf: Option<&str>) -> Found {
         }
         // 停在不是仓库的地方(比如上一级):看它最近改的文件在哪个仓库
         if let Some(root) = edited.as_deref().map(Path::new).and_then(Path::parent).filter(|d| d.is_dir()).and_then(repo_root) {
-            return Found { dir: root.to_string_lossy().into_owned(), how: t!("它最近改的文件在这", "its recent edits are here") };
+            return Found {
+                dir: root.to_string_lossy().into_owned(), how: t!("最近修改的文件所在仓库", "its recent edits are here")
+            };
         }
         if let Some(d) = cwd {
             return Found { dir: d, how: here };
@@ -200,7 +202,7 @@ pub fn find_in(w: &Where, conf: Option<&str>) -> Found {
         && lost
         && let Some(d) = proc_cwd(w.pid).filter(|d| *d != w.dir && in_repo(Path::new(d)))
     {
-        return Found { dir: d, how: t!("进程在这", "the process is here") };
+        return Found { dir: d, how: t!("进程所在目录", "the process is here") };
     }
     registered()
 }
@@ -254,14 +256,14 @@ mod tests {
         let w = Where { dir: top_s.into(), pid: 42, agent: Agent::Claude, id: "s-old".into() };
         // cd 进了仓库:跟着它
         std::fs::write(proj.join("s-new.jsonl"), line(&top) + &line(&repo)).unwrap();
-        assert_eq!(find_in(&w, conf.to_str()), Found { dir: repo.to_str().unwrap().into(), how: "Claude 现在在这" });
+        assert_eq!(find_in(&w, conf.to_str()), Found { dir: repo.to_str().unwrap().into(), how: "Claude 当前目录" });
         // 停在上一级、用绝对路径改了仓库里的文件:看文件
         let edit = format!(
             "{{\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"name\":\"Edit\",\"input\":{{\"replace_all\":false,\"file_path\":\"{}\"}}}}]}},\"cwd\":\"{top_s}\"}}\n",
             repo.join("src/main.rs").display()
         );
         std::fs::write(proj.join("s-new.jsonl"), line(&repo) + &edit).unwrap();
-        assert_eq!(find_in(&w, conf.to_str()), Found { dir: repo.to_str().unwrap().into(), how: "它最近改的文件在这" });
+        assert_eq!(find_in(&w, conf.to_str()), Found { dir: repo.to_str().unwrap().into(), how: "最近修改的文件所在仓库" });
         // 记录找不到:登记的目录
         let w = Where { pid: 0, id: String::new(), ..w };
         assert_eq!(find_in(&w, conf.to_str()), Found { dir: top_s.into(), how: "" });
@@ -279,7 +281,7 @@ mod tests {
         let body = format!("{{\"type\":\"turn_context\",\"payload\":{{\"cwd\":\"{}\"}}}}\n", repo.display());
         std::fs::write(day.join("rollout-2026-09-28T10-00-00-abc-123.jsonl"), body).unwrap();
         let w = Where { dir: "/elsewhere".into(), pid: 0, agent: Agent::Codex, id: "abc-123".into() };
-        assert_eq!(find_in(&w, conf.to_str()), Found { dir: repo.to_str().unwrap().into(), how: "Codex 现在在这" });
+        assert_eq!(find_in(&w, conf.to_str()), Found { dir: repo.to_str().unwrap().into(), how: "Codex 当前目录" });
         let _ = std::fs::remove_dir_all(&root);
     }
 

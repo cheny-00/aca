@@ -578,7 +578,7 @@ pub struct Source {
 
 /// 要读哪些账号目录:config.toml 里登记了配置目录的账号(`accounts`:哪家、名字、目录),再加上两家的默认目录(~/.claude、~/.codex)。
 /// 同一个目录只读一次,名字用登记的第一个账号。两个账号的记录目录(projects / sessions)链到同一处的,
-/// 分不出是谁的,合成一个、名字连起来(`甲·乙`)
+/// 分不出是谁的,合成一个、名字连起来(`甲·乙`;面板上写成「甲 / 乙」,`·` 留给后面接的套餐,见 `account_name`)
 pub fn sources(accounts: &[(Agent, String, String)], home: &str) -> Vec<Source> {
     let mut dirs: Vec<(Agent, String)> = accounts.iter().map(|(a, _, d)| (*a, d.clone())).collect();
     dirs.push((Agent::Claude, format!("{home}/.claude")));
@@ -1005,7 +1005,7 @@ pub const RANGES: [Tr; 4] =
 
 /// 一个账号在面板里叫什么:「Claude 甲」「Codex 乙」(不是 Codex 的都按 Claude 的目录读,也就叫 Claude)
 pub fn account_name(agent: Agent, who: &str) -> String {
-    format!("{} {who}", if agent == Agent::Codex { "Codex" } else { "Claude" })
+    format!("{} {}", if agent == Agent::Codex { "Codex" } else { "Claude" }, who.replace('·', " / "))
 }
 
 /// 面板上怎么写一个账号(account_name 起的全名):账号名就是家名的(默认目录 ~/.claude、~/.codex)只写家名
@@ -1016,11 +1016,12 @@ pub fn account_shown(name: &str) -> &str {
     }
 }
 
-/// 这个账号在不在只看的里面:空 = 都在;写全名(「Claude 甲」)或账号名都认,链在一起的(`甲·乙`)写哪个都算
+/// 这个账号在不在只看的里面:空 = 都在;写全名(「Claude 甲」,链在一起的写「Claude 甲 / 乙」,以前记下的「甲·乙」也认)
+/// 或账号名都认,链在一起的(`甲·乙`)写哪个都算
 pub fn picked(only: &[String], agent: Agent, who: &str) -> bool {
     only.is_empty() || {
         let name = account_name(agent, who);
-        only.iter().any(|o| *o == name || *o == who || who.split('·').any(|w| w == o))
+        only.iter().any(|o| *o == name || o.replace('·', " / ") == name || *o == who || who.split('·').any(|w| w == o))
     }
 }
 
@@ -2094,6 +2095,9 @@ pub(crate) mod tests {
         // 链在一起的账号写哪个名字都认,全名要连着是哪家
         assert!(picked(&["b".into()], Agent::Codex, "a·b") && picked(&["Codex a·b".into()], Agent::Codex, "a·b"));
         assert!(!picked(&["Claude a·b".into()], Agent::Codex, "a·b") && !picked(&["a·".into()], Agent::Codex, "a·b"));
+        // 面板上链在一起的写「甲 / 乙」,点留给套餐;按那个名字只看也认
+        assert_eq!(account_name(Agent::Codex, "a·b"), "Codex a / b");
+        assert!(picked(&["Codex a / b".into()], Agent::Codex, "a·b"));
     }
 
     #[test]

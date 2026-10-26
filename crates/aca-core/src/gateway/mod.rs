@@ -264,7 +264,7 @@ pub fn usage() -> std::collections::HashMap<String, (usize, Vec<String>)> {
 /// 把 `[mcps.<名字>]` 收进 / 移出 gateway(改 plugins.toml 里 gateway 的设置 servers)。下次有人来列工具时就是新的
 pub fn set_served(name: &str, on: bool) -> Res<()> {
     if on && !mcps_names().iter().any(|n| n == name) {
-        return Err(tr!("config.toml 里没有 [mcps.{name}]", "no [mcps.{name}] in config.toml"));
+        return Err(tr!("config.toml 中没有 [mcps.{name}]", "no [mcps.{name}] in config.toml"));
     }
     let mut servers = settings().servers;
     servers.retain(|s| s != name);
@@ -292,7 +292,7 @@ pub fn ctl(cmd: Value) -> Res<Value> {
 
 /// 同 [`ctl`],最多等 `wait`(状态栏这种每隔几秒问一次的,不能被它拖住)
 pub fn ctl_within(cmd: Value, wait: Duration) -> Res<Value> {
-    let s = UnixStream::connect(sock_path()).map_err(|_| t!("gateway 没在跑", "the gateway isn't running").to_string())?;
+    let s = UnixStream::connect(sock_path()).map_err(|_| t!("gateway 未运行", "the gateway isn't running").to_string())?;
     s.set_read_timeout(Some(wait)).ok();
     s.set_write_timeout(Some(wait)).ok();
     let mut w = s.try_clone().map_err(|e| e.to_string())?;
@@ -303,7 +303,7 @@ pub fn ctl_within(cmd: Value, wait: Duration) -> Res<Value> {
     writeln!(w, "{msg}").map_err(|e| e.to_string())?;
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).map_err(|e| e.to_string())?;
-    serde_json::from_str(&line).map_err(|_| t!("gateway 回的看不懂", "can't read the gateway's answer").to_string())
+    serde_json::from_str(&line).map_err(|_| t!("无法解析 gateway 的响应", "can't read the gateway's answer").to_string())
 }
 
 /// `aca plugin gateway status`:在不在跑、谁连着、下面每个服务的样子、最近几次调用
@@ -312,17 +312,17 @@ pub fn status_text() -> String {
     if !enabled() {
         out.push(
             t!(
-                "gateway 没开(aca plugin enable aca.gateway;没装:aca plugin install <aca 仓库>/plugins/gateway)",
+                "gateway 未开启(aca plugin enable aca.gateway;未安装:aca plugin install <aca 仓库>/plugins/gateway)",
                 "the gateway is off (aca plugin enable aca.gateway; not installed: aca plugin install <aca repo>/plugins/gateway)"
             )
             .to_string(),
         );
     }
     match ctl(json!({ "cmd": "status" })) {
-        Err(e) => out.push(tr!("{e}(第一个 agent 连上来时会自己起)", "{e} (it starts when the first agent connects)")),
+        Err(e) => out.push(tr!("{e}(第一个 agent 连接时会自动启动)", "{e} (it starts when the first agent connects)")),
         Ok(v) => {
             out.push(tr!(
-                "在跑:pid {},起来 {} 秒,{} 个连接",
+                "运行中:pid {},已运行 {} 秒,{} 个连接",
                 "running: pid {}, up {} s, {} connections",
                 v["pid"],
                 v["up"],
@@ -330,7 +330,7 @@ pub fn status_text() -> String {
             ));
             for c in v["clients"].as_array().into_iter().flatten() {
                 let s = c["session"].as_str().filter(|s| !s.is_empty()).unwrap_or("-");
-                out.push(tr!("  连着:会话 {s},{} 秒", "  connected: session {s}, {} s", c["secs"]));
+                out.push(tr!("  已连接:会话 {s},{} 秒", "  connected: session {s}, {} s", c["secs"]));
             }
             for s in v["servers"].as_array().into_iter().flatten() {
                 let who = s["session"].as_str().filter(|x| !x.is_empty()).map(|x| tr!("(会话 {x})", " (session {x})")).unwrap_or_default();
@@ -348,7 +348,7 @@ pub fn status_text() -> String {
     let calls = std::fs::read_to_string(calls_log()).unwrap_or_default();
     let recent: Vec<&str> = calls.lines().rev().take(5).collect();
     if !recent.is_empty() {
-        out.push(t!("最近的调用:", "recent calls:").to_string());
+        out.push(t!("最近调用:", "recent calls:").to_string());
         for l in recent.into_iter().rev() {
             let Ok(v) = serde_json::from_str::<Value>(l) else { continue };
             let ok = if v["ok"].as_bool() == Some(true) { "✓" } else { "✕" };

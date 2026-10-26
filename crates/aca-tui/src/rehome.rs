@@ -118,7 +118,7 @@ pub fn quota_spans(q: Option<&Quota>, at: i64, off: i64) -> Vec<Span<'static>> {
         v.push(Span::styled(tr!("  {} 重置", "  resets {}", crate::bill::when(r, at, off)), kit::dim()));
     }
     if q.updated > 0 && at - q.updated > 3600 {
-        v.push(Span::styled(tr!("  ({}的数)", "  (as of {})", crate::bill::ago(q.updated, at)), kit::dim()));
+        v.push(Span::styled(tr!("  ({}的数据)", "  (as of {})", crate::bill::ago(q.updated, at)), kit::dim()));
     }
     v
 }
@@ -183,7 +183,7 @@ impl Menu {
             return Flow::Stay;
         }
         if self.login(r) == Some(Login::Out) {
-            fx.flash = Some(tr!("{} 没登录 · a 去登录", "{} isn't logged in · a to log in", r.name));
+            fx.flash = Some(tr!("{} 未登录 · a 登录", "{} isn't logged in · a to log in", r.name));
             return Flow::Stay;
         }
         fx.job = Some(Job::Rehome { t: self.t.clone(), to: r.spec.clone(), label: r.name.clone() });
@@ -198,12 +198,12 @@ impl Menu {
     fn login_span(&self, r: &Acct) -> Span<'static> {
         let p = theme::pal();
         let (text, st) = match (&r.problem, r.account.is_empty(), self.login(r)) {
-            (Some(_), _, _) => (t!("用不了", "unusable"), theme::warn()),
+            (Some(_), _, _) => (t!("不可用", "unusable"), theme::warn()),
             (_, true, _) => ("", Style::new()),
-            (_, _, None) => (t!("… 在问", "… asking"), kit::dim()),
-            (_, _, Some(Login::In(_))) => (t!("● 登录着", "● logged in"), Style::new().fg(p.green)),
-            (_, _, Some(Login::Out)) => (t!("○ 没登录", "○ logged out"), theme::warn().add_modifier(Modifier::BOLD)),
-            (_, _, Some(Login::Unknown(_))) => (t!("? 问不出", "? unknown"), kit::dim()),
+            (_, _, None) => ("…", kit::dim()),
+            (_, _, Some(Login::In(_))) => (t!("● 已登录", "● logged in"), Style::new().fg(p.green)),
+            (_, _, Some(Login::Out)) => (t!("○ 未登录", "○ logged out"), theme::warn().add_modifier(Modifier::BOLD)),
+            (_, _, Some(Login::Unknown(_))) => (t!("? 未知", "? unknown"), kit::dim()),
         };
         Span::styled(format!("{text}{}", " ".repeat(LOGIN_W.saturating_sub(text.width()))), st)
     }
@@ -218,10 +218,10 @@ impl Overlay for Menu {
     }
 
     fn lines(&self, w: usize) -> Vec<Line<'static>> {
-        let title = tr!("「{}」换个账号接着跑", "Carry “{}” on under another account", self.t.title);
+        let title = tr!("「{}」切换账号继续", "Carry “{}” on under another account", self.t.title);
         let mut out = vec![kit::modal_title(&title, theme::accent(), kit::esc_hint(t!("取消", "cancel")), w), Line::raw("")];
         let mut now = vec![
-            Span::styled(t!("现在  ", "now   "), kit::dim()),
+            Span::styled(t!("当前  ", "now   "), kit::dim()),
             Span::styled(self.label.clone(), agent_style(self.agent).add_modifier(Modifier::BOLD)),
             Span::raw("   "),
         ];
@@ -229,7 +229,7 @@ impl Overlay for Menu {
         out.extend([Line::from(now), Line::raw("")]);
         if self.rows.is_empty() {
             let kind = if self.agent == Agent::Codex { "Codex" } else { "Claude" };
-            out.push(Line::raw(tr!("没有别的 {kind} 账号 · + 加一个", "No other {kind} account · + adds one")));
+            out.push(Line::raw(tr!("没有其他 {kind} 账号 · + 添加", "No other {kind} account · + adds one")));
             return out;
         }
         let name_w = self.rows.iter().map(|r| r.name.width()).max().unwrap_or(0).clamp(4, 12);
@@ -252,12 +252,11 @@ impl Overlay for Menu {
         }
         out.push(Line::raw(""));
         if self.busy {
-            out.push(Line::styled(t!("⚠ 换了会打断这一轮", "⚠ switching interrupts this turn"), theme::warn()));
+            out.push(Line::styled(t!("⚠ 切换将中断当前任务", "⚠ switching interrupts this turn"), theme::warn()));
+            out.push(Line::raw(""));
         }
-        out.push(Line::raw(t!("新账号头一轮要重建缓存", "The new account rebuilds the cache on its first turn")));
-        out.push(Line::raw(""));
         out.push(kit::keys_line(
-            &[("⏎", t!("换过去", "switch")), ("a", t!("账号页", "accounts")), ("+", t!("加账号", "add account"))],
+            &[("⏎", t!("切换", "switch")), ("a", t!("账号页", "accounts")), ("+", t!("添加账号", "add account"))],
             vec![],
             w,
         ));

@@ -402,12 +402,12 @@ fn stable_exe(p: &Path) -> PathBuf {
 
 /// 工具名 → (agent, 工具的定义)。hook 入口拿到的是内置那家的名字(`aca hook claude`)或者工具名,也走这里
 pub fn resolve(cfg: &Config, name: &str) -> Res<(Handle, Tool)> {
-    let tool = cfg.tool(name).ok_or_else(|| tr!("没有 {name} 这个工具(有:{})", "no tool {name} (there are: {})", cfg.names().join(" ")))?;
+    let tool = cfg.tool(name).ok_or_else(|| tr!("没有工具 {name}(可用:{})", "no tool {name} (there are: {})", cfg.names().join(" ")))?;
     let agent = match tool.kind.as_str() {
         "" => Handle::Declared(declared::Declared::new(name, &tool)?),
         kind => Handle::Builtin(builtin(kind).ok_or_else(|| {
             tr!(
-                "工具 {name} 的 kind 写的是 {kind},内置的只有 {};不写 kind 就是声明式工具",
+                "工具 {name} 的 kind 为 {kind},内置的只有 {};省略 kind 即为声明式工具",
                 "tool {name} has kind {kind}, but the built-ins are only {}; leave kind out for a declared tool",
                 kinds().collect::<Vec<_>>().join(" / ")
             )
@@ -438,7 +438,7 @@ pub fn account(cfg: &Config, agent: &dyn Agent, account: &str) -> Res<Account> {
         dir if is_dir(dir) => Account { home: config::dir(dir), ..Default::default() },
         name => cfg.account(agent.name(), name).cloned().ok_or_else(|| {
             tr!(
-                "config.toml 的 [accounts.{}] 里没有 {name}(没登记的可以直接写目录:{}:~/.xxx)",
+                "config.toml 的 [accounts.{}] 中没有 {name}(未登记的账号可直接写目录:{}:~/.xxx)",
                 "no {name} under [accounts.{}] in config.toml (unregistered ones can be a directory: {}:~/.xxx)",
                 agent.name(),
                 agent.name()
@@ -447,7 +447,7 @@ pub fn account(cfg: &Config, agent: &dyn Agent, account: &str) -> Res<Account> {
     };
     if !layer.home.is_empty() && agent.home_var().is_none() {
         return Err(tr!(
-            "{} 没说配置目录交给哪个环境变量(声明式工具写 home_var);不写的话账号里只能用 env / args",
+            "{} 未指定配置目录对应的环境变量(声明式工具写 home_var);未指定时账号中只能使用 env / args",
             "{} doesn't say which environment variable gets the config directory (declared tools set home_var); without it accounts can only use env / args",
             agent.name()
         ));
@@ -507,8 +507,8 @@ fn layered_env(agent: &dyn Agent, tool: &Tool, a: &Account) -> Res<Vec<(String, 
     let mut env = own(&tool.env);
     if !a.env_file.is_empty() {
         let text = std::fs::read_to_string(&a.env_file)
-            .map_err(|e| tr!("账号的 env_file 读不了 {}:{e}", "can't read the account's env_file {}: {e}", a.env_file))?;
-        env.extend(parse_env(&text).map_err(|n| tr!("{} 第 {n} 行不是 KEY=值", "{} line {n} isn't KEY=value", a.env_file))?);
+            .map_err(|e| tr!("无法读取账号的 env_file {}:{e}", "can't read the account's env_file {}: {e}", a.env_file))?;
+        env.extend(parse_env(&text).map_err(|n| tr!("{} 第 {n} 行不是 KEY=值 格式", "{} line {n} isn't KEY=value", a.env_file))?);
     }
     env.extend(own(&a.env));
     if let (Some(var), false) = (agent.home_var(), a.home.is_empty()) {
@@ -552,7 +552,7 @@ pub(crate) fn tail(path: &str, n: u64) -> Option<String> {
 pub(crate) fn hook_file(name: &str, content: &str) -> Res<PathBuf> {
     let path = paths::state_dir().join("hooks").join(name);
     if std::fs::read_to_string(&path).ok().as_deref() != Some(content) {
-        paths::write_atomic(&path, content).map_err(|e| tr!("写不了 {}:{e}", "can't write {}: {e}", path.display()))?;
+        paths::write_atomic(&path, content).map_err(|e| tr!("无法写入 {}:{e}", "can't write {}: {e}", path.display()))?;
     }
     Ok(path)
 }
@@ -579,7 +579,7 @@ pub fn launch(cfg: &Config, s: &Session, how: &How, say: Option<&str>) -> Res<La
     }
     let aca = self_exe();
     let mut cmd = agent.argv(&tool, s, how, &aca)?;
-    cmd[0] = which(&cmd[0]).ok_or_else(|| tr!("PATH 里没有 {}", "{} isn't on PATH", cmd[0]))?;
+    cmd[0] = which(&cmd[0]).ok_or_else(|| tr!("PATH 中找不到 {}", "{} isn't on PATH", cmd[0]))?;
     let lead = say.and_then(|text| Some((agent.opening(text)?, text)));
     let said = lead.is_some();
     if let Some((lead, text)) = lead {
@@ -613,7 +613,7 @@ pub(crate) fn opening_after_dashes(text: &str) -> Option<Vec<String>> {
 fn opening_file(id: &str, text: &str) -> Res<String> {
     use std::os::unix::fs::PermissionsExt;
     let path = paths::state_dir().join("opening").join(id);
-    paths::write_atomic(&path, text).map_err(|e| tr!("写不了 {}:{e}", "can't write {}: {e}", path.display()))?;
+    paths::write_atomic(&path, text).map_err(|e| tr!("无法写入 {}:{e}", "can't write {}: {e}", path.display()))?;
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     Ok(path.to_string_lossy().into_owned())
 }
@@ -635,7 +635,7 @@ pub fn exec_saying(file: &str, argv: &[String]) -> std::io::Error {
 pub fn direct(cfg: &Config, spec: &str, args: &[String]) -> Res<Launch> {
     let p = pick(cfg, spec)?;
     let mut cmd = base(&p.def, &p.agent.program());
-    cmd[0] = which(&cmd[0]).ok_or_else(|| tr!("PATH 里没有 {}", "{} isn't on PATH", cmd[0]))?;
+    cmd[0] = which(&cmd[0]).ok_or_else(|| tr!("PATH 中找不到 {}", "{} isn't on PATH", cmd[0]))?;
     cmd.extend(args.iter().cloned());
     let mut env = account_env(cfg, spec)?;
     let argv = without(&[FOREIGN, OURS], &env, cmd);
@@ -721,12 +721,12 @@ pub fn login_link(url: &str) -> i32 {
 
 fn hand_link(to: Option<PathBuf>, url: &str) {
     let Some(f) = to else {
-        return eprintln!("{}", tr!("aca 不替登录开浏览器,链接:{url}", "aca doesn't open a browser for logins; the link: {url}"));
+        return eprintln!("{}", tr!("aca 不会为登录打开浏览器,链接:{url}", "aca doesn't open a browser for logins; the link: {url}"));
     };
     // 先写到旁边再改名:界面不会读到写了一半的
     let part = f.with_extension("part");
     if let Err(e) = std::fs::write(&part, url).and_then(|()| std::fs::rename(&part, &f)) {
-        eprintln!("{}", tr!("登录链接交不给 aca 界面({}):{e}", "couldn't hand the login link to aca's UI ({}): {e}", f.display()));
+        eprintln!("{}", tr!("无法将登录链接发送到 aca 界面({}):{e}", "couldn't hand the login link to aca's UI ({}): {e}", f.display()));
     }
 }
 
@@ -744,7 +744,7 @@ pub fn tool_cmd(cfg: &Config, s: &Session, args: &[String]) -> Res<Launch> {
     let (agent, tool) = of(cfg, s)?;
     let layer = account(cfg, &*agent, &s.account)?;
     let mut cmd = base(&tool, &agent.program());
-    cmd[0] = which(&cmd[0]).ok_or_else(|| tr!("PATH 里没有 {}", "{} isn't on PATH", cmd[0]))?;
+    cmd[0] = which(&cmd[0]).ok_or_else(|| tr!("PATH 中找不到 {}", "{} isn't on PATH", cmd[0]))?;
     cmd.extend(args.iter().cloned());
     let env = layered_env(&*agent, &tool, &layer)?;
     Ok(Launch { argv: without(&[FOREIGN, OURS], &env, cmd), env, said: false })

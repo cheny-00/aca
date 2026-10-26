@@ -62,7 +62,7 @@ pub fn create(store: &Store, cfg: &Config, n: New) -> Res<Session> {
 pub fn create_saying(store: &Store, cfg: &Config, n: New, text: &str) -> Res<(Session, Option<String>)> {
     if text.len() > agent::OPENING_MAX {
         return Err(tr!(
-            "开场那句话太长({} 字节,最多 {})",
+            "开场消息过长({} 字节,上限 {})",
             "the opening message is too long ({} bytes, at most {})",
             text.len(),
             agent::OPENING_MAX
@@ -71,7 +71,7 @@ pub fn create_saying(store: &Store, cfg: &Config, n: New, text: &str) -> Res<(Se
     let hold = n.hold;
     let (s, said) = make(store, cfg, n, Some(text))?;
     let unsaid = match (hold, said) {
-        (true, _) => Some(t!("只登记没启动,没带上", "only registered, not started; not carried").to_string()),
+        (true, _) => Some(t!("仅登记,未启动", "only registered, not started; not carried").to_string()),
         (false, true) => None,
         (false, false) => send_fresh(store, cfg, &s.id, text, Duration::from_secs(60)).err(),
     };
@@ -208,6 +208,9 @@ fn launch_saying(cfg: &Config, s: &Session, pane: Option<&Pane>, how: How, say: 
         // 门铃等这次起来的 agent 自己接上(Claude 的 SessionStart)
         r.bell = false;
         r.started = paths::now();
+        // 记录现在有多长:这次定的只会写在后面(见 schedule::due)
+        r.started_file = r.transcript.clone();
+        r.started_len = std::fs::metadata(&r.transcript).map_or(0, |m| m.len());
         r.idle_stopped = 0;
         if r.status == "ended" {
             r.status = "idle".into();
@@ -230,16 +233,16 @@ pub fn start(store: &Store, cfg: &Config, key: &str) -> Res<&'static str> {
     let s = store.get(key)?;
     let pane = tmux::find(&s.id);
     if pane.as_ref().is_some_and(|p| !p.dead) {
-        return Ok(t!("已经在跑", "already running"));
+        return Ok(t!("已在运行", "already running"));
     }
     let (how, conv) = how_to_resume(cfg, &s, &runtime::load(&s.id));
     let said = match how {
-        How::Resume(_) => t!("启动了,接着原来的对话", "started, resuming the conversation"),
+        How::Resume(_) => t!("已启动,继续原对话", "started, resuming the conversation"),
         How::Fork(_) => t!(
-            "启动了,从原来那段对话重新分出来(分叉后还没说过话)",
+            "已启动,从原对话重新分叉(分叉后尚未对话)",
             "started, forked again from the original conversation (the fork hadn't talked yet)"
         ),
-        How::Fresh => t!("启动了,新的一段对话", "started, with a new conversation"),
+        How::Fresh => t!("已启动,开始新对话", "started, with a new conversation"),
     };
     launch(cfg, &Session { conv, ..s }, pane.as_ref(), how)?;
     Ok(said)
@@ -293,7 +296,7 @@ fn sync_conv(store: &Store, s: &Session) {
 
 pub fn stop(store: &Store, key: &str) -> Res<()> {
     let s = store.get(key)?;
-    let p = tmux::find(&s.id).ok_or(t!("没在跑", "not running"))?;
+    let p = tmux::find(&s.id).ok_or(t!("未运行", "not running"))?;
     halt(&p);
     sync_conv(store, &s);
     runtime::update(&s.id, |r| {
@@ -465,7 +468,7 @@ pub fn rehome(store: &Store, cfg: &Config, key: &str, to: &str) -> Res<Rehomed> 
     let p = agent::pick(cfg, &rehome_spec(cfg, &s, to))?;
     if p.agent.name() != agent.name() {
         return Err(tr!(
-            "{} 不是 {} 那一家:换账号只能在同一家里换(两家的对话记录不通),换家用界面里的 H 交接",
+            "{} 不属于 {}:只能在同一工具的账号之间切换(不同工具的对话记录不互通),跨工具请用界面中的 H 交接",
             "{} isn't a {} tool: accounts can only be switched within one family (their conversations don't mix); use H in the UI to hand off",
             p.tool,
             agent.name()
@@ -474,7 +477,7 @@ pub fn rehome(store: &Store, cfg: &Config, key: &str, to: &str) -> Res<Rehomed> 
     let label = |tool: &str, account: &str| if account.is_empty() { tool.to_string() } else { format!("{tool}:{account}") };
     let target = label(&p.tool, &p.account);
     if p.tool == s.tool && p.account == s.account {
-        return Err(tr!("已经是 {target} 了", "it's already on {target}"));
+        return Err(tr!("已是 {target}", "it's already on {target}"));
     }
     let (from, dest) = (agent::home(cfg, &s.tool, &s.account)?, agent::home(cfg, &p.tool, &p.account)?);
     let r = runtime::load(&s.id);
@@ -493,7 +496,7 @@ pub fn rehome(store: &Store, cfg: &Config, key: &str, to: &str) -> Res<Rehomed> 
             let f = agent.conv_files(a, &carry);
             if f.is_empty() {
                 return Err(tr!(
-                    "{} 里找不到对话 {carry} 的记录,接不过去",
+                    "{} 中找不到对话 {carry} 的记录,无法继续",
                     "can't find the record of conversation {carry} under {}, so it can't move",
                     a.display()
                 ));
@@ -516,7 +519,7 @@ pub fn rehome(store: &Store, cfg: &Config, key: &str, to: &str) -> Res<Rehomed> 
     if let Some((a, b)) = &moving {
         for rel in &files {
             copied += copy_over(&a.join(rel), &b.join(rel))
-                .map_err(|e| tr!("对话记录没拷过去({}):{e}", "couldn't copy the conversation ({}): {e}", rel.display()))?;
+                .map_err(|e| tr!("对话记录复制失败({}):{e}", "couldn't copy the conversation ({}): {e}", rel.display()))?;
         }
     }
     store.set_account(&s.id, &p.tool, &p.account)?;
@@ -608,7 +611,7 @@ pub fn fork(store: &Store, cfg: &Config, key: &str, title: &str) -> Res<Session>
     let (agent, _) = agent::of(cfg, &from)?;
     let conv = if r.conv.is_empty() { from.conv.clone() } else { r.conv.clone() };
     if !agent.can_fork() || conv.is_empty() {
-        return Err(t!("这个会话没有可以分叉的对话", "this session has no conversation to fork").into());
+        return Err(t!("该会话没有可分叉的对话", "this session has no conversation to fork").into());
     }
     let s = Session {
         id: fresh_id(store),
@@ -645,7 +648,7 @@ pub fn fork(store: &Store, cfg: &Config, key: &str, title: &str) -> Res<Session>
 pub fn rename(store: &Store, key: &str, title: &str) -> Res<String> {
     let title = title.trim();
     if title.is_empty() {
-        return Err(t!("名字不能是空的", "the name can't be empty").into());
+        return Err(t!("名称不能为空", "the name can't be empty").into());
     }
     let s = store.get(key)?;
     store.set_title(&s.id, title, true)?;
@@ -762,12 +765,12 @@ pub fn send(store: &Store, cfg: &Config, key: &str, text: &str, wait: Option<Dur
     let pane = loop {
         let row = status::one(cfg, &s, true);
         match (row.state, wait) {
-            (State::Stopped | State::Exited, _) => return Err(t!("会话没在跑", "the session isn't running").into()),
+            (State::Stopped | State::Exited, _) => return Err(t!("会话未运行", "the session isn't running").into()),
             (State::Running | State::Ask, Some(w)) if t.elapsed() < w => std::thread::sleep(Duration::from_millis(500)),
-            (State::Running | State::Ask, Some(_)) => return Err(t!("它一直没空下来,没发", "it never went idle; not sent").into()),
+            (State::Running | State::Ask, Some(_)) => return Err(t!("会话一直未空闲,未发送", "it never went idle; not sent").into()),
             (State::Ask, None) => {
                 return Err(tr!(
-                    "它在等确认,没发(打进去回车可能直接选中默认那一项);要替它回答:aca answer {}",
+                    "会话正在等待确认,未发送(输入后回车可能会直接选中默认选项);如需代为回答:aca answer {}",
                     "it's waiting for a confirmation; not sent (Enter might pick the default option); to answer for it: aca answer {}",
                     s.id
                 ));
@@ -795,7 +798,7 @@ pub fn send_fresh(store: &Store, cfg: &Config, key: &str, text: &str, wait: Dura
     let t = Instant::now();
     let mut last: Vec<String> = vec![];
     let pane = loop {
-        let p = tmux::find(&s.id).filter(|p| !p.dead).ok_or(t!("会话没在跑", "the session isn't running"))?;
+        let p = tmux::find(&s.id).filter(|p| !p.dead).ok_or(t!("会话未运行", "the session isn't running"))?;
         let now = tmux::capture(&p.pane);
         let settled = now.iter().any(|l| !l.trim().is_empty()) && now == last;
         let busy = matches!(status::one(cfg, &s, true).state, State::Running | State::Ask);
@@ -804,9 +807,9 @@ pub fn send_fresh(store: &Store, cfg: &Config, key: &str, text: &str, wait: Dura
         }
         if t.elapsed() > wait {
             return Err(if settled {
-                t!("它一直没空下来,没发", "it never went idle; not sent").into()
+                t!("会话一直未空闲,未发送", "it never went idle; not sent").into()
             } else {
-                t!("它一直没起来,没发", "it never came up; not sent").into()
+                t!("会话一直未启动完成,未发送", "it never came up; not sent").into()
             });
         }
         last = now;

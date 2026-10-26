@@ -110,7 +110,7 @@ fn load(q: &str) -> Option<State> {
 fn save(st: &State) -> Res<()> {
     let _ = std::fs::create_dir_all(dir());
     paths::write_atomic(&file(&st.qualified()), &serde_json::to_string_pretty(st).unwrap_or_default())
-        .map_err(|e| tr!("记不下来:{e}", "can't record it: {e}"))
+        .map_err(|e| tr!("无法记录:{e}", "can't record it: {e}"))
 }
 
 fn forget(q: &str) {
@@ -222,7 +222,7 @@ fn apply(st: &mut State, want: bool) -> Res<()> {
         // 先删文件再卸:到点跑的那一次就是它起的,卸的时候会被一起收走
         let _ = std::fs::remove_file(&path);
         if !isolated() && loaded(&label) {
-            ctl(&["bootout", &service]).map_err(|e| tr!("系统定时器没卸掉:{e}", "the system timer didn't uninstall: {e}"))?;
+            ctl(&["bootout", &service]).map_err(|e| tr!("无法卸载系统定时器:{e}", "the system timer didn't uninstall: {e}"))?;
         }
         return Ok(());
     }
@@ -245,12 +245,12 @@ fn apply(st: &mut State, want: bool) -> Res<()> {
     if let Some(d) = path.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    paths::write_atomic(&path, &text).map_err(|e| tr!("定时器的 plist 写不了:{e}", "can't write the timer's plist: {e}"))?;
+    paths::write_atomic(&path, &text).map_err(|e| tr!("无法写入定时器的 plist:{e}", "can't write the timer's plist: {e}"))?;
     if !isolated() {
         // 进过 disabled 名单的服务,bootstrap 只报「5: Input/output error」
         let _ = ctl(&["enable", &service]);
         ctl(&["bootstrap", &domain(), &path.to_string_lossy()])
-            .map_err(|e| tr!("系统定时器没装上:{e}", "the system timer didn't install: {e}"))?;
+            .map_err(|e| tr!("系统定时器安装失败:{e}", "the system timer didn't install: {e}"))?;
     }
     st.installed = st.every;
     Ok(())
@@ -264,7 +264,7 @@ fn inside(q: &str) -> bool {
 /// `插件.能力` → 登记、清单、清单里的这个定时
 fn declared(q: &str) -> Res<(Entry, Manifest, Timer)> {
     let (pid, run) = split_qualified(q)?;
-    let mut e = registry().into_iter().find(|e| e.id == pid).ok_or_else(|| tr!("没有链接过 {pid}", "{pid} isn't linked"))?;
+    let mut e = registry().into_iter().find(|e| e.id == pid).ok_or_else(|| tr!("未链接插件 {pid}", "{pid} isn't linked"))?;
     // 自带的:刚升级了 aca 就先换成新写出来的那份
     if e.source == first_party::SOURCE && first_party::refresh_one(pid) {
         e = registry().into_iter().find(|e| e.id == pid).unwrap_or(e);
@@ -275,7 +275,7 @@ fn declared(q: &str) -> Res<(Entry, Manifest, Timer)> {
         .iter()
         .find(|t| t.run == run)
         .cloned()
-        .ok_or_else(|| tr!("{pid} 没有定时 {run}(清单的 [[timers]])", "{pid} has no timer {run} ([[timers]] in its manifest)"))?;
+        .ok_or_else(|| tr!("{pid} 没有定时任务 {run}(见清单的 [[timers]])", "{pid} has no timer {run} ([[timers]] in its manifest)"))?;
     Ok((e, m, t))
 }
 
@@ -283,7 +283,7 @@ fn declared(q: &str) -> Res<(Entry, Manifest, Timer)> {
 pub fn on(q: &str) -> Res<String> {
     let (e, _, t) = declared(q)?;
     if !e.enabled {
-        return Err(tr!("{} 停着:先 aca plugin enable {}", "{} is paused: aca plugin enable {} first", e.id, e.id));
+        return Err(tr!("{} 已关闭:先运行 aca plugin enable {}", "{} is paused: aca plugin enable {} first", e.id, e.id));
     }
     let mut st = load(q).unwrap_or_else(|| State::new(&e.id, &t));
     let was = st.on;
@@ -296,9 +296,9 @@ pub fn on(q: &str) -> Res<String> {
     save(&st)?;
     r?;
     Ok(if was {
-        tr!("{q} 开着:每 {} 跑一次", "{q} is on: runs every {}", span(st.every))
+        tr!("{q} 已开启:每 {} 运行一次", "{q} is on: runs every {}", span(st.every))
     } else {
-        tr!("开了 {q}:每 {} 跑一次", "turned on {q}: runs every {}", span(st.every))
+        tr!("已开启 {q}:每 {} 运行一次", "turned on {q}: runs every {}", span(st.every))
     })
 }
 
@@ -310,7 +310,7 @@ pub fn off(q: &str) -> Res<String> {
         && e.enabled
     {
         return Err(tr!(
-            "{q} 跟着插件开关(清单里没写 manual):要停就 aca plugin disable {}",
+            "{q} 随插件开关(清单中未写 manual):如需关闭,运行 aca plugin disable {}",
             "{q} follows its plugin (no manual in the manifest): to stop it, aca plugin disable {}",
             e.id
         ));
@@ -326,7 +326,7 @@ pub fn off(q: &str) -> Res<String> {
         forget(q);
     }
     r?;
-    Ok(if was { tr!("关了 {q}", "turned off {q}") } else { tr!("{q} 本来就关着", "{q} was already off") })
+    Ok(if was { tr!("已关闭 {q}", "turned off {q}") } else { tr!("{q} 已是关闭状态", "{q} was already off") })
 }
 
 /// 插件登记、更新、开关之后:照清单把它的定时对一遍 —— 清单里没了的卸掉、不记了;every 变了的重装;
@@ -384,7 +384,7 @@ pub fn drop_plugin(id: &str) {
 
 /// 跑一次:插件的环境,`ACA_INVOKED_BY=timer`、`ACA_PLUGIN_TIMER=<插件.能力>`,没有会话,最多 [`LIMIT`]
 fn fire(e: &Entry, m: &Manifest, t: &Timer) -> Res<Fed> {
-    let a = m.actions.iter().find(|a| a.id == t.run).ok_or_else(|| tr!("{} 没有 {} 这个能力", "{} has no command {}", e.id, t.run))?;
+    let a = m.actions.iter().find(|a| a.id == t.run).ok_or_else(|| tr!("{} 没有能力 {}", "{} has no command {}", e.id, t.run))?;
     let q = format!("{}.{}", e.id, t.run);
     let ctx = Context { source: "timer".into(), ..Default::default() };
     let mut extra: Vec<(&str, &str)> = command_ids(&a.id, "{}").to_vec();
@@ -400,7 +400,7 @@ fn settle(q: &str, enabled: bool, started: u64, got: &Res<Fed>) {
     st.last = started;
     st.secs = paths::now().saturating_sub(started);
     (st.rc, st.why) = match got {
-        Ok(f) => (f.code, f.late.map(|s| tr!("过了 {s} 秒还没完,停掉了", "still running after {s} s; stopped")).unwrap_or_default()),
+        Ok(f) => (f.code, f.late.map(|s| tr!("超过 {s} 秒未完成,已停止", "still running after {s} s; stopped")).unwrap_or_default()),
         Err(e) => (None, e.clone()),
     };
     let want = st.on && enabled;
@@ -466,7 +466,7 @@ pub fn tick(q: &str) -> i32 {
 pub fn run_now(q: &str) -> Res<i32> {
     let (e, m, t) = declared(q)?;
     if !e.enabled {
-        return Err(tr!("{} 停着:先 aca plugin enable {}", "{} is paused: aca plugin enable {} first", e.id, e.id));
+        return Err(tr!("{} 已关闭:先运行 aca plugin enable {}", "{} is paused: aca plugin enable {} first", e.id, e.id));
     }
     let started = paths::now();
     let got = fire(&e, &m, &t);
@@ -531,12 +531,12 @@ impl Row {
         let mark = if self.on && self.enabled { "●" } else { "○" };
         let mut parts = vec![tr!("每 {}", "every {}", span(self.every))];
         if self.manual {
-            parts.push(tr!("插件自己开关", "switched by its plugin"));
+            parts.push(tr!("由插件自行开关", "switched by its plugin"));
         }
         parts.push(match (self.enabled, self.on) {
-            (false, _) => tr!("插件停着", "plugin paused"),
-            (true, true) => tr!("开着", "on"),
-            (true, false) => tr!("关着", "off"),
+            (false, _) => tr!("插件已关闭", "plugin paused"),
+            (true, true) => tr!("已开启", "on"),
+            (true, false) => tr!("已关闭", "off"),
         });
         if self.last > 0 {
             let ago = span(now.saturating_sub(self.last));
@@ -554,13 +554,13 @@ impl Row {
         let want = self.on && self.enabled;
         match (want, self.scheduled) {
             (true, false) => Some(tr!(
-                "{} 开着,可系统定时器没装上:aca plugin timer on {} 再装一次",
+                "{} 已开启,但系统定时器未安装:运行 aca plugin timer on {} 重新安装",
                 "{} is on but the system timer isn't installed: aca plugin timer on {} to install it again",
                 self.id,
                 self.id
             )),
             (false, true) => Some(tr!(
-                "{} 关着,系统定时器却还装着:到点它会自己卸掉,现在卸:aca plugin timer off {}",
+                "{} 已关闭,但系统定时器仍在:到时会自动卸载,如需立即卸载:aca plugin timer off {}",
                 "{} is off but the system timer is still installed: it removes itself when it fires; now: aca plugin timer off {}",
                 self.id,
                 self.id
@@ -620,16 +620,16 @@ mod tests {
             rc: Some(0),
             why: String::new(),
         };
-        assert_eq!(r.text(1180), "● aca.remote.collect  每 5m · 插件自己开关 · 开着 · 上次 3m 前 ✓");
+        assert_eq!(r.text(1180), "● aca.remote.collect  每 5m · 由插件自行开关 · 已开启 · 上次 3m 前 ✓");
         assert_eq!(r.mismatch(), None);
         let bad = Row { rc: Some(2), scheduled: false, ..r.clone() };
         assert!(bad.text(1180).ends_with("上次 3m 前 ✕ 退出码 2"));
-        assert!(bad.mismatch().unwrap().contains("系统定时器没装上"));
+        assert!(bad.mismatch().unwrap().contains("系统定时器未安装"));
         let off = Row { on: false, last: 0, ..r.clone() };
-        assert_eq!(off.text(1180), "○ aca.remote.collect  每 5m · 插件自己开关 · 关着");
-        assert!(off.mismatch().unwrap().contains("还装着"));
+        assert_eq!(off.text(1180), "○ aca.remote.collect  每 5m · 由插件自行开关 · 已关闭");
+        assert!(off.mismatch().unwrap().contains("仍在"));
         let paused = Row { enabled: false, scheduled: false, manual: false, ..r };
-        assert!(paused.text(1180).starts_with("○ aca.remote.collect  每 5m · 插件停着"));
+        assert!(paused.text(1180).starts_with("○ aca.remote.collect  每 5m · 插件已关闭"));
         assert_eq!(paused.mismatch(), None);
     }
 }

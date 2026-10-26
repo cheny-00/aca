@@ -83,7 +83,8 @@ fn plan(tool: &Tool, s: &Session, how: &How, aca: &str) -> Vec<String> {
     if tool.hook_trust == "bypass" {
         argv.push("--dangerously-bypass-hook-trust".into());
     }
-    // 开着的插件给它的:MCP 服务(Codex 给 MCP 子进程的环境只有白名单,会话 id 写进 env),aca 备好的插件副本
+    // 开着的插件给它的:aca 备好的插件副本(MCP 服务也在里面);做不成副本的 MCP 服务才走 -c mcp_servers
+    // (Codex 给 MCP 子进程的环境只有白名单,会话 id 写进 env)
     let mut env =
         vec![("ACA_SESSION_ID".to_string(), s.id.clone()), ("ACA_TOOL".into(), s.tool.clone()), ("ACA_BIN".into(), aca.to_string())];
     for k in ["ACA_HOME", "ACA_TMUX_SOCKET"] {
@@ -201,7 +202,7 @@ fn last_turn_end(text: &str, since: u64) -> Option<serde_json::Value> {
         let reply = p["last_agent_message"].as_str().unwrap_or("");
         return Some(serde_json::json!({ "hook_event_name": "Stop", "last_assistant_message": reply, "at": at? }));
     }
-    let message = p["error"]["message"].as_str().filter(|m| !m.trim().is_empty()).unwrap_or("这一轮出错了");
+    let message = p["error"]["message"].as_str().filter(|m| !m.trim().is_empty()).unwrap_or("本轮出错");
     // 类别:没带数据的写成字符串("server_overloaded"),带数据的写成只有一个键的对象({"http_connection_failed": {…}})
     let info = &p["error"]["codex_error_info"];
     let key = info.as_str().map(str::to_string).or_else(|| info.as_object()?.keys().next().cloned()).unwrap_or_default();
@@ -316,7 +317,7 @@ impl Agent for Codex {
             return (
                 args.to_vec(),
                 tr!(
-                    "两个账号走的服务不一样({} → {}),模型照新账号的 {now}(原来是 {was})",
+                    "两个账号使用的服务不同({} → {}),模型改用新账号的 {now}(原为 {was})",
                     "the accounts use different providers ({} → {}); the model is the new account's {now} (was {was})",
                     old.provider,
                     new.provider
@@ -336,8 +337,8 @@ impl Agent for Codex {
             return (out, String::new());
         }
         let note = match &new.model {
-            Some(m) => tr!("带上 -m {was}(新账号默认是 {m})", "with -m {was} (the new account defaults to {m})"),
-            None => tr!("带上 -m {was}", "with -m {was}"),
+            Some(m) => tr!("已加上 -m {was}(新账号默认为 {m})", "with -m {was} (the new account defaults to {m})"),
+            None => tr!("已加上 -m {was}", "with -m {was}"),
         };
         out.extend(["-m".to_string(), was]);
         (out, note)

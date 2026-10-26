@@ -135,7 +135,7 @@ impl Draft {
 
     pub fn finish(&self) -> Result<NewReq, String> {
         if self.text.trim().is_empty() {
-            return Err(t!("路径是空的", "the path is empty").into());
+            return Err(t!("路径不能为空", "the path is empty").into());
         }
         let (tool, account) = if self.shell { ("shell".to_string(), String::new()) } else { (self.tool.clone(), self.account.clone()) };
         let by_dir = self.by_dir();
@@ -282,7 +282,7 @@ impl Draft {
         let base = if head.is_empty() { home() } else { expand(&head) };
         let names = dirs_like(&base, &prefix);
         match names.as_slice() {
-            [] => self.hint = tr!("{} 下没有 {prefix}… 开头的目录", "no directory starting with {prefix}… under {}", tilde(&base)),
+            [] => self.hint = tr!("{} 下没有以 {prefix} 开头的目录", "no directory starting with {prefix}… under {}", tilde(&base)),
             [one] => self.text = format!("{head}{one}/"),
             many => {
                 let common = common_prefix(many);
@@ -532,7 +532,7 @@ impl DirPick {
             // 不用 --scheme=path:它给「/ 后面」的匹配加分,上级路径里的 /api-server 会压过行首的目录名 api-server
             "--highlight-line",
             "--prompt=› ",
-            t!("--ghost=搜目录", "--ghost=search directories"),
+            t!("--ghost=搜索目录", "--ghost=search directories"),
             "--with-shell=sh -c",
         ]
         .map(String::from)
@@ -614,9 +614,9 @@ pub fn fzf(cands: &[String], extra: &[&str]) -> Result<Option<String>, String> {
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                t!("没装 fzf", "fzf isn't installed").to_string()
+                t!("未安装 fzf", "fzf isn't installed").to_string()
             } else {
-                tr!("fzf 起不来:{e}", "can't start fzf: {e}")
+                tr!("无法启动 fzf:{e}", "can't start fzf: {e}")
             }
         })?;
     let mut stdin = child.stdin.take().unwrap();
@@ -630,7 +630,7 @@ pub fn fzf(cands: &[String], extra: &[&str]) -> Result<Option<String>, String> {
     match out.status.code() {
         Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string()).filter(|s| !s.is_empty())),
         Some(1 | 130) => Ok(None),
-        c => Err(tr!("fzf 出错({})", "fzf failed ({})", c.map_or(t!("被信号结束", "killed by a signal").to_string(), |c| c.to_string()))),
+        c => Err(tr!("fzf 出错({})", "fzf failed ({})", c.map_or(t!("被信号终止", "killed by a signal").to_string(), |c| c.to_string()))),
     }
 }
 
@@ -723,7 +723,7 @@ pub(crate) fn first_line(b: &[u8]) -> String {
 /// 登记 + 启动,返回会话 id
 pub fn create(req: &NewReq) -> Result<String, String> {
     if req.create_dir {
-        std::fs::create_dir_all(&req.dir).map_err(|e| tr!("建不了 {}:{e}", "can't create {}: {e}", tilde(&req.dir)))?;
+        std::fs::create_dir_all(&req.dir).map_err(|e| tr!("无法创建 {}:{e}", "can't create {}: {e}", tilde(&req.dir)))?;
     }
     let store = Store::open()?;
     let cfg = aca_core::config::load();

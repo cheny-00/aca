@@ -111,7 +111,7 @@ fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Too
         tool: "shell".into(),
         account: String::new(),
         agent: Agent::None,
-        note: t!("只开终端", "just a terminal").into(),
+        note: t!("仅打开终端", "just a terminal").into(),
         problem: None,
     };
     out.insert(0, shell);

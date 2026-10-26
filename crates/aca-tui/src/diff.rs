@@ -128,7 +128,7 @@ fn trunk(top: &str) -> Option<String> {
 
 fn branch_of(top: &str) -> String {
     run(top, &["symbolic-ref", "--short", "-q", "HEAD"])
-        .or_else(|| run(top, &["rev-parse", "--short", "HEAD"]).map(|h| tr!("{h}(没在分支上)", "{h} (detached)")))
+        .or_else(|| run(top, &["rev-parse", "--short", "HEAD"]).map(|h| tr!("{h}(不在分支上)", "{h} (detached)")))
         .unwrap_or_default()
 }
 
@@ -146,7 +146,7 @@ fn untracked(top: &str) -> Vec<String> {
 
 /// 和会话开的不是一个目录时,在顶上说一声
 fn moved(w: &Where, found: &workdir::Found) -> Option<String> {
-    (!found.how.is_empty() && found.dir != w.dir).then(|| tr!("会话开在 {}", "session opened in {}", crate::create::tilde(&w.dir)))
+    (!found.how.is_empty() && found.dir != w.dir).then(|| tr!("会话启动目录:{}", "session opened in {}", crate::create::tilde(&w.dir)))
 }
 
 /// 预览顶上的:找目录、数改动(同 `x` 默认看的:未提交的,没 git add 的新文件也算)
@@ -188,9 +188,9 @@ pub fn list_dir(dir: &str) -> Files {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Files { err: Some(t!("目录不在了", "the directory is gone").into()), ..out };
+            return Files { err: Some(t!("目录已不存在", "the directory is gone").into()), ..out };
         }
-        Err(e) => return Files { err: Some(tr!("读不了:{e}", "can't read: {e}")), ..out },
+        Err(e) => return Files { err: Some(tr!("无法读取:{e}", "can't read: {e}")), ..out },
     };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
@@ -217,7 +217,7 @@ pub fn load(w: &Where, mode: Mode) -> Diff {
     let say =
         |m: &str| notice(&[Some(format!("{} · {m}", crate::create::tilde(dir))), moved.clone()].into_iter().flatten().collect::<Vec<_>>());
     if dir.is_empty() || !std::path::Path::new(dir).is_dir() {
-        return say(t!("目录不在了", "the directory is gone"));
+        return say(t!("目录已不存在", "the directory is gone"));
     }
     let Some(top) = run(dir, &["rev-parse", "--show-toplevel"]) else {
         return say(t!("不是 git 仓库", "not a git repository"));
@@ -239,7 +239,7 @@ pub fn load(w: &Where, mode: Mode) -> Diff {
                 }
                 None => note = Some(tr!("和 {t} 没有共同提交", "no common commit with {t}")),
             },
-            None => note = Some(t!("没有主干", "no main branch").into()),
+            None => note = Some(t!("找不到主干分支", "no main branch").into()),
         }
     }
     let args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "--src-prefix=a/", "--dst-prefix=b/", base.as_str()];
@@ -258,10 +258,10 @@ pub fn load(w: &Where, mode: Mode) -> Diff {
 
 /// 没 git add 的新文件的内容;二进制、读不了的写一句话
 fn read_new(p: &std::path::Path) -> String {
-    let Ok(f) = std::fs::File::open(p) else { return t!("\0读不了", "\0unreadable").into() };
+    let Ok(f) = std::fs::File::open(p) else { return t!("\0无法读取", "\0unreadable").into() };
     let mut buf = vec![];
     if f.take(256 << 10).read_to_end(&mut buf).is_err() {
-        return t!("\0读不了", "\0unreadable").into();
+        return t!("\0无法读取", "\0unreadable").into();
     }
     if buf[..buf.len().min(8000)].contains(&0) {
         return t!("\0二进制文件", "\0binary file").into();
@@ -423,7 +423,7 @@ fn parse(patch: &str) -> Vec<File> {
             f.kind = 'R';
             f.path = p.to_string();
         } else if let Some(p) = line.strip_prefix("rename from ") {
-            f.about = Some(tr!("改名自 {p}", "renamed from {p}"));
+            f.about = Some(tr!("重命名自 {p}", "renamed from {p}"));
         } else if let Some(p) = line.strip_prefix("+++ b/") {
             f.path = p.to_string();
         } else if let Some(p) = line.strip_prefix("--- a/").filter(|_| f.kind == 'D') {
@@ -431,7 +431,7 @@ fn parse(patch: &str) -> Vec<File> {
         } else if line.starts_with("Binary files") {
             f.about = Some(t!("二进制文件", "binary file").into());
         } else if let Some(m) = line.strip_prefix("new mode ").filter(|_| f.about.is_none()) {
-            f.about = Some(tr!("权限改成 {m}", "mode changed to {m}"));
+            f.about = Some(tr!("权限改为 {m}", "mode changed to {m}"));
         }
     }
     files
@@ -499,10 +499,10 @@ pub fn render(h: &Head, patch: &str, new_files: &[(String, Option<String>)]) -> 
                 f.body.push(tr!("@@ 新文件,{} 行 @@", "@@ new file, {} lines @@", lines.len()));
                 f.body.extend(lines.iter().take(NEW_FILE_LINES).map(|l| format!("+{l}")));
                 if lines.len() > NEW_FILE_LINES {
-                    f.body.push(tr!("\\ 还有 {} 行没摆出来", "\\ {} more lines not shown", lines.len() - NEW_FILE_LINES));
+                    f.body.push(tr!("\\ 还有 {} 行未显示", "\\ {} more lines not shown", lines.len() - NEW_FILE_LINES));
                 }
             }
-            None => f.about = Some(t!("内容没摆出来(新文件太多)", "content not shown (too many new files)").into()),
+            None => f.about = Some(t!("内容未显示(新文件过多)", "content not shown (too many new files)").into()),
         }
         files.push(f);
     }
@@ -536,7 +536,7 @@ pub fn render(h: &Head, patch: &str, new_files: &[(String, Option<String>)]) -> 
         out.push(vec![seg(format!(" {n}"), theme::warn())], None);
     }
     if h.cut {
-        out.push(vec![seg(t!(" diff 太大,只读了前 8MB", " diff too large, only the first 8MB read"), theme::warn())], None);
+        out.push(vec![seg(t!(" diff 过大,只读取了前 8MB", " diff too large, only the first 8MB read"), theme::warn())], None);
     }
     if !h.commits.is_empty() {
         out.push(vec![], None);
@@ -572,7 +572,7 @@ pub fn render(h: &Head, patch: &str, new_files: &[(String, Option<String>)]) -> 
         }
         for (line, &n) in f.body.iter().zip(&pos[i].at) {
             if out.len() >= MAX_LINES {
-                out.push(vec![seg(t!(" …… 太长了,后面的没摆出来", " …… too long, the rest isn't shown"), theme::warn())], None);
+                out.push(vec![seg(t!(" …… 内容过长,其余部分未显示", " …… too long, the rest isn't shown"), theme::warn())], None);
                 full = true;
                 break;
             }
@@ -658,7 +658,7 @@ Binary files a/logo.png and b/logo.png differ
         assert_eq!(t[a + 1..a + 6], ["@@ -1,3 +1,3 @@ fn main() {", " keep", "-old", "+new", "+   more"]);
         assert_eq!(d.lines[a + 3][0].style.fg, Some(theme::pal().red));
         assert_eq!(d.lines[a + 4][0].style.fg, Some(theme::pal().green));
-        assert_eq!(t[d.files[2] + 1], "  改名自 old name.md");
+        assert_eq!(t[d.files[2] + 1], "  重命名自 old name.md");
         assert_eq!(t[d.files[3] + 1], "  二进制文件");
         assert_eq!(t[d.files[4] + 1..d.files[4] + 4], ["@@ 新文件,2 行 @@", "+a", "+b"]);
         assert_eq!(t[d.files[5] + 1], "  二进制文件");
@@ -780,6 +780,6 @@ Binary files a/logo.png and b/logo.png differ
         assert_eq!((g.repo, g.files), (None, Some(f)));
         assert_eq!(glance(&Where { dir: d.into(), ..Default::default() }).files, None);
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(list_dir(d).err.as_deref(), Some("目录不在了"));
+        assert_eq!(list_dir(d).err.as_deref(), Some("目录已不存在"));
     }
 }

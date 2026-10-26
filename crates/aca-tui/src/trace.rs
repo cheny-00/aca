@@ -589,10 +589,10 @@ pub fn find(s: &Session) -> Result<PathBuf, String> {
 
 /// 找到并读完这个会话的记录
 pub fn load(s: &Session) -> Result<Trace, String> {
-    let t = Trace::open(find(s)?, s.agent).map_err(|_| t!("读不了记录", "can't read the record").to_string())?;
+    let t = Trace::open(find(s)?, s.agent).map_err(|_| t!("无法读取记录", "can't read the record").to_string())?;
     if t.cx.old {
         // Codex 0.107 以前的格式
-        return Err(t!("记录格式太老,看不了", "the record's format is too old to read").into());
+        return Err(t!("记录格式过旧,无法查看", "the record's format is too old to read").into());
     }
     Ok(t)
 }
@@ -712,7 +712,7 @@ pub fn row(t: &Trace, i: usize, opened: bool, w: usize) -> Line<'static> {
         Kind::Copied => {
             let turns = n.kids.iter().filter(|&&k| t.nodes[k].kind == Kind::Turn).count();
             let fold = Span::styled(if opened { "▾ " } else { "▸ " }, theme::faint());
-            fit(vec![Span::raw(" "), fold], &tr!("上一段 · {turns} 轮 · 不计", "earlier · {turns} turns · not counted"), dim(), w)
+            fit(vec![Span::raw(" "), fold], &tr!("上一段 · {turns} 轮 · 不计入", "earlier · {turns} turns · not counted"), dim(), w)
         }
         _ => fit(vec![Span::raw("   "), Span::styled("── ", theme::faint())], &n.label, dim(), w),
     }
@@ -1152,7 +1152,7 @@ pub fn where_of(t: &Trace, i: usize) -> String {
     let turn = turn_of(t, i);
     let no = match t.turn_no(turn) {
         Some(x) => tr!("第 {x} 轮", "turn {x}"),
-        None if t.nodes[turn].rolled => t!("回退掉的", "rolled back").into(),
+        None if t.nodes[turn].rolled => t!("已回退", "rolled back").into(),
         None => t!("上一段", "earlier").into(),
     };
     match n.kind {

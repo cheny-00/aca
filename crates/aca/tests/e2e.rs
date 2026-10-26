@@ -340,7 +340,7 @@ fn stop_idle_stops_only_sessions_really_idle_long_enough_and_marks_them_apart() 
     let state = |id: &str| show(id)["state"].as_str().unwrap().to_string();
 
     // 还没闲够:不停
-    assert_eq!(sb.aca(&["stop", "--idle", "1h"]), "没有空闲了 1h 以上、能停的会话");
+    assert_eq!(sb.aca(&["stop", "--idle", "1h"]), "没有空闲超过 1h 且可停止的会话");
     std::thread::sleep(std::time::Duration::from_millis(2100));
     // 一轮刚报开始的头 3 秒列表先信 hook(在跑);过了这几秒,跑到一半的那个屏幕上看着是闲的
     std::thread::sleep(std::time::Duration::from_millis(3200).saturating_sub(half_at.elapsed()));
@@ -351,7 +351,7 @@ fn stop_idle_stops_only_sessions_really_idle_long_enough_and_marks_them_apart() 
     let mut titles: Vec<&str> = out.lines().map(|l| l.split("  ").nth(1).unwrap_or("").split('(').next().unwrap()).collect();
     titles.sort();
     assert_eq!(titles, ["压完了", "定时删掉了", "甲"], "{out}");
-    assert!(out.contains(&format!("☾ {idle}  甲(空闲了 ")) && out.contains(&format!("☾ {cron_off}  ")), "{out}");
+    assert!(out.contains(&format!("☾ {idle}  甲(已空闲 ")) && out.contains(&format!("☾ {cron_off}  ")), "{out}");
     assert_eq!(state(&idle), "exited");
     assert_eq!(state(&compacted), "exited");
     for id in [&unread, &bg, &half, &draft, &ticking, &subs, &cron_on, &looping, &compacting] {
@@ -365,7 +365,7 @@ fn stop_idle_stops_only_sessions_really_idle_long_enough_and_marks_them_apart() 
     assert!(serde_json::from_str::<Value>(&ev).unwrap()["idle"].as_u64().unwrap() >= 2, "{ev}");
 
     // 再起:接着原来的对话,记号清掉;人再停一次就是 ■
-    assert_eq!(sb.aca(&["start", &idle]), "启动了,接着原来的对话");
+    assert_eq!(sb.aca(&["start", &idle]), "已启动,继续原对话");
     assert_eq!(show(&idle)["idle_stopped"], 0);
     sb.aca(&["stop", &idle]);
     assert!(sb.aca(&["ls"]).contains(&format!("■ {idle}")));
@@ -658,16 +658,18 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
     // 不带参数:列出来看,什么都不动。认出了哪一家、哪个账号、哪段对话、要照搬的参数
     let listed = aca(&["adopt"]);
     assert!(
-        listed.contains("「修登录」 claude:sub") && listed.contains("对话 c-live") && listed.contains("带 --dangerously-skip-permissions"),
+        listed.contains("「修登录」 claude:sub")
+            && listed.contains("对话 c-live")
+            && listed.contains("参数 --dangerously-skip-permissions"),
         "{listed}"
     );
-    assert!(aca(&["adopt", &sid, "-n"]).contains("会接管"));
+    assert!(aca(&["adopt", &sid, "-n"]).contains("将接管"));
     assert_eq!(ls(), serde_json::json!([]));
     assert_eq!(panes(), format!("{tmux_name}|||off|0"));
 
     // 接管:登记了、tmux 会话名改成标题、agent 那一格记上了;进程还是原来那个,没被动过
     let said = aca(&["adopt", &tmux_name, "-g", "work"]);
-    assert!(said.contains("接管了「修登录」") && said.contains(&format!("{tmux_name} → 修登录")), "{said}");
+    assert!(said.contains("已接管「修登录」") && said.contains(&format!("{tmux_name} → 修登录")), "{said}");
     let row = ls()[0].clone();
     let id = row["id"].as_str().unwrap().to_string();
     assert_eq!(
@@ -688,7 +690,7 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
     assert!(alive(&pid), "接管不该动那个进程");
     // 再接一次:已经是 aca 的了
     let again = sb.cmd().env("HOME", &sb.home).args(["adopt", "修登录"]).output().unwrap();
-    assert!(!again.status.success() && String::from_utf8_lossy(&again.stderr).contains("已经是 aca 的会话"));
+    assert!(!again.status.success() && String::from_utf8_lossy(&again.stderr).contains("已是 aca 会话"));
 
     // 重启:原来那个进程退干净了(它不是窗格的根进程,外面还有一层 shell),在同一格里由 aca 起:接着那段对话、
     // 带着 hook、照搬的参数还在
@@ -704,7 +706,7 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
     );
 
     // 放手:登记没了,tmux 会话和里面的进程照留,变回普通会话(remain-on-exit 也收回去)
-    assert!(aca(&["release", &id]).contains("放手了「修登录」"));
+    assert!(aca(&["release", &id]).contains("已将「修登录」移出 aca"));
     assert_eq!(ls(), serde_json::json!([]));
     assert_eq!(panes(), "修登录|||off|0");
     assert!(alive(&now));
@@ -713,7 +715,7 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
     // aca 自己带进去的那几样(--resume、它的 --settings)不当成要照搬的参数
     write(&sb.home.join(format!("cc/sessions/{now}.json")), &format!(r#"{{"pid":{now},"sessionId":"c-live","cwd":"{}"}}"#, sb.proj()));
     let said = aca(&["adopt", &pane]);
-    assert!(said.contains(&format!("接管了「修登录」 {id}")) && !said.contains("重启之前"), "{said}");
+    assert!(said.contains(&format!("已接管「修登录」 {id}")) && !said.contains("重启前"), "{said}");
     let row = ls()[0].clone();
     assert_eq!((row["id"].as_str(), row["account"].as_str(), row["conv"].as_str()), (Some(id.as_str()), Some("sub"), Some("c-live")));
     assert!(aca(&["show", &id, "--json"]).contains("\"args\":[\"--dangerously-skip-permissions\"]"));
@@ -722,7 +724,7 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
     let other = sb.tmux(&["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", "杂项", "-c", &sb.proj(), "sleep 600"]);
     assert!(aca(&["adopt", "杂项", "-n"]).contains("shell"));
     let said = aca(&["adopt", &other, "--as", "fake:sub", "-t", "又一个", "--conv", "c-9", "--", "--mine"]);
-    assert!(said.contains("接管了「又一个」"), "{said}");
+    assert!(said.contains("已接管「又一个」"), "{said}");
     let row = serde_json::from_str::<Value>(&aca(&["show", "又一个", "--json"])).unwrap();
     assert_eq!(
         (row["tool"].as_str(), row["account"].as_str(), row["conv"].as_str(), row["locked"].as_bool(), row["tmux"].as_str()),
@@ -746,7 +748,7 @@ fn the_title_an_agent_writes_on_its_pane_is_followed_without_any_hook() {
     on_pane(&pane, "✳ 登录页 500 排查");
     let aca = |args: &[&str]| at_home(&sb, args);
     let said = aca(&["adopt", &pane]);
-    assert!(said.contains("接管了「登录页 500 排查」"), "{said}");
+    assert!(said.contains("已接管「登录页 500 排查」"), "{said}");
     let row = |id: &str| {
         let all = serde_json::from_str::<Value>(&aca(&["ls", "--json", "--no-screen"])).unwrap();
         all.as_array().unwrap().iter().find(|r| r["id"] == id).unwrap().clone()
@@ -811,7 +813,7 @@ fn a_session_agent_deck_started_keeps_its_title_group_and_id_when_adopted() {
 
     // 写名字里的一段就行
     let said = aca(&["adopt", "iron-dune"]);
-    assert!(said.contains("接管了「架构替换方案」 ad-77") && said.contains("agent-deck -p default remove ad-77"), "{said}");
+    assert!(said.contains("已接管「架构替换方案」 ad-77") && said.contains("agent-deck -p default remove ad-77"), "{said}");
     let row = serde_json::from_str::<Value>(&aca(&["show", "ad-77", "--json"])).unwrap();
     assert_eq!(
         (row["title"].as_str(), row["group"].as_str(), row["conv"].as_str(), row["tmux"].as_str(), row["created"].as_u64()),
@@ -865,13 +867,13 @@ fn a_session_imported_while_running_is_attached_to_its_registration_and_the_rest
     let ls = || serde_json::from_str::<Value>(&aca(&["ls", "--json"])).unwrap();
 
     // 先整批搬过(连在跑的也登记了):登记着,在 aca 看来是停着的
-    assert!(aca(&["import", "agent-deck", "--apply", "--all"]).contains("搬了 1 个"));
+    assert!(aca(&["import", "agent-deck", "--apply", "--all"]).contains("已导入 1 个"));
     assert_eq!(ls()[0]["state"], "stopped");
     let Some((_, pane, _)) = foreign_claude(&sb, Some("agentdeck_k_5"), "AGENTDECK_INSTANCE_ID=ad-5") else { return };
 
     // 接管:不另登记一条,把这个 tmux 会话接到那条上。对话、参数以进程上现在的为准,别的照登记的
     let said = aca(&["adopt", "k_5"]);
-    assert!(said.contains("接管了「导入过的」 ad-5"), "{said}");
+    assert!(said.contains("已接管「导入过的」 ad-5"), "{said}");
     let rows = ls();
     assert_eq!(rows.as_array().unwrap().len(), 1);
     assert_eq!(
@@ -887,13 +889,16 @@ fn a_session_imported_while_running_is_attached_to_its_registration_and_the_rest
     foreign_claude(&sb, None, "").unwrap();
     sb.tmux(&["new-session", "-d", "-s", "只是个壳", "-c", &sb.proj(), "sleep 600"]);
     let listed = aca(&["adopt"]);
-    assert!(listed.contains("另有 1 个 tmux 会话没认出 agent") && listed.contains("只是个壳") && !listed.contains("导入过的"), "{listed}");
+    assert!(
+        listed.contains("另有 1 个 tmux 会话未识别到 agent") && listed.contains("只是个壳") && !listed.contains("导入过的"),
+        "{listed}"
+    );
     let said = aca(&["adopt", "--all", "-g", "批量"]);
-    assert_eq!(said.matches("接管了").count(), 1, "{said}");
+    assert_eq!(said.matches("已接管").count(), 1, "{said}");
     let rows = ls();
     let groups: Vec<&str> = rows.as_array().unwrap().iter().map(|r| r["group"].as_str().unwrap()).collect();
     assert_eq!(groups, ["g", "批量"]);
-    assert_eq!(aca(&["adopt", "--all"]), "没有能直接接管的 tmux 会话");
+    assert_eq!(aca(&["adopt", "--all"]), "没有可直接接管的 tmux 会话");
 }
 
 #[test]
@@ -917,7 +922,7 @@ fn a_dir_becomes_a_group_named_after_it_and_the_group_can_be_renamed_and_rehomed
     let ui = sb.home.join("state/ui");
     write(&ui.join("spaces"), "group\tdefault\taca-2\th\ngroup\tdefault\taca\t2\n");
     write(&ui.join("view"), "group=aca-2\nfolded=aca-2\tother\n");
-    assert_eq!(sb.aca(&["group", "rename", "aca-2", "lab/aca"]), "aca-2 → lab/aca,1 个会话跟过去");
+    assert_eq!(sb.aca(&["group", "rename", "aca-2", "lab/aca"]), "aca-2 → lab/aca,1 个会话一并移动");
     assert_eq!(sb.json(&["show", &id, "--json"])["group"], "lab/aca");
     let spaces = std::fs::read_to_string(ui.join("spaces")).unwrap();
     assert!(spaces.contains("group\tdefault\tlab/aca\th\n") && spaces.contains("group\tdefault\taca\t2\n"), "{spaces}");
@@ -925,7 +930,7 @@ fn a_dir_becomes_a_group_named_after_it_and_the_group_can_be_renamed_and_rehomed
     assert!(view.contains("group=lab/aca\n") && view.contains("folded=lab/aca\tother\n"), "{view}");
     // 撞上已有的:不改
     let o = sb.run(&["group", "rename", "lab/aca", "ACA"]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("已经有 aca"));
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("aca 已存在"));
 
     // 默认目录:换一个;是别的组的不收;'' = 不记
     sb.aca(&["group", "dir", "lab/aca", &c]);
@@ -1016,7 +1021,7 @@ fn the_mod_rides_along_only_on_a_claude_build_that_takes_it_and_keeps_reporting(
     hands_over(&one, r#"{"context":{"window":1000000},"limits":[]}"#);
     let (two, argv) = start();
     assert!(!argv.contains("--plugin-dir"), "{argv}");
-    assert!(whys().contains("认不出") && !state.join(format!("mod/up/{two}")).exists());
+    assert!(whys().contains("无法识别") && !state.join(format!("mod/up/{two}")).exists());
 
     // 换了一版,它自己说不认这个事件:不带
     install(
@@ -1039,7 +1044,7 @@ fn the_mod_rides_along_only_on_a_claude_build_that_takes_it_and_keeps_reporting(
     sb.hook(&four, &pane, r#"{"hook_event_name":"UserPromptSubmit","session_id":"c4","prompt":"hi"}"#);
     sb.hook(&four, &pane, r#"{"hook_event_name":"Stop","session_id":"c4"}"#);
     assert!(!start().1.contains("--plugin-dir"));
-    assert!(whys().contains("没交来"), "{}", whys());
+    assert!(whys().contains("未收到任何用量"), "{}", whys());
 }
 
 #[test]
@@ -1150,7 +1155,7 @@ fn a_message_to_codex_goes_into_its_own_queue_and_waits_while_it_is_busy() {
 
     // 还没说过话:没有对话 id 排不进去;屏幕上也没有输入框,不打字。先存着
     let said = sb.aca(&["msg", &cx, "先看看 README"]);
-    assert!(said.contains("先存着"), "{said}");
+    assert!(said.contains("暂存"), "{said}");
     assert_eq!(sb.queued(), "");
     // 它说过一句、这一轮跑完了:它自己的 Stop hook 把存着的排进它的队列
     hook(r#"{"hook_event_name":"SessionStart","session_id":"th-1","source":"startup"}"#);
@@ -1171,7 +1176,7 @@ fn a_message_to_codex_goes_into_its_own_queue_and_waits_while_it_is_busy() {
     // 它在跑:再发的先存着,这一轮跑完马上排进去
     sb.set_screen(&cx, &pane, "• Working (5s • esc to interrupt)");
     let said = sb.aca(&["msg", &cx, "再补一句"]);
-    assert!(said.contains("它在跑"), "{said}");
+    assert!(said.contains("它正在运行"), "{said}");
     sb.set_screen(&cx, &pane, "• 好了");
     hook(r#"{"hook_event_name":"Stop","session_id":"th-1","last_assistant_message":"好了"}"#);
     assert!(sb.until(|| sb.queued().contains("再补一句")), "{}", sb.queued());
@@ -1180,7 +1185,7 @@ fn a_message_to_codex_goes_into_its_own_queue_and_waits_while_it_is_busy() {
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"th-1","prompt":"写一篇长文"}"#);
     hook(r#"{"hook_event_name":"Interrupt","session_id":"th-1"}"#);
     let said = sb.aca(&["msg", &cx, "第三句"]);
-    assert!(said.contains("打断"), "{said}");
+    assert!(said.contains("中断"), "{said}");
     assert!(!sb.queued().contains("第三句"));
 }
 
@@ -1191,14 +1196,14 @@ fn without_a_doorbell_a_message_is_typed_in_only_when_the_input_box_is_empty() {
     // 按 Claude 起的,但这次没接上门铃(像接管来、还没重启的):只能打字
     let id = sb.aca(&["new", "scr", &sb.proj()]);
     let pane = sb.pane(&id);
-    // 输入框里有你没发的字:不打,过一阵再看
+    // 输入框中有你未发送的内容:不打,过一阵再看
     sb.set_screen(&id, &pane, "❯ 人打的草稿");
     let said = sb.aca(&["msg", &id, "补一下测试"]);
-    assert!(said.contains("输入框里有你没发的字"), "{said}");
+    assert!(said.contains("输入框中有你未发送的内容"), "{said}");
     // 只有灰色的提示:打进去,存着的那条一起
     sb.set_screen(&id, &pane, "❯ \x1b[2mTry \"fix typecheck errors\"\x1b[0m");
     let said = sb.aca(&["msg", &id, "跑一下 e2e"]);
-    assert!(said.contains("打字送进去了"), "{said}");
+    assert!(said.contains("已输入并发送"), "{said}");
     let screen = sb.wait_screen(&pane, "跑一下 e2e");
     assert!(screen.contains("补一下测试") && screen.contains("跑一下 e2e") && !screen.contains("[aca]"), "{screen}");
     let inbox = sb.json(&["inbox", &id, "--json"]);
@@ -1237,7 +1242,7 @@ fn a_waiting_worker_is_answered_by_number_and_only_by_the_one_that_sent_it_out()
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("aca answer"));
     // 别的会话不能替它答;选项号要对得上
     let o = sb.as_session(&other, &["answer", &w, "2"], "");
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("不是你派出去的"));
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("不是你派出的会话"));
     assert!(!sb.as_session(&lead, &["answer", &w, "3"], "").status.success());
     // 派它的那个能:按下 2(假 agent 不读键,终端把它回显在屏幕上)
     let o = sb.as_session(&lead, &["answer", &w, "2"], "");
@@ -1265,7 +1270,7 @@ fn a_startup_gate_seen_only_on_screen_is_answered_by_walking_to_the_option() {
     );
     let shown = sb.aca(&["answer", &w]);
     assert!(
-        shown.contains("在问:Folder access · /p/api · Trust this folder?") && shown.contains("  1 Trust and continue\n  2 Quit"),
+        shown.contains("正在询问:Folder access · /p/api · Trust this folder?") && shown.contains("  1 Trust and continue\n  2 Quit"),
         "{shown}"
     );
     assert!(!sb.as_session(&lead, &["answer", &w, "3"], "").status.success());
@@ -1297,7 +1302,7 @@ fn waiting_for_a_worker_returns_when_its_turn_ends_and_its_notice_does_not_wake_
     sb.set_screen(&w, &pane, "❯ ");
     sb.hook(&w, &pane, r#"{"hook_event_name":"Stop","session_id":"c1","last_assistant_message":"读完了"}"#);
     let o = child.wait_with_output().unwrap();
-    assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stdout).trim()), (Some(0), format!("{w} 跑完一轮:「读完了」").as_str()));
+    assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stdout).trim()), (Some(0), format!("{w} 完成一轮:「读完了」").as_str()));
     // 它的通知已经记成送到了:门铃响了也不会再为它叫醒一次
     assert_eq!(sb.json(&["inbox", &lead, "--json"])[0]["stage"], "got");
     assert_eq!(sb.as_session(&lead, &["inbox", "take"], "{}").status.code(), Some(0));
@@ -1305,7 +1310,7 @@ fn waiting_for_a_worker_returns_when_its_turn_ends_and_its_notice_does_not_wake_
     // 一直没开始干活的:到时间就回,退出码 124
     let idle = sb.aca(&["new", "scr", &sb.proj()]);
     let o = sb.run(&["wait", &idle, "--timeout", "1"]);
-    assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stdout).trim()), (Some(124), format!("{idle} 还没完(到时间了)").as_str()));
+    assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stdout).trim()), (Some(124), format!("{idle} 尚未完成(已超时)").as_str()));
 }
 
 #[test]
@@ -1334,11 +1339,11 @@ fn a_plugin_installed_from_git_brings_its_claude_plugin_while_enabled_and_goes_a
 
     // 从 git 装:克隆到 aca 的数据目录,记下从哪来的,带给 Claude
     let url = format!("file://{}", src.display());
-    assert!(sb.aca(&["plugin", "install", &url]).contains("装好了 t.deleg(Deleg 0.1.0)"));
+    assert!(sb.aca(&["plugin", "install", &url]).contains("已安装 t.deleg(Deleg 0.1.0)"));
     let dir = sb.home.join("data/plugins/t.deleg");
     assert!(dir.join("claude/commands/hello.md").is_file());
     let ls = sb.aca(&["plugin", "ls"]);
-    assert!(ls.contains("● t.deleg  Deleg 0.1.0") && ls.contains(&format!("装自 {url}")) && ls.contains("带给 claude"), "{ls}");
+    assert!(ls.contains("● t.deleg  Deleg 0.1.0") && ls.contains(&format!("安装自 {url}")) && ls.contains("提供给 claude"), "{ls}");
     // 开着:起 Claude 时带上它的插件目录(只对这一次启动)
     let a = sb.aca(&["new", "argc", &sb.proj()]);
     let want = format!("--plugin-dir {}", dir.join("claude").canonicalize().unwrap().display());
@@ -1355,22 +1360,22 @@ fn a_plugin_installed_from_git_brings_its_claude_plugin_while_enabled_and_goes_a
     git(&src, &["commit", "-q", "-am", "v2"]);
     let said = sb.aca(&["plugin", "update"]);
     assert!(said.contains("t.deleg:") && said.contains("→") && said.contains("Deleg 0.2.0"), "{said}");
-    assert!(sb.aca(&["plugin", "update", "t.deleg"]).contains("已经是最新的"));
+    assert!(sb.aca(&["plugin", "update", "t.deleg"]).contains("已是最新版本"));
     // 删:连目录一起删,登记没了;插件自己的配置留着(aca 替它建的目录要是空的就不留,见 aca.copy 那条测试)
     write(&sb.home.join("config/plugins/t.deleg/mine.toml"), "x = 1\n");
-    assert!(sb.aca(&["plugin", "remove", "t.deleg"]).contains("删了 t.deleg"));
+    assert!(sb.aca(&["plugin", "remove", "t.deleg"]).contains("已删除 t.deleg"));
     // 一个插件都不列了;起来时带着它的那个会话被点名:要重启才去掉
     let ls = sb.aca(&["plugin", "ls"]);
     assert!(!dir.exists() && !ls.lines().any(|l| l.starts_with(['●', '○'])) && ls.contains("重启"), "{ls}");
     assert!(sb.home.join("config/plugins/t.deleg/mine.toml").is_file());
     // 钉在一个版本上:update 不动它
     sb.aca(&["plugin", "install", &url, "--ref", &v1]);
-    assert!(sb.aca(&["plugin", "update", "t.deleg"]).contains("钉在"));
+    assert!(sb.aca(&["plugin", "update", "t.deleg"]).contains("固定在"));
     assert!(sb.aca(&["plugin", "ls"]).contains("Deleg 0.1.0"));
     sb.aca(&["plugin", "remove", "t.deleg"]);
     // 本地目录:就是链接,删的时候目录不动
-    assert!(sb.aca(&["plugin", "install", &src.to_string_lossy()]).contains("装好了 t.deleg"));
-    assert!(sb.aca(&["plugin", "remove", "t.deleg"]).contains("没动"));
+    assert!(sb.aca(&["plugin", "install", &src.to_string_lossy()]).contains("已安装 t.deleg"));
+    assert!(sb.aca(&["plugin", "remove", "t.deleg"]).contains("未删除"));
     assert!(src.join("aca-plugin.toml").is_file());
 }
 
@@ -1433,10 +1438,10 @@ fn the_delegate_plugin_says_continue_to_a_worker_whose_turn_failed_for_a_transie
     let Some(sb) = Sandbox::new("delegate") else { return };
     sb.screen_tools();
     let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/delegate").canonicalize().unwrap();
-    assert!(sb.aca(&["plugin", "link", &plugin.to_string_lossy()]).contains("链接了 aca.delegate"));
+    assert!(sb.aca(&["plugin", "link", &plugin.to_string_lossy()]).contains("已链接 aca.delegate"));
     // 它给 Claude、Codex 带同一个插件目录,里面有 /delegate。文件写着模型自己不调它,设置 auto(默认开)开着时不作数
     let ls = sb.aca(&["plugin", "ls"]);
-    assert!(ls.contains("● aca.delegate") && ls.contains("带给 claude、codex"), "{ls}");
+    assert!(ls.contains("● aca.delegate") && ls.contains("提供给 claude、codex"), "{ls}");
     let cmd = std::fs::read_to_string(plugin.join("claude/commands/delegate.md")).unwrap();
     assert!(cmd.starts_with("---\n") && cmd.contains("\ndisable-model-invocation: true\n"));
     assert_eq!(sb.aca(&["plugin", "setting", "aca.delegate", "auto"]), "true");
@@ -1444,11 +1449,11 @@ fn the_delegate_plugin_says_continue_to_a_worker_whose_turn_failed_for_a_transie
     assert_eq!(sb.aca(&["plugin", "setting", "aca.delegate", "worker"]), "codex");
     sb.aca(&["plugin", "setting", "aca.delegate", "say", "继续"]);
     assert_eq!(sb.aca(&["plugin", "setting", "aca.delegate", "say"]), "继续");
-    assert!(sb.aca(&["plugin", "setting", "aca.delegate"]).contains("say = 继续(改过)"));
+    assert!(sb.aca(&["plugin", "setting", "aca.delegate"]).contains("say = 继续(已修改)"));
     assert!(!sb.run(&["plugin", "setting", "aca.delegate", "nope", "1"]).status.success());
     // 照默认值的类型读:整数的填字不行;字的写 true 也还是字
     let o = sb.run(&["plugin", "setting", "aca.delegate", "max_continue", "many"]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("要是整数"));
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("应为整数"));
     sb.aca(&["plugin", "setting", "aca.delegate", "say", "true"]);
     assert!(std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap().contains("say = \"true\""));
     sb.aca(&["plugin", "setting", "aca.delegate", "say", "继续"]);
@@ -1482,7 +1487,7 @@ fn the_delegate_plugin_says_continue_to_a_worker_whose_turn_failed_for_a_transie
     let log = || std::fs::read_to_string(sb.home.join("state/plugin-logs/aca.delegate.log")).unwrap_or_default();
     assert!(sb.wait_screen(&pane, "继续").contains("继续"), "{}\n{}", sb.tmux(&["capture-pane", "-p", "-t", &pane]), log());
     let log = log();
-    assert!(log.contains("第 1 次替它说「继续」"), "{log}");
+    assert!(log.contains("第 1 次代为发送「继续」"), "{log}");
     // 再试也一样的、你自己开的(没有 parent):不碰
     let other = sb.aca(&["new", "scr", &sb.proj(), "--parent", &lead]);
     let p2 = fail(&other, "prompt is too long");
@@ -1521,14 +1526,14 @@ fn a_codex_turn_that_ends_in_an_error_without_a_hook_is_found_in_its_rollout() {
     let o = child.wait_with_output().unwrap();
     let said = String::from_utf8_lossy(&o.stdout).to_string();
     assert_eq!(o.status.code(), Some(3), "{said}");
-    assert!(said.contains("出错(临时的") && said.contains("Our servers are currently overloaded"), "{said}");
+    assert!(said.contains("出错(临时错误") && said.contains("Our servers are currently overloaded"), "{said}");
     let is_failed = |l: &&str| l.contains(r#""event":"turn.failed""#);
     let ev = sb.aca(&["events", "-n", "100"]).lines().find(is_failed).unwrap().to_string();
     assert!(ev.contains("\"kind\":\"transient\""), "{ev}");
     // 派它的那个要了 failed 通知:收到了,说了是哪一类
     let notice = sb.json(&["inbox", &lead, "--json"]);
     assert_eq!(notice[0]["what"], "turn.failed");
-    assert!(notice[0]["text"].as_str().unwrap().contains("临时的"), "{notice}");
+    assert!(notice[0]["text"].as_str().unwrap().contains("临时错误"), "{notice}");
     // 只补一次:再看一眼不会再发
     sb.aca(&["ls"]);
     let all = sb.aca(&["events", "-n", "100"]);
@@ -1622,10 +1627,10 @@ fn a_worker_in_its_own_worktree_leaves_the_main_checkout_alone_and_rm_keeps_the_
     assert_eq!(sb.json(&["show", &id2, "--json"])["dir"], wt.to_string_lossy().as_ref());
 
     // 还有别的会话在里面:删一个,worktree 留着
-    assert!(sb.aca(&["rm", &id]).contains("还有别的会话在用"));
+    assert!(sb.aca(&["rm", &id]).contains("仍有其他会话在使用"));
     // 有没跟踪的文件(探针脚本之类):留着,不加 --force
     std::fs::write(wt.join("probe.sh"), "echo\n").unwrap();
-    assert!(sb.aca(&["rm", &id2]).contains("留着"));
+    assert!(sb.aca(&["rm", &id2]).contains("已保留"));
     assert!(wt.is_dir());
     // 干净了:删 worktree,分支和它上面的提交都还在
     std::fs::remove_file(wt.join("probe.sh")).unwrap();
@@ -1634,13 +1639,13 @@ fn a_worker_in_its_own_worktree_leaves_the_main_checkout_alone_and_rm_keeps_the_
     git(&wt, &["commit", "-q", "-m", "work"]);
     let id3 = sb.aca(&["new", "fake", &repo.to_string_lossy(), "-w", "feat/x"]);
     let said = sb.aca(&["rm", &id3]);
-    assert!(said.contains("删了,分支 feat/x 还在"), "{said}");
+    assert!(said.contains("分支 feat/x 保留"), "{said}");
     assert!(!wt.exists());
     assert_eq!(git(&repo, &["log", "-1", "--format=%s", "feat/x"]), "work");
 
     // 不是仓库、分支名不对:不建
     let o = sb.run(&["new", "fake", &sb.home.join("config").to_string_lossy(), "-w", "x"]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("不在 git 仓库里"));
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("不在 git 仓库中"));
     assert!(!sb.run(&["new", "fake", &repo.to_string_lossy(), "-w", "bad..name"]).status.success());
 }
 
@@ -1655,11 +1660,11 @@ fn interrupting_a_running_worker_presses_esc_only_for_the_one_that_sent_it_out()
     let err = |o: &Output| String::from_utf8_lossy(&o.stderr).to_string();
     // 没在跑:不按
     sb.set_screen(&w, &pane, "❯ ");
-    assert!(err(&sb.as_session(&lead, &["interrupt", &w], "")).contains("没在跑"));
+    assert!(err(&sb.as_session(&lead, &["interrupt", &w], "")).contains("无需中止"));
     // 在跑:别的会话按不了,派它的那个能
     sb.set_screen(&w, &pane, "✻ Pondering… (3s · ↓ 1k tokens)");
     sb.hook(&w, &pane, r#"{"hook_event_name":"UserPromptSubmit","session_id":"c1","prompt":"写一篇长文"}"#);
-    assert!(err(&sb.as_session(&other, &["interrupt", &w], "")).contains("不是你派出去的"));
+    assert!(err(&sb.as_session(&other, &["interrupt", &w], "")).contains("不是你派出的会话"));
     let o = sb.as_session(&lead, &["interrupt", &w], "");
     assert!(o.status.success(), "{}", err(&o));
     // 按下的是 Esc(假 agent 不读键,终端回显成 ^[)
@@ -1727,13 +1732,13 @@ command = ["sh", "-c", "echo \"$ACA_SETTING_GREETING\" >> \"$ACA_PLUGIN_STATE_DI
     // 从 plugins.toml 里划掉:sync 后本机也没了(链接的目录不动)
     let kept = text.lines().take_while(|l| !l.contains("t.decl")).collect::<Vec<_>>().join("\n");
     std::fs::write(&decl, kept + "\n").unwrap();
-    assert!(sb.aca(&["plugin", "sync"]).contains("不再用 t.decl"));
+    assert!(sb.aca(&["plugin", "sync"]).contains("已移除 t.decl"));
     assert!(sb.aca(&["plugin", "ls"]).is_empty() && dir.join("aca-plugin.toml").is_file());
     // 写回去:sync 照它链接,停着的照样停着
     std::fs::write(&decl, format!("[plugins.\"t.decl\"]\nsource = \"{}\"\nenabled = false\n", dir.display())).unwrap();
-    assert!(sb.aca(&["plugin", "sync"]).contains("链接了 t.decl"));
+    assert!(sb.aca(&["plugin", "sync"]).contains("已链接 t.decl"));
     assert!(sb.aca(&["plugin", "ls"]).starts_with("○ t.decl"));
-    assert!(sb.aca(&["plugin", "sync"]).contains("没什么要做的"));
+    assert!(sb.aca(&["plugin", "sync"]).contains("无需更改"));
 }
 
 #[test]
@@ -1799,17 +1804,21 @@ command = ["sh", "-c", "echo \"hello $ACA_PLUGIN_ARGS_JSON from $ACA_SESSION_ID\
     assert_eq!(mcp["mcpServers"]["aca-t-both"]["args"], serde_json::json!(["plugin", "mcp", "t.both"]));
     assert_eq!(mcp["mcpServers"]["aca"]["args"], serde_json::json!(["plugin", "tools"]));
 
-    // Codex:插件 MCP 和能力的 MCP 走 -c mcp_servers(会话 id 写在 env 里),插件目录变成它认得的副本、按会话打开
+    // Codex:插件目录变成它认得的副本、按会话打开;插件 MCP 和能力的 MCP 也各做成一个只有 .mcp.json 的副本,
+    // 不走 -c mcp_servers(那样 Codex 起不了标题),会话 id 从 Codex 的环境里转过去
     let x = sb.aca(&["new", "argx:t", &sb.proj()]);
     let flags = after(&args_of(&x), "-c");
-    let server = flags.iter().find(|f| f.starts_with("mcp_servers.aca-t-both=")).unwrap_or_else(|| panic!("{flags:?}"));
-    assert!(server.contains("\"plugin\"") && server.contains(&format!("ACA_SESSION_ID = \"{x}\"")), "{server}");
-    assert!(
-        flags.iter().any(|f| f.starts_with("mcp_servers.aca=")) && flags.contains(&"plugins.t-both@aca.enabled=true".to_string()),
-        "{flags:?}"
-    );
+    assert!(!flags.iter().any(|f| f.starts_with("mcp_servers.")), "{flags:?}");
+    for p in ["t-both", "mcp-aca-t-both", "mcp-aca"] {
+        assert!(flags.contains(&format!("plugins.{p}@aca.enabled=true")), "{p} {flags:?}");
+    }
     let link = codex_home.join("plugins/cache/aca");
     assert_eq!(std::fs::read_link(&link).unwrap(), sb.home.join("data/codex-plugins"));
+    let mcp: Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.home.join("data/codex-plugins/mcp-aca-t-both/local/.mcp.json")).unwrap()).unwrap();
+    let server = &mcp["mcpServers"]["aca-t-both"];
+    assert_eq!(server["args"], serde_json::json!(["plugin", "mcp", "t.both"]));
+    assert!(server["env_vars"].as_array().unwrap().iter().any(|v| v == "ACA_SESSION_ID"), "{server}");
     let copy = sb.home.join("data/codex-plugins/t-both/local");
     let skill = std::fs::read_to_string(copy.join("skills/greet/SKILL.md")).unwrap();
     assert!(skill.starts_with("---\nname: greet\ndescription: 打招呼\n---\n"), "{skill}");
@@ -2012,9 +2021,9 @@ fn with_the_gateway_on_an_agent_mounts_one_server_and_a_shared_mcp_runs_once_for
     assert!(st.contains("1 个连接") && !st.contains(&format!("会话 {b}):ready")) && st.contains("服务 t-gw:ready"), "{st}");
     ca.close();
     // 停掉:不留进程
-    assert!(sb.aca(&["plugin", "gateway", "stop"]).contains("停了"));
+    assert!(sb.aca(&["plugin", "gateway", "stop"]).contains("已停止"));
     std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(sb.aca(&["plugin", "gateway", "status"]).contains("没在跑"));
+    assert!(sb.aca(&["plugin", "gateway", "status"]).contains("未运行"));
 }
 
 #[test]
@@ -2091,7 +2100,7 @@ fn first_party_plugins_install_by_name_bring_what_they_need_and_running_sessions
     assert!(!sb.aca(&["plugin", "ls"]).contains("主线"));
     // 自带的不写路径;装完说带了什么
     let out = sb.aca(&["plugin", "install", "aca.delegate"]);
-    assert!(out.contains("装好了 aca.delegate") && out.contains("给 agent:claude、codex 的插件目录"), "{out}");
+    assert!(out.contains("已安装 aca.delegate") && out.contains("提供给 agent:claude、codex 的插件目录"), "{out}");
     let copy = sb.home.join("data/first-party/delegate");
     assert!(copy.join("aca-plugin.toml").exists() && copy.join("claude/commands/delegate.md").exists());
     let decl = std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap();
@@ -2109,9 +2118,9 @@ fn first_party_plugins_install_by_name_bring_what_they_need_and_running_sessions
     let mut decl = std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap();
     decl.push_str("\n[plugins.\"aca.remote\"]\n");
     std::fs::write(sb.home.join("config/plugins.toml"), decl).unwrap();
-    assert!(sb.aca(&["plugin", "sync"]).contains("装了 aca.remote"));
+    assert!(sb.aca(&["plugin", "sync"]).contains("已安装 aca.remote"));
     // 视图:命令行打出它的输出
-    assert!(sb.aca(&["plugin", "view", "aca.remote.tasks"]).contains("没有远端任务"));
+    assert!(sb.aca(&["plugin", "view", "aca.remote.tasks"]).contains("暂无远端任务"));
     assert!(sb.aca(&["plugin", "actions"]).contains("aca.remote.tasks  视图  远端任务"));
     // 删:aca 写出来的那份一起删
     sb.aca(&["plugin", "remove", "aca.remote"]);
@@ -2155,7 +2164,7 @@ fn mcps_scattered_in_accounts_are_listed_and_taken_into_the_gateway_without_touc
     assert!(!std::fs::read_to_string(&cfg).unwrap().contains("[mcps."));
     // 收进来:写进 aca 的 config.toml、gateway 的 servers;账号里的原样
     let out = run(&["plugin", "gateway", "import", "--apply"]);
-    assert!(out.contains("收进了 gateway:fs github") && out.contains("账号里的那份还在"), "{out}");
+    assert!(out.contains("已导入 gateway:fs github") && out.contains("账号中的配置仍保留"), "{out}");
     let conf = std::fs::read_to_string(&cfg).unwrap();
     assert!(
         conf.contains("[mcps.github]") && conf.contains("TOKEN = \"s3cret\"") && conf.contains("[mcps.fs]") && !conf.contains("[mcps.web]"),
@@ -2167,7 +2176,7 @@ fn mcps_scattered_in_accounts_are_listed_and_taken_into_the_gateway_without_touc
     run(&["plugin", "gateway", "import", "--apply"]);
     assert_eq!(std::fs::read_to_string(&cfg).unwrap().matches("[mcps.github]").count(), 1);
     // drop 移出 gateway
-    assert!(run(&["plugin", "gateway", "drop", "fs"]).contains("不再经 gateway"));
+    assert!(run(&["plugin", "gateway", "drop", "fs"]).contains("不再通过 gateway"));
     assert!(std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap().contains("servers = [\"github\"]"));
 }
 
@@ -2177,7 +2186,7 @@ fn a_list_view_prints_as_rows_and_its_keys_commands_run_though_not_in_the_menu()
     let Some(sb) = Sandbox::new("listview") else { return };
     sb.aca(&["plugin", "install", "aca.remote"]);
     let text = sb.aca(&["plugin", "view", "aca.remote.tasks"]);
-    assert!(text.contains("还没配 server") && text.contains("没有远端任务"), "{text}");
+    assert!(text.contains("尚未配置 server") && text.contains("暂无远端任务"), "{text}");
     let raw: Value = serde_json::from_str(&sb.aca(&["plugin", "view", "--json", "aca.remote.tasks"])).unwrap();
     assert_eq!(raw["rows"], serde_json::json!([]));
     // collect 只露给 cli,菜单里没有;键 r 要跑它
@@ -2190,12 +2199,12 @@ fn a_list_view_prints_as_rows_and_its_keys_commands_run_though_not_in_the_menu()
         .map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(ids, ["aca.remote.run", "aca.remote.new", "aca.remote.list", "aca.remote.rm", "aca.remote.collect", "aca.remote.check"]);
-    assert!(sb.aca(&["plugin", "run", "aca.remote.collect"]).contains("取过了,没有新的"));
+    assert!(sb.aca(&["plugin", "run", "aca.remote.collect"]).contains("已获取,没有新结果"));
     // aca mounts、aca remote 挪进了插件:指路
     let o = sb.run(&["mounts", "nope"]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("挪进了插件 aca.tailnet"));
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("已移到插件 aca.tailnet"));
     let o = sb.run(&["remote", "run", "gpu1", "--", "make"]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("挪进了插件 aca.remote"));
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("已移到插件 aca.remote"));
 }
 
 /// aca.remote 整个在插件里(remote.sh,sh + jq + curl + ssh):用假的 server(curl)和假的远端(ssh 在本机跑)走一遍 ——
@@ -2254,7 +2263,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
 
     // 还没配 server:说去哪配
     let (good, out) = run(&["plugin", "run", "aca.remote.run", "--session", &lead, "host=gpu1", "command=true"]);
-    assert!(!good && out.contains("还没配 server") && out.contains("aca plugin setting aca.remote url"), "{out}");
+    assert!(!good && out.contains("尚未配置 server") && out.contains("aca plugin setting aca.remote url"), "{out}");
     sb.aca(&["plugin", "setting", "aca.remote", "url", "https://hook.test/"]);
     sb.aca(&["plugin", "setting", "aca.remote", "token", "right-token-0123456789"]);
     // 口令打码列;记它的 plugins.toml 只有自己能读
@@ -2263,14 +2272,14 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     assert_eq!(std::os::unix::fs::PermissionsExt::mode(&decl.permissions()) & 0o777, 0o600);
     write(&fake.join("token"), "wrong-token-0123456789");
     let (good, out) = run(&["plugin", "run", "aca.remote.check"]);
-    assert!(!good && out.contains("口令不对"), "{out}");
+    assert!(!good && out.contains("口令不正确"), "{out}");
     write(&fake.join("token"), "right-token-0123456789");
     let out = ok(&["plugin", "run", "aca.remote.check"]);
-    assert!(out.contains("连上了,口令也对 · jobhook 0.1.0"), "{out}");
+    assert!(out.contains("已连接,口令正确 · jobhook 0.1.0"), "{out}");
 
     // 连不上那台机器:说为什么,刚登记的撤掉(server、本机都没留),定时没开着
     let (good, out) = run(&["plugin", "run", "aca.remote.run", "--session", &lead, "host=nohost", "command=true"]);
-    assert!(!good && out.contains("没在 nohost 上跑起来:ssh: Could not resolve hostname nohost"), "{out}");
+    assert!(!good && out.contains("无法在 nohost 上启动:ssh: Could not resolve hostname nohost"), "{out}");
     assert_eq!(std::fs::read_dir(&hub).unwrap().count(), 0);
     assert_eq!(std::fs::read_dir(&tasks).map(|d| d.count()).unwrap_or(0), 0);
     assert_eq!(timer()["on"], false);
@@ -2287,7 +2296,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
         "note=训练",
         "within=6h",
     ]);
-    assert!(out.contains("已在 gpu1 后台跑起来") && out.contains("日志:gpu1:~/.aca-hooks/") && !out.contains("不在 aca 的会话里"), "{out}");
+    assert!(out.contains("已在 gpu1 后台跑起来") && out.contains("日志:gpu1:~/.aca-hooks/") && !out.contains("不在 aca 的会话中"), "{out}");
     let id =
         std::fs::read_dir(&tasks).unwrap().flatten().find_map(|e| e.file_name().to_str()?.strip_suffix(".json").map(String::from)).unwrap();
     assert_eq!(id.len(), 32);
@@ -2295,7 +2304,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     assert_eq!((t["session"].as_str(), t["title"].as_str(), t["within"].as_i64()), (Some(lead.as_str()), Some("lead"), Some(21600)), "{t}");
     let tm = timer();
     assert_eq!((tm["on"].as_bool(), tm["scheduled"].as_bool()), (Some(true), Some(true)), "{tm}");
-    assert!(ok(&["plugin", "run", "aca.remote.list"]).contains("gpu1 上的「训练」  在等 · 已经"));
+    assert!(ok(&["plugin", "run", "aca.remote.list"]).contains("gpu1 上的「训练」  等待中 · 已等"));
     // 远端跑完回调到 server(假的远端在本机后台跑,等它)
     let rec = hub.join(format!("{id}.json"));
     assert!(sb.until(|| std::fs::read_to_string(&rec).is_ok_and(|t| t.contains("\"done\""))), "没回调");
@@ -2310,12 +2319,12 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     assert_eq!(task(&id)["state"], "sent");
     let tm = timer();
     assert_eq!((tm["on"].as_bool(), tm["scheduled"].as_bool(), tm["rc"].as_i64()), (Some(false), Some(false), Some(0)), "{tm}");
-    assert!(ok(&["plugin", "log", "aca.remote"]).contains("gpu1 上的「训练」:发给会话了"));
+    assert!(ok(&["plugin", "log", "aca.remote"]).contains("gpu1 上的「训练」:已发送到会话"));
     // 列表:✕ 退出码,⏎ 复制看日志的命令
     let v: Value = serde_json::from_str(&ok(&["plugin", "view", "--json", "aca.remote.tasks"])).unwrap();
     let row = &v["rows"][0];
     assert_eq!((row["mark"].as_str(), row["tone"].as_str()), (Some("✕"), Some("bad")), "{v}");
-    assert!(row["right"].as_str().unwrap().starts_with("退出码 3 · ") && row["right"].as_str().unwrap().ends_with("发给会话了"), "{v}");
+    assert!(row["right"].as_str().unwrap().starts_with("退出码 3 · ") && row["right"].as_str().unwrap().ends_with("已发送到会话"), "{v}");
     assert_eq!(row["fields"]["log_cmd"], format!("ssh gpu1 tail -n 50 ~/.aca-hooks/{id}.log"));
     assert!(row["detail"][0].as_str().unwrap().contains("会话「lead」"), "{v}");
 
@@ -2330,7 +2339,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     assert!(inbox(&other).contains("「手动」过了 1d 还没有回调"));
     ok(&["plugin", "run", "aca.remote.collect"]);
     assert_eq!(inbox(&other).matches("还没有回调").count(), 1);
-    assert!(ok(&["plugin", "run", "aca.remote.list"]).contains("失联 · 过了 1d 没回调"));
+    assert!(ok(&["plugin", "run", "aca.remote.list"]).contains("失联 · 超过 1d 未回调"));
     set_hub(&lost, &|v| {
         v["state"] = "done".into();
         v["rc"] = 0.into();
@@ -2344,7 +2353,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     let id_gone = ok(&["plugin", "run", "aca.remote.new", "--session", &gone, "note=没人收"]).lines().next().unwrap()[3..].to_string();
     sb.aca(&["rm", &gone]);
     let out = ok(&["plugin", "run", "aca.remote.new", "note=外面"]);
-    assert!(out.contains("不在 aca 的会话里"), "{out}");
+    assert!(out.contains("不在 aca 的会话中"), "{out}");
     let id_out = out.lines().next().unwrap()[3..].to_string();
     for id in [&id_gone, &id_out] {
         set_hub(id, &|v| {
@@ -2353,7 +2362,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
         });
     }
     let out = ok(&["plugin", "run", "aca.remote.collect"]);
-    assert!(out.contains("「没人收」:结束了,没送达(会话已经不在了)") && out.contains("「外面」:结束了,没送达(登记时不在会话里)"), "{out}");
+    assert!(out.contains("「没人收」:已结束,未送达(会话已不存在)") && out.contains("「外面」:已结束,未送达(登记时不在会话中)"), "{out}");
     assert_eq!(task(&id_gone)["state"], "kept");
     assert_eq!(timer()["on"], false);
 
@@ -2361,19 +2370,19 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     let waiting = ok(&["plugin", "run", "aca.remote.new", "--session", &lead, "note=等着"]).lines().next().unwrap()[3..].to_string();
     write(&fake.join("down"), "");
     let out = ok(&["plugin", "run", "aca.remote.collect"]);
-    assert!(out.contains("这次没取到:连不上 server:(7) Failed to connect"), "{out}");
+    assert!(out.contains("本次未获取到:无法连接 server:(7) Failed to connect"), "{out}");
     let (good, out) = run(&["plugin", "run", "aca.remote.rm", &format!("id={}", &waiting[..6])]);
-    assert!(!good && out.contains("连不上 server"), "{out}");
+    assert!(!good && out.contains("无法连接 server"), "{out}");
     std::fs::remove_file(fake.join("down")).unwrap();
     // 另一个正在取:这次不取;锁放了很久的当没人要
     write(&tasks.join(".lock"), &format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()));
-    assert!(ok(&["plugin", "run", "aca.remote.collect"]).contains("另一个正在取"));
+    assert!(ok(&["plugin", "run", "aca.remote.collect"]).contains("另一次获取正在进行"));
     write(&tasks.join(".lock"), "1000");
-    assert!(!ok(&["plugin", "run", "aca.remote.collect"]).contains("另一个正在取"));
-    assert!(ok(&["plugin", "run", "aca.remote.rm", &format!("id={}", &waiting[..6])]).contains("已撤 「等着」"));
+    assert!(!ok(&["plugin", "run", "aca.remote.collect"]).contains("另一次获取正在进行"));
+    assert!(ok(&["plugin", "run", "aca.remote.rm", &format!("id={}", &waiting[..6])]).contains("已撤销 「等着」"));
     assert!(!hub.join(format!("{waiting}.json")).exists() && !tasks.join(format!("{waiting}.json")).exists());
     let (good, out) = run(&["plugin", "run", "aca.remote.rm", "id=zz"]);
-    assert!(!good && out.contains("没有 zz 开头的 id"), "{out}");
+    assert!(!good && out.contains("没有以 zz 开头的 id"), "{out}");
     assert_eq!(timer()["on"], false);
 }
 
@@ -2412,7 +2421,7 @@ fn timers_run_when_due_follow_their_plugin_and_a_manual_one_switches_itself_off_
 
     // 链接上:跟着插件的那个开了(plist 跑这个 aca 的 tick),manual 的关着
     let ls = sb.aca(&["plugin", "timer"]);
-    assert!(ls.contains("● t.timed.tick  每 10m · 开着") && ls.contains("○ t.timed.poll  每 1m · 插件自己开关 · 关着"), "{ls}");
+    assert!(ls.contains("● t.timed.tick  每 10m · 已开启") && ls.contains("○ t.timed.poll  每 1m · 由插件自行开关 · 已关闭"), "{ls}");
     let p = std::fs::read_to_string(plist("tick")).unwrap();
     assert!(p.contains("<string>tick</string>\n        <string>t.timed.tick</string>") && p.contains("<integer>600</integer>"), "{p}");
     assert!(p.contains(env!("CARGO_BIN_EXE_aca")), "{p}");
@@ -2433,10 +2442,10 @@ fn timers_run_when_due_follow_their_plugin_and_a_manual_one_switches_itself_off_
     assert!(sb.aca(&["plugin", "timer"]).contains("✕ 退出码 3"));
     // 跟着插件的关不了
     let o = sb.run(&["plugin", "timer", "off", "t.timed.tick"]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("跟着插件开关"), "{o:?}");
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("随插件开关"), "{o:?}");
 
     // manual 的:插件说开才开;跑着的那一次里它关掉自己,跑完才卸(plist 没了、记着关了),上次跑得怎么样照记
-    assert!(sb.aca(&["plugin", "timer", "on", "t.timed.poll"]).contains("开了 t.timed.poll:每 1m 跑一次"));
+    assert!(sb.aca(&["plugin", "timer", "on", "t.timed.poll"]).contains("已开启 t.timed.poll:每 1m 运行一次"));
     assert!(plist("poll").exists());
     sb.aca(&["plugin", "timer", "tick", "t.timed.poll"]);
     assert_eq!(count("polls"), 1);
@@ -2454,7 +2463,7 @@ fn timers_run_when_due_follow_their_plugin_and_a_manual_one_switches_itself_off_
     // 插件停着:都卸掉,到点了也不跑;开回来照原来的
     sb.aca(&["plugin", "disable", "t.timed"]);
     assert!(!plist("tick").exists());
-    assert!(sb.aca(&["plugin", "timer"]).contains("○ t.timed.tick  每 10m · 插件停着"));
+    assert!(sb.aca(&["plugin", "timer"]).contains("○ t.timed.tick  每 10m · 插件已关闭"));
     sb.aca(&["plugin", "timer", "tick", "t.timed.tick"]);
     assert_eq!(count("ticks"), 3);
     sb.aca(&["plugin", "enable", "t.timed"]);
@@ -2468,7 +2477,7 @@ fn timers_run_when_due_follow_their_plugin_and_a_manual_one_switches_itself_off_
     // 插件删了:它的定时都没了
     sb.aca(&["plugin", "unlink", "t.timed"]);
     assert!(!plist("tick").exists() && !timers.join("t.timed.tick.json").exists());
-    assert!(sb.aca(&["plugin", "timer"]).contains("没有插件写了定时"));
+    assert!(sb.aca(&["plugin", "timer"]).contains("没有插件设置定时任务"));
     // 已经没了的到点了:把自己卸掉,什么都不跑
     assert!(sb.run(&["plugin", "timer", "tick", "t.timed.tick"]).status.success());
     assert_eq!(count("ticks"), 3);
@@ -2554,28 +2563,28 @@ tcp6       0      0  fd7a:115c:a1e0::.9000  *.*                    LISTEN
     let (ok, out) = run(true, &["plugin", "view", "--json", "aca.tailnet.mounts"]);
     assert!(ok, "{out}");
     let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["head"], "mac.tail.ts.net\n发布 关着 · 2 样");
+    assert_eq!(v["head"], "mac.tail.ts.net\n发布 已关闭 · 2 项");
     assert_eq!(v["fields"]["publish_to"], "on");
     let row = |id: &str| v["rows"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap_or_else(|| panic!("没有 {id}:{v}")).clone();
     let r = row("https:443/");
-    assert_eq!((r["mark"].as_str(), r["tone"].as_str(), r["right"].as_str()), (Some("✕"), Some("bad"), Some("没在听")));
+    assert_eq!((r["mark"].as_str(), r["tone"].as_str(), r["right"].as_str()), (Some("✕"), Some("bad"), Some("未监听")));
     assert_eq!(r["text"], ":443 /         → 127.0.0.1:8420");
     assert_eq!((r["fields"]["url"].as_str(), r["fields"]["drop"].as_str()), (Some("https://mac.tail.ts.net/"), Some("https:443/")));
-    assert_eq!(row("https:8443/")["right"], "在听 · 公网");
-    assert_eq!(row("https:8443/docs")["right"], "文件在 · 公网");
-    assert_eq!(row("tcp:2222")["right"], "在听");
+    assert_eq!(row("https:8443/")["right"], "监听中 · 公网");
+    assert_eq!(row("https:8443/docs")["right"], "文件存在 · 公网");
+    assert_eq!(row("tcp:2222")["right"], "监听中");
     let fg = row("fg:https:9000/");
-    assert!(fg["fields"].get("drop").is_none() && fg["right"] == "没在听 · 前台", "{fg}");
+    assert!(fg["fields"].get("drop").is_none() && fg["right"] == "未监听 · 前台", "{fg}");
     // 给人 / agent 看的那份
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.list"]);
     assert!(ok && out.starts_with("mac.tail.ts.net\n✕ https://mac.tail.ts.net/ "), "{out}");
-    assert!(out.contains("● https://mac.tail.ts.net:8443/docs  → ") && out.contains("文件在 · 公网"), "{out}");
+    assert!(out.contains("● https://mac.tail.ts.net:8443/docs  → ") && out.contains("文件存在 · 公网"), "{out}");
 
     // 撤:带上端口和路径;开到公网的用 funnel 撤;撤完写出怎么加回去
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.drop", "target=https:8443/docs"]);
     assert!(
-        ok && out.contains("已撤 https://mac.tail.ts.net:8443/docs")
-            && out.contains("要加回去:tailscale funnel --bg --https=8443 --set-path=/docs"),
+        ok && out.contains("已撤销 https://mac.tail.ts.net:8443/docs")
+            && out.contains("如需加回:tailscale funnel --bg --https=8443 --set-path=/docs"),
         "{out}"
     );
     run(false, &["plugin", "run", "aca.tailnet.drop", "target=https://mac.tail.ts.net/"]);
@@ -2583,30 +2592,30 @@ tcp6       0      0  fd7a:115c:a1e0::.9000  *.*                    LISTEN
     assert_eq!(did(), "funnel --https=8443 --set-path=/docs off\nserve --https=443 --set-path=/ off\nserve --tcp=2222 off\n");
     // 没有这条、前台的:不去敲命令
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.drop", "target=https:443/"]);
-    assert!(!ok && out.contains("没有 https:443/ 这一条挂载"), "{out}");
+    assert!(!ok && out.contains("没有挂载 https:443/"), "{out}");
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.drop", "target=fg:https:9000/"]);
-    assert!(!ok && out.contains("前台挂的撤不了"), "{out}");
+    assert!(!ok && out.contains("前台挂载无法撤销"), "{out}");
     assert_eq!(did().lines().count(), 3);
     // tailscale 说撤了、其实没撤;撤一条带走了别的:都照实说,带走的写出怎么加回去
     reset();
     write(&fake.join("off_ignored"), "");
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.drop", "target=https:443/"]);
-    assert!(!ok && out.contains("还挂着") && out.contains("tailscale serve --https=443 --set-path=/ off"), "{out}");
+    assert!(!ok && out.contains("仍在挂载中") && out.contains("tailscale serve --https=443 --set-path=/ off"), "{out}");
     reset();
     write(&fake.join("off_wipes"), "");
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.drop", "target=https:443/"]);
-    assert!(!ok && out.contains("跟着没了") && out.contains("tailscale serve --bg --tcp=2222 tcp://127.0.0.1:22"), "{out}");
+    assert!(!ok && out.contains("也一起消失了") && out.contains("tailscale serve --bg --tcp=2222 tcp://127.0.0.1:22"), "{out}");
     assert!(out.contains("http://mac.tail.ts.net:8080/hi") && !out.contains("9000"), "{out}");
 
     // 挂:tailnet 里同一个端口号;目标没在听的提一句;端口号已经有了的不动
     reset();
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.add", "port=3000"]);
-    assert!(ok && out.trim() == "已挂 https://mac.tail.ts.net:3000/", "{out}");
+    assert!(ok && out.trim() == "已挂载 https://mac.tail.ts.net:3000/", "{out}");
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.add", "port=5174"]);
-    assert!(ok && out.contains("本机 5174 现在没在听"), "{out}");
+    assert!(ok && out.contains("本机 5174 当前未监听"), "{out}");
     for taken in ["443", "2222", "9000"] {
         let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.add", &format!("port={taken}")]);
-        assert!(!ok && out.contains("已经挂着别的"), "{taken}: {out}");
+        assert!(!ok && out.contains("已有其他挂载"), "{taken}: {out}");
     }
     assert_eq!(did(), "serve --bg --https=3000 http://localhost:3000\nserve --bg --https=5174 http://localhost:5174\n");
     // tailscale 没在跑:列表照样出来,写着为什么;挂不了
@@ -2621,18 +2630,18 @@ tcp6       0      0  fd7a:115c:a1e0::.9000  *.*                    LISTEN
     reset();
     write(&fake.join("tpub"), "busy");
     let (ok, out) = run(true, &["plugin", "run", "aca.tailnet.publish", "to=on"]);
-    assert!(!ok && out.contains("没打开:tailnet 的 :8443 上挂着别的东西"), "{out}");
+    assert!(!ok && out.contains("无法开启:tailnet 的 :8443 上挂着别的东西"), "{out}");
     write(&fake.join("tpub"), "off");
     write(&fake.join("pub_stuck"), "");
     let (ok, out) = run(true, &["plugin", "run", "aca.tailnet.publish", "to=on"]);
-    assert!(!ok && out.contains("tpub 说打开了,可现在是:关着 · 2 样"), "{out}");
+    assert!(!ok && out.contains("已请求 tpub 开启,但当前状态为:已关闭 · 2 项"), "{out}");
     let _ = std::fs::remove_file(fake.join("pub_stuck"));
     let (ok, out) = run(true, &["plugin", "run", "aca.tailnet.publish", "to=on"]);
     assert!(ok && out.contains("发布已打开"), "{out}");
     let (_, out) = run(true, &["plugin", "view", "--json", "aca.tailnet.mounts"]);
-    assert!(out.contains("发布 开着 · 2 样") && out.contains(r#""publish_to":"off""#), "{out}");
+    assert!(out.contains("发布 已开启 · 2 项") && out.contains(r#""publish_to":"off""#), "{out}");
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.publish", "to=on"]);
-    assert!(!ok && out.contains("没装 tpub"), "{out}");
+    assert!(!ok && out.contains("未安装 tpub"), "{out}");
     // 没装 tpub:没有发布那行,p 按不了
     let (_, out) = run(false, &["plugin", "view", "--json", "aca.tailnet.mounts"]);
     assert!(!out.contains("发布") && !out.contains("publish_to"), "{out}");
@@ -2646,13 +2655,13 @@ fn a_new_plugin_links_and_runs_check_names_problems_and_emit_runs_hooks_in_the_f
     let d = dir.to_str().unwrap();
     let out = sb.aca(&["plugin", "new", d]);
     assert!(out.contains("(me.hello)") && out.contains("aca plugin run me.hello.hello"), "{out}");
-    assert!(sb.aca(&["plugin", "check", d]).contains("✓ 没发现问题"));
+    assert!(sb.aca(&["plugin", "check", d]).contains("✓ 未发现问题"));
     // 已经有东西的目录不动
     assert!(!sb.run(&["plugin", "new", d]).status.success());
     sb.aca(&["plugin", "link", d]);
     assert!(sb.aca(&["plugin", "run", "me.hello.hello"]).contains("你好!会话 (没有)"));
     // 钩子还注释着:没人订
-    assert!(sb.aca(&["plugin", "emit", "turn.done"]).contains("没有开着的插件订了 turn.done"));
+    assert!(sb.aca(&["plugin", "emit", "turn.done"]).contains("没有已开启的插件订阅 turn.done"));
     let m = dir.join("aca-plugin.toml");
     let text = std::fs::read_to_string(&m).unwrap();
     write(&m, &text.replace("# [[events]]\n# on = \"turn.done\"\n# command = [\"sh\", \"hello.sh\"]", "[[events]]\non = \"turn.done\"\ncommand = [\"sh\", \"-c\", \"echo $ACA_PLUGIN_EVENT $ACA_PLUGIN_EVENT_JSON\"]\n\n[[events]]\non = \"turn.failed\"\nif = { kind = \"transient\" }\ncommand = [\"sh\", \"-c\", \"echo again; exit 3\"]"));
@@ -2662,7 +2671,7 @@ fn a_new_plugin_links_and_runs_check_names_problems_and_emit_runs_hooks_in_the_f
     assert!(out.contains("--- me.hello · sh -c echo") && out.contains("退出码 0"), "{out}");
     assert!(out.contains(r#""event":"turn.done""#) && out.contains(r#""secs":12"#) && out.contains(r#""last":"好了""#), "{out}");
     // if 对不上的不跑;对得上、退出码不是 0 的,emit 的退出码也不是 0
-    assert!(sb.aca(&["plugin", "emit", "turn.failed", "kind=account"]).contains("没有开着的插件订了"));
+    assert!(sb.aca(&["plugin", "emit", "turn.failed", "kind=account"]).contains("没有已开启的插件订阅"));
     let o = sb.run(&["plugin", "emit", "turn.failed", "kind=transient"]);
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(!o.status.success() && out.contains("退出码 3") && out.contains("again"), "{out}");
@@ -2677,13 +2686,13 @@ fn a_new_plugin_links_and_runs_check_names_problems_and_emit_runs_hooks_in_the_f
     let o = sb.run(&["plugin", "check", bad.to_str().unwrap()]);
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(
-        !o.status.success() && out.contains("✕ 命令 a:gone.sh 在插件目录里没有") && out.contains("⚠ 要用到 surely-missing-prog-aca"),
+        !o.status.success() && out.contains("✕ 命令 a:插件目录中没有 gone.sh") && out.contains("⚠ 需要 surely-missing-prog-aca"),
         "{out}"
     );
     // 链接时也提醒缺的程序;aca plugin ls 也说
     let out = sb.aca(&["plugin", "link", bad.to_str().unwrap()]);
-    assert!(out.contains("要用到 surely-missing-prog-aca"), "{out}");
-    assert!(sb.aca(&["plugin", "ls"]).contains("⚠ x.bad:要用到 surely-missing-prog-aca"));
+    assert!(out.contains("需要 surely-missing-prog-aca"), "{out}");
+    assert!(sb.aca(&["plugin", "ls"]).contains("⚠ x.bad:需要 surely-missing-prog-aca"));
 }
 
 /// 插件接口(api 1)的约定:每种调法交给命令的环境变量正好是这些、文档里都写了;列表视图只读标准输出;
@@ -2835,8 +2844,8 @@ manual = true
         "id = \"t.typo\"\nname = \"Typo\"\nversion = \"1\"\ndescripton = \"x\"\n[[commands]]\nid = \"go\"\ncommand = [\"true\"]\n[[keys]]\nkey = \"g\"\nrun = \"go\"\nneeds = [\"sh\"]\n",
     );
     let out = sb.aca(&["plugin", "link", typo.to_str().unwrap()]);
-    assert!(out.contains("不认识 descripton") && out.contains("不认识 keys[1].needs"), "{out}");
-    assert!(sb.aca(&["plugin", "check", typo.to_str().unwrap()]).contains("⚠ 清单里不认识 keys[1].needs"));
+    assert!(out.contains("无法识别的 descripton") && out.contains("无法识别的 keys[1].needs"), "{out}");
+    assert!(sb.aca(&["plugin", "check", typo.to_str().unwrap()]).contains("⚠ 清单中有无法识别的 keys[1].needs"));
     // 照新一版接口写的:不让链接,说先升级 aca
     let newer = sb.home.join("work/newer");
     write(&newer.join("aca-plugin.toml"), "id = \"t.newer\"\nname = \"Newer\"\nversion = \"1\"\napi = 2\n");
@@ -2846,7 +2855,7 @@ manual = true
     let twin = sb.home.join("work/twin");
     write(&twin.join("aca-plugin.toml"), "id = \"t-contract\"\nname = \"Twin\"\nversion = \"1\"\n");
     let o = sb.run(&["plugin", "link", twin.to_str().unwrap()]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("同一个名字"), "{o:?}");
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("同名"), "{o:?}");
 }
 
 /// 你在某个会话的 tmux 里另开的窗口:不写 id 的 show / output / plugin run 冲着这个会话。
@@ -3017,9 +3026,9 @@ fn aca_tmux_install_adds_two_lines_and_uninstall_puts_everything_back() {
     let conf = sb.home.join("tmux.conf");
     let original = "set -g status-right \"MINE\"\nbind a run-shell 'tmux display-popup \"aca ui --client #{client_name}\"'\n\n# ====\n# TPM\n# ====\nrun '~/.tmux/plugins/tpm/tpm'\n";
     write(&conf, original);
-    assert!(sb.aca(&["tmux"]).contains("没装"));
+    assert!(sb.aca(&["tmux"]).contains("未安装"));
     let out = sb.aca(&["tmux", "install"]);
-    assert!(out.contains("第 5 行加了") && out.contains("开着的 tmux 已经用上了") && out.contains("第 2 行是你自己写的"), "{out}");
+    assert!(out.contains("第 5 行添加") && out.contains("运行中的 tmux 已生效") && out.contains("第 2 行是你自己添加的"), "{out}");
     let text = std::fs::read_to_string(&conf).unwrap();
     let ours = sb.home.join("config/tmux.conf");
     assert!(text.contains("\n# aca:") && text.contains(&format!("source-file -q {}\n\n# ====\n# TPM", ours.display())), "{text}");
@@ -3027,13 +3036,13 @@ fn aca_tmux_install_adds_two_lines_and_uninstall_puts_everything_back() {
     assert_eq!(ours_bound(), 2);
     assert_eq!(right().matches("tmux-status").count(), 1, "{}", right());
     // 再装一遍:那份重写,tmux.conf 里不多一行,状态栏不接两遍
-    assert!(sb.aca(&["tmux", "install"]).contains("已经有 source 它的那一行了"));
+    assert!(sb.aca(&["tmux", "install"]).contains("中已有 source 它的行"));
     assert_eq!(std::fs::read_to_string(&conf).unwrap(), text);
     assert_eq!(right().matches("tmux-status").count(), 1);
-    assert!(sb.aca(&["tmux"]).contains("装了"));
+    assert!(sb.aca(&["tmux"]).contains("已安装"));
     // 会话自己设了 status-right(agent-deck 建的那些):看的还是全局那份,不再接
     sb.tmux(&["set-option", "-t", &sb.pane(&id), "status-right", "这个会话自己的"]);
-    assert!(!sb.aca(&["tmux", "install"]).contains("只留了一遍"));
+    assert!(!sb.aca(&["tmux", "install"]).contains("已去重"));
     assert_eq!(right().matches("tmux-status").count(), 1, "{}", right());
     // 早先接重了的:装的时候收成一遍,你自己的那些原样
     let file = std::fs::read_to_string(&ours).unwrap();
@@ -3041,17 +3050,17 @@ fn aca_tmux_install_adds_two_lines_and_uninstall_puts_everything_back() {
     let one = right();
     sb.tmux(&["set-option", "-ag", "status-right", &seg.repeat(3 - one.matches(seg).count())]);
     let out = sb.aca(&["tmux", "install"]);
-    assert!(out.contains("原来接了 3 遍,只留了一遍"), "{out}\n{}", right());
+    assert!(out.contains("原先重复了 3 次,已去重"), "{out}\n{}", right());
     assert_eq!(right().matches(seg).count(), 1, "{}", right());
     assert_eq!(right().replace(seg, ""), one.replace(seg, ""));
     // 卸:原样回来
     let out = sb.aca(&["tmux", "uninstall"]);
-    assert!(out.contains("两行拿掉了") && out.contains("也撤了"), "{out}");
+    assert!(out.contains("配置的两行") && out.contains("已同时移除"), "{out}");
     assert_eq!(std::fs::read_to_string(&conf).unwrap(), original);
     assert!(!ours.exists());
     assert_eq!(ours_bound(), 0);
     assert_eq!(right(), before);
-    assert!(sb.aca(&["tmux", "uninstall"]).contains("没有 source aca 那份的行"));
+    assert!(sb.aca(&["tmux", "uninstall"]).contains("中没有 source aca 配置的行"));
 }
 
 /// 升级了 aca、没跑 install.sh(brew 之类):界面一打开,aca 那份 tmux 设置照这一版重写,开着的 tmux 也用上。
@@ -3149,7 +3158,7 @@ fn a_session_whose_program_isnt_there_leaves_nothing_behind() {
     let o = sb.run(&["new", "gone", &sb.proj(), "-t", "ghost"]);
     assert!(!o.status.success());
     let err = String::from_utf8_lossy(&o.stderr);
-    assert!(err.contains("PATH 里没有 aca-no-such-agent"), "{err}");
+    assert!(err.contains("PATH 中找不到 aca-no-such-agent"), "{err}");
     assert_eq!(sb.json(&["ls", "--json", "--no-screen"]), serde_json::json!([]));
     let ev = sb.event_names();
     assert!(ev.ends_with(&["session.created".to_string(), "session.removed".to_string()]), "{ev:?}");
@@ -3210,7 +3219,7 @@ fn your_own_plugin_is_there_without_linking_and_gets_the_sessions_text() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     write(&manifest, "[[commands]]\nid = \"x\"\n");
     let ls = sb.aca(&["plugin", "ls"]);
-    assert!(ls.contains("user") && ls.contains("清单有问题") && ls.contains("command"), "{ls}");
+    assert!(ls.contains("user") && ls.contains("清单有误") && ls.contains("command"), "{ls}");
     // 删了就没了
     std::fs::remove_file(&manifest).unwrap();
     assert!(!sb.aca(&["plugin", "ls"]).contains("user"));
@@ -3270,7 +3279,7 @@ fn agent_tools_and_menu_keys_are_yours_to_decide() {
     let (names, _) = agent_tools(&sb, None);
     assert_eq!(names, ["t-perm__ls"]);
     let choices = sb.aca(&["plugin", "allow", "t.perm"]);
-    assert!(choices.contains("✓ ls") && choices.contains("○ add  要你点名才给"), "{choices}");
+    assert!(choices.contains("✓ ls") && choices.contains("○ add  需明确允许"), "{choices}");
     // 点名给;收回 ls:写进 plugins.toml,能力服务照它列、照它调
     sb.aca(&["plugin", "allow", "t.perm", "add"]);
     assert_eq!(agent_tools(&sb, None).0, ["t-perm__ls", "t-perm__add"]);
@@ -3279,33 +3288,33 @@ fn agent_tools_and_menu_keys_are_yours_to_decide() {
     assert!(std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap().contains("tools = [\"add\"]"));
     let (names, said) = agent_tools(&sb, Some("t-perm__ls"));
     assert_eq!(names, ["t-perm__add"]);
-    assert!(said.contains("没有 t-perm__ls 这个工具"), "{said}");
+    assert!(said.contains("没有工具 t-perm__ls"), "{said}");
     assert_eq!(agent_tools(&sb, Some("t-perm__add")).1.trim(), "add");
     // 清单里没写给 agent 的给不了;--reset 回到清单的
     let o = sb.run(&["plugin", "allow", "t.other", "x"]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("不能给 agent"));
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("不能提供给 agent"));
     sb.aca(&["plugin", "allow", "t.perm", "--reset"]);
     assert_eq!(agent_tools(&sb, None).0, ["t-perm__ls"]);
     assert!(!std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap().contains("tools ="));
 
     // 两个插件的清单都要 m:先登记的拿到,另一个点名(列插件时也说)
     let keys = sb.aca(&["plugin", "key"]);
-    assert!(keys.contains("m  t.perm.ls  列") && keys.contains("⚠ 键 m 给了 t.perm「列」,t.other「叉」没拿到"), "{keys}");
-    assert!(sb.aca(&["plugin", "ls"]).contains("⚠ 键 m 给了"));
+    assert!(keys.contains("m  t.perm.ls  列") && keys.contains("⚠ 键 m 已分配给 t.perm「列」,t.other「叉」未分配到"), "{keys}");
+    assert!(sb.aca(&["plugin", "ls"]).contains("⚠ 键 m 已分配给"));
     // 给 t.other 换一个;把 t.perm 的去掉;再把 m 给 t.other
     assert!(sb.aca(&["plugin", "key", "t.other", "x", "M"]).contains("按 M"));
     assert!(!sb.aca(&["plugin", "key"]).contains("⚠"));
-    assert!(sb.aca(&["plugin", "key", "t.perm", "ls", "--none"]).contains("没有键"));
+    assert!(sb.aca(&["plugin", "key", "t.perm", "ls", "--none"]).contains("未设键"));
     sb.aca(&["plugin", "key", "t.other", "x", "m"]);
     let keys = sb.aca(&["plugin", "key"]);
     assert!(keys.contains("m  t.other.x") && !keys.contains("t.perm.ls"), "{keys}");
     // 你写的先拿:t.perm 回到清单的 m,也拿不到
     sb.aca(&["plugin", "key", "t.perm", "ls", "--reset"]);
     let keys = sb.aca(&["plugin", "key"]);
-    assert!(keys.contains("m  t.other.x") && keys.contains("⚠ 键 m 给了 t.other「叉」,t.perm「列」没拿到"), "{keys}");
+    assert!(keys.contains("m  t.other.x") && keys.contains("⚠ 键 m 已分配给 t.other「叉」,t.perm「列」未分配到"), "{keys}");
     // 不能用的键、没有的目标
     let o = sb.run(&["plugin", "key", "t.perm", "ls", "/"]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains(": 菜单自己用的"));
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains(": 菜单占用"));
     let o = sb.run(&["plugin", "key", "t.perm", "nope", "z"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("没有 nope"));
 }
@@ -3358,16 +3367,16 @@ fn a_plugins_hotkey_is_bound_in_tmux_while_the_plugin_is_on_and_yours_are_left_a
     let got = sb.home.join("state/plugins/t.hot/got.txt");
     assert!(sb.until(|| std::fs::read_to_string(&got).is_ok_and(|t| t.contains("make test"))), "窗格没跑");
     // 换键:旧的三处都解了;写进 plugins.toml。清单没给热键的窗格也能给一个;同一个键第二个拿不到,点名
-    assert!(sb.aca(&["plugin", "hotkey", "t.hot", "pad", "C-^"]).contains("在会话里按 C-^"));
+    assert!(sb.aca(&["plugin", "hotkey", "t.hot", "pad", "C-^"]).contains("在会话中按 C-^"));
     assert_eq!(bound(), all("C-^"));
     let decl = std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap();
     assert!(decl.contains("hotkeys = { pad = \"C-^\" }"), "{decl}");
     let out = sb.aca(&["plugin", "hotkey", "t.hot", "other", "C-^"]);
-    assert!(out.contains("没有热键") && out.contains("键 C-^ 给了 t.hot「便签」"), "{out}");
-    assert!(sb.aca(&["plugin", "ls"]).contains("键 C-^ 给了 t.hot「便签」"));
+    assert!(out.contains("未设热键") && out.contains("键 C-^ 已分配给 t.hot「便签」"), "{out}");
+    assert!(sb.aca(&["plugin", "ls"]).contains("键 C-^ 已分配给 t.hot「便签」"));
     sb.aca(&["plugin", "hotkey", "t.hot", "other", "--reset"]);
     // 写得不对的不收:光一个字符的、aca 自己的、不是窗格的
-    for (pane, key, why) in [("pad", "y", "tmux"), ("pad", "C-q", "C-q"), ("pad", "C-M-c", "C-M-c"), ("nope", "M-y", "没有 nope")] {
+    for (pane, key, why) in [("pad", "y", "tmux"), ("pad", "C-q", "C-q"), ("pad", "C-M-c", "C-M-c"), ("nope", "M-y", "没有窗格 nope")] {
         let o = sb.run(&["plugin", "hotkey", "t.hot", pane, key]);
         assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains(why), "{pane} {key}:{o:?}");
     }
@@ -3375,13 +3384,13 @@ fn a_plugins_hotkey_is_bound_in_tmux_while_the_plugin_is_on_and_yours_are_left_a
     // 那个键你自己在 tmux 里绑了别的:不动你的,点名;翻着看的那两张里你没绑,照绑
     sb.tmux(&["bind-key", "-n", "F5", "display-message", "mine"]);
     let out = sb.aca(&["plugin", "hotkey", "t.hot", "pad", "F5"]);
-    assert!(out.contains("键 F5 你在 tmux 里绑了别的,没动它"), "{out}");
+    assert!(out.contains("键 F5 已在 tmux 中绑定了其他操作,未修改"), "{out}");
     assert!(sb.tmux(&["list-keys", "-T", "root"]).lines().any(|l| l.contains("F5") && l.contains("display-message mine")));
     assert_eq!(bound(), ["copy-mode-vi:F5", "copy-mode:F5"]);
     // 回到清单的;不要键;停掉 / 再开
     sb.aca(&["plugin", "hotkey", "t.hot", "pad", "--reset"]);
     assert_eq!(bound(), all("C-M-y"));
-    assert!(sb.aca(&["plugin", "hotkey", "t.hot", "pad", "--none"]).contains("没有热键"));
+    assert!(sb.aca(&["plugin", "hotkey", "t.hot", "pad", "--none"]).contains("未设热键"));
     assert!(bound().is_empty());
     sb.aca(&["plugin", "hotkey", "t.hot", "pad", "--reset"]);
     sb.aca(&["plugin", "disable", "t.hot"]);
@@ -3468,32 +3477,32 @@ fn the_next_key_takes_the_client_to_what_waits_and_the_status_bar_only_counts() 
     press("C-M-n");
     assert!(sb.until(|| at() == ask), "没回到在问的那个:{}", at());
     press("C-M-n");
-    assert!(sb.until(|| sb.tmux(&["show-messages"]).contains("没有在等你的")), "{}", sb.tmux(&["show-messages"]));
+    assert!(sb.until(|| sb.tmux(&["show-messages"]).contains("暂无待处理会话")), "{}", sb.tmux(&["show-messages"]));
     assert_eq!(at(), ask);
     out(&["kill-server"]);
 
     // 自己敲也行(不在 tmux 里、没有终端:连不上去,说进不去;不算看过)
     let o = sb.run(&["next", "--session", &ask]);
-    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("没有在等你的"), "{o:?}");
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("暂无待处理会话"), "{o:?}");
 
     // 换键:旧的解掉、新的绑上,记在 config.toml;写得不能当热键的不收
     let out = sb.aca(&["tmux", "key", "next", "M-n"]);
-    assert!(out.contains("在会话里按 Alt+N(M-n)"), "{out}");
+    assert!(out.contains("在会话中按 Alt+N(M-n)"), "{out}");
     assert_eq!((keys("C-M-n"), keys("M-n")), (0, 3));
     assert!(std::fs::read_to_string(sb.home.join("config/config.toml")).unwrap().contains("[keys]\nnext = \"M-n\""));
     let o = sb.run(&["tmux", "key", "next", "n"]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("热键要写成 tmux 的键名"), "{o:?}");
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("热键应写为带 Ctrl / Alt 的 tmux 键名"), "{o:?}");
     assert_eq!(keys("M-n"), 3);
     // 那个键你自己在 tmux 里绑了别的:不动你的,点名
     sb.tmux(&["bind-key", "-n", "F7", "display-message", "mine"]);
     let out = sb.aca(&["tmux", "key", "next", "F7"]);
-    assert!(out.contains("键 F7 你在 tmux 里绑了别的,没动它"), "{out}");
+    assert!(out.contains("键 F7 已在 tmux 中绑定了其他操作,未修改"), "{out}");
     assert!(sb.tmux(&["list-keys", "-T", "root"]).lines().any(|l| l.contains(" F7 ") && l.contains("display-message mine")));
     // 不要键:都解掉,aca tmux 里说没绑;aca next 照样能敲
     let out = sb.aca(&["tmux", "key", "next", "--none"]);
-    assert!(out.contains("没绑键"), "{out}");
+    assert!(out.contains("未绑定按键"), "{out}");
     assert_eq!(sb.tmux(&["list-keys"]).lines().filter(|l| l.contains(" next --hotkey ")).count(), 0);
-    assert!(sb.aca(&["tmux"]).contains("没绑键"));
+    assert!(sb.aca(&["tmux"]).contains("未绑定按键"));
 }
 
 /// 只在屏幕上看得出在等你的(hook 没报:没信任 hook 的 Codex、启动时的确认框):列表里是 ◐,进下一个的键也要去得了
@@ -3511,7 +3520,7 @@ fn the_next_key_also_goes_to_a_session_only_its_screen_says_is_waiting() {
     );
     // 不在 tmux 里、没有终端:挑中的是它,只是连不上去
     let o = sb.run(&["next", "--session", &here]);
-    assert!(String::from_utf8_lossy(&o.stdout).contains("进不去「门口」"), "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stdout).contains("无法进入「门口」"), "{o:?}");
 }
 
 /// 从界面进一个会话,先路过刚离开的那个(进去之后 ^` 回得去):tmux 把路过记成连进去过,
@@ -3672,7 +3681,7 @@ fn the_notify_plugin_shows_a_desktop_notification_for_your_sessions_and_skips_wo
         return;
     }
     let out = sb.aca(&["plugin", "install", "aca.notify"]);
-    assert!(out.contains("装好了 aca.notify") && out.contains("turn.done"), "{out}");
+    assert!(out.contains("已安装 aca.notify") && out.contains("turn.done"), "{out}");
     let (rec, log) = (sb.home.join("rec.sh"), sb.home.join("shown.txt"));
     write(&rec, &format!("printf '%s|%s\\n' \"$1\" \"$2\" >> '{}'\n", log.display()));
     sb.aca(&["plugin", "setting", "aca.notify", "command", &format!("sh '{}'", rec.display())]);
@@ -3789,11 +3798,7 @@ fn the_opening_message_goes_in_as_a_launch_argument_and_only_the_first_time() {
 
     // 只登记没启动:那句话没处带,说一声,会话照样建好
     let o = sb.run(&["new", "rec", &sb.proj(), "-t", "先不起", "--hold", "--say", "两个 词"]);
-    assert!(
-        o.status.success() && String::from_utf8_lossy(&o.stderr).contains("第一句话没发进去"),
-        "{}",
-        String::from_utf8_lossy(&o.stderr)
-    );
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stderr).contains("开场消息未发送"), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(sb.json(&["show", "先不起", "--json"])["state"], "stopped");
 }
 
@@ -3933,7 +3938,7 @@ fn restart_as_another_account_carries_the_conversation_over_and_back() {
 
     // 换到 b:三样拷到 b 的同一位置,在原地带着 b 的目录接着 c1 起
     let (home, args, said) = relaunch(&id, &["restart", &id, "--as", "b"]);
-    assert!(said.contains("换到了 rc:b") && said.contains("3 个文件"), "{said}");
+    assert!(said.contains("已切换到 rc:b") && said.contains("3 个文件"), "{said}");
     assert_eq!((home.as_str(), after(&args, "--resume").as_deref()), (cb.to_str().unwrap(), Some("c1")), "{args:?}");
     assert_eq!(read(&cb.join(rel)), read(&ca.join(rel)));
     assert!(cb.join("projects/-proj/c1/subagents/agent-1.jsonl").is_file() && cb.join("file-history/c1/f@v1").is_file());
@@ -3964,7 +3969,7 @@ fn restart_as_another_account_carries_the_conversation_over_and_back() {
         String::from_utf8_lossy(&o.stderr).into_owned()
     };
     assert!(fails(&["restart", &id, "--as", "rx:x"]).contains("H 交接"));
-    assert!(fails(&["restart", &id, "--as", "b"]).contains("已经是 rc:b"));
+    assert!(fails(&["restart", &id, "--as", "b"]).contains("已是 rc:b"));
     assert!(fails(&["restart", &id, "--as", "a", "--fresh"]).contains("--fresh"));
 
     // Codex:记录在 sessions/<日期>/ 底下;两个账号默认模型不一样,带上原来用的那个
@@ -4040,16 +4045,83 @@ fn closing_the_terminal_under_the_interface_quits_quietly() {
     sb.tmux(&["kill-pane", "-t", "first"]);
     assert_eq!(codes(1), "0\n");
     let log = std::fs::read_to_string(ui.join("exit.log")).unwrap();
-    assert!(log.contains("终端没了,界面跟着退出(终端)"), "{log}");
+    assert!(log.contains("终端已关闭,界面随之退出(终端)"), "{log}");
     assert!(!ui.join("last-exit").exists());
 
     // 下次打开:底栏不提
     open("second", "快捷键");
     let screen = sb.tmux(&["capture-pane", "-p", "-t", "second"]);
-    assert!(!screen.contains("上次的界面"), "{screen}");
+    assert!(!screen.contains("上次界面"), "{screen}");
     sb.tmux(&["kill-pane", "-t", "second"]);
     assert_eq!(codes(2), "0\n0\n");
-    assert_eq!(std::fs::read_to_string(ui.join("exit.log")).unwrap().matches("终端没了").count(), 2);
+    assert_eq!(std::fs::read_to_string(ui.join("exit.log")).unwrap().matches("终端已关闭").count(), 2);
+}
+
+/// 开着的界面放到后台不等的(起会话时的 trust-watch、订了事件的插件),退了要收掉。
+/// 以前丢下就不管:界面一开好几天,底下每起 / 删一个会话就多挂一个僵尸(2026-10-25 看到 37 个)
+#[test]
+fn the_interface_reaps_what_it_leaves_running_in_the_background() {
+    let Some(sb) = Sandbox::new("reap") else { return };
+    add_config(&sb, "[trust]\nfolder = true\n");
+    let heard = sb.home.join("heard");
+    let dir = sb.home.join("hear");
+    write(
+        &dir.join("aca-plugin.toml"),
+        &format!(
+            "id = \"test.hear\"\nname = \"Hear\"\nversion = \"0.1.0\"\n\
+             [[events]]\non = \"session.*\"\ncommand = [\"sh\", \"-c\", \"echo $ACA_PLUGIN_EVENT >> '{}'\"]\n",
+            heard.display()
+        ),
+    );
+    sb.aca(&["plugin", "link", &dir.to_string_lossy()]);
+    let id = sb.aca(&["new", "fake", &sb.proj(), "-t", "x"]);
+    sb.hook(&id, &sb.pane(&id), r#"{"hook_event_name":"Stop","session_id":"r1"}"#);
+    let script = sb.home.join("ui.sh");
+    let q = |p: &Path| format!("'{}'", p.display());
+    write(
+        &script,
+        &format!(
+            "unset TMUX TMUX_PANE KITTY_WINDOW_ID TERM_PROGRAM SSH_CONNECTION SSH_TTY\n\
+             export HOME={home} ACA_HOME={home} ACA_TMUX_SOCKET={sock} ACA_LANG=zh ACA_IME=0 TERM=xterm-256color\n\
+             exec {aca} ui\n",
+            home = q(&sb.home),
+            sock = sb.socket,
+            aca = q(Path::new(env!("CARGO_BIN_EXE_aca"))),
+        ),
+    );
+    sb.tmux(&["new-session", "-d", "-s", "ui", "-x", "120", "-y", "30", "/bin/sh", script.to_str().unwrap()]);
+    assert!(sb.until(|| sb.tmux(&["capture-pane", "-p", "-t", "ui"]).contains("快捷键")), "界面没打开");
+    let ui = sb.tmux(&["display-message", "-p", "-t", "ui", "#{pane_pid}"]);
+
+    // 界面里重启它:放出去一个 trust-watch、一个插件的事件钩子(起的时候 aca new 已经听到过一次)。
+    // 刚打开那一下的按键界面不收(见 ui.rs 的 STARTUP_QUIET)
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    sb.tmux(&["send-keys", "-t", "ui", "R"]);
+    let started = || std::fs::read_to_string(&heard).unwrap_or_default().matches("session.started").count() == 2;
+    assert!(sb.until(started), "{}", sb.tmux(&["capture-pane", "-p", "-t", "ui"]));
+    // trust-watch 见 agent 报了 hook 就退,不用干等半分钟
+    sb.hook(&id, &sb.pane(&id), r#"{"hook_event_name":"SessionStart","session_id":"r1"}"#);
+
+    // 界面底下的子进程(状态):还在跑的等它退,剩下的都退了(Z)就该看得出收没收
+    let kids = || -> Vec<String> {
+        let o = Command::new("ps").args(["-axo", "ppid=,stat="]).output().unwrap();
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut w = l.split_whitespace();
+                (w.next()? == ui).then(|| w.next().unwrap_or_default().to_string())
+            })
+            .collect()
+    };
+    for _ in 0..150 {
+        if kids().iter().all(|s| s.starts_with('Z')) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let left = kids();
+    assert!(!left.iter().any(|s| s.starts_with('Z')), "界面底下挂着僵尸:{left:?}");
 }
 
 /// 打到管道里、对面先走了(`aca ls | head -1`、`aca help | less` 没翻完就退):不打 panic,141 退出(同被 SIGPIPE 带走的)

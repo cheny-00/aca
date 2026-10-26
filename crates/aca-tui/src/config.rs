@@ -79,19 +79,19 @@ fn problems_in(text: &str) -> Vec<String> {
     let Ok(t) = text.parse::<toml::Table>() else { return vec![] };
     let mut bad = vec![];
     if t.get("ime").and_then(|s| s.get("auto")).is_some_and(|v| !v.is_bool()) {
-        bad.push(t!("config.toml [ime] auto:只认 true / false", "config.toml [ime] auto: only true / false").into());
+        bad.push(t!("config.toml [ime] auto:只能是 true 或 false", "config.toml [ime] auto: only true / false").into());
     }
     if t.get("new_group").and_then(|s| s.get("default_path")).is_some_and(|v| !v.is_str()) {
         bad.push(
-            t!("config.toml [new_group] default_path:要写成 \"目录\"", "config.toml [new_group] default_path: write it as \"<dir>\"")
+            t!("config.toml [new_group] default_path:应写成 \"目录\"", "config.toml [new_group] default_path: write it as \"<dir>\"")
                 .into(),
         );
     }
     if let Some(e) = aca_core::config::login_problem_in(text) {
-        bad.push(tr!("config.toml [login] 当成没写:{e}", "config.toml [login] is ignored: {e}"));
+        bad.push(tr!("config.toml [login] 已忽略:{e}", "config.toml [login] is ignored: {e}"));
     }
     if let Some(e) = aca_core::config::idle_problem_in(text) {
-        bad.push(tr!("config.toml [idle] 当成没写,不自动停:{e}", "config.toml [idle] is ignored, nothing is auto-stopped: {e}"));
+        bad.push(tr!("config.toml [idle] 已忽略,不会自动停止:{e}", "config.toml [idle] is ignored, nothing is auto-stopped: {e}"));
     }
     bad
 }
@@ -101,8 +101,8 @@ fn problems_in(text: &str) -> Vec<String> {
 pub fn set(section: &str, key: &str, value: Value) -> Result<(), String> {
     let path = path();
     let text = read();
-    let new = with_value(&text, section, key, &value).ok_or(t!("config.toml 格式不对,没记下", "config.toml is malformed; not saved"))?;
-    crate::state::write_atomic(&path, &new).map_err(|e| tr!("没记下:{e}", "not saved: {e}"))
+    let new = with_value(&text, section, key, &value).ok_or(t!("config.toml 格式有误,未保存", "config.toml is malformed; not saved"))?;
+    crate::state::write_atomic(&path, &new).map_err(|e| tr!("未保存:{e}", "not saved: {e}"))
 }
 
 /// 把 `[section]` 下的 key 改成 value:有这一行就换掉(缩进照旧),有这一段没这行就加在表头下面,都没有就在末尾加一段。
@@ -171,11 +171,11 @@ mod tests {
         assert!(problems_in("[ime]\nauto = false\n[new_group]\ndefault_path = \"~/x\"\n").is_empty());
         // [login] 写错了:那一节当没写,设置页说一句
         let bad = problems_in("[login]\nremote = \"maybe\"\n");
-        assert!(bad.len() == 1 && bad[0].starts_with("config.toml [login] 当成没写:") && bad[0].contains("maybe"), "{bad:?}");
+        assert!(bad.len() == 1 && bad[0].starts_with("config.toml [login] 已忽略:") && bad[0].contains("maybe"), "{bad:?}");
         assert!(problems_in("[login]\nremote = \"yes\"\nbrowsers = [\"Firefox\"]\n").is_empty());
         // [idle] 写错了:不自动停,设置页说一句
         let bad = problems_in("[idle]\nstop_after = \"三小时\"\n");
-        assert!(bad.len() == 1 && bad[0].starts_with("config.toml [idle] 当成没写,不自动停:") && bad[0].contains("三小时"), "{bad:?}");
+        assert!(bad.len() == 1 && bad[0].starts_with("config.toml [idle] 已忽略,不会自动停止:") && bad[0].contains("三小时"), "{bad:?}");
         assert!(problems_in("[idle]\nstop_after = \"3h\"\n").is_empty());
     }
 

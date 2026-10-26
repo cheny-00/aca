@@ -35,6 +35,10 @@ use crate::theme;
 
 /// 来源最多输这么长
 const INPUT_MAX: usize = 300;
+/// 高亮的设置的说明最多占几行
+const HINT_MOST: usize = 6;
+/// 框至少这么高(行数,不算外框和底下那句话)
+const LEAST_ROWS: usize = 20;
 
 /// 从哪来的
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,7 +94,7 @@ impl Origin {
 fn called(id: &str, item: Option<&str>) -> String {
     let e = plugin::registry().into_iter().find(|e| e.id == id);
     if item.is_none() && e.as_ref().is_some_and(|e| e.source == plugin::user::SOURCE) {
-        return t!("你自己的那份", "your own").into();
+        return t!("你自己的", "your own").into();
     }
     let m = e.and_then(|e| plugin::read_manifest(Path::new(&e.path)).ok()).map(|(m, _)| m);
     let found = match (&m, item) {
@@ -158,7 +162,7 @@ pub fn load() -> Vec<Row> {
 fn gateway_live(on: bool) -> Option<String> {
     match aca_core::gateway::ctl(serde_json::json!({ "cmd": "status" })) {
         Ok(v) => Some(tr!(
-            "在跑 · {} 个连接 · {} 个服务",
+            "运行中 · {} 个连接 · {} 个服务",
             "running · {} connections · {} servers",
             v["clients"].as_array().map_or(0, Vec::len),
             v["servers"].as_array().map_or(0, Vec::len)
@@ -195,18 +199,18 @@ impl Act {
         match self {
             // 「可装」里的给的是 id:换成清单里的名字;别处的(地址、目录)是你输的,照写
             Act::Install(src) => {
-                tr!("正在装 {}…", "installing {}…", plugin::first_party::manifest(src).map_or_else(|| src.clone(), |m| m.name))
+                tr!("正在安装 {}…", "installing {}…", plugin::first_party::manifest(src).map_or_else(|| src.clone(), |m| m.name))
             }
             Act::Update(Some(id)) => tr!("正在更新 {}…", "updating {}…", called(id, None)),
             Act::Update(None) => t!("正在更新插件…", "updating plugins…").into(),
-            Act::Remove(id) => tr!("正在删 {}…", "removing {}…", called(id, None)),
-            Act::Enable(id, true) => tr!("正在开 {}…", "switching on {}…", called(id, None)),
-            Act::Enable(id, false) => tr!("正在关 {}…", "switching off {}…", called(id, None)),
-            Act::Sync | Act::AfterEdit => t!("正在照 plugins.toml 同步…", "syncing with plugins.toml…").into(),
-            Act::Tool(id, tool, true) => tr!("正在把「{}」给 agent…", "giving agents “{}”…", called(id, Some(tool))),
+            Act::Remove(id) => tr!("正在删除 {}…", "removing {}…", called(id, None)),
+            Act::Enable(id, true) => tr!("正在开启 {}…", "switching on {}…", called(id, None)),
+            Act::Enable(id, false) => tr!("正在关闭 {}…", "switching off {}…", called(id, None)),
+            Act::Sync | Act::AfterEdit => t!("正在按 plugins.toml 同步…", "syncing with plugins.toml…").into(),
+            Act::Tool(id, tool, true) => tr!("正在将「{}」提供给 agent…", "giving agents “{}”…", called(id, Some(tool))),
             Act::Tool(id, tool, false) => tr!("正在收回「{}」…", "withholding “{}”…", called(id, Some(tool))),
-            Act::Key(id, target, _) => tr!("正在改「{}」的键…", "changing the key for “{}”…", called(id, Some(target))),
-            Act::Setting(_, name, _) => tr!("正在改 {name}…", "changing {name}…"),
+            Act::Key(id, target, _) => tr!("正在修改「{}」的按键…", "changing the key for “{}”…", called(id, Some(target))),
+            Act::Setting(_, name, _) => tr!("正在修改 {name}…", "changing {name}…"),
         }
     }
 }
@@ -217,9 +221,9 @@ pub fn job(a: &Act) -> Outcome {
         Act::Install(src) => match plugin::install(src, None) {
             Ok((m, warn)) => {
                 let warn = if warn.is_empty() { String::new() } else { tr!(" · 提醒:{}", " · note: {}", warn.join(t!(";", "; "))) };
-                Outcome::Done(tr!("装好了 {} {}{warn}", "installed {} {}{warn}", m.name, m.version))
+                Outcome::Done(tr!("已安装 {} {}{warn}", "installed {} {}{warn}", m.name, m.version))
             }
-            Err(e) => Outcome::Failed(tr!("没装上:{e}", "not installed: {e}")),
+            Err(e) => Outcome::Failed(tr!("安装失败:{e}", "not installed: {e}")),
         },
         Act::Update(one) => {
             let ids: Vec<String> = match one {
@@ -232,25 +236,25 @@ pub fn job(a: &Act) -> Outcome {
             let said: Vec<String> = ids.iter().map(|id| plugin::update(id).unwrap_or_else(|e| format!("{id}: {e}"))).collect();
             Outcome::Done(said.join(" · "))
         }
-        Act::Remove(id) => plugin::remove(id).map_or_else(|e| Outcome::Failed(tr!("没删:{e}", "not removed: {e}")), Outcome::Done),
+        Act::Remove(id) => plugin::remove(id).map_or_else(|e| Outcome::Failed(tr!("删除失败:{e}", "not removed: {e}")), Outcome::Done),
         Act::Enable(id, on) => match plugin::enable(id, *on) {
-            Ok(()) if *on => Outcome::Done(tr!("开了 {}", "switched on {}", called(id, None))),
-            Ok(()) => Outcome::Done(tr!("关了 {}", "switched off {}", called(id, None))),
+            Ok(()) if *on => Outcome::Done(tr!("已开启 {}", "switched on {}", called(id, None))),
+            Ok(()) => Outcome::Done(tr!("已关闭 {}", "switched off {}", called(id, None))),
             Err(e) => Outcome::Failed(e),
         },
         Act::Sync => match plugin::sync() {
-            Ok(said) if said.is_empty() => Outcome::Done(t!("跟 plugins.toml 一致", "matches plugins.toml").into()),
+            Ok(said) if said.is_empty() => Outcome::Done(t!("与 plugins.toml 一致", "matches plugins.toml").into()),
             Ok(said) => Outcome::Done(said.join(" · ")),
-            Err(e) => Outcome::Failed(tr!("没同步:{e}", "not synced: {e}")),
+            Err(e) => Outcome::Failed(tr!("同步失败:{e}", "not synced: {e}")),
         },
         Act::AfterEdit => match plugin::sync() {
-            Ok(said) if said.is_empty() => Outcome::Done(t!("改好了", "saved").into()),
-            Ok(said) => Outcome::Done(tr!("改好了:{}", "saved: {}", said.join(" · "))),
+            Ok(said) if said.is_empty() => Outcome::Done(t!("已修改", "saved").into()),
+            Ok(said) => Outcome::Done(tr!("已修改:{}", "saved: {}", said.join(" · "))),
             Err(e) => Outcome::Failed(tr!("plugins.toml 有问题:{e} · e 再改", "plugins.toml has a problem: {e} · e to fix it")),
         },
         Act::Tool(id, tool, on) => match plugin::yours::allow(id, tool, *on) {
-            Ok(_) if *on => Outcome::Done(tr!("「{}」给 agent 了", "agents get “{}”", called(id, Some(tool)))),
-            Ok(_) => Outcome::Done(tr!("「{}」不给 agent 了", "agents no longer get “{}”", called(id, Some(tool)))),
+            Ok(_) if *on => Outcome::Done(tr!("已将「{}」提供给 agent", "agents get “{}”", called(id, Some(tool)))),
+            Ok(_) => Outcome::Done(tr!("已停止向 agent 提供「{}」", "agents no longer get “{}”", called(id, Some(tool)))),
             Err(e) => Outcome::Failed(e),
         },
         Act::Key(id, target, key) => match plugin::yours::set_key(id, target, key.as_deref()) {
@@ -259,14 +263,14 @@ pub fn job(a: &Act) -> Outcome {
                 let what = called(id, Some(target));
                 Outcome::Done(match now {
                     Some(k) => tr!("「{what}」的键:{k}", "“{what}”: key {k}"),
-                    None => tr!("「{what}」没有键了", "“{what}” has no key now"),
+                    None => tr!("「{what}」已无按键", "“{what}” has no key now"),
                 })
             }
             Err(e) => Outcome::Failed(e),
         },
         Act::Setting(id, name, value) => match plugin::set_setting(id, name, value.as_deref()) {
-            Ok(()) if value.is_some() => Outcome::Done(tr!("{name} 改好了", "{name} saved")),
-            Ok(()) => Outcome::Done(tr!("{name} 回到默认的了", "{name} is back to its default")),
+            Ok(()) if value.is_some() => Outcome::Done(tr!("{name} 已修改", "{name} saved")),
+            Ok(()) => Outcome::Done(tr!("{name} 已恢复默认", "{name} is back to its default")),
             Err(e) => Outcome::Failed(e),
         },
     }
@@ -307,7 +311,7 @@ pub fn back_from(ed: Edited, fx: &mut Fx) {
     match (mtime(&ed.path) != ed.before, ed.sync) {
         (false, _) => {}
         (true, true) => fx.job = Some(Job::Plugins(Act::AfterEdit)),
-        (true, false) => fx.say(t!("改好了", "saved")),
+        (true, false) => fx.say(t!("已修改", "saved")),
     }
 }
 
@@ -317,7 +321,7 @@ pub fn show_log(id: &str, name: &str, fx: &mut Fx) {
     if log.exists() {
         fx.external = Some(crate::ui::External::View { path: log.to_string_lossy().into_owned(), line: 1, temp: false });
     } else {
-        fx.say(tr!("{name} 还没有日志", "{name} has no log yet"));
+        fx.say(tr!("{name} 暂无日志", "{name} has no log yet"));
     }
 }
 
@@ -355,6 +359,8 @@ pub struct Page {
     tune: fn(&str) -> Tune,
     /// e 打开了文件:回来时改了就同步
     edited: Option<Edited>,
+    /// 右边那一栏最多要几行(桌面宽度,所有插件里最长的,见 `measure`):定框高用
+    tall: usize,
 }
 
 /// 开着的会话里,起来时带的和现在不一样的(标题)
@@ -395,6 +401,17 @@ pub(crate) fn scroll(at: Option<usize>, len: usize, h: usize) -> usize {
     }
 }
 
+/// 高亮落在一个设置上时它的说明最多占几行(前面空一行):定框高时按最长的那个算
+fn hint_tall(d: &Detail, w: usize) -> usize {
+    d.data
+        .settings
+        .iter()
+        .filter(|s| !s.desc.is_empty())
+        .map(|s| 1 + crate::ui::wrap_width(&tr!("{}:{}", "{}: {}", s.name, s.desc), w).len().min(HINT_MOST))
+        .max()
+        .unwrap_or(0)
+}
+
 impl Page {
     pub fn new(load: fn() -> Vec<Row>) -> Page {
         Page::with(load, stale, plugin::drift, crate::plugtune::load)
@@ -415,6 +432,7 @@ impl Page {
             drift_of,
             tune,
             edited: None,
+            tall: 0,
         };
         p.reload();
         p
@@ -422,6 +440,32 @@ impl Page {
 
     fn cur(&self) -> Option<&Row> {
         self.rows.get(self.sel)
+    }
+
+    /// 两栏各多宽:左边按最长的名字,其余给右边
+    fn split(&self, w: usize) -> (usize, usize) {
+        let names = self.rows.iter().map(|r| title(r).width()).max().unwrap_or(0);
+        let lw = (names + 4 + 5).clamp(22, 32);
+        (lw, w.saturating_sub(lw + DIVIDER.width()))
+    }
+
+    /// 右边那一栏最多要几行:每个插件都算一遍(高亮那个用现成的详情,别的现读),取最长的。定框高用,所以挪高亮不变
+    fn measure(&mut self) {
+        let (_, rw) = self.split(self.width() as usize - 6);
+        let mut tall = 0;
+        for (i, r) in self.rows.iter().enumerate() {
+            let fresh;
+            let d = match (r.available || r.problem.is_some(), i == self.sel) {
+                (true, _) => None,
+                (false, true) => self.detail.as_ref(),
+                (false, false) => {
+                    fresh = Detail::new((self.tune)(&r.id));
+                    Some(&fresh)
+                }
+            };
+            tall = tall.max(self.right_of(r, d, rw).0.len() + d.map_or(0, |d| hint_tall(d, rw)));
+        }
+        self.tall = tall;
     }
 
     /// 「可装」那一段从第几行开始
@@ -461,14 +505,14 @@ impl Page {
         let mut out = vec![];
         let mut at = None;
         if self.first_available() == Some(0) {
-            out.push(Line::styled(t!("还没装插件", "nothing installed yet"), kit::dim()));
+            out.push(Line::styled(t!("尚未安装插件", "nothing installed yet"), kit::dim()));
         }
         for (i, r) in self.rows.iter().enumerate() {
             if Some(i) == self.first_available() {
                 if !out.is_empty() {
                     out.push(Line::raw(""));
                 }
-                out.push(Line::styled(t!("可装", "Available"), kit::dim().add_modifier(Modifier::BOLD)));
+                out.push(Line::styled(t!("可安装", "Available"), kit::dim().add_modifier(Modifier::BOLD)));
             }
             let on = i == self.sel;
             if on {
@@ -483,9 +527,8 @@ impl Page {
             let (tag, tag_st) = match (r.available, &r.problem, r.enabled) {
                 (true, ..) => ("", kit::dim()),
                 (_, Some(_), _) => (t!("有问题", "broken"), theme::warn()),
-                _ if !r.alerts.is_empty() && r.enabled => (t!("出错了", "failing"), theme::warn()),
-                _ if !r.lacks.is_empty() => (t!("缺程序", "missing"), theme::warn()),
-                (_, None, false) => (t!("关着", "off"), kit::dim()),
+                _ if !r.alerts.is_empty() && r.enabled => (t!("出错", "failing"), theme::warn()),
+                _ if !r.lacks.is_empty() => (t!("缺少程序", "missing"), theme::warn()),
                 _ => ("", kit::dim()),
             };
             let name_st = match (r.available, r.enabled) {
@@ -509,10 +552,10 @@ impl Page {
     /// 右边的标题:名字(强调色粗体)、淡的版本和从哪来(一两个字),右边写开着 / 关着
     fn header(r: &Row, w: usize) -> Line<'static> {
         let (state, st) = match (r.available, &r.problem, r.enabled) {
-            (true, ..) => (t!("还没装", "not installed"), kit::dim()),
+            (true, ..) => (t!("未安装", "not installed"), kit::dim()),
             (_, Some(_), _) => (t!("✕ 清单有问题", "✕ manifest problem"), theme::warn()),
-            (_, None, true) => (t!("● 开着", "● on"), theme::accent()),
-            (_, None, false) => (t!("○ 关着", "○ off"), kit::dim()),
+            (_, None, true) => (t!("● 已开启", "● on"), theme::accent()),
+            (_, None, false) => (t!("○ 已关闭", "○ off"), kit::dim()),
         };
         let room = w.saturating_sub(state.width() + 2);
         let name = kit::clip(&title(r), room).trim_end().to_string();
@@ -534,10 +577,10 @@ impl Page {
         };
         let mut out = vec![];
         if let Some(text) = &self.typing {
-            out.push(Line::styled(t!("从别处装", "Install from elsewhere"), theme::accent().add_modifier(Modifier::BOLD)));
+            out.push(Line::styled(t!("从其他来源安装", "Install from elsewhere"), theme::accent().add_modifier(Modifier::BOLD)));
             out.push(Line::raw(""));
             out.push(Line::from(vec![
-                Span::styled(t!("从哪装 > ", "install from > "), theme::accent()),
+                Span::styled(t!("安装来源 > ", "install from > "), theme::accent()),
                 Span::raw(kit::clip(text, w.saturating_sub(12)).trim_end().to_string()),
                 Span::raw("▏"),
             ]));
@@ -546,29 +589,37 @@ impl Page {
             return (out, None);
         }
         let Some(r) = self.cur() else {
-            out.extend(wrap(t!("还没装插件 · i 装一个", "No plugins yet · i installs one"), Style::new(), 2));
+            out.extend(wrap(t!("尚未安装插件 · i 安装", "No plugins yet · i installs one"), Style::new(), 2));
             return (out, None);
         };
-        out.push(Self::header(r, w));
+        self.right_of(r, self.detail.as_ref(), w)
+    }
+
+    /// 一个插件在右边那一栏的样子:标题、问题、说明(最多三行)、能改的(detail);定框高时每个插件都算一遍
+    fn right_of(&self, r: &Row, detail: Option<&Detail>, w: usize) -> (Vec<Line<'static>>, Option<usize>) {
+        let wrap = |text: &str, st: Style, most: usize| {
+            crate::ui::wrap_width(text, w).into_iter().take(most).map(move |l| Line::styled(l, st)).collect::<Vec<_>>()
+        };
+        let mut out = vec![Self::header(r, w)];
         out.push(Line::raw(""));
         if let Some(p) = &r.problem {
             out.extend(wrap(&tr!("清单有问题:{p}", "manifest problem: {p}"), theme::warn(), 4));
             out.push(Line::raw(""));
         }
         if !r.alerts.is_empty() {
-            out.push(Line::styled(t!("出错了", "Failing"), theme::warn().add_modifier(Modifier::BOLD)));
+            out.push(Line::styled(t!("出错", "Failing"), theme::warn().add_modifier(Modifier::BOLD)));
             for a in r.alerts.iter().take(4) {
                 out.extend(wrap(a, theme::warn(), 2));
             }
             out.push(Line::raw(""));
         }
         if !r.description.is_empty() {
-            out.extend(wrap(&r.description, Style::new(), 4));
+            out.extend(wrap(&r.description, Style::new(), 3));
             out.push(Line::raw(""));
         }
         if r.available {
             if !r.brings.is_empty() {
-                out.push(Line::styled(t!("装上会带来", "Brings"), Style::new().add_modifier(Modifier::BOLD)));
+                out.push(Line::styled(t!("安装后将添加", "Brings"), Style::new().add_modifier(Modifier::BOLD)));
                 let fields: Vec<(&str, &str)> = r.brings.iter().map(|b| b.split_once([':', ':']).unwrap_or(("", b))).collect();
                 let label_w = fields.iter().map(|(l, _)| l.width()).max().unwrap_or(0) + 2;
                 for (l, v) in fields {
@@ -577,7 +628,7 @@ impl Page {
                 }
                 out.push(Line::raw(""));
             }
-            out.push(Line::from(kit::button(t!("⏎ 装上", "⏎ install"), theme::pal().accent)));
+            out.push(Line::from(kit::button(t!("⏎ 安装", "⏎ install"), theme::pal().accent)));
             return (out, None);
         }
         // gateway:现在在不在跑,写在能改的前面(它下面的 MCP 按 m 进去管,键栏里有)
@@ -590,7 +641,7 @@ impl Page {
             out.push(Line::raw(""));
         }
         let mut hl = None;
-        if let Some(d) = &self.detail {
+        if let Some(d) = detail {
             let (body, at) = d.body(w, self.focus == Focus::Detail);
             hl = at.map(|i| i + out.len());
             out.extend(body);
@@ -600,13 +651,12 @@ impl Page {
 
     /// 高亮在右边一个设置上:「名字:说明」折行写全,放在详情下面(前面空一行,见 `right_in`);最多这么多行
     fn hint(&self, w: usize) -> Vec<Line<'static>> {
-        const MOST: usize = 6;
         let Some((name, desc)) = self.detail.as_ref().filter(|_| self.focus == Focus::Detail).and_then(Detail::hint) else {
             return vec![];
         };
         let mut out = vec![Line::raw("")];
         let text = tr!("{name}:{desc}", "{name}: {desc}");
-        out.extend(crate::ui::wrap_width(&text, w).into_iter().take(MOST).map(|l| Line::styled(l, kit::dim())));
+        out.extend(crate::ui::wrap_width(&text, w).into_iter().take(HINT_MOST).map(|l| Line::styled(l, kit::dim())));
         out
     }
 
@@ -635,16 +685,16 @@ impl Page {
         let mut out = vec![];
         if let Some(r) = self.cur().filter(|_| self.armed) {
             let what = match r.from {
-                Origin::Linked => t!("只取消登记,目录不动", "only unregisters it; the directory stays"),
-                Origin::Git => t!("连克隆的目录一起删", "the cloned directory goes too"),
+                Origin::Linked => t!("仅取消登记,保留目录", "only unregisters it; the directory stays"),
+                Origin::Git => t!("同时删除克隆的目录", "the cloned directory goes too"),
                 Origin::Bundled | Origin::Mine => "",
             };
-            let ask = tr!("删掉 {}?", "remove {}?", title(r));
+            let ask = tr!("删除 {}?", "remove {}?", title(r));
             out.extend(wrap(&if what.is_empty() { ask } else { tr!("{ask}{what}", "{ask} {what}") }));
         }
         if !self.drift.is_empty() {
             out.extend(wrap(&tr!(
-                "plugins.toml 跟本机对不上:{} · S 照它同步",
+                "plugins.toml 与本机不一致:{} · S 同步",
                 "plugins.toml doesn't match this machine: {} · S syncs",
                 self.drift.join(t!("、", ", "))
             )));
@@ -654,7 +704,7 @@ impl Page {
             let names: Vec<String> = self.stale.iter().take(3).map(|t| format!("「{t}」")).collect();
             let (n, rest) = (self.stale.len(), self.stale.len().saturating_sub(3));
             let more = if rest > 0 { tr!("等 {n} 个", " and {rest} more") } else { String::new() };
-            out.extend(wrap(&tr!("{}{more}重启后用上新插件", "restart {}{more} to pick up the plugin changes", names.join(t!("", ", ")))));
+            out.extend(wrap(&tr!("{}{more}重启后启用新插件", "restart {}{more} to pick up the plugin changes", names.join(t!("", ", ")))));
         }
         out
     }
@@ -662,10 +712,10 @@ impl Page {
     /// 底下那行键:跟着高亮在哪一栏、高亮的是什么
     fn keys(&self) -> Vec<(&'static str, &'static str)> {
         if self.typing.is_some() {
-            return vec![("⏎", t!("装", "install")), ("^U", t!("清空", "clear")), ("Esc", t!("不装了", "cancel"))];
+            return vec![("⏎", t!("安装", "install")), ("^U", t!("清空", "clear")), ("Esc", t!("取消", "cancel"))];
         }
         if self.armed {
-            return vec![("x", t!("删掉", "remove")), ("Esc", t!("不删", "keep"))];
+            return vec![("x", t!("删除", "remove")), ("Esc", t!("取消", "keep"))];
         }
         if let (Focus::Detail, Some(d)) = (self.focus, &self.detail) {
             let mut keys = d.keys();
@@ -675,21 +725,23 @@ impl Page {
             return keys;
         }
         match self.cur() {
-            None => vec![("i", t!("装", "install")), ("e", t!("编辑", "edit"))],
-            Some(r) if r.available => vec![("⏎", t!("装上", "install")), ("i", t!("从别处装", "install other")), ("e", t!("编辑", "edit"))],
+            None => vec![("i", t!("从其他来源安装", "install other")), ("e", t!("编辑", "edit"))],
+            Some(r) if r.available => {
+                vec![("⏎", t!("安装", "install")), ("i", t!("从其他来源安装", "install other")), ("e", t!("编辑", "edit"))]
+            }
             Some(r) => {
                 let mut keys = vec![];
                 if self.detail.as_ref().is_some_and(|d| d.rows() > 0) {
-                    keys.push(("⏎", t!("进去改", "change")));
+                    keys.push(("⏎", t!("进入", "change")));
                 }
                 if r.id == aca_core::gateway::PLUGIN {
-                    keys.push(("m", t!("管 MCP", "MCPs")));
+                    keys.push(("m", t!("管理 MCP", "MCPs")));
                 }
                 keys.extend([
                     (t!("空格", "space"), t!("开/关", "on/off")),
-                    ("i", t!("装", "install")),
+                    ("i", t!("从其他来源安装", "install other")),
                     ("u", t!("更新", "update")),
-                    ("x", t!("删", "remove")),
+                    ("x", t!("删除", "remove")),
                     ("e", t!("编辑", "edit")),
                 ]);
                 if self.detail.as_ref().is_some_and(|d| d.data.log) {
@@ -710,6 +762,15 @@ impl Overlay for Page {
         true
     }
 
+    /// 高度照内容定:标题、两栏里长的那一栏(右边按所有插件里最长的,见 `measure`)、提醒、细线、键。
+    /// 挪高亮不变,装了 / 删了插件才变;x 问删不删那两行出来时跟着长一点
+    fn fill_rows(&self) -> Option<u16> {
+        let w = self.width() as usize - 6;
+        let (lw, _) = self.split(w);
+        let body = self.list(lw).0.len().max(self.tall);
+        Some((2 + body + self.banners(w).len() + 2).max(LEAST_ROWS) as u16)
+    }
+
     fn lines(&self, w: usize) -> Vec<Line<'static>> {
         self.lines_in(w, 32)
     }
@@ -717,16 +778,14 @@ impl Overlay for Page {
     /// 标题、两栏(窄屏上下叠)、提醒、细线、键;正好 h 行,框的大小不跟着高亮变
     fn lines_in(&self, w: usize, h: usize) -> Vec<Line<'static>> {
         let in_detail = self.focus == Focus::Detail;
-        let esc = if in_detail { t!("回列表", "back to the list") } else { t!("关闭", "close") };
+        let esc = if in_detail { t!("返回列表", "back to the list") } else { t!("关闭", "close") };
         let mut out = vec![kit::modal_title(t!("插件", "Plugins"), theme::accent(), kit::esc_hint(esc), w), Line::raw("")];
         let mut foot = self.banners(w);
         foot.push(Line::styled("─".repeat(w), theme::faint()));
         foot.push(kit::keys_line(&self.keys(), vec![], w));
         let bh = h.saturating_sub(out.len() + foot.len());
         if w >= SPLIT_W {
-            let names = self.rows.iter().map(|r| title(r).width()).max().unwrap_or(0);
-            let lw = (names + 4 + 5).clamp(22, 32);
-            let rw = w.saturating_sub(lw + DIVIDER.width());
+            let (lw, rw) = self.split(w);
             let (left, at) = self.list(lw);
             let right = self.right_in(rw, bh);
             let lo = scroll(at, left.len(), bh);
@@ -806,7 +865,7 @@ impl Overlay for Page {
                     return Flow::Stay;
                 }
                 KeyCode::Char('u' | 'x' | 'd' | 'l') => {
-                    fx.say(tr!("{} 还没装 · ⏎ 装上", "{} isn't installed · ⏎ installs it", title(r)));
+                    fx.say(tr!("{} 未安装 · ⏎ 安装", "{} isn't installed · ⏎ installs it", title(r)));
                     return Flow::Stay;
                 }
                 _ => {}
@@ -815,7 +874,7 @@ impl Overlay for Page {
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 if armed {
-                    fx.say(t!("没删", "not removed"));
+                    fx.say(t!("未删除", "not removed"));
                 }
                 return Flow::Close;
             }
@@ -829,7 +888,7 @@ impl Overlay for Page {
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Tab => match (self.cur(), &self.detail) {
                 (Some(_), Some(d)) if d.rows() > 0 => self.focus = Focus::Detail,
-                (Some(r), _) => fx.say(tr!("{} 没有能改的", "{} has nothing to change", title(r))),
+                (Some(r), _) => fx.say(tr!("{} 没有可修改的设置", "{} has nothing to change", title(r))),
                 (None, _) => {}
             },
             KeyCode::Char('m') if self.cur().is_some_and(|r| r.id == aca_core::gateway::PLUGIN) => {
@@ -857,7 +916,7 @@ impl Overlay for Page {
             KeyCode::Char('x' | 'd') => match self.cur() {
                 None => {}
                 Some(r) if r.from == Origin::Mine => {
-                    fx.say(t!("你自己的那份删不了 · 空格 关掉它", "your own can't be removed · space switches it off"))
+                    fx.say(t!("无法删除你自己的插件 · 空格 关闭", "your own can't be removed · space switches it off"))
                 }
                 Some(_) if !armed => self.armed = true,
                 Some(r) => fx.job = Some(Job::Plugins(Act::Remove(r.id.clone()))),
@@ -878,6 +937,7 @@ impl Overlay for Page {
         self.sel = same.unwrap_or(self.sel).min(self.rows.len().saturating_sub(1));
         self.armed = false;
         self.follow();
+        self.measure();
     }
 
     fn returned(&mut self, fx: &mut Fx) {
@@ -994,9 +1054,9 @@ mod tests {
             set(rows);
             let p = page();
             let t = text_in(&p, 110, 30).join("\n");
-            assert!(t.contains("出错了") && t.contains("钩子 turn.done 退出码 3 · 5m 前") && t.contains("l 日志"), "{t}");
+            assert!(t.contains("出错") && t.contains("钩子 turn.done 退出码 3 · 5m 前") && t.contains("l 日志"), "{t}");
             // 关着的(my.local)照旧标「关着」
-            assert!(t.lines().any(|l| l.contains(" ○ Local") && l.contains("关着")), "{t}");
+            assert!(t.lines().any(|l| l.contains(" ○ Local") && !l.contains("已关闭")), "{t}");
         });
     }
 
@@ -1009,10 +1069,11 @@ mod tests {
             let t = lines.join("\n");
             assert_eq!(lines.len(), 30);
             assert!(lines.iter().all(|l| l.width() <= 110), "{t}");
-            // 左边:开没开、名字;关着的写出来
-            assert!(t.contains("▌● Delegate") && t.contains(" ○ Local") && t.contains("关着"), "{t}");
+            // 左边:开没开、名字;关着的只画 ○,不再写一遍「关着」
+            assert!(t.contains("▌● Delegate") && t.contains(" ○ Local"), "{t}");
+            assert!(!t.lines().any(|l| l.contains(" ○ Local") && l.contains("已关闭")), "{t}");
             // 右边:名字、版本和从哪来(一两个字)、开着,说明,能改的;id、来源地址不写
-            assert!(t.contains("Delegate  0.1.0 · git") && t.contains("● 开着"), "{t}");
+            assert!(t.contains("Delegate  0.1.0 · git") && t.contains("● 已开启"), "{t}");
             assert!(!t.contains("aca.delegate") && !t.contains("github.com"), "{t}");
             assert!(
                 t.contains("派活给别的 agent") && t.contains("设置") && t.contains("say  continue") && t.contains("agents  skills"),
@@ -1020,7 +1081,7 @@ mod tests {
             );
             // 设置的说明不挤在行里
             assert!(!t.contains("what to say"), "{t}");
-            assert!(t.contains("⏎ 进去改") && t.contains("e 编辑") && t.contains("l 日志") && t.contains("Esc 关闭"), "{t}");
+            assert!(t.contains("⏎ 进入") && t.contains("e 编辑") && t.contains("l 日志") && t.contains("Esc 关闭"), "{t}");
             // 高亮的底色只铺左边那一栏,不漫到右边
             let row = &p.lines_in(110, 30)[2];
             let div = row.spans.iter().position(|s| s.content == DIVIDER).unwrap();
@@ -1031,24 +1092,44 @@ mod tests {
             let t = lines.join("\n");
             assert_eq!(lines.len(), 30);
             assert!(
-                t.contains("Local  0.0.1 · 本地") && t.contains("○ 关着") && !t.contains("say  continue") && !t.contains("⏎ 进去改"),
+                t.contains("Local  0.0.1 · 本地") && t.contains("○ 已关闭") && !t.contains("say  continue") && !t.contains("⏎ 进入"),
                 "{t}"
             );
             // 窄屏(手机):上下叠着,不出界,也是正好那么高
             let narrow = text_in(&p, 40, 24);
             assert!(narrow.len() == 24 && narrow.iter().all(|l| l.width() <= 40), "{narrow:?}");
-            assert!(narrow.join("\n").contains("○ Local") && narrow.join("\n").contains("○ 关着"), "{narrow:?}");
+            assert!(narrow.join("\n").contains("○ Local") && narrow.join("\n").contains("○ 已关闭"), "{narrow:?}");
             // 清单坏了的标出来
             set(vec![Row { id: "bad".into(), problem: Some("清单读不懂".into()), ..Default::default() }]);
             let t = text(&page(), 110).join("\n");
             assert!(t.contains("✕ bad") && t.contains("有问题") && t.contains("清单有问题:清单读不懂"), "{t}");
             // 要用的程序这台机器上没有:列表里标出来
             set(vec![Row { id: "x".into(), name: "X".into(), enabled: true, lacks: vec!["jq".into()], ..Default::default() }]);
-            assert!(text(&page(), 110).join("\n").contains("缺程序"));
+            assert!(text(&page(), 110).join("\n").contains("缺少程序"));
             // 一个都没有:告诉怎么装
             set(vec![]);
             let t = text(&page(), 110).join("\n");
-            assert!(t.contains("还没装插件 · i 装一个"), "{t}");
+            assert!(t.contains("尚未安装插件 · i 安装"), "{t}");
+        });
+    }
+
+    #[test]
+    fn the_box_is_as_tall_as_the_longest_plugin_and_moving_the_highlight_doesnt_change_it() {
+        i18n::with(Lang::Zh, || {
+            set(two());
+            let mut p = page();
+            let (_, rw) = p.split(120 - 6);
+            // 右边按 Delegate 算:它的详情加上高亮一个设置时那两行说明;挪到 Local 上右边变短,框不变
+            let right = p.right(rw).0.len();
+            assert_eq!(p.tall, right + 2, "{right}");
+            let h = p.fill_rows().unwrap();
+            press(&mut p, KeyCode::Down);
+            assert!(p.right(rw).0.len() < right);
+            assert_eq!((p.tall, p.fill_rows()), (right + 2, Some(h)));
+            assert!(h >= LEAST_ROWS as u16 && h < 32, "{h}");
+            // 插件多了跟着列表长
+            set((0..30).map(|i| Row { id: format!("p{i}"), name: format!("P{i}"), ..Default::default() }).collect());
+            assert!(page().fill_rows().unwrap() >= 2 + 30 + 2);
         });
     }
 
@@ -1071,7 +1152,7 @@ mod tests {
             press(&mut p, KeyCode::Enter);
             let t = text(&p, 110).join("\n");
             // 高亮到了右边:设置那行标出来,它的说明写在这一栏最下面,底下是它的键,左边那行不再铺底色
-            assert!(t.contains("▌ say") && t.contains("⏎ 改") && t.contains("- 默认") && t.contains("Esc 回列表"), "{t}");
+            assert!(t.contains("▌ say") && t.contains("⏎ 修改") && t.contains("- 默认") && t.contains("Esc 返回列表"), "{t}");
             assert!(!t.contains("空格 开/关"), "{t}");
             let lines = text(&p, 110);
             let at = lines.iter().position(|l| l.contains("say:what to say")).expect("说明");
@@ -1097,7 +1178,7 @@ mod tests {
             let mut p = page();
             press(&mut p, KeyCode::Char('j'));
             let (fx, _) = press(&mut p, KeyCode::Enter);
-            assert!(fx.flash.unwrap().contains("Local 没有能改的"));
+            assert!(fx.flash.unwrap().contains("Local 没有可修改的设置"));
             assert_eq!(press(&mut p, KeyCode::Esc).1, Flow::Close);
         });
     }
@@ -1117,7 +1198,7 @@ mod tests {
             // x 第一次只提醒,写清楚会怎样;第二次才删;中间按别的就算了
             assert_eq!(press(&mut p, KeyCode::Char('x')).0.job, None);
             let t = text(&p, 110).join("\n");
-            assert!(t.contains("删掉 Local?只取消登记,目录不动") && t.contains("x 删掉 • Esc 不删"), "{t}");
+            assert!(t.contains("删除 Local?仅取消登记,保留目录") && t.contains("x 删除 • Esc 取消"), "{t}");
             assert_eq!(press(&mut p, KeyCode::Char('x')).0.job, Some(Job::Plugins(Act::Remove("my.local".into()))));
             press(&mut p, KeyCode::Char('x'));
             press(&mut p, KeyCode::Char('k'));
@@ -1130,11 +1211,11 @@ mod tests {
     fn plugins_toml_out_of_step_with_this_machine_is_named_and_s_syncs_otherwise_it_isnt_mentioned() {
         i18n::with(Lang::Zh, || {
             set(two());
-            assert!(!text(&page(), 110).join("\n").contains("对不上"));
-            DRIFT.with(|d| *d.borrow_mut() = vec!["要装 aca.bark".into(), "要删 my.local".into()]);
+            assert!(!text(&page(), 110).join("\n").contains("与本机不一致"));
+            DRIFT.with(|d| *d.borrow_mut() = vec!["将安装 aca.bark".into(), "将删除 my.local".into()]);
             let t = text(&page(), 110).join("\n");
             DRIFT.with(|d| d.borrow_mut().clear());
-            assert!(t.contains("plugins.toml 跟本机对不上:要装 aca.bark、要删 my.local · S 照它同步"), "{t}");
+            assert!(t.contains("plugins.toml 与本机不一致:将安装 aca.bark、将删除 my.local · S 同步"), "{t}");
         });
     }
 
@@ -1157,7 +1238,7 @@ mod tests {
             // 你自己的清单:改了马上生效,不用同步
             let mut fx = Fx::default();
             back_from(e2, &mut fx);
-            assert!(fx.job.is_none() && fx.flash.unwrap().contains("改好了"));
+            assert!(fx.job.is_none() && fx.flash.unwrap().contains("已修改"));
             let _ = std::fs::remove_file(&f);
         });
     }
@@ -1179,19 +1260,19 @@ mod tests {
             set(rows);
             let mut p = page();
             let t = text(&p, 110).join("\n");
-            assert!(t.contains("可装") && t.contains("+ MCP Gateway"), "{t}");
+            assert!(t.contains("可安装") && t.contains("+ MCP Gateway"), "{t}");
             // 装了的排前面,可装的在「可装」那一行下面
-            assert!(t.find("Local").unwrap() < t.find("可装").unwrap(), "{t}");
+            assert!(t.find("Local").unwrap() < t.find("可安装").unwrap(), "{t}");
             press(&mut p, KeyCode::Char('j'));
             press(&mut p, KeyCode::Char('j'));
             let t = text(&p, 110).join("\n");
-            assert!(t.contains("MCP Gateway  0.1.0 · 自带") && t.contains("还没装") && !t.contains("aca.gateway"), "{t}");
-            assert!(t.contains("所有 agent 共用的 MCP") && t.contains("装上会带来") && t.contains("给 agent  一个 MCP 服务"), "{t}");
-            assert!(t.contains("设置      servers") && t.contains(" ⏎ 装上 ") && t.contains("i 从别处装"), "{t}");
+            assert!(t.contains("MCP Gateway  0.1.0 · 自带") && t.contains("未安装") && !t.contains("aca.gateway"), "{t}");
+            assert!(t.contains("所有 agent 共用的 MCP") && t.contains("安装后将添加") && t.contains("给 agent  一个 MCP 服务"), "{t}");
+            assert!(t.contains("设置      servers") && t.contains(" ⏎ 安装 ") && t.contains("i 从其他来源安装"), "{t}");
             // 还没装:删、更新、日志都说先装;⏎ / 空格装
             let (fx, _) = press(&mut p, KeyCode::Char('x'));
             assert_eq!(fx.job, None);
-            assert!(fx.flash.unwrap().contains("MCP Gateway 还没装"));
+            assert!(fx.flash.unwrap().contains("MCP Gateway 未安装"));
             assert_eq!(press(&mut p, KeyCode::Enter).0.job, Some(Job::Plugins(Act::Install("aca.gateway".into()))));
             assert_eq!(press(&mut p, KeyCode::Char(' ')).0.job, Some(Job::Plugins(Act::Install("aca.gateway".into()))));
             // 窄屏也不出界
@@ -1199,7 +1280,7 @@ mod tests {
             // 只有可装的:左边说还没装插件
             set(vec![Row { id: "aca.bark".into(), from: Origin::Bundled, available: true, ..Default::default() }]);
             let t = text(&page(), 110).join("\n");
-            assert!(t.contains("还没装插件") && t.contains("+ aca.bark"), "{t}");
+            assert!(t.contains("尚未安装插件") && t.contains("+ aca.bark"), "{t}");
         });
     }
 
@@ -1215,7 +1296,7 @@ mod tests {
             }
             press(&mut p, KeyCode::Backspace);
             let t = text(&p, 110).join("\n");
-            assert!(t.contains("从别处装") && t.contains("从哪装 > x/aca-delegate▏") && t.contains("⏎ 装"), "{t}");
+            assert!(t.contains("从其他来源安装") && t.contains("安装来源 > x/aca-delegate▏") && t.contains("⏎ 安装"), "{t}");
             // 打字时 q、x 是字,不是关掉 / 删除
             assert_eq!(press(&mut p, KeyCode::Char('q')).1, Flow::Stay);
             press(&mut p, KeyCode::Backspace);
@@ -1237,12 +1318,12 @@ mod tests {
             STALE.with(|s| *s.borrow_mut() = vec!["主线".into(), "读登录".into()]);
             let t = text(&page(), 120).join("\n");
             STALE.with(|s| s.borrow_mut().clear());
-            assert!(t.contains("「主线」「读登录」重启后用上新插件"), "{t}");
+            assert!(t.contains("「主线」「读登录」重启后启用新插件"), "{t}");
             // 多了只点名前三个
             STALE.with(|s| *s.borrow_mut() = ["a", "b", "c", "d", "e"].map(String::from).to_vec());
             let t = text(&page(), 120).join("\n");
             STALE.with(|s| s.borrow_mut().clear());
-            assert!(t.contains("「a」「b」「c」等 5 个重启后用上新插件"), "{t}");
+            assert!(t.contains("「a」「b」「c」等 5 个重启后启用新插件"), "{t}");
         });
     }
 
@@ -1268,7 +1349,7 @@ mod tests {
             assert!(t.contains("▌● 你自己的") && !t.contains("/c/aca/user") && !t.contains("你自己的  0"), "{t}");
             assert!(t.contains("e 编辑"), "{t}");
             let (fx, _) = press(&mut p, KeyCode::Char('x'));
-            assert!(fx.job.is_none() && fx.flash.unwrap().contains("你自己的那份删不了"));
+            assert!(fx.job.is_none() && fx.flash.unwrap().contains("无法删除你自己的插件"));
             assert!(!p.armed);
             // e:你自己的那份打开它的清单
             let (fx, _) = press(&mut p, KeyCode::Char('e'));

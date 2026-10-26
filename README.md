@@ -100,7 +100,7 @@ curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | sh -
 | `--version <tag>` | Install a specific release, for example `v0.1.0` (default: the latest) |
 | `--from-source` | Build with cargo instead of downloading (see [Build from source](#build-from-source) for what it needs) |
 | `--statusline <how>` | Also connect Claude's status bar right away: `aca`, `wrap` or `off` (see [below](#claudes-subscription-limits-and-status-bar)) |
-| `--no-setup` | Only install the binary and print nothing about next steps |
+| `--no-setup` | Only install the binary; don't open setup or print next steps |
 
 ### Download by hand
 
@@ -220,14 +220,14 @@ without doing it. `aca help keys` describes every key in detail.
 |---|---|
 | `↑` `↓` or `j` `k` | Move. A number jumps to that row |
 | `Enter` | Go into the session. A stopped one (`■`) starts again first and resumes its conversation |
-| `n` / `N` | New session: pick the tool and account first / the same tool and directory as the selected one |
+| `n` / `N` | New / new with the current settings (same tool, account and directory as the selected session) |
 | `i` | Go to the next session waiting for you |
 | `Space` | Each row gets a letter; press one to go into that session |
 | `/` | Filter the list |
 | `z` | Read its output full screen, without going in |
 | `x` | What it changed: the git diff of the directory it is working in |
 | `Z` | The conversation record, turn by turn: what it ran, what it changed, what each turn cost |
-| `e` / `s` | Write a note, the next thing to say to it / send the note |
+| `e` / `s` | Write a note, the next thing to say to it (on a group: the group's overall thoughts) / send the note |
 | `f` | Fork: a new session that continues from this conversation |
 | `H` | Hand off: a new session, with any tool or account, picks up where this one is |
 | `X` | Carry on under another account, for when this one runs out of quota |
@@ -238,10 +238,10 @@ without doing it. `aca help keys` describes every key in detail.
 | `v` `V` | Select several (as in yazi): `v` then move to stretch a range (`Esc` keeps it), `V` stretches one that unselects, `Space` selects one; then `d` `D` `R` `m` `u` `p` `Q` act on all of them, `Ctrl+Z` undoes the batch in one step |
 | `Tab` | Pick a group to show, or all of them |
 | `$` | Usage and cost |
-| `P` / `:` | Plugins / the menu of what your plugins can do for the selected row |
+| `P` / `:` | Plugins / commands: everything aca and your plugins can do to the selected row, each with its key; `/` filters |
 | `Ctrl+S` | Settings: theme, language, accounts and logins |
 | `Ctrl+L` | Restart the interface in place, for example on a newly installed aca |
-| `q` `q` or `Esc` | Quit aca. The sessions keep running |
+| `q` `q` | Quit aca. The sessions keep running. In the tmux popup `Esc` closes it too |
 
 **Inside a session**
 
@@ -321,7 +321,8 @@ folder = true                             # answer "do you trust this folder?" f
 stop_after = "3h"                         # while the interface is open, stop sessions idle this long (they
                                           # resume their conversation with ⏎); idle agents still use CPU
 remove_after = "30d"                      # delete sessions stopped this long (into the trash, ^Z / b brings
-                                          # them back within a day); "never" or unset keeps them
+                                          # them back within a day); "never" or unset keeps them. Pinned ones
+                                          # and ones with a note are never deleted
 
 [keys]
 next = "M-n"                              # Alt+N instead of Ctrl+Alt+N for "next session waiting for you"
@@ -487,7 +488,7 @@ them. To bring one under aca **without stopping it**:
 aca adopt                      # list the sessions that can be adopted
 aca adopt my-session           # adopt one (in the interface: A)
 aca adopt --all
-aca release <id>               # the reverse: forget it, leave the process running
+aca release <id>               # let go: unregister only, the tmux session and its processes stay
 ```
 
 aca works out which tool and account the session belongs to and which conversation it is in. Until its

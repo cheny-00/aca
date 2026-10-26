@@ -3,22 +3,22 @@ name = "Notify"
 version = "0.1.0"
 api = 1
 needs = ["jq"]
-description = "跑完了、在等你确认、出错了,在这台机器上弹一条桌面通知。你正连着那个会话(在看)就不弹"
-description_en = "When a session finishes, waits for you or fails, show a desktop notification on this machine. Nothing is shown while you are attached to that session (watching it)."
+description = "会话完成一轮、等待回应或出错时显示桌面通知;你正在查看该会话时不显示"
+description_en = "Shows a desktop notification when a session finishes, waits or fails; not while you are watching it."
 
 [settings.command]
 default = ""
-desc = "换一个弹通知的命令,标题和正文是它的两个参数(比如你自己写的一个脚本)。空着,或者它发不出去(退出码不是 0):macOS 用 osascript,Linux 用 notify-send"
+desc = "改用其他命令显示通知,标题和正文是它的两个参数(例如你自己写的脚本)。留空,或该命令失败(退出码不为 0)时:macOS 用 osascript,Linux 用 notify-send"
 desc_en = "Another command to show notifications with; the title and body are its two arguments (a script of your own, say). Empty, or if it fails (exit code not 0): osascript on macOS, notify-send on Linux."
 
 [settings.workers]
 default = false
-desc = "派出去的 worker 也弹(它们跑完本来会告诉派它们的那个会话)"
+desc = "派出的 worker 也显示通知(worker 完成后本来就会通知派出它的会话)"
 desc_en = "Also notify for dispatched workers (a finished worker reports to the session that dispatched it anyway)."
 
 [settings.attached]
 default = false
-desc = "你正连着那个会话时也弹"
+desc = "你正在查看该会话时也显示通知"
 desc_en = "Also notify while you are attached to that session."
 
 [[events]]
@@ -35,7 +35,7 @@ command = ["sh", "notify.sh"]
 
 [[commands]]
 id = "test"
-title = "弹一条试试"
+title = "显示一条测试通知"
 title_en = "Show a test one"
 desc = "Show a test notification."
 # 诊断用的,不进 : 菜单(那里是对着高亮那一行做事的);aca plugin run aca.notify.test

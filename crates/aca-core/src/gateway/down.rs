@@ -94,10 +94,10 @@ impl Down {
         match self.state() {
             State::Ready => return Ok(()),
             State::Failed { msg, fails, .. } if fails >= GIVE_UP => {
-                return Err(tr!("连着失败 {fails} 次,停下了:{msg}", "failed {fails} times in a row, stopped: {msg}"));
+                return Err(tr!("连续失败 {fails} 次,已停止:{msg}", "failed {fails} times in a row, stopped: {msg}"));
             }
             State::Failed { msg, at, fails } if at.elapsed() < Duration::from_secs((1u64 << fails.min(5)).min(30)) => {
-                return Err(tr!("刚失败过,等一会儿再起:{msg}", "failed just now; will retry shortly: {msg}"));
+                return Err(tr!("刚刚失败,稍后再启动:{msg}", "failed just now; will retry shortly: {msg}"));
             }
             _ => {}
         }
@@ -107,7 +107,7 @@ impl Down {
                 State::Failed { fails, .. } => fails + 1,
                 _ => 1,
             };
-            self.note(&format!("没起来:{msg}"));
+            self.note(&tr!("启动失败:{msg}", "failed to start: {msg}"));
             self.stop_child();
             *self.state.lock().unwrap() = State::Failed { msg: msg.clone(), at: Instant::now(), fails };
         }
@@ -118,7 +118,7 @@ impl Down {
         let log = log_of(&self.log_name());
         let _ = std::fs::create_dir_all(log.parent().unwrap());
         let err = std::fs::OpenOptions::new().create(true).append(true).open(&log).map_err(|e| e.to_string())?;
-        self.note(&format!("起:{} {}", self.spec.command, self.spec.args.join(" ")));
+        self.note(&tr!("启动:{} {}", "starting: {} {}", self.spec.command, self.spec.args.join(" ")));
         let mut c = Command::new(&self.spec.command);
         c.args(&self.spec.args).envs(self.spec.env.iter().map(|(k, v)| (k, v)));
         if !self.session.is_empty() {
@@ -136,7 +136,7 @@ impl Down {
             .stderr(Stdio::from(err))
             .process_group(0)
             .spawn()
-            .map_err(|e| tr!("{} 起不来:{e}", "can't start {}: {e}", self.spec.command))?;
+            .map_err(|e| tr!("无法启动 {}:{e}", "can't start {}: {e}", self.spec.command))?;
         let out = child.stdout.take().unwrap();
         *self.stdin.lock().unwrap() = child.stdin.take();
         *self.child.lock().unwrap() = Some(child);
@@ -149,7 +149,7 @@ impl Down {
             json!({ "protocolVersion": PROTOCOL, "capabilities": { "roots": { "listChanged": false } }, "clientInfo": { "name": "aca-gateway", "version": env!("CARGO_PKG_VERSION") } }),
         )?;
         if init.get("error").is_some() {
-            return Err(tr!("握手被拒:{}", "handshake refused: {}", init["error"]));
+            return Err(tr!("握手被拒绝:{}", "handshake refused: {}", init["error"]));
         }
         self.write(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))?;
         let tools = self.list_tools()?;
@@ -186,14 +186,14 @@ impl Down {
         self.write(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))?;
         rx.recv_timeout(START_TIMEOUT).map_err(|_| {
             self.pending.lock().unwrap().remove(&id);
-            tr!("{method} 没回答", "no answer to {method}")
+            tr!("{method} 无响应", "no answer to {method}")
         })
     }
 
     fn write(&self, msg: &Value) -> Res<()> {
         let mut g = self.stdin.lock().unwrap();
-        let w = g.as_mut().ok_or(t!("它没在跑", "it isn't running"))?;
-        writeln!(w, "{msg}").and_then(|_| w.flush()).map_err(|e| tr!("写不进去:{e}", "can't write to it: {e}"))
+        let w = g.as_mut().ok_or(t!("未运行", "it isn't running"))?;
+        writeln!(w, "{msg}").and_then(|_| w.flush()).map_err(|e| tr!("无法写入:{e}", "can't write to it: {e}"))
     }
 
     /// 替连接转一个工具调用(不等:回答来了由读线程交给它)。`params` 里的工具名已经换回它自己的
@@ -274,7 +274,7 @@ fn read_loop(me: Weak<Down>, out: std::process::ChildStdout, generation: u64) {
         let Ok(line) = line else { break };
         let Some(d) = me.upgrade() else { return };
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            d.note(&format!("看不懂的一行:{}", line.chars().take(200).collect::<String>()));
+            d.note(&tr!("无法解析的一行:{}", "unreadable line: {}", line.chars().take(200).collect::<String>()));
             continue;
         };
         let is_reply = msg.get("result").is_some() || msg.get("error").is_some();
@@ -328,10 +328,10 @@ fn read_loop(me: Weak<Down>, out: std::process::ChildStdout, generation: u64) {
     let Some(d) = me.upgrade() else { return };
     if d.generation.load(Ordering::SeqCst) == generation {
         let was_ready = d.state() == State::Ready;
-        d.note("退出了");
+        d.note(t!("已退出", "exited"));
         d.stdin.lock().unwrap().take();
         if was_ready {
-            *d.state.lock().unwrap() = State::Failed { msg: t!("退出了", "exited").into(), at: Instant::now(), fails: 1 };
+            *d.state.lock().unwrap() = State::Failed { msg: t!("已退出", "exited").into(), at: Instant::now(), fails: 1 };
         }
     }
     let waiting: Vec<(u64, Waiter)> = d.pending.lock().unwrap().drain().collect();
@@ -340,7 +340,7 @@ fn read_loop(me: Weak<Down>, out: std::process::ChildStdout, generation: u64) {
             && let Some(c) = client.upgrade()
         {
             c.send(
-                &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": tr!("{} 退出了", "{} exited", d.spec.name) } }),
+                &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": tr!("{} 已退出", "{} exited", d.spec.name) } }),
             );
         }
     }

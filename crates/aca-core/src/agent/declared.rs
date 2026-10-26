@@ -40,7 +40,9 @@ fn compile(tool: &str, field: &str, patterns: &[String]) -> Res<Vec<Regex>> {
     patterns
         .iter()
         .map(|p| {
-            Regex::new(p).map_err(|e| tr!("工具 {tool} 的 {field} 里 {p} 不是正则:{e}", "{p} in {field} of tool {tool} isn't a regex: {e}"))
+            Regex::new(p).map_err(|e| {
+                tr!("工具 {tool} 的 {field} 中 {p} 不是有效的正则表达式:{e}", "{p} in {field} of tool {tool} isn't a regex: {e}")
+            })
         })
         .collect()
 }
@@ -58,7 +60,7 @@ fn strip_spinner(title: &str) -> &str {
 impl Declared {
     pub fn new(name: &str, t: &Tool) -> Res<Declared> {
         if !matches!(t.title.as_str(), "" | "pane") {
-            return Err(tr!("工具 {name} 的 title 只能写 \"pane\" 或者不写", "tool {name}: title can only be \"pane\" or left out"));
+            return Err(tr!("工具 {name} 的 title 只能写 \"pane\" 或省略", "tool {name}: title can only be \"pane\" or left out"));
         }
         Ok(Declared {
             name: name.to_string(),

@@ -313,6 +313,18 @@ fn runs_out(used: f64, resets: i64, len: i64, at: i64) -> Option<i64> {
     (t < resets).then_some(t)
 }
 
+/// 账号的全名(「Claude sub」)拆成两段写:哪家用那家的颜色(同列表里的账号名),名字用 rest 的样式。
+/// 账号在计费页里有自己的一块颜色(走势、横条),和列表里橙 = Claude、蓝 = Codex 不是一套:家名上色,两套就对得上了
+fn family_spans(name: &str, agent: Option<Agent>, rest: Style) -> Vec<Span<'static>> {
+    let (fam, tail) = name.split_once(' ').map_or((name, ""), |(f, t)| (f, t));
+    let agent = agent.unwrap_or(if fam == "Codex" { Agent::Codex } else { Agent::Claude });
+    let mut v = vec![Span::styled(fam.to_string(), crate::ui::agent_style(agent).patch(rest))];
+    if !tail.is_empty() {
+        v.push(Span::styled(format!(" {tail}"), rest));
+    }
+    v
+}
+
 /// 额度那块的账号全名(找颜色用的那个)
 fn quota_name(q: &Quota) -> String {
     match q.agent {
@@ -325,11 +337,8 @@ fn quota_name(q: &Quota) -> String {
 /// label_w:窗口名对齐到几格(整块里最长的那个,见 `label_width`)
 fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, (now, off): (i64, i64), w: usize, label_w: usize) {
     let name = crate::usage::account_shown(&quota_name(q)).to_string();
-    let mut left = vec![
-        Span::raw(" "),
-        Span::styled("■ ", Style::new().fg(swatch)),
-        Span::styled(name.clone(), Style::new().add_modifier(Modifier::BOLD)),
-    ];
+    let mut left = vec![Span::raw(" "), Span::styled("■ ", Style::new().fg(swatch))];
+    left.extend(family_spans(&name, Some(q.agent), Style::new().add_modifier(Modifier::BOLD)));
     let mut used_w = 3 + name.width();
     for extra in [&q.plan, &q.note].into_iter().filter(|x| !x.is_empty()) {
         left.push(Span::styled(format!(" · {extra}"), dim()));
@@ -393,7 +402,7 @@ fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, (now, off
         if let (Some(r), Some(len)) = (win.resets, len)
             && let Some(t) = runs_out(win.used, r, len, base).filter(|&t| t > now)
         {
-            let s = tr!("       照这速度 {} 用完", "       at this pace, used up {}", when(t, now, off));
+            let s = tr!("       按当前速度 {} 用完", "       at this pace, used up {}", when(t, now, off));
             if s.width() <= w {
                 out.push(Line::styled(s, Style::new().fg(if win.used >= 70.0 { p.red } else { p.amber })));
             }
@@ -459,7 +468,7 @@ fn picked_note(r: &Report, g: &Range, sel: usize) -> String {
 }
 
 fn totals_block(r: &Report, sel: usize, w: usize) -> Vec<Line<'static>> {
-    let mut out = vec![head(t!("按 API 价", "At API prices"), "", w)];
+    let mut out = vec![head(t!("按 API 价格", "At API prices"), "", w)];
     let fixed = 3 + 8 + MONEY_W;
     let pick = |long: bool| -> Vec<String> { r.ranges.iter().enumerate().map(|(i, g)| compare(g, i, long)).collect() };
     let fits = |c: &[String]| fixed + 2 + c.iter().map(|x| x.width()).max().unwrap_or(0) <= w;
@@ -512,7 +521,7 @@ fn usage_block(g: &Range, sel: usize, w: usize) -> Vec<Line<'static>> {
         facts.push(fact(t!("缓存命中 ", "cache hits "), format!("{:.0}%", g.toks[2] as f64 / ctx as f64 * 100.0), ""));
     }
     if g.saved >= 0.005 {
-        facts.push(fact(t!("缓存省了 ", "cache saved "), money(g.saved), ""));
+        facts.push(fact(t!("缓存节省 ", "cache saved "), money(g.saved), ""));
     }
     flow(&mut out, facts, " · ", w);
     if g.parts.iter().sum::<f64>() <= 0.0 {
@@ -785,7 +794,9 @@ fn trend_block(g: &Range, sel: usize, pal: &[(String, Color)], w: usize) -> Vec<
             .names
             .iter()
             .map(|(name, c)| {
-                vec![Span::styled("■ ", Style::new().fg(*c)), Span::styled(crate::usage::account_shown(name).to_string(), dim())]
+                let mut v = vec![Span::styled("■ ", Style::new().fg(*c))];
+                v.extend(family_spans(crate::usage::account_shown(name), None, dim()));
+                v
             })
             .collect();
         flow(&mut out, items, "   ", w);
@@ -873,7 +884,12 @@ fn rows_block(title: &str, rows: &[Row], total: f64, top: usize, kind: Kind, pal
             Kind::Src => clip(crate::usage::account_shown(&r.name), name_col),
             Kind::Model => clip(&r.name, name_col),
         };
-        let mut spans = vec![Span::raw("  "), Span::styled(name, name_style)];
+        let mut spans = vec![Span::raw("  ")];
+        if kind == Kind::Src && !faint {
+            spans.extend(family_spans(&name, Some(r.agent), name_style));
+        } else {
+            spans.push(Span::styled(name, name_style));
+        }
         if note_col > 0 {
             spans.push(Span::styled(format!("  {}", lpad(&r.note, note_col)), dim()));
         }
@@ -911,7 +927,7 @@ fn unpriced_block(g: &Range, w: usize) -> Vec<Line<'static>> {
     if g.unpriced.is_empty() {
         return vec![];
     }
-    let mut out = vec![head(t!("没算钱的模型", "Unpriced models"), "", w)];
+    let mut out = vec![head(t!("未计价的模型", "Unpriced models"), "", w)];
     for (m, t) in &g.unpriced {
         out.push(Line::from(vec![
             Span::raw("  "),
@@ -958,7 +974,7 @@ fn side_by_side(left: Vec<Line<'static>>, right: Vec<Line<'static>>, cw: usize) 
 pub fn lines(r: &Report, sel: usize, more: bool, w: usize) -> Vec<Line<'static>> {
     if r.ranges.is_empty() {
         let w = w.min(MAX_W);
-        return stack(vec![quota_block(r, w), vec![head(t!("按 API 价", "At API prices"), "", w)]]);
+        return stack(vec![quota_block(r, w), vec![head(t!("按 API 价格", "At API prices"), "", w)]]);
     }
     let sel = sel.min(r.ranges.len() - 1);
     let g = &r.ranges[sel];
@@ -974,10 +990,16 @@ pub fn lines(r: &Report, sel: usize, more: bool, w: usize) -> Vec<Line<'static>>
         } else {
             (quota, stack(vec![totals_block(r, sel, cw), usage(cw)]))
         };
-        let left = stack(vec![trend_block(g, sel, &pal, cw), heat(cw), dirs(cw), unpriced_block(g, cw)]);
+        // 左边走势下面接「按模型」(不分账号的那块,和按目录一类),右边是分账号上色的两块:两栏差不多一样长
+        let left = stack(vec![
+            trend_block(g, sel, &pal, cw),
+            rows_block(t!("按模型", "By model"), &g.by_model, g.cost, usize::MAX, Kind::Model, &[], cw),
+            heat(cw),
+            dirs(cw),
+            unpriced_block(g, cw),
+        ]);
         let right = stack(vec![
             rows_block(t!("按账号", "By account"), &g.by_src, g.cost, usize::MAX, Kind::Src, &pal, cw),
-            rows_block(t!("按模型", "By model"), &g.by_model, g.cost, usize::MAX, Kind::Model, &[], cw),
             rows_block(t!("按会话", "By session"), &g.by_session, g.cost, TOP_SESSIONS, Kind::Session, &pal, cw),
         ]);
         let mut out = side_by_side(tl, tr, cw);
@@ -1084,7 +1106,7 @@ mod tests {
         // 横条从同一列开始;Fable 过了四天用了八成,重置前用完
         assert_eq!(t.len(), 5, "{t:#?}");
         assert!(t[1].starts_with("      5h ") && t[2].starts_with("      7d ") && t[3].starts_with("   Fable "), "{t:#?}");
-        assert!(t[4].contains("照这速度"), "{t:#?}");
+        assert!(t[4].contains("按当前速度"), "{t:#?}");
     }
 
     fn report() -> Report {
@@ -1193,8 +1215,8 @@ mod tests {
         let (i7, l7) = find(&t, "   7d ▄▄");
         assert!(l7.contains("74%") && l7.contains("周五 10:00 重置"));
         // 7 天用了 74%、还剩两天:照这速度会提前用完
-        assert!(t[i7 + 1].contains("照这速度") && t[i7 + 1].contains("用完"), "{}", t[i7 + 1]);
-        assert!(!t[find(&t, "   5h").0 + 1].contains("照这速度"));
+        assert!(t[i7 + 1].contains("按当前速度") && t[i7 + 1].contains("用完"), "{}", t[i7 + 1]);
+        assert!(!t[find(&t, "   5h").0 + 1].contains("按当前速度"));
         // 过了重置时间的不瞎报
         assert!(find(&t, "已重置").1.ends_with("      已重置"));
         assert!(find(&t, "Codex cx · plus").1.ends_with("1 天前更新"));
@@ -1207,7 +1229,7 @@ mod tests {
         assert!(find(&t, "其余 5 个").1.contains("$15.00"));
         assert!(find(&t, "按会话").1.trim_end().ends_with('─'));
         assert!(!find(&t, "会话3").1.contains("work"));
-        assert!(find(&t, "没算钱的模型").0 < find(&t, "gpt-5.5-codex").0);
+        assert!(find(&t, "未计价的模型").0 < find(&t, "gpt-5.5-codex").0);
         assert!(find(&t, "gpt-5.5-codex").1.contains("1.2 万 token"));
         // 收着的:用量、钱花在哪几项、按目录;今天本来就不画星期 × 钟点
         for gone in ["调用 1,234 次", "缓存命中", "■ 缓存读", "按目录", "其余 2 个", "按星期和钟点"] {
@@ -1218,7 +1240,7 @@ mod tests {
         let at = |s: &str| find(&t, s).0;
         assert!(at("按 API 价") < at("用量") && at("用量") < at("按小时") && at("按会话") < at("按目录"));
         assert!(find(&t, "调用 1,234 次").1.contains("3.4 亿 token"));
-        assert!(t.iter().any(|l| l.contains("缓存命中 97%")) && t.iter().any(|l| l.contains("缓存省了 $1,500")));
+        assert!(t.iter().any(|l| l.contains("缓存命中 97%")) && t.iter().any(|l| l.contains("缓存节省 $1,500")));
         assert!(t.iter().any(|l| l.contains("■ 缓存读 $100.00 48%")) && t.iter().any(|l| l.contains("■ 输入 $1.00 <1%")));
         assert!(!t.iter().any(|l| l.contains("搜索")));
         assert!(find(&t, "其余 2 个").1.contains("$43.00"));

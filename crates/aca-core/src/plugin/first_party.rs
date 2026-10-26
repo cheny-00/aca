@@ -102,13 +102,13 @@ pub fn unpack(id: &str) -> Res<PathBuf> {
     };
     write().map_err(|e| {
         let _ = std::fs::remove_dir_all(&tmp);
-        tr!("写不了 {}:{e}", "can't write {}: {e}", tmp.display())
+        tr!("无法写入 {}:{e}", "can't write {}: {e}", tmp.display())
     })?;
     let old = root().join(format!(".{}-old-{}", b.dir, paths::short_id()));
     if dir.exists() {
-        std::fs::rename(&dir, &old).map_err(|e| tr!("换不了 {}:{e}", "can't replace {}: {e}", dir.display()))?;
+        std::fs::rename(&dir, &old).map_err(|e| tr!("无法替换 {}:{e}", "can't replace {}: {e}", dir.display()))?;
     }
-    std::fs::rename(&tmp, &dir).map_err(|e| tr!("换不了 {}:{e}", "can't replace {}: {e}", dir.display()))?;
+    std::fs::rename(&tmp, &dir).map_err(|e| tr!("无法替换 {}:{e}", "can't replace {}: {e}", dir.display()))?;
     let _ = std::fs::remove_dir_all(&old);
     Ok(dir)
 }

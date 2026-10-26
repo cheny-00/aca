@@ -132,9 +132,8 @@ const FREE: &[&str] = &[
     "插件 id",
     "事件",
     "字段=值…",
-    "插件.动作",
-    "插件.视图",
     "插件.能力",
+    "插件.视图",
     "aca.名字",
     "名字…",
     "插件",
@@ -383,8 +382,8 @@ fn complete_with(words: &[String], values: &dyn Fn(Kind, &str) -> Vec<Cand>) -> 
             for c in GROUPS.iter().flat_map(|g| g.1.iter()) {
                 out.extend(c.names.iter().map(|n| ("command", n.to_string(), brief(c, n))));
             }
-            out.push(("command", "help".into(), tr!("看说明:aca help <命令>", "read the help: aca help <COMMAND>")));
-            out.push(("command", "version".into(), tr!("这个 aca 是哪天装的", "which build of aca this is")));
+            out.push(("command", "help".into(), tr!("查看说明:aca help <命令>", "read the help: aca help <COMMAND>")));
+            out.push(("command", "version".into(), tr!("aca 的版本和安装时间", "which build of aca this is")));
         }
         return out;
     };
@@ -434,7 +433,7 @@ fn complete_with(words: &[String], values: &dyn Fn(Kind, &str) -> Vec<Cand>) -> 
                 out.push((
                     "group",
                     BY_DIR.to_string(),
-                    tr!("按目录定的组(没有就以目录名新建)", "the group its directory decides (named after it if new)"),
+                    tr!("按目录确定分组(不存在时以目录名新建)", "the group its directory decides (named after it if new)"),
                 ));
             }
             if let Some(k) = it.kind {
@@ -511,19 +510,19 @@ fn tool_note(cfg: &config::Config, name: &str) -> String {
             v.push(tr!("环境 {}", "env {}", a.env.keys().cloned().collect::<Vec<_>>().join(" ")));
         }
         if !a.env_file.is_empty() {
-            v.push(tr!("环境读 {}", "env from {}", tilde(&a.env_file)));
+            v.push(tr!("环境文件 {}", "env from {}", tilde(&a.env_file)));
         }
         return v.join(" · ");
     }
     let Some(t) = cfg.tool(name) else { return String::new() };
     let what = match t.kind.as_str() {
-        "shell" => return tr!("普通 shell,不起 agent", "a plain shell, no agent"),
+        "shell" => return tr!("普通 shell,不启动 agent", "a plain shell, no agent"),
         "" => tr!("声明式工具", "declared tool"),
         k if k == name => String::new(),
-        k => tr!("按 {k} 起", "starts as {k}"),
+        k => tr!("按 {k} 启动", "starts as {k}"),
     };
     let acct = if t.account.is_empty() {
-        tr!("不写账号:用它自己的配置目录", "no account given: its own config directory")
+        tr!("不写账号:使用它自己的配置目录", "no account given: its own config directory")
     } else {
         tr!("不写账号 = {}", "default account = {}", t.account)
     };
@@ -540,7 +539,7 @@ fn sessions(archived: bool) -> Vec<Cand> {
         .filter(|s| (s.archived > 0) == archived)
         .map(|s| {
             let r = runtime::load(&s.id);
-            let group = if s.group.is_empty() { tr!("没分组", "no group") } else { s.group.clone() };
+            let group = if s.group.is_empty() { tr!("未分组", "no group") } else { s.group.clone() };
             (r.ts.max(s.created), ("session", s.id.clone(), format!("{} · {group}", status::title(&s, &r))))
         })
         .collect();
@@ -688,10 +687,10 @@ mod tests {
         let start = help::find("start").unwrap();
         assert_eq!(
             (brief(start, "start"), brief(start, "stop")),
-            ("启动(接着原来的对话)".into(), "停下(agent 退出,窗格和登记留着)".into())
+            ("启动(继续原来的对话)".into(), "停止(agent 退出,窗格和登记保留)".into())
         );
         let d = |s: &str, v: &str| cands(s).into_iter().find(|c| c.1 == v).map(|c| c.2).unwrap_or_default();
-        assert!(d("group ", "rename").starts_with("<路径> <新路径> · 改名"), "{}", d("group ", "rename"));
+        assert!(d("group ", "rename").starts_with("<路径> <新路径> · 重命名"), "{}", d("group ", "rename"));
         assert!(d("new claude -", "-g").starts_with("分组 · 可以带层级"), "{}", d("new claude -", "-g"));
         assert!(d("new claude -", "--hold").starts_with("只登记"), "{}", d("new claude -", "--hold"));
     }
@@ -704,9 +703,9 @@ mod tests {
         );
         assert_eq!(tool_note(&cfg, "codex:labs"), "/x/.labs · --profile labs");
         assert_eq!(tool_note(&cfg, "claude"), "不写账号 = sub");
-        assert_eq!(tool_note(&cfg, "codex"), "不写账号:用它自己的配置目录");
-        assert_eq!(tool_note(&cfg, "ccx"), "按 claude 起 · 不写账号:用它自己的配置目录");
-        assert_eq!(tool_note(&cfg, "shell"), "普通 shell,不起 agent");
+        assert_eq!(tool_note(&cfg, "codex"), "不写账号:使用它自己的配置目录");
+        assert_eq!(tool_note(&cfg, "ccx"), "按 claude 启动 · 不写账号:使用它自己的配置目录");
+        assert_eq!(tool_note(&cfg, "shell"), "普通 shell,不启动 agent");
     }
 
     /// 用法里括号中的占位词(选项名去掉,a | b 拆开)

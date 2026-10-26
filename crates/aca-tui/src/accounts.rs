@@ -206,16 +206,16 @@ pub(crate) fn foreign(a: Agent, abs: &str, home: &str) -> Option<(Agent, String)
     let theirs = marks(dir, other);
     if theirs.len() > marks(dir, a).len() {
         let more = if theirs.len() > 2 { "…" } else { "" };
-        return Some((other, tr!("里面有 {}{more}", "it has {}{more}", theirs[..theirs.len().min(2)].join(t!("、", ", ")))));
+        return Some((other, tr!("其中包含 {}{more}", "it has {}{more}", theirs[..theirs.len().min(2)].join(t!("、", ", ")))));
     }
     let default = format!("{home}/{}", if other == Agent::Codex { ".codex" } else { ".claude" });
-    (abs == default).then(|| (other, tr!("{} 默认用它", "the {} default", who(other))))
+    (abs == default).then(|| (other, tr!("{} 的默认目录", "the {} default", who(other))))
 }
 
 /// 登记不了的那句话
 fn foreign_said(a: Agent, shown: &str, (other, why): &(Agent, String)) -> String {
     tr!(
-        "{shown} 是 {} 的目录({why}),不能加成 {} 的账号",
+        "{shown} 是 {} 的目录({why}),不能添加为 {} 账号",
         "{shown} is a {} directory ({why}); it can't be a {} account",
         who(*other),
         who(a)
@@ -259,7 +259,7 @@ fn codex_said(ok: bool, out: &str) -> Login {
     } else if let Some(how) = line.strip_prefix("Logged in using ") {
         Login::In(how.trim_start_matches("an ").replace(" - ", " ").trim().to_string())
     } else if line.is_empty() {
-        if ok { Login::Unknown(t!("没说", "said nothing").into()) } else { Login::Out }
+        if ok { Login::Unknown(t!("无输出", "said nothing").into()) } else { Login::Out }
     } else {
         Login::Unknown(line)
     }
@@ -288,11 +288,11 @@ pub fn login(a: Agent, name: &str) -> Login {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Login::Unknown(t!("没答", "no answer").into());
+                return Login::Unknown(t!("无响应", "no answer").into());
             }
         }
     }
-    let Ok(out) = child.wait_with_output() else { return Login::Unknown(t!("没答", "no answer").into()) };
+    let Ok(out) = child.wait_with_output() else { return Login::Unknown(t!("无响应", "no answer").into()) };
     let (said, err) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     match a {
         // Codex 把这一行打在标准错误上
@@ -368,7 +368,8 @@ fn gap(text: &str) -> &'static str {
 /// config.toml 里 `[accounts.<家>]` 下加一行 `名 = "目录"`:有这一节就接在它最后一个键后面,
 /// 没有就在末尾新起一节;别的内容(注释、别的设置)原样不动
 fn add_line(text: &str, fam: &str, name: &str, dir: &str) -> Result<String, String> {
-    let doc: Table = text.parse().map_err(|_| t!("config.toml 格式不对,没改", "config.toml is malformed; nothing changed").to_string())?;
+    let doc: Table =
+        text.parse().map_err(|_| t!("config.toml 格式有误,未修改", "config.toml is malformed; nothing changed").to_string())?;
     let line = format!("{name} = {}\n", Value::String(dir.to_string()));
     let header = Regex::new(&format!(r"(?m)^[ \t]*\[[ \t]*accounts[ \t]*\.[ \t]*{fam}[ \t]*\][ \t]*(?:#[^\n]*)?(?:\r?\n|\z)")).unwrap();
     let out = match header.find(text) {
@@ -382,12 +383,12 @@ fn add_line(text: &str, fam: &str, name: &str, dir: &str) -> Result<String, Stri
         None => format!("{text}{}[accounts.{fam}]\n{line}", gap(text)),
     };
     let back: Table = out.parse().map_err(|_| {
-        t!("config.toml 里 [accounts] 的写法认不出,没改", "can't make out [accounts] in config.toml; nothing changed").to_string()
+        t!("无法识别 config.toml 中 [accounts] 的写法,未修改", "can't make out [accounts] in config.toml; nothing changed").to_string()
     })?;
     let keys = ["accounts", fam, name];
     let got = back.get("accounts").and_then(|a| a.get(fam)).and_then(|f| f.get(name)).and_then(|d| d.as_str());
     if got != Some(dir) || without(doc, &keys) != without(back, &keys) {
-        return Err(t!("改完核对不上,没改", "the result didn't check out; nothing changed").into());
+        return Err(t!("写入后校验不一致,未修改", "the result didn't check out; nothing changed").into());
     }
     Ok(out)
 }
@@ -395,22 +396,22 @@ fn add_line(text: &str, fam: &str, name: &str, dir: &str) -> Result<String, Stri
 /// 加之前的核对,不写:名字、目录写得对不对,和已有的重不重,config.toml 改不改得了。
 /// 回(config.toml 现在的全文, 加完的全文, 展开的目录)
 fn planned(path: &Path, home: &str, a: Agent, name: &str, dir: &str) -> Result<(String, String, String), String> {
-    let fam = fam(a).ok_or(t!("只能加 Claude / Codex 的账号", "only Claude / Codex accounts can be added"))?;
+    let fam = fam(a).ok_or(t!("只能添加 Claude / Codex 账号", "only Claude / Codex accounts can be added"))?;
     if !valid_name(name) {
-        return Err(t!("账号名只能用字母、数字、- 和 _", "an account name is letters, digits, - and _").into());
+        return Err(t!("账号名只能包含字母、数字、- 和 _", "an account name is letters, digits, - and _").into());
     }
     let abs = expand(dir, home);
     if !abs.starts_with('/') {
-        return Err(t!("目录要写成 ~/… 或 /…", "the directory must look like ~/… or /…").into());
+        return Err(t!("目录必须以 ~/ 或 / 开头", "the directory must look like ~/… or /…").into());
     }
-    let text = read(path).map_err(|e| tr!("读不了 config.toml:{e}", "can't read config.toml: {e}"))?;
+    let text = read(path).map_err(|e| tr!("无法读取 config.toml:{e}", "can't read config.toml: {e}"))?;
     // 同一家里,名字、目录都不能和已有的重
     let known = list_in(&text, fam);
     if known.iter().any(|(n, _)| n == name) {
-        return Err(tr!("已经有这个账号:{name}", "that account already exists: {name}"));
+        return Err(tr!("账号已存在:{name}", "that account already exists: {name}"));
     }
     if let Some((n, _)) = known.iter().find(|(_, d)| !d.is_empty() && expand(d, home) == abs) {
-        return Err(tr!("这个目录已经是账号 {n} 的了", "this directory already belongs to account {n}"));
+        return Err(tr!("该目录已属于账号 {n}", "this directory already belongs to account {n}"));
     }
     if let Some(theirs) = foreign(a, &abs, home) {
         return Err(foreign_said(a, &tilde(&abs, home), &theirs));
@@ -426,12 +427,12 @@ pub(crate) fn check_in(path: &Path, home: &str, a: Agent, name: &str, dir: &str)
 
 pub(crate) fn add_in(path: &Path, home: &str, a: Agent, name: &str, dir: &str) -> Result<Added, String> {
     let (text, new, abs) = planned(path, home, a, name, dir)?;
-    if !write(path, &text, &new).map_err(|e| tr!("写 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
-        return Err(t!("config.toml 刚被改过,再加一次", "config.toml just changed; add it again").into());
+    if !write(path, &text, &new).map_err(|e| tr!("写入 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
+        return Err(t!("config.toml 已被修改,请重试", "config.toml just changed; add it again").into());
     }
     let created = !Path::new(&abs).exists();
     std::fs::create_dir_all(&abs)
-        .map_err(|e| tr!("账号加上了,但目录建不了:{e}", "account added, but the directory couldn't be created: {e}"))?;
+        .map_err(|e| tr!("已添加账号,但无法创建目录:{e}", "account added, but the directory couldn't be created: {e}"))?;
     Ok(Added { dir: abs, created })
 }
 
@@ -440,12 +441,13 @@ pub(crate) fn add_in(path: &Path, home: &str, a: Agent, name: &str, dir: &str) -
 fn drop_line(text: &str, fam: &str, name: &str) -> Result<String, String> {
     let odd = || {
         t!(
-            "这个账号在 config.toml 里的写法认不出,没改(自己删那几行)",
+            "无法识别该账号在 config.toml 中的写法,未修改(请手动删除)",
             "can't make out how this account is written in config.toml; nothing changed (remove those lines yourself)"
         )
         .to_string()
     };
-    let doc: Table = text.parse().map_err(|_| t!("config.toml 格式不对,没改", "config.toml is malformed; nothing changed").to_string())?;
+    let doc: Table =
+        text.parse().map_err(|_| t!("config.toml 格式有误,未修改", "config.toml is malformed; nothing changed").to_string())?;
     let line = account_line(text, fam, name).ok_or_else(odd)?;
     let out = format!("{}{}", &text[..line.start], &text[line.end..]);
     let keys = ["accounts", fam, name];
@@ -484,14 +486,15 @@ fn inline(v: &Value) -> String {
 fn with_args(text: &str, fam: &str, name: &str, args: &[String]) -> Result<String, String> {
     let odd = || {
         t!(
-            "这个账号在 config.toml 里的写法认不出,没改(自己改那几行)",
+            "无法识别该账号在 config.toml 中的写法,未修改(请手动修改)",
             "can't make out how this account is written in config.toml; nothing changed (edit those lines yourself)"
         )
         .to_string()
     };
-    let doc: Table = text.parse().map_err(|_| t!("config.toml 格式不对,没改", "config.toml is malformed; nothing changed").to_string())?;
+    let doc: Table =
+        text.parse().map_err(|_| t!("config.toml 格式有误,未修改", "config.toml is malformed; nothing changed").to_string())?;
     let old = doc.get("accounts").and_then(|a| a.get(fam)).and_then(|f| f.get(name)).cloned();
-    let old = old.ok_or_else(|| tr!("没有这个账号:{fam}:{name}", "no such account: {fam}:{name}"))?;
+    let old = old.ok_or_else(|| tr!("账号不存在:{fam}:{name}", "no such account: {fam}:{name}"))?;
     let list = Value::Array(args.iter().cloned().map(Value::String).collect());
     let line = account_line(text, fam, name);
     // 改完它该是什么样
@@ -549,14 +552,14 @@ fn with_args(text: &str, fam: &str, name: &str, args: &[String]) -> Result<Strin
 
 /// 换一个账号自己的启动参数(删之前的存成 config.toml.bak-aca)。回 false = 和原来一样,没写
 pub(crate) fn set_args_in(path: &Path, a: Agent, name: &str, args: &[String]) -> Result<bool, String> {
-    let fam = fam(a).ok_or(t!("只有 Claude / Codex 的账号", "only Claude / Codex have accounts"))?;
-    let text = read(path).map_err(|e| tr!("读不了 config.toml:{e}", "can't read config.toml: {e}"))?;
+    let fam = fam(a).ok_or(t!("仅支持 Claude / Codex 账号", "only Claude / Codex have accounts"))?;
+    let text = read(path).map_err(|e| tr!("无法读取 config.toml:{e}", "can't read config.toml: {e}"))?;
     let new = with_args(&text, fam, name, args)?;
     if new == text {
         return Ok(false);
     }
-    if !write(path, &text, &new).map_err(|e| tr!("写 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
-        return Err(t!("config.toml 刚被改过,再存一次", "config.toml just changed; save again").into());
+    if !write(path, &text, &new).map_err(|e| tr!("写入 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
+        return Err(t!("config.toml 已被修改,请重试", "config.toml just changed; save again").into());
     }
     Ok(true)
 }
@@ -566,7 +569,7 @@ pub(crate) fn set_args_in(path: &Path, a: Agent, name: &str, args: &[String]) ->
 fn with_common_args(text: &str, fam: &str, args: &[String]) -> Result<String, String> {
     let list = Value::Array(args.iter().cloned().map(Value::String).collect());
     let new = crate::config::with_value(text, &format!("tools.{fam}"), "args", &list).ok_or(t!(
-        "config.toml 的写法认不出,没改(自己改那几行)",
+        "无法识别 config.toml 的写法,未修改(请手动修改)",
         "can't make out how config.toml is written; nothing changed (edit those lines yourself)"
     ))?;
     // with_value 是原地换掉那一行的:行数一样时,不一样的那行就是它,把原来那行的注释接上
@@ -584,14 +587,14 @@ fn with_common_args(text: &str, fam: &str, args: &[String]) -> Result<String, St
 
 /// 换这一家每个账号都带的启动参数(删之前的存成 config.toml.bak-aca)。回 false = 和原来一样,没写
 pub(crate) fn set_common_args_in(path: &Path, a: Agent, args: &[String]) -> Result<bool, String> {
-    let fam = fam(a).ok_or(t!("只有 Claude / Codex 的账号", "only Claude / Codex have accounts"))?;
-    let text = read(path).map_err(|e| tr!("读不了 config.toml:{e}", "can't read config.toml: {e}"))?;
+    let fam = fam(a).ok_or(t!("仅支持 Claude / Codex 账号", "only Claude / Codex have accounts"))?;
+    let text = read(path).map_err(|e| tr!("无法读取 config.toml:{e}", "can't read config.toml: {e}"))?;
     if aca_core::config::parse(&text).tool(fam).map(|t| t.args).unwrap_or_default() == args {
         return Ok(false);
     }
     let new = with_common_args(&text, fam, args)?;
-    if !write(path, &text, &new).map_err(|e| tr!("写 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
-        return Err(t!("config.toml 刚被改过,再存一次", "config.toml just changed; save again").into());
+    if !write(path, &text, &new).map_err(|e| tr!("写入 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
+        return Err(t!("config.toml 已被修改,请重试", "config.toml just changed; save again").into());
     }
     Ok(true)
 }
@@ -604,14 +607,14 @@ pub struct Removed {
 
 /// 删一个账号:只去掉 config.toml 里那一行(删之前的存成 config.toml.bak-aca)。配置目录、里面的登录都不动
 pub(crate) fn remove_in(path: &Path, home: &str, a: Agent, name: &str) -> Result<Removed, String> {
-    let fam = fam(a).ok_or(t!("只有 Claude / Codex 的账号", "only Claude / Codex have accounts"))?;
-    let text = read(path).map_err(|e| tr!("读不了 config.toml:{e}", "can't read config.toml: {e}"))?;
+    let fam = fam(a).ok_or(t!("仅支持 Claude / Codex 账号", "only Claude / Codex have accounts"))?;
+    let text = read(path).map_err(|e| tr!("无法读取 config.toml:{e}", "can't read config.toml: {e}"))?;
     let Some((_, dir)) = list_in(&text, fam).into_iter().find(|(n, _)| n == name) else {
-        return Err(tr!("没有这个账号:{fam}:{name}", "no such account: {fam}:{name}"));
+        return Err(tr!("账号不存在:{fam}:{name}", "no such account: {fam}:{name}"));
     };
     let new = drop_line(&text, fam, name)?;
-    if !write(path, &text, &new).map_err(|e| tr!("写 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
-        return Err(t!("config.toml 刚被改过,再删一次", "config.toml just changed; remove it again").into());
+    if !write(path, &text, &new).map_err(|e| tr!("写入 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
+        return Err(t!("config.toml 已被修改,请重试", "config.toml just changed; remove it again").into());
     }
     Ok(Removed { dir: if dir.is_empty() { dir } else { tilde(&expand(&dir, home), home) } })
 }
@@ -625,7 +628,7 @@ pub(crate) fn default_of(cfg: &aca_core::config::Config, a: Agent, name: &str) -
 /// 这个账号在它那一家里往上 / 往下挪一格;已经在头上 / 尾上的回 false。
 /// 顺序记在 `[ui] menu`:就是 `n` 菜单的顺序,两处是同一个。挪的时候把整个菜单的顺序写全(以后加的照旧跟在后面)
 pub(crate) fn shift_in(path: &Path, home: &str, a: Agent, name: &str, up: bool) -> Result<bool, String> {
-    let text = read(path).map_err(|e| tr!("读不了 config.toml:{e}", "can't read config.toml: {e}"))?;
+    let text = read(path).map_err(|e| tr!("无法读取 config.toml:{e}", "can't read config.toml: {e}"))?;
     let cfg = aca_core::config::parse(&text);
     let menu = crate::config::list_in(&text, "ui", "menu");
     let order = |menu: &[String]| -> Vec<String> {
@@ -633,7 +636,7 @@ pub(crate) fn shift_in(path: &Path, home: &str, a: Agent, name: &str, up: bool) 
     };
     let mut want = order(&menu);
     let Some(at) = want.iter().position(|n| n == name) else {
-        return Err(tr!("没有这个账号:{name}", "no such account: {name}"));
+        return Err(tr!("账号不存在:{name}", "no such account: {name}"));
     };
     let to = if up { at.checked_sub(1) } else { Some(at + 1).filter(|i| *i < want.len()) };
     let Some(to) = to else { return Ok(false) };
@@ -652,7 +655,7 @@ pub(crate) fn shift_in(path: &Path, home: &str, a: Agent, name: &str, up: bool) 
     names.insert(if up { j } else { j + 1 }, name.to_string());
     // 两家有重名的账号时菜单按名字排不开:挪完不是想要的顺序就不写
     let hand = t!(
-        "挪不了(有重名的,或者 [ui] menu 写成了好几行):在 config.toml 的 [ui] menu 里自己排",
+        "无法移动(有重名项,或 [ui] menu 分成了多行):请在 config.toml 的 [ui] menu 中手动调整顺序",
         "can't move it (a duplicate name, or [ui] menu spans several lines): order it yourself under [ui] menu in config.toml"
     );
     if order(&names) != want {
@@ -660,8 +663,8 @@ pub(crate) fn shift_in(path: &Path, home: &str, a: Agent, name: &str, up: bool) 
     }
     let value = Value::Array(names.into_iter().map(Value::String).collect());
     let new = crate::config::with_value(&text, "ui", "menu", &value).ok_or(hand)?;
-    if !write(path, &text, &new).map_err(|e| tr!("写 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
-        return Err(t!("config.toml 刚被改过,再挪一次", "config.toml just changed; move it again").into());
+    if !write(path, &text, &new).map_err(|e| tr!("写入 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
+        return Err(t!("config.toml 已被修改,请重试", "config.toml just changed; move it again").into());
     }
     Ok(true)
 }
@@ -736,21 +739,21 @@ mod tests {
         let codex = make(".cx", &["auth.json", "config.toml", "version.json", "history.jsonl"]);
         let claude = make(".cc", &[".claude.json", "settings.json", "history.jsonl"]);
         let who = |a, dir: &str| foreign(a, dir, &home);
-        assert_eq!(who(Agent::Claude, &codex), Some((Agent::Codex, "里面有 auth.json、config.toml…".into())));
-        assert_eq!(who(Agent::Codex, &claude), Some((Agent::Claude, "里面有 .claude.json、settings.json".into())));
+        assert_eq!(who(Agent::Claude, &codex), Some((Agent::Codex, "其中包含 auth.json、config.toml…".into())));
+        assert_eq!(who(Agent::Codex, &claude), Some((Agent::Claude, "其中包含 .claude.json、settings.json".into())));
         assert_eq!((who(Agent::Codex, &codex), who(Agent::Claude, &claude)), (None, None));
         // 登记错了之后起过一次,里面多了这一家的一个文件:还是另一家的
         std::fs::write(d.join(".cx/.claude.json"), "{}").unwrap();
         assert_eq!(who(Agent::Claude, &codex).map(|x| x.0), Some(Agent::Codex));
         // 另一家默认的那个目录:还没有也算;空目录、新目录谁的都不是
-        assert_eq!(who(Agent::Claude, &format!("{home}/.codex")), Some((Agent::Codex, "Codex 默认用它".into())));
-        assert_eq!(who(Agent::Codex, &format!("{home}/.claude")), Some((Agent::Claude, "Claude Code 默认用它".into())));
+        assert_eq!(who(Agent::Claude, &format!("{home}/.codex")), Some((Agent::Codex, "Codex 的默认目录".into())));
+        assert_eq!(who(Agent::Codex, &format!("{home}/.claude")), Some((Agent::Claude, "Claude Code 的默认目录".into())));
         assert_eq!((who(Agent::Claude, &make(".empty", &[])), who(Agent::Codex, &format!("{home}/.nowhere"))), (None, None));
         // 加的时候就拦下:config.toml 不动
         let path = d.join("aca/config.toml");
         assert_eq!(
             add_in(&path, &home, Agent::Claude, "codex", "~/.cx").unwrap_err(),
-            "~/.cx 是 Codex 的目录(里面有 auth.json、config.toml…),不能加成 Claude Code 的账号"
+            "~/.cx 是 Codex 的目录(其中包含 auth.json、config.toml…),不能添加为 Claude Code 账号"
         );
         assert!(!path.exists() && add_in(&path, &home, Agent::Codex, "cx", "~/.cx").is_ok());
         let _ = std::fs::remove_dir_all(&d);
@@ -790,7 +793,7 @@ mod tests {
         );
         // 一个值占好几行、没这个账号、坏文件:不改
         assert!(with_args("[accounts.codex]\nlabs = { home = \"~/.labs\", args = [\n\"a\"] }\n", "codex", "labs", &[]).is_err());
-        assert_eq!(with_args(old, "claude", "nobody", &[]).unwrap_err(), "没有这个账号:claude:nobody");
+        assert_eq!(with_args(old, "claude", "nobody", &[]).unwrap_err(), "账号不存在:claude:nobody");
         assert!(with_args("[accounts\n", "claude", "work", &[]).is_err());
     }
 
@@ -831,7 +834,7 @@ mod tests {
         std::fs::create_dir_all(d.join("aca")).unwrap();
         std::fs::create_dir_all(d.join(".claude-work")).unwrap();
         std::fs::write(&path, old).unwrap();
-        assert_eq!(remove_in(&path, &home, Agent::Claude, "nope").unwrap_err(), "没有这个账号:claude:nope");
+        assert_eq!(remove_in(&path, &home, Agent::Claude, "nope").unwrap_err(), "账号不存在:claude:nope");
         // 哪些工具默认用它:删之前要说
         let cfg = aca_core::config::parse(old);
         assert_eq!((default_of(&cfg, Agent::Claude, "work"), default_of(&cfg, Agent::Codex, "work")), (vec!["claude".to_string()], vec![]));
@@ -884,7 +887,7 @@ mod tests {
         assert!(shift_in(&path, &home, Agent::Codex, "nope", true).is_err());
         // [ui] menu 写成好几行的:改不动,说去哪自己排
         std::fs::write(&path, old.replace("menu = [\"sub\", \"labs\", \"firm\"]", "menu = [\n  \"sub\",\n]")).unwrap();
-        assert!(shift_in(&path, &home, Agent::Claude, "official", true).unwrap_err().contains("[ui] menu 里自己排"));
+        assert!(shift_in(&path, &home, Agent::Claude, "official", true).unwrap_err().contains("[ui] menu 中手动调整顺序"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -928,14 +931,14 @@ mod tests {
             "# 注释留着\n[new_group]\ndefault_path = \"~/w\"\n\n[accounts.claude]\nteam = \"~/.ct\"\n\n[accounts.codex]\ncx = \"~/.codex-cx\"\n"
         );
         // 同名、同目录、不合法的名字:不加,文件不动
-        assert_eq!(add_in(&path, &home, Agent::Codex, "cx", "~/.other").unwrap_err(), "已经有这个账号:cx");
-        assert_eq!(add_in(&path, &home, Agent::Claude, "t2", "~/.ct/").unwrap_err(), "这个目录已经是账号 team 的了");
-        assert_eq!(add_in(&path, &home, Agent::Codex, "c2", "~/.codex-cx").unwrap_err(), "这个目录已经是账号 cx 的了");
+        assert_eq!(add_in(&path, &home, Agent::Codex, "cx", "~/.other").unwrap_err(), "账号已存在:cx");
+        assert_eq!(add_in(&path, &home, Agent::Claude, "t2", "~/.ct/").unwrap_err(), "该目录已属于账号 team");
+        assert_eq!(add_in(&path, &home, Agent::Codex, "c2", "~/.codex-cx").unwrap_err(), "该目录已属于账号 cx");
         assert!(add_in(&path, &home, Agent::Claude, "a b", "~/.x").is_err());
         assert!(add_in(&path, &home, Agent::Claude, "rel", "rel/dir").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), a);
         // 只核对:说的是同一句话,能加的回展开的目录,文件、目录都不碰
-        assert_eq!(check_in(&path, &home, Agent::Codex, "cx", "~/.other").unwrap_err(), "已经有这个账号:cx");
+        assert_eq!(check_in(&path, &home, Agent::Codex, "cx", "~/.other").unwrap_err(), "账号已存在:cx");
         assert_eq!(check_in(&path, &home, Agent::Claude, "me", "~/.claude-me/").unwrap(), format!("{home}/.claude-me"));
         assert!(!d.join(".claude-me").exists());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), a);

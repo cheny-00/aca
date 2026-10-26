@@ -120,23 +120,22 @@ fn merge(ours: &str, theirs: &str, dir: &str) -> Res<String> {
     } else {
         let file = Path::new(dir).join(paths::expand(theirs));
         std::fs::read_to_string(&file)
-            .map_err(|e| tr!("你带的 --settings 读不了 {}:{e}", "can't read the --settings you passed {}: {e}", file.display()))?
+            .map_err(|e| tr!("无法读取 --settings 指定的 {}:{e}", "can't read the --settings you passed {}: {e}", file.display()))?
     };
     let mut all: Value =
-        serde_json::from_str(&text).map_err(|e| tr!("你带的 --settings 不是 JSON:{e}", "the --settings you passed isn't JSON: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| tr!("--settings 不是有效的 JSON:{e}", "the --settings you passed isn't JSON: {e}"))?;
     let ours: Value = serde_json::from_str(ours).unwrap();
     let hooks = all
         .as_object_mut()
-        .ok_or(t!("你带的 --settings 不是一个 JSON 对象", "the --settings you passed isn't a JSON object"))?
+        .ok_or(t!("--settings 不是 JSON 对象", "the --settings you passed isn't a JSON object"))?
         .entry("hooks")
         .or_insert_with(|| json!({}));
-    let hooks =
-        hooks.as_object_mut().ok_or(t!("你带的 --settings 里 hooks 不是对象", "hooks in the --settings you passed isn't an object"))?;
+    let hooks = hooks.as_object_mut().ok_or(t!("--settings 中的 hooks 不是对象", "hooks in the --settings you passed isn't an object"))?;
     for (ev, entries) in ours["hooks"].as_object().unwrap() {
         let mine = hooks.entry(ev.clone()).or_insert_with(|| json!([]));
         let mine = mine
             .as_array_mut()
-            .ok_or_else(|| tr!("你带的 --settings 里 hooks.{ev} 不是数组", "hooks.{ev} in the --settings you passed isn't an array"))?;
+            .ok_or_else(|| tr!("--settings 中的 hooks.{ev} 不是数组", "hooks.{ev} in the --settings you passed isn't an array"))?;
         mine.extend(entries.as_array().unwrap().iter().cloned());
     }
     Ok(serde_json::to_string_pretty(&all).unwrap())

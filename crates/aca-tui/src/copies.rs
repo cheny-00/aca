@@ -31,9 +31,9 @@ impl Menu {
     pub fn new(title: &str, id: &str, info: &str) -> Menu {
         let line = |k: &str| info.lines().find_map(|l| l.strip_prefix(k)).unwrap_or("").trim().to_string();
         let rows = vec![
-            Row { key: 'i', name: "aca id", value: id.to_string(), none: t!("A 接管后才有", "only after adopting with A") },
-            Row { key: 's', name: "session id", value: line("Session: "), none: t!("还没有对话", "no conversation yet") },
-            Row { key: 'p', name: "path", value: line("Path: "), none: t!("不知道目录", "directory unknown") },
+            Row { key: 'i', name: "aca id", value: id.to_string(), none: t!("A 接管后可用", "only after adopting with A") },
+            Row { key: 's', name: "session id", value: line("Session: "), none: t!("暂无对话", "no conversation yet") },
+            Row { key: 'p', name: "path", value: line("Path: "), none: t!("目录未知", "directory unknown") },
         ];
         let sel = rows.iter().position(|r| !r.value.is_empty()).unwrap_or(0);
         Menu { title: title.to_string(), rows, sel }
@@ -145,9 +145,9 @@ mod tests {
         let mut m = Menu::new("裸", "", "Path: /w/x");
         assert_eq!(m.sel, 2);
         let rows = text(&m, 66);
-        assert!(rows.iter().any(|r| r.contains("A 接管后才有")) && rows.iter().any(|r| r.contains("还没有对话")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("A 接管后可用")) && rows.iter().any(|r| r.contains("暂无对话")), "{rows:#?}");
         let (f, fx) = press(&mut m, KeyCode::Char('i'));
-        assert_eq!((f, fx.copy, fx.flash.as_deref()), (Flow::Stay, None, Some("没有 aca id:A 接管后才有")));
+        assert_eq!((f, fx.copy, fx.flash.as_deref()), (Flow::Stay, None, Some("没有 aca id:A 接管后可用")));
         press(&mut m, KeyCode::Up);
         assert_eq!(m.sel, 2);
         // 手机宽度:一行不超宽

@@ -4,12 +4,14 @@
 //! 这里只管怎么列、怎么画、按键做什么,和几样自己的小状态(置顶、便签、已读、工作区,见 state.rs)。
 
 mod accounts;
+mod acts;
 mod acctpage;
 mod ansi;
 mod bar;
 mod bill;
 mod browser;
 mod caps;
+mod clicked;
 mod clip;
 mod config;
 mod copies;
@@ -112,9 +114,9 @@ fn print_list(kw: &str) {
         .collect();
     if rows.is_empty() {
         lines.push(if kw.is_empty() {
-            t!("tmux 里没有会话", "no sessions in tmux").to_string()
+            t!("tmux 中没有会话", "no sessions in tmux").to_string()
         } else {
-            tr!("没有匹配「{kw}」的", "nothing matches “{kw}”")
+            tr!("没有匹配「{kw}」的会话", "nothing matches “{kw}”")
         });
     }
     if hidden > 0 {
@@ -151,13 +153,13 @@ fn print_cost(range: Option<&str>, only: &[String]) {
             r.accounts.iter().filter(|a| r.ranges[3].by_src.iter().any(|b| b.name == a.name)).map(|a| a.name.as_str()).collect();
         let head = if names.is_empty() {
             tr!(
-                " 没有叫 {} 的账号(有:{})",
+                " 找不到账号 {}(现有:{})",
                 " no account named {} (there are: {})",
                 only.join(" / "),
                 r.accounts.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(" / ")
             )
         } else {
-            tr!(" 只看 {}", " only {}", names.join(" + "))
+            tr!(" 仅显示 {}", " only {}", names.join(" + "))
         };
         let _ = writeln!(out, "{head}\n");
     }

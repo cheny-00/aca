@@ -660,16 +660,16 @@ pub(crate) fn fail_text(t: &Trace, n: &Node) -> String {
 pub(crate) fn call_note(t: &Trace, n: &Node) -> Option<String> {
     let last = t.read_at(*n.src.last()?)?;
     let why = match last.pointer("/message/diagnostics/cache_miss_reason/type")?.as_str()? {
-        "unavailable" => return Some(t!("缓存没命中", "cache miss").into()),
-        "ttl_expired" => t!("过期了", "it expired"),
-        "previous_message_not_found" => t!("没找到上一条", "the previous message wasn't cached"),
-        "messages_changed" => t!("前面的对话变了", "earlier messages changed"),
-        "system_changed" => t!("系统提示变了", "the system prompt changed"),
-        "tools_changed" => t!("工具变了", "the tools changed"),
-        "model_changed" => t!("换了模型", "the model changed"),
+        "unavailable" => return Some(t!("缓存未命中", "cache miss").into()),
+        "ttl_expired" => t!("已过期", "it expired"),
+        "previous_message_not_found" => t!("找不到上一条", "the previous message wasn't cached"),
+        "messages_changed" => t!("前文已变化", "earlier messages changed"),
+        "system_changed" => t!("系统提示已变化", "the system prompt changed"),
+        "tools_changed" => t!("工具已变化", "the tools changed"),
+        "model_changed" => t!("模型已更换", "the model changed"),
         x => x,
     };
-    Some(tr!("缓存没命中:{why}", "cache miss: {why}"))
+    Some(tr!("缓存未命中:{why}", "cache miss: {why}"))
 }
 
 /// 工具发起时的输入
@@ -1079,7 +1079,7 @@ pub(crate) mod tests {
         let (ps, fold) = tool_item(&t, ag1, false, 0, false);
         let text = plain(&ps, 80);
         assert!(fold && text[0].starts_with("▸ Agent Explore · 找 width") && text[0].contains("3 调用 · $"), "{text:#?}");
-        assert_eq!(&text[1..], ["  找到 4 处:", "  src/bill.rs:12", "  src/ui.rs:88", "  … 另 2 行"]);
+        assert_eq!(&text[1..], ["  找到 4 处:", "  src/bill.rs:12", "  src/ui.rs:88", "  … 还有 2 行"]);
         // 几个子代理写在右栏这一轮的头上,左栏底下只有时刻、时长、钱
         let head = plain(&steps(&t, turn, false, 0, &|_| false)[0].paras, 80);
         assert!(head[0].contains(" · 3 子代理 · "), "{head:?}");
@@ -1109,7 +1109,7 @@ pub(crate) mod tests {
         assert!(t.sub_live(ag1, true, ts_ms(&at(6000))) && !t.sub_live(ag1, false, ts_ms(&at(6000))));
         assert!(t.sub_of(ag3).is_none());
         let busy = crate::trace::chat(&t, t.roots[0], true, ts_ms(&at(6000)));
-        assert!(crate::ansi::plain(&busy.foot.body).starts_with("● 子代理在跑 · "));
+        assert!(crate::ansi::plain(&busy.foot.body).starts_with("● 子代理运行中 · "));
         // 接着写:a1 写完、a3 出来、通知到了
         std::fs::write(&a1, &full).unwrap();
         std::fs::write(&a3, meta3).unwrap();
@@ -1400,7 +1400,7 @@ pub(crate) mod tests {
         assert_eq!(seg_of(&lines[1], "use").fg, Some(p.syn_kw));
         // Bash:收着露输出的头 3 行;展开先写整条命令,再是全部输出
         let (text, _) = tool_text(&t, tool("Bash"), false);
-        assert_eq!(text[1..], ["  running 220 tests", "  test bill::cols ... ok", "  test ui::wide ... ok", "  … 另 3 行"]);
+        assert_eq!(text[1..], ["  running 220 tests", "  test bill::cols ... ok", "  test ui::wide ... ok", "  … 还有 3 行"]);
         let (text, _) = tool_text(&t, tool("Bash"), true);
         assert_eq!(text[1], "  $ cargo test --release");
         let lines = crate::trace::wrap(&tool_item(&t, tool("Bash"), false, 0, true).0, 60);
@@ -1408,7 +1408,7 @@ pub(crate) mod tests {
         assert_eq!(text.last().unwrap(), "  test result: ok. 220 passed");
         // 全露了的不能 o
         let (text, fold) = tool_text(&t, tool("Grep"), false);
-        assert!(fold && text.last().unwrap() == "  … 另 1 行", "{text:?}");
+        assert!(fold && text.last().unwrap() == "  … 还有 1 行", "{text:?}");
     }
 
     #[test]

@@ -40,8 +40,9 @@ static LIVE: Mutex<Option<String>> = Mutex::new(None);
 
 /// exit.log 超过这么大就挪成 exit.log.1,重新记
 const CAP: u64 = 256 * 1024;
-/// 看门的线程多久看一次终端
-const PROBE: Duration = Duration::from_millis(250);
+/// 看门的线程多久看一次终端。SIGHUP 来了不用等它,这个探针只管终端没发信号就没了的情况;连着两次没写进去才算,
+/// 加上 GRACE 三四秒内发现,所以不用看得太勤(250 毫秒时采样里它是界面进程除等待之外最大的一项)
+const PROBE: Duration = Duration::from_secs(1);
 /// 发现终端没了以后,等主线程自己收尾这么久(它一轮最多 150 毫秒);还在 = 卡住了
 const GRACE: Duration = Duration::from_millis(1500);
 
@@ -125,24 +126,24 @@ fn log_gone(why: Option<&anyhow::Error>, restore: Option<&std::io::Error>, stuck
         return;
     }
     let name = place_name(place());
-    let mut body = tr!("终端没了,界面跟着退出({name})\n", "the terminal went away and the interface quit with it ({name})\n");
+    let mut body = tr!("终端已关闭,界面随之退出({name})\n", "the terminal went away and the interface quit with it ({name})\n");
     if let Some(e) = why {
-        body += &tr!("  主循环停在:{e:#}\n", "  the main loop stopped on: {e:#}\n");
+        body += &tr!("  主循环终止于:{e:#}\n", "  the main loop stopped on: {e:#}\n");
     }
     if hung_up() {
-        body += t!("  收到了挂断信号(SIGHUP)\n", "  got the hangup signal (SIGHUP)\n");
+        body += t!("  收到挂断信号(SIGHUP)\n", "  got the hangup signal (SIGHUP)\n");
     }
     if EIO.load(Ordering::Relaxed) {
-        body += t!("  往终端写报错了(EIO)\n", "  writing to the terminal failed (EIO)\n");
+        body += t!("  写入终端出错(EIO)\n", "  writing to the terminal failed (EIO)\n");
     }
     if stuck {
         body += t!(
-            "  主线程卡住了(在等终端输入),由看门的线程收尾\n",
+            "  主线程无响应(正在等待终端输入),由看门线程收尾\n",
             "  the main thread was stuck waiting for terminal input; the watchdog finished up\n"
         );
     }
     if let Some(e) = restore {
-        body += &tr!("  还原终端:{e}\n", "  restoring the terminal: {e}\n");
+        body += &tr!("  还原终端失败:{e}\n", "  restoring the terminal: {e}\n");
     }
     let dir = dir();
     let now = now_secs();
@@ -154,7 +155,7 @@ fn on_panic(info: &PanicHookInfo<'_>, main: bool) {
     let msg = payload(info);
     let mut body = tr!("程序出错(线程 {thread}):{msg}\n", "the program failed (thread {thread}): {msg}\n");
     if let Some(at) = info.location() {
-        body += &tr!("  在 {at}\n", "  at {at}\n");
+        body += &tr!("  位置:{at}\n", "  at {at}\n");
     }
     body += t!("  调用栈:\n", "  backtrace:\n");
     for l in std::backtrace::Backtrace::force_capture().to_string().lines() {
@@ -167,7 +168,7 @@ fn on_panic(info: &PanicHookInfo<'_>, main: bool) {
     if main {
         write_last(&dir, now, "panic", place(), &short);
     } else if let Ok(mut live) = LIVE.lock() {
-        *live = Some(tr!("后台出错了:{short} · 细节在 exit.log", "something failed in the background: {short} · details in exit.log"));
+        *live = Some(tr!("后台出错:{short} · 详见 exit.log", "something failed in the background: {short} · details in exit.log"));
     }
 }
 
@@ -190,7 +191,7 @@ fn take_notice_in(dir: &Path, now: i64, tz: i64) -> Option<String> {
     let note = f.nth(1).unwrap_or("");
     let when = when(at, now, tz);
     Some(tr!(
-        "上次的界面 {when} 出错退出了:{note} · 细节在 exit.log",
+        "上次界面于 {when} 异常退出:{note} · 详见 exit.log",
         "the last interface quit on an error at {when}: {note} · details in exit.log"
     ))
 }
@@ -229,7 +230,7 @@ fn payload(info: &PanicHookInfo<'_>) -> String {
 /// 一段:标题行(几点、哪个进程、开了多久)+ 细节
 fn entry(now: i64, tz: i64, up: Option<Duration>, body: &str) -> String {
     let pid = std::process::id();
-    let up = up.map(|d| tr!(" · 开了 {}", " · up {}", span(d))).unwrap_or_default();
+    let up = up.map(|d| tr!(" · 运行了 {}", " · up {}", span(d))).unwrap_or_default();
     format!("── {} · pid {pid}{up} ──\n{body}\n", stamp(now, tz))
 }
 
@@ -329,7 +330,7 @@ mod tests {
         let d = tmp("panic");
         write_last(&d, AT, "panic", "ssh", "index out of\tbounds\nline two");
         let m = take_notice_in(&d, AT + 86400, CST).unwrap();
-        assert_eq!(m, "上次的界面 10/14 22:59 出错退出了:index out of bounds line two · 细节在 exit.log");
+        assert_eq!(m, "上次界面于 10/14 22:59 异常退出:index out of bounds line two · 详见 exit.log");
         // 说过就删了
         assert_eq!(take_notice_in(&d, AT + 86400, CST), None);
         let _ = std::fs::remove_dir_all(&d);
@@ -351,7 +352,7 @@ mod tests {
         append(&d, &entry(AT, CST, Some(Duration::from_secs(2 * 86400 + 5 * 3600 + 7)), "终端没了\n"));
         let log = std::fs::read_to_string(d.join("exit.log")).unwrap();
         assert!(log.starts_with("── 2026-10-14 22:59:33 · pid "), "{log}");
-        assert!(log.contains(" · 开了 2 天 5 小时 ──\n终端没了\n"), "{log}");
+        assert!(log.contains(" · 运行了 2 天 5 小时 ──\n终端没了\n"), "{log}");
         append(&d, "second\n");
         assert!(std::fs::read_to_string(d.join("exit.log")).unwrap().ends_with("second\n"));
         std::fs::write(d.join("exit.log"), "x".repeat(CAP as usize + 1)).unwrap();

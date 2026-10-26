@@ -191,12 +191,12 @@ fn after(name: &str, eg: &str, v: &Option<toml::Value>) -> Result<Option<u64>, S
         Some(toml::Value::String(s)) if s.trim().eq_ignore_ascii_case("never") => Ok(None),
         Some(toml::Value::String(s)) => span(s).map(|n| (n > 0).then_some(n)).ok_or_else(|| {
             crate::tr!(
-                "{name} 写成 30m、3h、1d、1h30m 或 never 这样,不认 \"{s}\"",
+                "{name} 应写为 30m、3h、1d、1h30m 或 never,无法识别 \"{s}\"",
                 "write {name} like 30m, 3h, 1d, 1h30m or never, not \"{s}\""
             )
         }),
         Some(v) => Err(crate::tr!(
-            "{name} 要写成带单位的字符串,比如 \"{eg}\",不认 {v}",
+            "{name} 应为带单位的字符串,如 \"{eg}\",无法识别 {v}",
             "{name} takes a string with a unit, like \"{eg}\", not {v}"
         )),
     }
@@ -294,7 +294,7 @@ impl TryFrom<toml::Value> for Remote {
             },
             _ => {}
         }
-        Err(crate::tr!("remote 认 auto / yes / no,不认 {v}", "remote takes auto / yes / no, not {v}"))
+        Err(crate::tr!("remote 只能为 auto / yes / no,无法识别 {v}", "remote takes auto / yes / no, not {v}"))
     }
 }
 

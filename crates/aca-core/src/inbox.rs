@@ -21,7 +21,6 @@
 //! 派的时候说(`aca new --notify`),不说不叫。
 
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -31,11 +30,12 @@ use serde_json::{Value, json};
 
 use crate::agent::{self, Agent, Delivery};
 use crate::config::Config;
+use crate::i18n::Tr;
 use crate::paths::{self, Res};
 use crate::runtime::{self, Run, clip};
 use crate::status::{self, State};
 use crate::store::{Session, Store};
-use crate::{event, tmux};
+use crate::{event, t, tmux, tr};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -76,9 +76,9 @@ pub enum Stage {
 impl Stage {
     pub fn said(self) -> &'static str {
         match self {
-            Stage::Pending => "没送",
-            Stage::Queued => "排着",
-            Stage::Got => "送到了",
+            Stage::Pending => t!("未送达", "not delivered"),
+            Stage::Queued => t!("排队中", "queued"),
+            Stage::Got => t!("已送达", "delivered"),
         }
     }
 }
@@ -98,11 +98,11 @@ pub enum Sent {
 impl Sent {
     pub fn said(&self) -> String {
         match self {
-            Sent::Nothing => "没有要叫醒它的".into(),
-            Sent::Bell => "按了门铃".into(),
-            Sent::Queued => "排进了它的队列,它空下来自己开一轮".into(),
-            Sent::Typed => "打字送进去了".into(),
-            Sent::Held(why) => format!("先存着:{why}"),
+            Sent::Nothing => t!("无需唤醒", "no need to wake it").into(),
+            Sent::Bell => t!("已按门铃", "rang the doorbell").into(),
+            Sent::Queued => t!("已排入它的队列,空闲后会自动开始一轮", "queued; it starts a turn on its own once idle").into(),
+            Sent::Typed => t!("已输入并发送", "typed in and sent").into(),
+            Sent::Held(why) => tr!("暂存:{why}", "kept: {why}"),
         }
     }
 }
@@ -523,14 +523,14 @@ fn wait_turn(id: &str, retry: bool, why: &str) -> Res<Sent> {
 
 /// 过 `secs` 秒在后台送一次(`aca inbox deliver`):不等它,hook 和命令马上返回
 fn later(id: &str, secs: u64, more: &[&str]) {
-    let _ = Command::new(agent::self_exe())
-        .args(["inbox", "deliver", id, "--after", &secs.to_string()])
-        .args(more)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn();
+    let _ = crate::proc::detach(
+        Command::new(agent::self_exe())
+            .args(["inbox", "deliver", id, "--after", &secs.to_string()])
+            .args(more)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
 }
 
 fn ring(id: &str) {
@@ -538,6 +538,9 @@ fn ring(id: &str) {
     // 原地改,不换文件:换了文件,盯着它的那一头可能就跟丢了
     let _ = std::fs::write(bell(id), paths::now_ms().to_string());
 }
+
+/// 它没在跑:等它起来再送
+const NOT_RUNNING: Tr = Tr::new("它未运行:启动后再送达", "it isn't running: delivered when it starts");
 
 /// 发的那一刻(和之后每次补送)送一次:看对方是哪一家、现在在干什么,挑一种送法。`retry` = 这已经是隔了一阵的再试
 pub fn deliver(store: &Store, cfg: &Config, id: &str, retry: bool) -> Res<Sent> {
@@ -551,8 +554,10 @@ pub fn deliver(store: &Store, cfg: &Config, id: &str, retry: bool) -> Res<Sent> 
     let pane = tmux::find(&s.id).filter(|p| !p.dead);
     let held = |why: &str| Ok(Sent::Held(why.to_string()));
     match agent.delivery() {
-        Delivery::Keep => held("它是个 shell,不往里打字;在 aca inbox 里看"),
-        Delivery::Bell if pane.is_none() => held("它没在跑:起来时再送"),
+        Delivery::Keep => {
+            held(t!("它是 shell,不会输入到其中;可在 aca inbox 中查看", "it's a shell, nothing is typed into it; see aca inbox"))
+        }
+        Delivery::Bell if pane.is_none() => held(NOT_RUNNING.get()),
         Delivery::Bell if r.bell => {
             ring(&s.id);
             let ids: Vec<String> = msgs.iter().filter(|m| m.wake).map(|m| m.id.clone()).collect();
@@ -562,10 +567,26 @@ pub fn deliver(store: &Store, cfg: &Config, id: &str, retry: bool) -> Res<Sent> 
         Delivery::Queue if !r.conv.is_empty() => {
             if pane.is_some() {
                 match status::one(cfg, &s, true).state {
-                    State::Running => return wait_turn(&s.id, retry, "它在跑:这一轮跑完再排进去"),
-                    State::Ask => return wait_turn(&s.id, retry, "它在等确认:确认完、这一轮跑完再排进去"),
+                    State::Running => {
+                        return wait_turn(&s.id, retry, t!("它正在运行:本轮结束后再排入", "it's running: queued after this turn"));
+                    }
+                    State::Ask => {
+                        return wait_turn(
+                            &s.id,
+                            retry,
+                            t!(
+                                "它正在等待确认:确认后、本轮结束时再排入",
+                                "it's waiting for a confirmation: queued once that's answered and the turn ends"
+                            ),
+                        );
+                    }
                     // 被打断的对话,Codex 自己也不开跑排着的(退出再 resume 起来也一样,0.162 实测),等下一轮正常跑完
-                    _ if r.event == "Interrupt" => return held("你刚按 Esc 打断了它:等你下一轮跑完再送"),
+                    _ if r.event == "Interrupt" => {
+                        return held(t!(
+                            "你刚按 Esc 中断了它:下一轮结束后再送达",
+                            "you just interrupted it with Esc: delivered after your next turn ends"
+                        ));
+                    }
                     _ => {}
                 }
             }
@@ -575,12 +596,15 @@ pub fn deliver(store: &Store, cfg: &Config, id: &str, retry: bool) -> Res<Sent> 
                     mark_queued(&s.id, &ids);
                     Ok(Sent::Queued)
                 }
-                Err(e) if pane.is_none() => held(&format!("排不进它的队列({e}),它也没在跑:起来后再送")),
+                Err(e) if pane.is_none() => held(&tr!(
+                    "无法排入它的队列({e}),且它未运行:启动后再送达",
+                    "can't queue it ({e}) and it isn't running: delivered when it starts"
+                )),
                 Err(_) => type_in(cfg, &s, &*agent, &pane.unwrap(), &msgs, retry),
             }
         }
         _ => match &pane {
-            None => held("它没在跑:起来时再送"),
+            None => held(NOT_RUNNING.get()),
             Some(p) => type_in(cfg, &s, &*agent, p, &msgs, retry),
         },
     }
@@ -597,7 +621,7 @@ fn enqueue(cfg: &Config, s: &Session, agent: &dyn Agent, conv: &str, text: &str)
         if std::path::Path::new(&s.dir).is_dir() {
             c.current_dir(&s.dir);
         }
-        let mut child = c.spawn().map_err(|e| format!("起不来:{e}"))?;
+        let mut child = c.spawn().map_err(|e| tr!("无法启动:{e}", "can't start: {e}"))?;
         let t = Instant::now();
         let status = loop {
             if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
@@ -605,7 +629,8 @@ fn enqueue(cfg: &Config, s: &Session, agent: &dyn Agent, conv: &str, text: &str)
             }
             if t.elapsed() > Duration::from_secs(20) {
                 let _ = child.kill();
-                return Err("20 秒没回".into());
+                let _ = child.wait();
+                return Err(t!("20 秒内无响应", "no answer within 20 seconds").into());
             }
             std::thread::sleep(Duration::from_millis(50));
         };
@@ -624,12 +649,18 @@ fn enqueue(cfg: &Config, s: &Session, agent: &dyn Agent, conv: &str, text: &str)
 /// 打字送进去:它空着、你没在那一格打字、输入框里没有你没发的字才打;不然过一阵再看一次
 fn type_in(cfg: &Config, s: &Session, agent: &dyn Agent, pane: &tmux::Pane, msgs: &[Msg], retry: bool) -> Res<Sent> {
     let why = match status::one(cfg, s, true).state {
-        State::Running => return wait_turn(&s.id, retry, "它在跑:这一轮跑完再送"),
-        State::Ask => return wait_turn(&s.id, retry, "它在等确认:不往确认框里打字"),
-        _ if tmux::typing(&pane.pane, TYPING_SECS) => Some("你正在那一格打字"),
+        State::Running => return wait_turn(&s.id, retry, t!("它正在运行:本轮结束后再送达", "it's running: delivered after this turn")),
+        State::Ask => {
+            return wait_turn(
+                &s.id,
+                retry,
+                t!("它正在等待确认:不会输入到确认框", "it's waiting for a confirmation: nothing is typed into the prompt"),
+            );
+        }
+        _ if tmux::typing(&pane.pane, TYPING_SECS) => Some(t!("你正在该窗格中输入", "you're typing in that pane")),
         _ => match agent.prompt_mark().map(|m| draft(m, &tmux::capture_ansi(&pane.pane))) {
-            Some(Some(true)) => Some("输入框里有你没发的字"),
-            Some(None) => Some("屏幕上没看到它的输入框"),
+            Some(Some(true)) => Some(t!("输入框中有你未发送的内容", "its input box has text you haven't sent")),
+            Some(None) => Some(t!("屏幕上找不到它的输入框", "can't find its input box on screen")),
             _ => None,
         },
     };
@@ -652,19 +683,29 @@ pub fn send(store: &Store, cfg: &Config, to: &str, text: &str) -> Res<(Msg, Sent
     let me = std::env::var("ACA_SESSION_ID").ok().filter(|x| !x.is_empty()).and_then(|x| store.get(&x).ok());
     let to = match to {
         "parent" => {
-            let me = me.as_ref().ok_or("parent 是派你的那个:要在某个会话里发")?;
-            store.get(&me.parent).map_err(|_| "你没有 parent(不是被派出来的)".to_string())?
+            let me = me.as_ref().ok_or(t!(
+                "parent 指派出当前会话的那个会话:只能在会话中使用",
+                "parent is the session that dispatched this one: only works from inside a session"
+            ))?;
+            store
+                .get(&me.parent)
+                .map_err(|_| t!("当前会话没有 parent(不是被派出的会话)", "this session has no parent (it wasn't dispatched)").to_string())?
         }
         key => store.get(key)?,
     };
     let (from, who) = match &me {
-        Some(m) if m.id == to.id => return Err("不能发给自己".into()),
+        Some(m) if m.id == to.id => return Err(t!("不能发送给自己", "can't send to yourself").into()),
         Some(m) => (m.id.clone(), who(m, &runtime::load(&m.id))),
         None => ("you".to_string(), "你".to_string()),
     };
     let m = post(Msg { from, who, to: to.id.clone(), kind: "msg".into(), wake: true, text: clip(text.trim(), 4000), ..Default::default() });
     if !m.wake {
-        return Ok((m, Sent::Held("10 分钟里发得太多了:这条只存不叫醒".into())));
+        return Ok((
+            m,
+            Sent::Held(
+                t!("10 分钟内发送过多:此条只保存,不唤醒", "too many within 10 minutes: this one is only kept, nobody is woken").into(),
+            ),
+        ));
     }
     let sent = deliver(store, cfg, &to.id, false)?;
     Ok((m, sent))
@@ -777,7 +818,7 @@ fn outcome(cfg: &Config, s: &Session, since: u64, now: u64) -> Option<Outcome> {
 pub fn wait(store: &Store, cfg: &Config, keys: &[String], any: bool, timeout: Option<Duration>) -> Res<Vec<(Session, Outcome)>> {
     let sessions: Vec<Session> = keys.iter().map(|k| store.get(k)).collect::<Res<_>>()?;
     if sessions.is_empty() {
-        return Err("要给会话".into());
+        return Err(t!("需要会话", "needs a session").into());
     }
     let since = paths::now();
     let t = Instant::now();

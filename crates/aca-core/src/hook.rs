@@ -11,7 +11,6 @@
 //! 标准输入读完(不读完 agent 那头会 broken pipe),不等任何慢的东西。
 
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
@@ -19,7 +18,7 @@ use serde_json::{Value, json};
 use crate::agent::{self, Agent, Delivery, Events};
 use crate::runtime::Run;
 use crate::store::{Session, Store};
-use crate::{config, event, inbox, paths, runtime, tmux};
+use crate::{config, event, inbox, paths, proc, runtime, tmux};
 
 /// 这一轮结束了(跑完 / 被打断):标题该有了,也要看一眼有没有人连着
 fn turn_ended(v: &Value) -> bool {
@@ -88,13 +87,19 @@ pub fn run(tool: &str) -> i32 {
     events.extend(retitle(&id, |r| agent.title(r, &pane_title)));
     // 标题常常比「跑完」晚一两秒才有(第一轮尤其):还没有的话,留一个不等它的后手过几秒再看一次
     if ended && runtime::load(&id).auto_title.is_empty() {
-        let _ = Command::new(agent::self_exe())
-            .args(["retitle", &id, tool, "3"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn();
+        let _ = proc::detach(
+            Command::new(agent::self_exe())
+                .args(["retitle", &id, tool, "3"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        );
+    }
+    // Codex 不过状态栏:一轮跑完,留一个不等它的后手看看额度动了没有(动了它往事件流写 limits.changed)
+    if ended && agent.name() == "codex" && !cfg!(test) {
+        let _ = proc::detach(
+            Command::new(agent::self_exe()).args(["limits", "--codex"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()),
+        );
     }
     settle(&cfg, &id, agent, &v, events);
     0

@@ -140,7 +140,7 @@ pub fn next(args: &[String]) -> i32 {
         let _ = reads.mark_read(&here, now, &|_| true);
     }
     let Some(r) = pick(&rows, &reads, &here) else {
-        say(t!("没有在等你的", "nothing waits for you"));
+        say(t!("暂无待处理会话", "nothing waits for you"));
         return 0;
     };
     // Ctrl+Q、热键的绑定服务重启就没了:进会话前补一遍(同 `aca attach`)
@@ -157,8 +157,8 @@ pub fn next(args: &[String]) -> i32 {
         let sid = aca_core::tmux::find(&r.id).map(|p| p.sid).unwrap_or_default();
         match aca_core::tmux::cmd().args(["attach-session", "-t", &sid]).status() {
             Ok(st) if st.success() => Ok(()),
-            Ok(_) => Err(tr!("进不去「{}」", "couldn't go into “{}”", r.title)),
-            Err(e) => Err(tr!("tmux 起不来:{e}", "couldn't run tmux: {e}")),
+            Ok(_) => Err(tr!("无法进入「{}」", "couldn't go into “{}”", r.title)),
+            Err(e) => Err(tr!("无法启动 tmux:{e}", "couldn't run tmux: {e}")),
         }
     };
     match went {

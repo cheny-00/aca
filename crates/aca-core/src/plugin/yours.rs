@@ -35,7 +35,7 @@ pub fn tool_choices(id: &str) -> Res<Vec<(String, bool, bool)>> {
 }
 
 fn find(id: &str) -> Res<Entry> {
-    registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有 {id} 这个插件", "no plugin {id}"))
+    registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有插件 {id}", "no plugin {id}"))
 }
 
 /// 给 / 不给 agent 一个能力当工具(写进 plugins.toml 的 `tools`;跟清单默认的一样就不写)。返回现在给的
@@ -43,7 +43,7 @@ pub fn allow(id: &str, tool: &str, on: bool) -> Res<Vec<String>> {
     let e = find(id)?;
     if !e.tools.iter().chain(&e.tools_ask).any(|t| t == tool) {
         return Err(tr!(
-            "{id} 的 {tool} 不能给 agent(清单的 expose 里没写 agent / agent?)",
+            "{id} 的 {tool} 不能提供给 agent(清单的 expose 中没有 agent / agent?)",
             "{id}'s {tool} can't go to agents (its expose has neither agent nor agent?)"
         ));
     }
@@ -109,7 +109,7 @@ fn settle_by<K: Clone + Eq + std::hash::Hash + std::fmt::Display>(
             notes.push((
                 w.plugin.clone(),
                 tr!(
-                    "键 {c} 给了 {}「{}」,{}「{}」没拿到(plugins.toml 里给它换一个:[plugins.\"{}\"] {field} = {{ {} = \"…\" }})",
+                    "键 {c} 已分配给 {}「{}」,{}「{}」未分配到(在 plugins.toml 中为它换一个:[plugins.\"{}\"] {field} = {{ {} = \"…\" }})",
                     "key {c} went to {} “{}”; {} “{}” didn't get it (give it another in plugins.toml: [plugins.\"{}\"] {field} = {{ {} = \"…\" }})",
                     o.plugin,
                     o.title,
@@ -148,8 +148,8 @@ fn key_ok(k: &str) -> Res<char> {
     let mut cs = k.chars();
     match (cs.next(), cs.next()) {
         (Some(c), None) if !c.is_whitespace() && !MENU_KEYS_TAKEN.contains(&k) => Ok(c),
-        (Some(_), None) if !k.trim().is_empty() => Err(tr!("{k} 是 : 菜单自己用的", "{k} is taken by the : menu")),
-        _ => Err(tr!("键要是一个字符:「{k}」", "a key is one character: “{k}”")),
+        (Some(_), None) if !k.trim().is_empty() => Err(tr!("{k} 已被 : 菜单占用", "{k} is taken by the : menu")),
+        _ => Err(tr!("键应为单个字符:「{k}」", "a key is one character: “{k}”")),
     }
 }
 
@@ -162,7 +162,7 @@ pub fn set_key(id: &str, target: &str, key: Option<&str>) -> Res<()> {
         || m.views.iter().any(|v| v.id == target);
     if !in_menu {
         return Err(tr!(
-            "{id} 没有 {target}(: 菜单里的能力、窗格、视图才有键)",
+            "{id} 没有 {target}(只有 : 菜单中的能力、窗格、视图能设键)",
             "{id} has no {target} (only : menu commands, panes and views take keys)"
         ));
     }
@@ -184,7 +184,7 @@ pub fn set_hotkey(id: &str, pane: &str, key: Option<&str>) -> Res<()> {
     let e = find(id)?;
     let (m, _) = super::read_manifest(std::path::Path::new(&e.path))?;
     if !m.panes.iter().any(|p| p.id == pane) {
-        return Err(tr!("{id} 没有 {pane} 这个窗格(热键只开窗格)", "{id} has no pane {pane} (hotkeys open panes only)"));
+        return Err(tr!("{id} 没有窗格 {pane}(热键只能打开窗格)", "{id} has no pane {pane} (hotkeys open panes only)"));
     }
     if let Some(k) = key.filter(|k| !k.is_empty()) {
         hotkey_ok(k)?;
@@ -217,7 +217,10 @@ mod tests {
             // 两个插件的清单要同一个键:先登记的拿,后面那个点名,告诉它去 hotkeys 里换
             let (got, notes) = settle_hotkeys(&[h("a", "pick", Some("C-]"), None), h("b", "pad", Some("C-]"), None)]);
             assert_eq!(got, [Some("C-]".to_string()), None]);
-            assert!(notes[0].1.contains("键 C-] 给了 a「pick」,b「pad」没拿到") && notes[0].1.contains("hotkeys = { pad = "), "{notes:?}");
+            assert!(
+                notes[0].1.contains("键 C-] 已分配给 a「pick」,b「pad」未分配到") && notes[0].1.contains("hotkeys = { pad = "),
+                "{notes:?}"
+            );
             // 你写的先拿;不要;清单没给的你给一个;写得不对的点名,键不给
             let (got, notes) = settle_hotkeys(&[
                 h("a", "pick", Some("C-]"), Some("")),
@@ -241,7 +244,10 @@ mod tests {
             assert_eq!(got, [Some('m'), None]);
             assert_eq!(notes.len(), 1);
             assert_eq!(notes[0].0, "b");
-            assert!(notes[0].1.contains("键 m 给了 a「mounts」,b「mail」没拿到") && notes[0].1.contains("keys = { mail = "), "{notes:?}");
+            assert!(
+                notes[0].1.contains("键 m 已分配给 a「mounts」,b「mail」未分配到") && notes[0].1.contains("keys = { mail = "),
+                "{notes:?}"
+            );
             // 你给 b 写了 m:你写的先拿,a 的清单默认没拿到
             let (got, notes) = settle(&[w("a", "mounts", Some('m'), None), w("b", "mail", Some('m'), Some("m"))]);
             assert_eq!((got, notes[0].0.as_str()), (vec![None, Some('m')], "a"));
@@ -254,7 +260,7 @@ mod tests {
             ]);
             assert_eq!(got, [Some('M'), None, None, None]);
             assert_eq!(notes.len(), 2, "{notes:?}");
-            assert!(notes[0].1.contains("一个字符") && notes[1].1.contains(": 菜单自己用的"), "{notes:?}");
+            assert!(notes[0].1.contains("单个字符") && notes[1].1.contains(": 菜单占用"), "{notes:?}");
         });
     }
 }

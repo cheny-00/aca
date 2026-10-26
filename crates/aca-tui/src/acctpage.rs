@@ -104,11 +104,11 @@ impl Form {
             KeyCode::Enter => {
                 let name = self.text.trim().to_string();
                 if name.is_empty() {
-                    self.hint = t!("账号名是空的", "the account name is empty").into();
+                    self.hint = t!("账号名不能为空", "the account name is empty").into();
                 } else if !accounts::valid_name(&name) {
-                    self.hint = t!("账号名只能用字母、数字、- 和 _", "an account name is letters, digits, - and _").into();
+                    self.hint = t!("账号名只能包含字母、数字、- 和 _", "an account name is letters, digits, - and _").into();
                 } else if taken(self.agent, &name) {
-                    self.hint = tr!("已经有这个账号:{name}", "that account already exists: {name}");
+                    self.hint = tr!("账号已存在:{name}", "that account already exists: {name}");
                 } else {
                     (self.step, self.text, self.hint) = (Step::Dir, accounts::default_dir(self.agent, &name), String::new());
                     self.name = name;
@@ -136,11 +136,11 @@ impl Form {
     pub fn lines(&self, w: usize, done: &str) -> Vec<Line<'static>> {
         let bold = theme::accent().add_modifier(Modifier::BOLD);
         if self.step == Step::Tool {
-            let mut out = vec![Line::styled(t!("加账号 · 哪个工具的", "Add an account · for which tool"), bold)];
+            let mut out = vec![Line::styled(t!("添加账号 · 选择工具", "Add an account · for which tool"), bold)];
             let name_w = accounts::who(Agent::Claude).width();
             for a in [Agent::Claude, Agent::Codex] {
                 let on = a == self.agent;
-                let note = tr!("目录默认 {}", "directory defaults to {}", accounts::default_dir(a, t!("<名字>", "<NAME>")));
+                let note = tr!("默认目录 {}", "directory defaults to {}", accounts::default_dir(a, t!("<名字>", "<NAME>")));
                 let mut name = who_span(a);
                 name.content = format!("{:name_w$}", name.content).into();
                 let room = w.saturating_sub(2 + name_w + 2);
@@ -153,13 +153,13 @@ impl Form {
                 out.push(kit::picked(line, w, on));
             }
             out.push(Line::raw(""));
-            out.push(kit::keys_line(&[("⏎", t!("下一步", "next")), ("↑↓", t!("换", "switch")), ("Esc", t!("退回", "back"))], vec![], w));
+            out.push(kit::keys_line(&[("⏎", t!("下一步", "next")), ("↑↓", t!("切换", "switch")), ("Esc", t!("返回", "back"))], vec![], w));
             return out;
         }
         let (mut title, tip, enter) = match self.step {
             Step::Dir => (
                 vec![Span::styled(tr!(" 账号 · {} · 目录", " account · {} · directory", self.name), bold)],
-                t!("没有就新建", "Created if missing"),
+                t!("不存在时自动创建", "Created if missing"),
                 done,
             ),
             _ => (
@@ -168,7 +168,7 @@ impl Form {
                 t!("下一步", "next"),
             ),
         };
-        title.splice(0..0, [Span::styled(t!("加 ", "Add a "), bold), who_span(self.agent)]);
+        title.splice(0..0, [Span::styled(t!("添加 ", "Add a "), bold), who_span(self.agent)]);
         let input = vec![Span::styled("> ", bold), Span::raw(tail(&self.text, w.saturating_sub(3))), Span::styled("▏", theme::accent())];
         let mut out = vec![Line::from(title), Line::from(input)];
         if self.hint.is_empty() {
@@ -177,7 +177,7 @@ impl Form {
             out.extend(fold(&self.hint, w).into_iter().map(|l| Line::styled(l, theme::warn())));
         }
         out.push(Line::raw(""));
-        out.push(kit::keys_line(&[("⏎", enter), ("Esc", t!("退回", "back"))], vec![], w));
+        out.push(kit::keys_line(&[("⏎", enter), ("Esc", t!("返回", "back"))], vec![], w));
         out
     }
 }
@@ -265,10 +265,10 @@ fn own_spec(a: Agent) -> String {
 /// 问到的登录怎么写:记号、一句话、颜色。None = 还在问
 fn login_said(l: Option<Login>) -> (&'static str, String, Style) {
     match l {
-        None => ("…", t!("在问", "asking").into(), kit::dim()),
-        Some(Login::In(who)) if who.is_empty() => ("●", t!("登录着", "logged in").into(), Style::new().fg(theme::pal().green)),
+        None => ("…", t!("查询中", "asking").into(), kit::dim()),
+        Some(Login::In(who)) if who.is_empty() => ("●", t!("已登录", "logged in").into(), Style::new().fg(theme::pal().green)),
         Some(Login::In(who)) => ("●", who, Style::new().fg(theme::pal().green)),
-        Some(Login::Out) => ("○", t!("没登录", "not logged in").into(), theme::warn()),
+        Some(Login::Out) => ("○", t!("未登录", "not logged in").into(), theme::warn()),
         Some(Login::Unknown(said)) => ("?", said, kit::dim()),
     }
 }
@@ -316,7 +316,7 @@ fn field(out: &mut Vec<Line<'static>>, w: usize, lw: usize, label: &str, lead: O
 /// 启动参数改的时候是一行字,照 shell 的写法分:空格隔开,带空格的用引号包上(`'…'` 原样,`"…"` 里 `\"` `\\` 转义)。
 /// 引号没配上 = Err
 fn split(s: &str) -> Result<Vec<String>, String> {
-    let unclosed = || t!("引号没配上", "a quote isn't closed").to_string();
+    let unclosed = || t!("引号不成对", "a quote isn't closed").to_string();
     let mut out = vec![];
     // None = 不在一个词里(连着的引号、字算同一个词:`--x='a b'`)
     let mut cur: Option<String> = None;
@@ -591,7 +591,7 @@ impl Page {
             return ("⚠", tr!("是 {} 的目录", "a {} directory", accounts::who(*other)), theme::warn());
         }
         if !r.there {
-            return ("⚠", t!("目录不在", "directory missing").into(), theme::warn());
+            return ("⚠", t!("目录不存在", "directory missing").into(), theme::warn());
         }
         login_said(self.login_of(r))
     }
@@ -613,7 +613,7 @@ impl Page {
                     }
                     out.push(kit::picked(Line::from(who_span(a)), w, on && self.form.is_none()));
                     if !matches!(items.get(n + 1), Some(Item::Acct(_))) {
-                        out.push(Line::styled(t!("  还没有账号", "  no accounts yet"), kit::dim()));
+                        out.push(Line::styled(t!("  暂无账号", "  no accounts yet"), kit::dim()));
                     }
                     continue;
                 }
@@ -636,7 +636,7 @@ impl Page {
             out.push(kit::picked(line, w, on && self.form.is_none()));
         }
         if items.is_empty() {
-            out.push(Line::styled(t!("还没有账号", "no accounts yet"), kit::dim()));
+            out.push(Line::styled(t!("暂无账号", "no accounts yet"), kit::dim()));
         }
         (out, at)
     }
@@ -644,13 +644,13 @@ impl Page {
     /// 右边那一栏:在加账号就是那张表单,按过 d 是要删什么,高亮的是段头就是那一家的,不然是高亮那个账号的整页
     fn right(&self, w: usize) -> Vec<Line<'static>> {
         if let Some(f) = &self.form {
-            return f.lines(w, t!("加上", "add"));
+            return f.lines(w, t!("添加", "add"));
         }
         match self.item() {
             // 哪一家都没装、没登记(键栏有 +)
             None => {
                 let none = t!(
-                    "没加账号时用的是 ~/.claude、~/.codex;另一个订阅、另一个 key:+ 加账号",
+                    "默认使用 ~/.claude、~/.codex · + 添加账号",
                     "Without accounts, ~/.claude and ~/.codex are used; for another subscription or key: + adds an account"
                 );
                 fold(none, w).into_iter().map(|l| Line::styled(l, kit::dim())).collect()
@@ -675,7 +675,7 @@ impl Page {
         let bare = !self.rows.iter().any(|r| r.a.agent == a);
         if let Some(own) = self.own.iter().find(|o| o.agent == a).filter(|_| bare) {
             let none = tr!(
-                "没加账号时用的是 {};另一个订阅、另一个 key:+ 加账号",
+                "默认使用 {} · + 添加账号",
                 "Without accounts, {} is used; for another subscription or key: + adds an account",
                 own.dir
             );
@@ -714,7 +714,7 @@ impl Page {
             field(out, w, label_w(), "", None, &self.args_err, theme::warn());
         }
         out.push(Line::raw(""));
-        out.push(kit::keys_line(&[("⏎", t!("存", "save")), ("^U", t!("清空", "clear"))], vec![], w));
+        out.push(kit::keys_line(&[("⏎", t!("保存", "save")), ("^U", t!("清空", "clear"))], vec![], w));
     }
 
     /// 名字后面那个「默认」:哪些工具不写账号时用它。只有它自己那一家的就不写是哪个
@@ -744,7 +744,7 @@ impl Page {
             let theirs = accounts::who(*other);
             let said = [
                 tr!("⚠ 这是 {theirs} 的目录({why})", "⚠ This is a {theirs} directory ({why})"),
-                tr!("d 删掉;要用它,+ 加成 {theirs} 的账号", "d removes it; to use it, + adds it for {theirs}"),
+                tr!("d 删除 · + 添加为 {theirs} 账号", "d removes it; to use it, + adds it for {theirs}"),
             ];
             out.extend(said.iter().flat_map(|s| fold(s, w)).map(|l| Line::styled(l, theme::warn())));
             out.push(Line::raw(""));
@@ -754,9 +754,9 @@ impl Page {
         if r.foreign.is_none() {
             let (mark, said, st) = self.state(r);
             let said = match (r.there, mark) {
-                (false, _) => t!("目录不在 · d 删掉", "directory missing · d removes it").to_string(),
-                (_, "○") => t!("没登录 · ⏎ 登录", "not logged in · ⏎ logs in").to_string(),
-                (_, "?") => tr!("问不出登录着没有:{said}", "can't tell whether it's logged in: {said}"),
+                (false, _) => t!("目录不存在 · d 删除", "directory missing · d removes it").to_string(),
+                (_, "○") => t!("未登录 · ⏎ 登录", "not logged in · ⏎ logs in").to_string(),
+                (_, "?") => tr!("无法确认登录状态:{said}", "can't tell whether it's logged in: {said}"),
                 _ => said,
             };
             put(&mut out, labels[1], Some((mark, st)), &said, if mark == "●" { plain } else { st });
@@ -771,7 +771,7 @@ impl Page {
             out.push(Line::from(spans));
         }
         if let Some((bar, feeds)) = r.bar {
-            let said = if feeds || self.mods { bar.to_string() } else { tr!("{bar} · 看不到额度", "{bar} · no quotas") };
+            let said = if feeds || self.mods { bar.to_string() } else { tr!("{bar} · 无额度信息", "{bar} · no quotas") };
             put(&mut out, labels[3], None, &said, plain);
         }
         // 启动参数:账号自己的,和这一家每个账号都带的(排在前面,在段头上改)
@@ -779,7 +779,7 @@ impl Page {
         self.args_field(&mut out, w, &own);
         let common = self.common(r.a.agent);
         if !common.is_empty() {
-            let every = tr!("每个 {} 账号都带:{}", "every {} account gets: {}", accounts::who(r.a.agent), join(common));
+            let every = tr!("所有 {} 账号都附带:{}", "every {} account gets: {}", accounts::who(r.a.agent), join(common));
             let label = if self.editing.is_none() && own.is_empty() { labels[4] } else { "" };
             put(&mut out, label, None, &every, kit::dim());
         }
@@ -790,7 +790,7 @@ impl Page {
         // 有内容才写的几项,和上面空一行
         let (mut more, n) = (vec![], r.used.len());
         if n > 0 {
-            put(&mut more, labels[5], None, &tr!("{n} 个在用", "{n} using it"), plain);
+            put(&mut more, labels[5], None, &tr!("{n} 个正在使用", "{n} using it"), plain);
             let room = w.saturating_sub(lw + 2);
             for title in r.used.iter().take(if n > TITLES { TITLES - 1 } else { TITLES }) {
                 more.push(Line::styled(format!("{}· {}", " ".repeat(lw), kit::clip(title, room).trim_end()), kit::dim()));
@@ -814,29 +814,29 @@ impl Page {
     fn confirm(&self, r: &Row, w: usize) -> Vec<Line<'static>> {
         let me = accounts::who(r.a.agent);
         let kept = if r.a.dir.is_empty() || !r.there {
-            t!("只从 aca 里去掉。", "It's only taken out of aca.")
+            t!("仅从 aca 中移除。", "It's only taken out of aca.")
         } else {
-            t!("只从 aca 里去掉,目录和里面的登录留着。", "It's only taken out of aca; the directory and its login stay.")
+            t!("仅从 aca 中移除,目录和登录信息保留。", "It's only taken out of aca; the directory and its login stay.")
         };
         let mut said = vec![kept.to_string()];
         if !r.used.is_empty() {
             said.push(tr!(
-                "有 {} 个会话在用它,删了以后它们重启不了。",
+                "{} 个会话正在使用它,删除后这些会话将无法重启。",
                 "{} sessions use it; once removed they can't restart.",
                 r.used.len()
             ));
         }
         for tool in &r.default_of {
             said.push(tr!(
-                "它是 {tool} 的默认账号,删了以后不指定账号的 {tool} 起不来。",
+                "它是 {tool} 的默认账号,删除后未指定账号的 {tool} 会话将无法启动。",
                 "It's {tool}'s default account; once removed, {tool} won't start without an account given."
             ));
         }
-        let title = tr!("删掉 {me} 账号 {}?", "Remove the {me} account {}?", r.a.name);
+        let title = tr!("删除 {me} 账号 {}?", "Remove the {me} account {}?", r.a.name);
         let mut out = vec![Line::styled(title, theme::warn().add_modifier(Modifier::BOLD)), Line::raw("")];
         out.extend(said.iter().flat_map(|s| fold(s, w)).map(|l| Line::styled(l, Style::new())));
         out.push(Line::raw(""));
-        out.push(kit::keys_line(&[("y", t!("删掉", "remove")), (t!("别的键", "any other key"), t!("不删", "keep"))], vec![], w));
+        out.push(kit::keys_line(&[("y", t!("删除", "remove")), (t!("其他键", "any other key"), t!("取消", "keep"))], vec![], w));
         out
     }
 
@@ -850,18 +850,18 @@ impl Page {
         let me = accounts::who(r.a.agent);
         // 还没问到的不写:当它登录着问一句
         let now = match self.login_of(r) {
-            Some(Login::In(who)) if !who.is_empty() => tr!("它现在登录着:{who}。", "It is logged in now: {who}."),
-            Some(Login::In(_)) => t!("它现在登录着。", "It is logged in now.").to_string(),
-            Some(Login::Unknown(said)) => tr!("问不出登录着没有:{said}", "can't tell whether it's logged in: {said}"),
+            Some(Login::In(who)) if !who.is_empty() => tr!("当前已登录:{who}。", "It is logged in now: {who}."),
+            Some(Login::In(_)) => t!("当前已登录。", "It is logged in now.").to_string(),
+            Some(Login::Unknown(said)) => tr!("无法确认登录状态:{said}", "can't tell whether it's logged in: {said}"),
             _ => String::new(),
         };
         let lost = if r.a.agent == Agent::Codex {
             t!(
-                "Codex 一开始登录就删掉现在这份:中途没登完,这个账号就没登录了。",
+                "Codex 开始登录时会清除当前登录,中途退出将变为未登录。",
                 "Codex's login deletes the current one as it starts: if you don't finish, this account is left logged out."
             )
         } else {
-            t!("重新登录会换掉现在这份登录。", "Logging in again replaces the current login.")
+            t!("重新登录将替换当前登录。", "Logging in again replaces the current login.")
         };
         let title = tr!("重新登录 {me} 账号 {}?", "Log the {me} account {} in again?", r.a.name);
         let mut out = vec![Line::styled(title, theme::warn().add_modifier(Modifier::BOLD)), Line::raw("")];
@@ -870,7 +870,7 @@ impl Page {
         }
         out.extend(fold(lost, w).into_iter().map(|l| Line::styled(l, theme::warn())));
         out.push(Line::raw(""));
-        let keys = [("y", t!("重新登录", "log in again")), (t!("别的键", "any other key"), t!("不登录", "leave it"))];
+        let keys = [("y", t!("重新登录", "log in again")), (t!("其他键", "any other key"), t!("取消", "leave it"))];
         out.push(kit::keys_line(&keys, vec![], w));
         out
     }
@@ -879,7 +879,7 @@ impl Page {
     fn login(&mut self, fx: &mut Fx) {
         let Some(r) = self.cur() else { return };
         if let Some((other, _)) = &r.foreign {
-            return fx.say(tr!("是 {} 的目录,不在这登录", "a {} directory, not logging in here", accounts::who(*other)));
+            return fx.say(tr!("是 {} 的目录,不能在此登录", "a {} directory, not logging in here", accounts::who(*other)));
         }
         if self.logged_out(r) { self.open_login(fx) } else { self.asking = Some(Asking::Relogin) }
     }
@@ -919,7 +919,7 @@ impl Page {
                 self.read();
                 self.at(a, &name);
                 // Claude 的额度靠状态栏:接不接在 s 里挑,不替人接(键栏写着 s)
-                fx.say(tr!("已加 {} 账号 {name}", "added the {} account {name}", accounts::who(a)));
+                fx.say(tr!("已添加 {} 账号 {name}", "added the {} account {name}", accounts::who(a)));
                 if added.created {
                     fx.term = Some(self.term(&name, a, accounts::login_cmd(a, &name)));
                 }
@@ -949,7 +949,7 @@ impl Page {
                     // 高亮跟着原来那一项
                     self.read();
                     // 开着的会话不动,新起、重启的才用这份
-                    fx.say(t!("存了,新会话生效", "saved; new sessions use it"));
+                    fx.say(t!("已保存,新会话生效", "saved; new sessions use it"));
                 }
             }
             Err(e) => self.args_err = e,
@@ -962,7 +962,7 @@ impl Page {
         match accounts::remove_in(&self.env.config, &self.env.home, a, &name) {
             // 目录留着:删之前的确认里说过了
             Ok(_) => {
-                fx.say(tr!("删掉了 {} 账号 {name}", "removed the {} account {name}", accounts::who(a)));
+                fx.say(tr!("已删除 {} 账号 {name}", "removed the {} account {name}", accounts::who(a)));
                 self.read();
             }
             Err(e) => fx.say(e),
@@ -1011,18 +1011,18 @@ impl Overlay for Page {
     /// 标题、两栏(窄屏上下叠)、细线、键;正好 h 行
     fn lines_in(&self, w: usize, h: usize) -> Vec<Line<'static>> {
         let busy = self.form.is_some() || self.asking.is_some() || self.editing.is_some();
-        let esc = kit::esc_hint(if busy { t!("退回", "back") } else { t!("关闭", "close") });
+        let esc = kit::esc_hint(if busy { t!("返回", "back") } else { t!("关闭", "close") });
         let mut out = vec![kit::modal_title(t!("账号", "Accounts"), theme::accent(), esc, w), Line::raw("")];
         // 放不下时后面的键先不写:最要紧的排前面。在填表单、在问删不删时键写在右边那一栏里
         let out_now = self.cur().is_none_or(|r| r.foreign.is_some() || self.logged_out(r));
         let all = [
             ("⏎", if out_now { t!("登录", "log in") } else { t!("重新登录", "log in again") }),
-            ("+", t!("加账号", "add")),
-            ("d", t!("删", "remove")),
-            ("⇧↑↓", t!("挪", "move")),
+            ("+", t!("添加账号", "add")),
+            ("d", t!("删除", "remove")),
+            ("⇧↑↓", t!("移动", "move")),
             ("p", t!("启动参数", "launch args")),
             ("s", t!("状态栏", "status bar")),
-            ("r", t!("重查", "recheck")),
+            ("r", t!("刷新", "recheck")),
         ];
         // 段头上没有只对一个账号的那几个;状态栏那张表一个账号都没有时是空的
         let on_head = |k: &str| ["+", "p", "r"].contains(&k) || (k == "s" && !self.rows.is_empty());
@@ -1263,17 +1263,17 @@ mod tests {
         // sub:额度;启动参数只有每个 Claude 账号都带的那份
         press(&mut p, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
         assert_eq!(on(&p), "sub");
-        shows(&shown(&p, 110), &["额度      5h 12% · 7d 61%", "启动参数  每个 Claude Code 账号都带:--x"]);
+        shows(&shown(&p, 110), &["额度      5h 12% · 7d 61%", "启动参数  所有 Claude Code 账号都附带:--x"]);
         // p:改它自己的,存进 config.toml 那一行
         press(&mut p, &[KeyCode::Char('p')]);
         assert!(p.typing());
         type_in(&mut p, "--model 'big one'");
-        shows(&shown(&p, 110), &["启动参数  --model 'big one'▏", "⏎ 存 • ^U 清空"]);
+        shows(&shown(&p, 110), &["启动参数  --model 'big one'▏", "⏎ 保存 • ^U 清空"]);
         let fx = press(&mut p, &[KeyCode::Enter]);
-        assert_eq!((fx.flash.as_deref(), p.editing.is_none()), (Some("存了,新会话生效"), true));
+        assert_eq!((fx.flash.as_deref(), p.editing.is_none()), (Some("已保存,新会话生效"), true));
         let saved = std::fs::read_to_string(&p.env.config).unwrap();
         assert!(saved.contains("sub = { home = \"~/.claude-sub\", args = [\"--model\", \"big one\"] }\n"), "{saved}");
-        shows(&shown(&p, 110), &["启动参数  --model 'big one'", "          每个 Claude Code 账号都带:--x"]);
+        shows(&shown(&p, 110), &["启动参数  --model 'big one'", "          所有 Claude Code 账号都附带:--x"]);
         // 引号没配上:说为什么,接着改;Esc 不改
         press(&mut p, &[KeyCode::Char('p')]);
         type_in(&mut p, " \"oops");
@@ -1304,7 +1304,7 @@ mod tests {
         assert!(text.iter().any(|l| l.starts_with("Claude Code") && l.contains("│  Claude Code")), "{text:#?}");
         shows(&text, &["启动参数  --x"]);
         // 段头上没有只对一个账号的键
-        assert_eq!(text.last().unwrap(), "+ 加账号 • p 启动参数 • s 状态栏 • r 重查");
+        assert_eq!(text.last().unwrap(), "+ 添加账号 • p 启动参数 • s 状态栏 • r 刷新");
         assert!(press(&mut p, &[KeyCode::Enter]).term.is_none() && p.asking.is_none());
         press(&mut p, &[KeyCode::Char('d')]);
         assert!(p.asking.is_none());
@@ -1312,9 +1312,9 @@ mod tests {
         press(&mut p, &[KeyCode::Char('p')]);
         assert!(p.typing());
         type_in(&mut p, " --effort high");
-        shows(&shown(&p, 110), &["启动参数  --x --effort high▏", "⏎ 存 • ^U 清空"]);
+        shows(&shown(&p, 110), &["启动参数  --x --effort high▏", "⏎ 保存 • ^U 清空"]);
         let fx = press(&mut p, &[KeyCode::Enter]);
-        assert_eq!((fx.flash.as_deref(), p.editing.is_none(), on(&p)), (Some("存了,新会话生效"), true, "Claude Code"));
+        assert_eq!((fx.flash.as_deref(), p.editing.is_none(), on(&p)), (Some("已保存,新会话生效"), true, "Claude Code"));
         let saved = std::fs::read_to_string(&p.env.config).unwrap();
         assert_eq!(saved, config.replace("args = [\"--x\"]", "args = [\"--x\", \"--effort\", \"high\"]"));
         // 账号那页写着每个账号都带的
@@ -1322,7 +1322,7 @@ mod tests {
         assert_eq!(on(&p), "cx");
         press(&mut p, &[KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down]);
         assert_eq!(on(&p), "sub");
-        shows(&shown(&p, 110), &["启动参数  每个 Claude Code 账号都带:--x --effort high"]);
+        shows(&shown(&p, 110), &["启动参数  所有 Claude Code 账号都附带:--x --effort high"]);
         // Codex 那一段:原来没有这一段,加在最后
         press(&mut p, &[KeyCode::Down]);
         assert_eq!(on(&p), "Codex");
@@ -1332,7 +1332,7 @@ mod tests {
         press(&mut p, &[KeyCode::Enter]);
         assert_eq!(std::fs::read_to_string(&p.env.config).unwrap(), format!("{saved}\n[tools.codex]\nargs = [\"--search\"]\n"));
         press(&mut p, &[KeyCode::Down]);
-        shows(&shown(&p, 110), &["启动参数  每个 Codex 账号都带:--search"]);
+        shows(&shown(&p, 110), &["启动参数  所有 Codex 账号都附带:--search"]);
         // 没改就回车:不写、不说;引号没配上:说为什么,接着改
         press(&mut p, &[KeyCode::Up, KeyCode::Char('p')]);
         let before = std::fs::read_to_string(&p.env.config).unwrap();
@@ -1340,8 +1340,8 @@ mod tests {
         press(&mut p, &[KeyCode::Char('p')]);
         type_in(&mut p, " 'oops");
         press(&mut p, &[KeyCode::Enter]);
-        assert!(p.editing.is_some() && p.args_err == "引号没配上");
-        shows(&shown(&p, 110), &["引号没配上"]);
+        assert!(p.editing.is_some() && p.args_err == "引号不成对");
+        shows(&shown(&p, 110), &["引号不成对"]);
         press(&mut p, &[KeyCode::Esc]);
         assert!(p.editing.is_none() && std::fs::read_to_string(&p.env.config).unwrap() == before);
         let _ = std::fs::remove_dir_all(&root);
@@ -1372,16 +1372,16 @@ mod tests {
         let at = |want: &str| text.iter().position(|l| l.starts_with(want)).unwrap_or_else(|| panic!("没有「{want}」开头的行:{text:#?}"));
         assert!(at("Claude Code") < at("  sub ") && at("  gone ") < at("Codex") && at("Codex") < at("  cx "), "{text:#?}");
         assert!(row(&text, "sub").contains("● max") && !row(&text, "sub").contains("me@example.com"), "{text:#?}");
-        assert!(row(&text, "firm").contains("○ 没登录") && row(&text, "cx").contains("● ChatGPT"), "{text:#?}");
+        assert!(row(&text, "firm").contains("○ 未登录") && row(&text, "cx").contains("● ChatGPT"), "{text:#?}");
         // 另一家的目录、不在的目录:标出来,不去问它登录(问了会在里面写东西)
-        assert!(row(&text, "codex").contains("⚠ 是 Codex 的目录") && row(&text, "gone").contains("⚠ 目录不在"), "{text:#?}");
+        assert!(row(&text, "codex").contains("⚠ 是 Codex 的目录") && row(&text, "gone").contains("⚠ 目录不存在"), "{text:#?}");
         assert!(!p.logins.lock().unwrap().keys().any(|k| k == "claude:codex" || k == "claude:gone"));
         // 右边:高亮那个(加错的)—— 是谁的目录、怎么办;没有登录那一项
         assert_eq!(on(&p), "codex");
-        shows(&text, &["⚠ 这是 Codex 的目录(里面有 auth.json、config.toml…)", "d 删掉;要用它,+ 加成 Codex 的账号", "目录      ~/.codex"]);
+        shows(&text, &["⚠ 这是 Codex 的目录(其中包含 auth.json、config.toml…)", "d 删除 · + 添加为 Codex 账号", "目录      ~/.codex"]);
         assert!(!text.iter().any(|l| l.contains(" 登录    ")), "{text:#?}");
         press(&mut p, &[KeyCode::Down, KeyCode::Down]);
-        shows(&shown(&p, 110), &["登录      ⚠ 目录不在 · d 删掉"]);
+        shows(&shown(&p, 110), &["登录      ⚠ 目录不存在 · d 删除"]);
         // 登录着的:是谁、是默认、状态栏、哪些会话在用;n 菜单里列着就不写
         press(&mut p, &[KeyCode::Down]);
         let text = shown(&p, 110);
@@ -1391,8 +1391,8 @@ mod tests {
                 "sub  默认",
                 "目录      ~/.claude-sub",
                 "登录      ● max · me@example.com",
-                "状态栏    不接 · 看不到额度",
-                "会话      2 个在用",
+                "状态栏    不接入 · 无额度信息",
+                "会话      2 个正在使用",
                 "        · 写账号页",
                 "        · 查额度",
             ],
@@ -1401,7 +1401,7 @@ mod tests {
         // 没会话在用、不是默认的不写;n 菜单里藏着的写一句
         press(&mut p, &[KeyCode::Up, KeyCode::Up]);
         let text = shown(&p, 110);
-        shows(&text, &["登录      ○ 没登录 · ⏎ 登录", "n 菜单    不显示"]);
+        shows(&text, &["登录      ○ 未登录 · ⏎ 登录", "n 菜单    不显示"]);
         assert!(!text.iter().any(|l| l.contains(" 会话    ") || l.contains("默认")), "{text:#?}");
         // 往上绕过段头到最后一个
         press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Up]);
@@ -1418,7 +1418,7 @@ mod tests {
         dir(&root, ".claude-sub", &[]);
         let uses = (1..=9).map(|i| (Agent::Claude, "sub".to_string(), format!("会话 {i}"))).collect();
         let text = shown(&Page::load(env, uses, false), 110);
-        shows(&text, &["会话      9 个在用", "· 会话 4", "· …还有 5 个"]);
+        shows(&text, &["会话      9 个正在使用", "· 会话 4", "· …还有 5 个"]);
         assert!(!text.iter().any(|l| l.contains("会话 5")), "{text:#?}");
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1429,13 +1429,13 @@ mod tests {
         let before = std::fs::read_to_string(&p.env.config).unwrap();
         assert_eq!(names(&p), ["codex", "firm", "gone", "sub", "cx"]);
         press(&mut p, &[KeyCode::Char('d')]);
-        shows(&shown(&p, 110), &["删掉 Claude Code 账号 codex?", "只从 aca 里去掉,目录和里面的登录留着。", "y 删掉 • 别的键 不删"]);
+        shows(&shown(&p, 110), &["删除 Claude Code 账号 codex?", "仅从 aca 中移除,目录和登录信息保留。", "y 删除 • 其他键 取消"]);
         assert!(!shown(&p, 110).iter().any(|l| l.contains("config.toml")));
         // 别的键:不删,键也不往下走(j 不挪高亮)
         press(&mut p, &[KeyCode::Char('j')]);
         assert_eq!((on(&p), std::fs::read_to_string(&p.env.config).unwrap()), ("codex", before.clone()));
         let fx = press(&mut p, &[KeyCode::Char('d'), KeyCode::Char('y')]);
-        assert_eq!(fx.flash.as_deref(), Some("删掉了 Claude Code 账号 codex"));
+        assert_eq!(fx.flash.as_deref(), Some("已删除 Claude Code 账号 codex"));
         assert_eq!(names(&p), ["firm", "gone", "sub", "cx"]);
         // 只少了那一行;目录和里面的东西都在;删之前的那份留着
         assert_eq!(std::fs::read_to_string(&p.env.config).unwrap(), before.replace("codex = \"~/.codex\"\n", ""));
@@ -1443,7 +1443,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("aca/config.toml.bak-aca")).unwrap(), before);
         // 有会话在用的、是默认账号的:删之前说清楚
         press(&mut p, &[KeyCode::Down, KeyCode::Down, KeyCode::Char('d')]);
-        shows(&shown(&p, 110), &["删掉 Claude Code 账号 sub?", "有 2 个会话在用它,删了以后它们重启不了。", "它是 claude 的默认账号"]);
+        shows(&shown(&p, 110), &["删除 Claude Code 账号 sub?", "2 个会话正在使用它,删除后这些会话将无法重启。", "它是 claude 的默认账号"]);
         press(&mut p, &[KeyCode::Esc]);
         assert_eq!(names(&p).len(), 4);
         std::fs::remove_dir_all(&root).unwrap();
@@ -1490,20 +1490,20 @@ mod tests {
         // 第一步:两个工具摆出来挑,不是在打字(j / k 是挑);表单在右边那一栏,左边的列表还在
         assert!(!p.typing());
         let text = shown(&p, 110);
-        shows(&text, &["加账号 · 哪个工具的", "› Claude Code  目录默认 ~/.claude-<名字>", "  Codex        目录默认 ~/.codex-<名字>"]);
+        shows(&text, &["添加账号 · 选择工具", "› Claude Code  默认目录 ~/.claude-<名字>", "  Codex        默认目录 ~/.codex-<名字>"]);
         assert!(row(&text, "sub").contains("● max"), "{text:#?}");
         press(&mut p, &[KeyCode::Enter]);
         assert!(p.typing());
-        shows(&shown(&p, 110), &["加 Claude Code 账号 · 名字", "字母、数字、- 和 _"]);
+        shows(&shown(&p, 110), &["添加 Claude Code 账号 · 名字", "字母、数字、- 和 _"]);
         // 名字:空的、写得不对的、这一家里重了的,当场说
         press(&mut p, &[KeyCode::Enter]);
-        assert_eq!(p.form.as_ref().unwrap().hint, "账号名是空的");
+        assert_eq!(p.form.as_ref().unwrap().hint, "账号名不能为空");
         type_in(&mut p, "a b");
         press(&mut p, &[KeyCode::Enter]);
-        assert_eq!(p.form.as_ref().unwrap().hint, "账号名只能用字母、数字、- 和 _");
+        assert_eq!(p.form.as_ref().unwrap().hint, "账号名只能包含字母、数字、- 和 _");
         retype(&mut p, "sub");
         press(&mut p, &[KeyCode::Enter]);
-        assert_eq!(p.form.as_ref().unwrap().hint, "已经有这个账号:sub");
+        assert_eq!(p.form.as_ref().unwrap().hint, "账号已存在:sub");
         // 把 Codex 默认的目录登记成 Claude 的账号:不给,说它是谁的
         retype(&mut p, "mine");
         press(&mut p, &[KeyCode::Enter]);
@@ -1511,11 +1511,11 @@ mod tests {
         std::fs::remove_dir_all(root.join(".codex")).unwrap();
         retype(&mut p, "~/.codex");
         press(&mut p, &[KeyCode::Enter]);
-        assert_eq!(p.form.as_ref().unwrap().hint, "~/.codex 是 Codex 的目录(Codex 默认用它),不能加成 Claude Code 的账号");
+        assert_eq!(p.form.as_ref().unwrap().hint, "~/.codex 是 Codex 的目录(Codex 的默认目录),不能添加为 Claude Code 账号");
         dir(&root, ".elsewhere", &["auth.json", "config.toml", "version.json"]);
         retype(&mut p, "~/.elsewhere");
         press(&mut p, &[KeyCode::Enter]);
-        assert!(p.form.as_ref().unwrap().hint.starts_with("~/.elsewhere 是 Codex 的目录(里面有 auth.json、config.toml…)"));
+        assert!(p.form.as_ref().unwrap().hint.starts_with("~/.elsewhere 是 Codex 的目录(其中包含 auth.json、config.toml…)"));
         assert_eq!(std::fs::read_to_string(&p.env.config).unwrap(), before);
         // Esc 一步步退回第一步,换成 Codex:同一个目录就能加了;目录本来就在,不用登录
         press(&mut p, &[KeyCode::Esc, KeyCode::Esc, KeyCode::Down, KeyCode::Enter]);
@@ -1524,16 +1524,16 @@ mod tests {
         retype(&mut p, "~/.elsewhere");
         let fx = press(&mut p, &[KeyCode::Enter]);
         assert!(p.form.is_none() && fx.term.is_none());
-        assert_eq!(fx.flash.as_deref(), Some("已加 Codex 账号 mine"));
+        assert_eq!(fx.flash.as_deref(), Some("已添加 Codex 账号 mine"));
         assert_eq!((names(&p), on(&p)), (vec!["firm", "gone", "sub", "cx", "mine"], "mine"));
         shows(&shown(&p, 110), &["目录      ~/.elsewhere", "登录      ● ChatGPT"]);
         // 新建的目录:加完在下半屏开终端,带着这个账号跑它自己的登录
         press(&mut p, &[KeyCode::Char('+'), KeyCode::Enter]);
         type_in(&mut p, "work");
         press(&mut p, &[KeyCode::Enter]);
-        shows(&shown(&p, 110), &["加 Claude Code 账号 · work · 目录", "> ~/.claude-work", "没有就新建"]);
+        shows(&shown(&p, 110), &["加 Claude Code 账号 · work · 目录", "> ~/.claude-work", "不存在时自动创建"]);
         let fx = press(&mut p, &[KeyCode::Enter]);
-        assert_eq!(fx.flash.as_deref(), Some("已加 Claude Code 账号 work"));
+        assert_eq!(fx.flash.as_deref(), Some("已添加 Claude Code 账号 work"));
         let term = fx.term.unwrap();
         assert!(
             root.join(".claude-work").is_dir() && term.run.as_deref().is_some_and(|c| c.ends_with("' run claude:work")),
@@ -1553,7 +1553,7 @@ mod tests {
         let (root, mut p) = page("login");
         // 另一家的目录:不在里面登录
         let fx = press(&mut p, &[KeyCode::Enter]);
-        assert_eq!((fx.term.is_none(), fx.flash.as_deref()), (true, Some("是 Codex 的目录,不在这登录")));
+        assert_eq!((fx.term.is_none(), fx.flash.as_deref()), (true, Some("是 Codex 的目录,不能在此登录")));
         let fx = press(&mut p, &[KeyCode::Down, KeyCode::Enter]);
         let term = fx.term.unwrap();
         assert_eq!(term.title, "登录 Claude Code · firm");
@@ -1566,16 +1566,13 @@ mod tests {
         let fx = press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Up, KeyCode::Enter]);
         assert!(fx.term.is_none() && p.asking == Some(Asking::Relogin));
         let text = shown(&p, 110);
-        shows(
-            &text,
-            &["重新登录 Codex 账号 cx?", "它现在登录着:ChatGPT。", "Codex 一开始登录就删掉现在这份", "y 重新登录 • 别的键 不登录"],
-        );
-        assert!(text.last().unwrap().is_empty(), "在问的时候底下不写别的键:{text:#?}");
+        shows(&text, &["重新登录 Codex 账号 cx?", "当前已登录:ChatGPT。", "Codex 开始登录时会清除当前登录", "y 重新登录 • 其他键 取消"]);
+        assert!(text.last().unwrap().is_empty(), "在问的时候底下不写其他键:{text:#?}");
         // 别的键:不登录,回到那一页,键也不往下走
         let fx = press(&mut p, &[KeyCode::Enter]);
         assert!(fx.term.is_none() && p.asking.is_none() && on(&p) == "cx");
         shows(&shown(&p, 110), &["登录      ● ChatGPT"]);
-        assert!(shown(&p, 110).last().unwrap().starts_with("⏎ 重新登录 • + 加账号"));
+        assert!(shown(&p, 110).last().unwrap().starts_with("⏎ 重新登录 • + 添加账号"));
         let fx = press(&mut p, &[KeyCode::Enter, KeyCode::Char('y')]);
         let term = fx.term.unwrap();
         assert!(term.run.as_deref().is_some_and(|c| c.ends_with("' run codex:cx -- login")));
@@ -1583,20 +1580,20 @@ mod tests {
         // Claude 登录着的也先问;还没问到的、问不出的当它登录着(还没问到的不写现在登录着没有)
         let fx = press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Enter]);
         assert!(fx.term.is_none() && on(&p) == "sub");
-        shows(&shown(&p, 110), &["重新登录 Claude Code 账号 sub?", "它现在登录着:max · me@example.com。", "重新登录会换掉现在这份登录。"]);
+        shows(&shown(&p, 110), &["重新登录 Claude Code 账号 sub?", "当前已登录:max · me@example.com。", "重新登录将替换当前登录。"]);
         let fx = press(&mut p, &[KeyCode::Char('y')]);
         assert!(fx.term.unwrap().run.as_deref().is_some_and(|c| c.ends_with("' run claude:sub -- auth login")));
         p.logins.lock().unwrap().remove("claude:sub");
         assert!(press(&mut p, &[KeyCode::Enter]).term.is_none() && p.asking == Some(Asking::Relogin));
         let text = shown(&p, 110);
-        shows(&text, &["重新登录 Claude Code 账号 sub?", "重新登录会换掉现在这份登录。"]);
-        assert!(!text.iter().any(|l| l.contains("登录着")), "{text:#?}");
+        shows(&text, &["重新登录 Claude Code 账号 sub?", "重新登录将替换当前登录。"]);
+        assert!(!text.iter().any(|l| l.contains("已登录")), "{text:#?}");
         press(&mut p, &[KeyCode::Esc]);
         // 没登录的那一行写的是「登录」,⏎ 直接去
         press(&mut p, &[KeyCode::Up, KeyCode::Up]);
         assert_eq!(on(&p), "firm");
-        shows(&shown(&p, 110), &["登录      ○ 没登录 · ⏎ 登录"]);
-        assert!(shown(&p, 110).last().unwrap().starts_with("⏎ 登录 • + 加账号"));
+        shows(&shown(&p, 110), &["登录      ○ 未登录 · ⏎ 登录"]);
+        assert!(shown(&p, 110).last().unwrap().starts_with("⏎ 登录 • + 添加账号"));
         // r:问到的都丢掉重问(登录完回来按一下)
         p.logins.lock().unwrap().insert("claude:firm".into(), Login::Unknown("旧的".into()));
         press(&mut p, &[KeyCode::Char('r')]);
@@ -1636,11 +1633,11 @@ mod tests {
         assert_eq!((on(&p), tall), ("codex", Some(22)));
         // 宽的:最下面是细线和键;在填表单时键写在右边那一栏里,底下那行空着
         let wide = shown(&p, 116);
-        assert_eq!(wide[wide.len() - 1], "⏎ 登录 • + 加账号 • d 删 • ⇧↑↓ 挪 • p 启动参数 • s 状态栏 • r 重查");
+        assert_eq!(wide[wide.len() - 1], "⏎ 登录 • + 添加账号 • d 删除 • ⇧↑↓ 移动 • p 启动参数 • s 状态栏 • r 刷新");
         assert!(wide[wide.len() - 2].starts_with("────"), "{wide:#?}");
         press(&mut p, &[KeyCode::Char('+')]);
         let form = shown(&p, 116);
-        assert!(form.last().unwrap().is_empty() && form.iter().any(|l| l.ends_with("⏎ 下一步 • ↑↓ 换 • Esc 退回")), "{form:#?}");
+        assert!(form.last().unwrap().is_empty() && form.iter().any(|l| l.ends_with("⏎ 下一步 • ↑↓ 切换 • Esc 返回")), "{form:#?}");
         press(&mut p, &[KeyCode::Esc]);
         // 手机那么宽:上下叠,列表在上、高亮那个的整页在下
         press(&mut p, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
@@ -1656,17 +1653,17 @@ mod tests {
         // 没装的 Codex 不提
         assert_eq!(on(&none), "Claude Code");
         assert!(text.iter().any(|l| l.starts_with("Claude Code") && l.contains("│  Claude Code")), "{text:#?}");
-        shows(&text, &["  还没有账号", "没加账号时用的是 ~/.claude;另一个订阅、另一个 key:+ 加账号", "登录      ○ 没登录"]);
+        shows(&text, &["  暂无账号", "默认使用 ~/.claude · + 添加账号", "登录      ○ 未登录"]);
         shows(&text, &["          登录:aca run claude -- auth login"]);
         assert!(!text.iter().any(|l| l.contains("Codex") || l.contains("aca run codex")), "{text:#?}");
-        assert_eq!(text.last().unwrap(), "+ 加账号 • p 启动参数 • r 重查");
+        assert_eq!(text.last().unwrap(), "+ 添加账号 • p 启动参数 • r 刷新");
         // 哪一家都没装:只能加
         let (root3, mut env) = home("bare", "");
         env.installed = |_| false;
         let bare = Page::load(env, vec![], false);
         let text = shown(&bare, 110);
-        shows(&text, &["还没有账号", "没加账号时用的是 ~/.claude、~/.codex"]);
-        assert_eq!(text.last().unwrap(), "+ 加账号");
+        shows(&text, &["暂无账号", "默认使用 ~/.claude、~/.codex"]);
+        assert_eq!(text.last().unwrap(), "+ 添加账号");
         assert!(bare.item().is_none());
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&root2).unwrap();

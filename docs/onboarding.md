@@ -108,6 +108,7 @@ mark in front of each session tells you its state:
 | `○` | Idle, and you have seen its last reply | |
 | `✕` | Something went wrong | Go in and look |
 | `■` | Not running | `Enter` starts it again and resumes the conversation |
+| `☾` | Stopped by aca after sitting idle (set by `[idle]` in `config.toml`) | `Enter` starts it again and resumes the conversation |
 
 Sessions can be put in groups, for example one group per project. A new session goes into the group of the
 session you had selected; `m` moves it.
@@ -121,7 +122,7 @@ Press `?` in the interface for the full list. These cover most days:
 | `↑` `↓` or `j` `k` | Move in the list |
 | `Enter` | Go into the session (starts it first if it is not running) |
 | `Ctrl+Q` | Come back from a session |
-| `n` / `N` | New session: pick a tool / same tool and directory as the selected one |
+| `n` / `N` | New / new with the current settings (same tool, account and directory as the selected session) |
 | `i` | Jump to the next session that needs you |
 | `z` | Read the session's output full screen without going in |
 | `x` | See what it changed (the git diff of its working directory) |
@@ -132,7 +133,7 @@ Press `?` in the interface for the full list. These cover most days:
 | `/` | Filter the list |
 | `$` | Usage and cost |
 | `Ctrl+S` | Settings: theme, language, accounts |
-| `q` `q` or `Esc` | Quit aca. Sessions keep running |
+| `q` `q` | Quit aca. Sessions keep running |
 
 The README's [Keys](../README.md#keys) section lists a few more, the keys that work inside a session, and
 which keys you can change.

@@ -107,7 +107,7 @@ impl Overlay for View {
             Line::raw(""),
         ];
         if self.rows.is_empty() {
-            out.push(Line::styled(t!("没有 MCP", "no MCPs"), kit::dim()));
+            out.push(Line::styled(t!("暂无 MCP", "no MCPs"), kit::dim()));
         }
         let name_w = self.rows.iter().map(|r| r.name.width()).max().unwrap_or(0).min(16);
         for (i, r) in self.rows.iter().enumerate() {
@@ -149,7 +149,7 @@ impl Overlay for View {
             KeyCode::Up | KeyCode::Char('k') if n > 0 => self.sel = (self.sel + n - 1) % n,
             KeyCode::Char(' ') => match self.rows.get_mut(self.sel) {
                 Some(r) if matches!(r.kind, Kind::Project | Kind::Gateway) => r.want = !r.want,
-                Some(_) => fx.say(t!("这一项只读", "this one is read-only")),
+                Some(_) => fx.say(t!("此项只读", "this one is read-only")),
                 None => {}
             },
             KeyCode::Enter => {
@@ -159,14 +159,14 @@ impl Overlay for View {
                     // gateway 那组当场改:写这个会话的名单,在跑的 gateway 通知它重新拉工具列表
                     // Claude 马上重新拉工具列表,Codex 要重启
                     match aca_core::gateway::set_off(&self.t.id, &gateway_off(&self.rows)) {
-                        Ok(()) => fx.say(t!("改好了 · Codex 重启后生效", "changed · Codex picks it up after a restart")),
+                        Ok(()) => fx.say(t!("已修改 · Codex 重启后生效", "changed · Codex picks it up after a restart")),
                         Err(e) => fx.say(e),
                     }
                 }
                 if !on.is_empty() || !off.is_empty() {
                     fx.job = Some(Job::Mcp { t: self.t.clone(), dir: self.dir.clone(), on, off });
                 } else if !gw_changed {
-                    fx.say(t!("MCP 没改", "MCPs unchanged"));
+                    fx.say(t!("MCP 未修改", "MCPs unchanged"));
                 }
                 return Flow::Close;
             }
@@ -218,8 +218,8 @@ fn gateway_rows(session: &str, cat: &[(String, String)]) -> Vec<Row> {
         .map(|(spec, off)| {
             let desc = match (&spec.plugin, spec.tools) {
                 // 名字已经是从插件 id 来的,不再写一遍
-                (Some(_), _) => t!("插件带的", "from a plugin").to_string(),
-                (None, true) => t!("插件给 agent 的工具", "plugin tools for agents").to_string(),
+                (Some(_), _) => t!("来自插件", "from a plugin").to_string(),
+                (None, true) => t!("插件提供给 agent 的工具", "plugin tools for agents").to_string(),
                 (None, false) => {
                     cat.iter().find(|(n, _)| aca_core::plugin::mount::safe(n) == spec.name).map(|(_, d)| d.clone()).unwrap_or_default()
                 }
@@ -274,16 +274,16 @@ fn applied(text: &str, cat: &toml::Table, on: &[String], off: &[String]) -> Resu
     let mut doc: serde_json::Value = if text.trim().is_empty() {
         serde_json::json!({})
     } else {
-        serde_json::from_str(text).map_err(|e| tr!(".mcp.json 读不懂:{e}", "can't parse .mcp.json: {e}"))?
+        serde_json::from_str(text).map_err(|e| tr!("无法解析 .mcp.json:{e}", "can't parse .mcp.json: {e}"))?
     };
-    let root = doc.as_object_mut().ok_or(t!(".mcp.json 不是一个对象", ".mcp.json isn't an object"))?;
+    let root = doc.as_object_mut().ok_or(t!(".mcp.json 不是 JSON 对象", ".mcp.json isn't an object"))?;
     let servers = root
         .entry("mcpServers")
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .ok_or(t!(".mcp.json 的 mcpServers 不是一个对象", "mcpServers in .mcp.json isn't an object"))?;
+        .ok_or(t!(".mcp.json 的 mcpServers 不是 JSON 对象", "mcpServers in .mcp.json isn't an object"))?;
     for n in on {
-        let e = entry_of(cat, n).ok_or_else(|| tr!("config.toml 的 [mcps] 里没有 {n}", "no {n} under [mcps] in config.toml"))?;
+        let e = entry_of(cat, n).ok_or_else(|| tr!("config.toml 的 [mcps] 中没有 {n}", "no {n} under [mcps] in config.toml"))?;
         servers.insert(n.clone(), e);
     }
     for n in off {
@@ -300,18 +300,18 @@ pub fn apply(dir: &str, on: &[String], off: &[String]) -> Outcome {
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let new = match applied(&text, &config(), on, off) {
         Ok(t) => t,
-        Err(e) => return Outcome::Failed(tr!("MCP 没改:{e}", "MCPs unchanged: {e}")),
+        Err(e) => return Outcome::Failed(tr!("MCP 未修改:{e}", "MCPs unchanged: {e}")),
     };
     if let Err(e) = aca_core::paths::write_atomic(&path, &new) {
-        return Outcome::Failed(tr!("MCP 没改:写不了 {}:{e}", "MCPs unchanged: can't write {}: {e}", path.display()));
+        return Outcome::Failed(tr!("MCP 未修改:无法写入 {}:{e}", "MCPs unchanged: can't write {}: {e}", path.display()));
     }
     tidy(dir, !on.is_empty());
     let mut parts = vec![];
     if !on.is_empty() {
-        parts.push(tr!("已挂上 {}", "attached {}", on.join(t!("、", ", "))));
+        parts.push(tr!("已挂载 {}", "attached {}", on.join(t!("、", ", "))));
     }
     if !off.is_empty() {
-        parts.push(tr!("已卸下 {}", "detached {}", off.join(t!("、", ", "))));
+        parts.push(tr!("已卸载 {}", "detached {}", off.join(t!("、", ", "))));
     }
     parts.push(t!("重启后生效", "takes effect after a restart").into());
     Outcome::Done(parts.join(" · "))
@@ -516,8 +516,8 @@ mod tests {
         );
         // 目录里没有的、文件写坏了的:不动,说清楚
         assert!(applied(had, &cat, &["nope".into()], &[]).unwrap_err().contains("nope"));
-        assert!(applied("{", &cat, &[], &["web".into()]).unwrap_err().contains("读不懂"));
-        assert!(applied("[]", &cat, &[], &[]).unwrap_err().contains("不是一个对象"));
+        assert!(applied("{", &cat, &[], &["web".into()]).unwrap_err().contains("无法解析"));
+        assert!(applied("[]", &cat, &[], &[]).unwrap_err().contains("不是 JSON 对象"));
     }
 
     #[test]

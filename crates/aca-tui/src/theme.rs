@@ -95,96 +95,96 @@ fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color
             t!("界面", "Interface"),
             "accent",
             t!(
-                "强调色:顶上的标签、预览的框、底栏的主操作、弹窗的边框",
+                "强调色:顶栏标签、预览边框、底栏主操作、弹窗边框",
                 "accent: the tabs on top, the preview frame, the main action in the bottom bar, popup borders"
             ),
             &mut p.accent,
         ),
-        (t!("界面", "Interface"), "on_accent", t!("强调色底上的字", "text on the accent color"), &mut p.on_accent),
-        (t!("界面", "Interface"), "sel", t!("选中项整块的底色", "background of the selected item"), &mut p.sel),
-        (t!("界面", "Interface"), "pick", t!("v 多选选上的那几行的底色", "background of the rows selected with v"), &mut p.pick),
-        (t!("界面", "Interface"), "fade", t!("弹窗打开时底下那层的字", "text of the layer under an open popup"), &mut p.fade),
+        (t!("界面", "Interface"), "on_accent", t!("强调色背景上的文字", "text on the accent color"), &mut p.on_accent),
+        (t!("界面", "Interface"), "sel", t!("选中项的背景色", "background of the selected item"), &mut p.sel),
+        (t!("界面", "Interface"), "pick", t!("多选(v)选中行的背景色", "background of the rows selected with v"), &mut p.pick),
+        (t!("界面", "Interface"), "fade", t!("弹窗打开时底层的文字", "text of the layer under an open popup"), &mut p.fade),
         (t!("界面", "Interface"), "shadow", t!("弹窗的阴影", "popup shadow"), &mut p.shadow),
         (
             t!("界面", "Interface"),
             "minor",
-            t!("次要的字:编号、时间、目录、计数、按键的说明", "minor text: numbers, times, directories, counts, key hints"),
+            t!("次要文字:编号、时间、目录、计数、按键说明", "minor text: numbers, times, directories, counts, key hints"),
             &mut p.minor,
         ),
         (
             t!("界面", "Interface"),
             "faint",
-            t!("只是分隔用的符号:• │ ▾ └,小标题后面的线", "separator symbols: • │ ▾ └, the line after a subheading"),
+            t!("分隔符号:• │ ▾ └ 和小标题后的线", "separator symbols: • │ ▾ └, the line after a subheading"),
             &mut p.faint,
         ),
         (
             t!("界面", "Interface"),
             "warn",
-            t!("提示 / 警告的字,便签和置顶的记号", "hint / warning text, the marks for notes and pins"),
+            t!("提示和警告文字、便签和置顶标记", "hint / warning text, the marks for notes and pins"),
             &mut p.warn,
         ),
         (
             t!("界面", "Interface"),
             "hint",
-            t!("空格跳转时还要按的字母的底色", "background of the letters still to type when jumping with space"),
+            t!("空格跳转时待按字母的背景色", "background of the letters still to type when jumping with space"),
             &mut p.hint,
         ),
         (
             t!("界面", "Interface"),
             "hint_typed",
-            t!("空格跳转时已经按了的字母的底色", "background of the letters already typed when jumping"),
+            t!("空格跳转时已按字母的背景色", "background of the letters already typed when jumping"),
             &mut p.hint_typed,
         ),
-        (t!("界面", "Interface"), "on_hint", t!("跳转字母本身", "the jump letters themselves"), &mut p.on_hint),
+        (t!("界面", "Interface"), "on_hint", t!("跳转字母", "the jump letters themselves"), &mut p.on_hint),
         (
             t!("状态", "State"),
             "red",
             t!(
-                "◐ 待确认 / ✕ 出错;删除的确认框、改动页删掉的行、额度 ≥ 90%",
-                "◐ needs you / ✕ error; delete confirmations, removed lines in diffs, quota ≥ 90%"
+                "◆ 等待回应 / ✕ 出错;删除确认框、改动页删除的行、额度 ≥ 90%",
+                "◆ needs you / ✕ error; delete confirmations, removed lines in diffs, quota ≥ 90%"
             ),
             &mut p.red,
         ),
         (
             t!("状态", "State"),
             "green",
-            t!("● 在跑;改动页加的行;v 多选选上的记号", "● running; added lines in diffs; the mark on rows selected with v"),
+            t!("● 运行中;改动页新增的行;多选(v)选中标记", "● running; added lines in diffs; the mark on rows selected with v"),
             &mut p.green,
         ),
-        (t!("状态", "State"), "amber", t!("◐ 跑完了没看;额度 ≥ 70%", "◐ finished, unread; quota ≥ 70%"), &mut p.amber),
-        (t!("状态", "State"), "muted", t!("○ 空闲 / ■ 没在跑", "○ idle / ■ not running"), &mut p.muted),
-        (t!("状态", "State"), "hunk", t!("改动页里 @@ 那一行、改了名的文件", "the @@ line in diffs, renamed files"), &mut p.hunk),
-        (t!("账号", "Accounts"), "claude", t!("列表里 Claude 的账号名", "Claude account names in the list"), &mut p.claude),
-        (t!("账号", "Accounts"), "codex", t!("列表里 Codex 的账号名", "Codex account names in the list"), &mut p.codex),
-        (t!("账号", "Accounts"), "pi", t!("列表里 Pi 的账号名", "Pi account names in the list"), &mut p.pi),
-        (t!("账号", "Accounts"), "opencode", t!("列表里 OpenCode 的账号名", "OpenCode account names in the list"), &mut p.opencode),
+        (t!("状态", "State"), "amber", t!("◐ 未读;额度 ≥ 70%", "◐ finished, unread; quota ≥ 70%"), &mut p.amber),
+        (t!("状态", "State"), "muted", t!("○ 空闲 / ■ 已停止", "○ idle / ■ not running"), &mut p.muted),
+        (t!("状态", "State"), "hunk", t!("改动页的 @@ 行、重命名的文件", "the @@ line in diffs, renamed files"), &mut p.hunk),
+        (t!("账号", "Accounts"), "claude", t!("列表中 Claude 的账号名", "Claude account names in the list"), &mut p.claude),
+        (t!("账号", "Accounts"), "codex", t!("列表中 Codex 的账号名", "Codex account names in the list"), &mut p.codex),
+        (t!("账号", "Accounts"), "pi", t!("列表中 Pi 的账号名", "Pi account names in the list"), &mut p.pi),
+        (t!("账号", "Accounts"), "opencode", t!("列表中 OpenCode 的账号名", "OpenCode account names in the list"), &mut p.opencode),
         (
             t!("计费", "Billing"),
             "total",
             t!(
-                "不分账号的条:走势小图、按模型、按目录、额度没到 70% 的条",
+                "不区分账号的条:趋势图、按模型、按目录、额度低于 70% 的条",
                 "bars not split by account: trend sparkline, by model, by directory, quotas under 70%"
             ),
             &mut p.total,
         ),
-        (t!("计费", "Billing"), "other", t!("没颜色的账号(「其他」)", "accounts without a color (“other”)"), &mut p.other),
-        (t!("计费", "Billing"), "track", t!("额度条没用掉的那截", "the unused part of a quota bar"), &mut p.track),
-        (t!("代码", "Code"), "syn_kw", t!("会话记录(Z)里代码的关键字", "keywords in code in the session record (Z)"), &mut p.syn_kw),
-        (t!("代码", "Code"), "syn_str", t!("代码里的字符串", "strings in code"), &mut p.syn_str),
-        (t!("代码", "Code"), "syn_num", t!("代码里的数字、常量", "numbers and constants in code"), &mut p.syn_num),
-        (t!("代码", "Code"), "syn_fn", t!("代码里的函数名", "function names in code"), &mut p.syn_fn),
-        (t!("代码", "Code"), "syn_ty", t!("代码里的类型名", "type names in code"), &mut p.syn_ty),
-        (t!("代码", "Code"), "syn_com", t!("代码里的注释", "comments in code"), &mut p.syn_com),
+        (t!("计费", "Billing"), "other", t!("无颜色的账号(「其他」)", "accounts without a color (“other”)"), &mut p.other),
+        (t!("计费", "Billing"), "track", t!("额度条的剩余部分", "the unused part of a quota bar"), &mut p.track),
+        (t!("代码", "Code"), "syn_kw", t!("会话记录(Z)中代码的关键字", "keywords in code in the session record (Z)"), &mut p.syn_kw),
+        (t!("代码", "Code"), "syn_str", t!("代码中的字符串", "strings in code"), &mut p.syn_str),
+        (t!("代码", "Code"), "syn_num", t!("代码中的数字、常量", "numbers and constants in code"), &mut p.syn_num),
+        (t!("代码", "Code"), "syn_fn", t!("代码中的函数名", "function names in code"), &mut p.syn_fn),
+        (t!("代码", "Code"), "syn_ty", t!("代码中的类型名", "type names in code"), &mut p.syn_ty),
+        (t!("代码", "Code"), "syn_com", t!("代码中的注释", "comments in code"), &mut p.syn_com),
         (
             t!("代码", "Code"),
             "add_bg",
-            t!("会话记录的改动里加的那行的底色", "background of added lines in the session record's changes"),
+            t!("会话记录改动中新增行的背景色", "background of added lines in the session record's changes"),
             &mut p.add_bg,
         ),
         (
             t!("代码", "Code"),
             "del_bg",
-            t!("会话记录的改动里删的那行的底色", "background of removed lines in the session record's changes"),
+            t!("会话记录改动中删除行的背景色", "background of removed lines in the session record's changes"),
             &mut p.del_bg,
         ),
     ]
@@ -349,7 +349,7 @@ fn resolve(name: &str, dir: &Path, seen: &mut Vec<String>, bad: &mut Vec<String>
     {
         Ok(t) => t,
         Err(e) => {
-            bad.push(tr!("{at} 读不了,当没有这个文件:{e}", "{at} can't be read, treated as missing: {e}"));
+            bad.push(tr!("无法读取 {at},已忽略:{e}", "{at} can't be read, treated as missing: {e}"));
             return builtin(name);
         }
     };
@@ -357,19 +357,19 @@ fn resolve(name: &str, dir: &Path, seen: &mut Vec<String>, bad: &mut Vec<String>
         None => "latte".to_string(),
         Some(toml::Value::String(s)) => s.trim().to_string(),
         Some(v) => {
-            bad.push(tr!("{at} base = {v}:要写主题的名字,从 latte 改起", "{at} base = {v}: should be a theme name; starting from latte"));
+            bad.push(tr!("{at} base = {v}:应为主题名,已改用 latte", "{at} base = {v}: should be a theme name; starting from latte"));
             "latte".to_string()
         }
     };
     let parent = resolve(&base, dir, seen, bad).unwrap_or_else(|| {
-        bad.push(tr!("{at} base = \"{base}\":没有这个主题,从 latte 改起", "{at} base = \"{base}\": no such theme; starting from latte"));
+        bad.push(tr!("{at} base = \"{base}\":主题不存在,已改用 latte", "{at} base = \"{base}\": no such theme; starting from latte"));
         latte()
     });
     let dark = match t.get("dark") {
         None => parent.dark,
         Some(toml::Value::Boolean(b)) => *b,
         Some(v) => {
-            bad.push(tr!("{at} dark = {v}:写 true 或 false", "{at} dark = {v}: write true or false"));
+            bad.push(tr!("{at} dark = {v}:应为 true 或 false", "{at} dark = {v}: write true or false"));
             parent.dark
         }
     };
@@ -387,7 +387,7 @@ fn apply(mut p: Pal, over: &toml::Table, at: &str, bad: &mut Vec<String>) -> Pal
         let list = |v: &toml::Value, max: usize, bad: &mut Vec<String>| {
             let Some(a) = v.as_array().filter(|a| !a.is_empty() && a.len() <= max) else {
                 bad.push(tr!(
-                    "{at} {k}:要写成 [\"#RRGGBB\", …]{}",
+                    "{at} {k}:应写成 [\"#RRGGBB\", …]{}",
                     "{at} {k}: write it as [\"#RRGGBB\", …]{}",
                     if max < usize::MAX { tr!(",最多 {max} 个", ", at most {max}") } else { String::new() }
                 ));
@@ -395,7 +395,7 @@ fn apply(mut p: Pal, over: &toml::Table, at: &str, bad: &mut Vec<String>) -> Pal
             };
             let got: Vec<Color> = a.iter().filter_map(color).collect();
             if got.len() < a.len() {
-                bad.push(tr!("{at} {k}:里面有认不出的颜色,整组当没写", "{at} {k}: has a color it can't read; the whole list is ignored"));
+                bad.push(tr!("{at} {k}:包含无法识别的颜色,已忽略整组", "{at} {k}: has a color it can't read; the whole list is ignored"));
                 return None;
             }
             Some(got)
@@ -421,9 +421,9 @@ fn apply(mut p: Pal, over: &toml::Table, at: &str, bad: &mut Vec<String>) -> Pal
             _ => match tokens(&mut p).into_iter().find(|x| x.1 == k) {
                 Some((.., slot)) => match color(v) {
                     Some(c) => *slot = c,
-                    None => bad.push(tr!("{at} {k} = {v}:认不出的颜色", "{at} {k} = {v}: unknown color")),
+                    None => bad.push(tr!("{at} {k} = {v}:无法识别的颜色", "{at} {k} = {v}: unknown color")),
                 },
-                None => bad.push(tr!("{at} {k}:没有这个名字(aca theme 看有哪些)", "{at} {k}: no such name (aca theme lists them)")),
+                None => bad.push(tr!("{at} {k}:名称不存在(运行 aca theme 查看)", "{at} {k}: no such name (aca theme lists them)")),
             },
         }
     }
@@ -436,7 +436,7 @@ fn configured(text: &str, bad: &mut Vec<String>) -> Option<String> {
         Ok(t) => t,
         Err(e) => {
             if !text.trim().is_empty() {
-                bad.push(tr!("config.toml 格式不对,整个当没写:{}", "config.toml is malformed, all of it ignored: {}", e.message().trim()));
+                bad.push(tr!("config.toml 格式有误,已全部忽略:{}", "config.toml is malformed, all of it ignored: {}", e.message().trim()));
             }
             return None;
         }
@@ -446,7 +446,7 @@ fn configured(text: &str, bad: &mut Vec<String>) -> Option<String> {
     for (k, v) in th {
         match (k.as_str(), v) {
             ("name", toml::Value::String(s)) => name = Some(s.trim().to_string()),
-            _ => bad.push(tr!("config.toml [theme] {k}:只认 name = \"主题名\"", "config.toml [theme] {k}: only name = \"<theme>\"")),
+            _ => bad.push(tr!("config.toml [theme] {k}:只支持 name = \"主题名\"", "config.toml [theme] {k}: only name = \"<theme>\"")),
         }
     }
     name
@@ -471,7 +471,7 @@ fn pick(cfg: &str, dir: &Path, env: Option<&str>, chosen: Option<&str>) -> (Them
         .or(from_cfg)
         .unwrap_or_else(|| "latte".into());
     let t = resolve(&name, dir, &mut vec![], &mut bad).unwrap_or_else(|| {
-        bad.push(tr!("没有叫 {name} 的主题,用 latte", "no theme named {name}; using latte"));
+        bad.push(tr!("主题 {name} 不存在,已改用 latte", "no theme named {name}; using latte"));
         latte()
     });
     (t, bad)
@@ -683,7 +683,7 @@ fn swatch(c: Color) -> String {
 fn row(color: bool, name: &str, c: Color, was: Option<(&str, Color)>, about: &str) -> String {
     let changed = was.filter(|w| w.1 != c);
     let val = if changed.is_some() { format!("{c} *") } else { c.to_string() };
-    let tail = changed.map_or(String::new(), |(b, w)| tr!("({b} 里 {w})", "({w} in {b})"));
+    let tail = changed.map_or(String::new(), |(b, w)| tr!("({b} 中的 {w})", "({w} in {b})"));
     let sw = if color { swatch(c) } else { String::new() };
     format!("  {sw} {name:<12} {val:<10} {about}{tail}")
 }
@@ -708,13 +708,13 @@ fn kind(t: &Theme) -> String {
 
 /// 一套主题的每种颜色
 fn show(t: &Theme, now: &str, color: bool) {
-    let using = if t.name == now { t!(" · 现在用的", " · in use") } else { "" };
+    let using = if t.name == now { t!(" · 当前使用", " · in use") } else { "" };
     println!("{}", tr!("aca 的配色:{}({}{using})", "aca colors: {} ({}{using})", t.name, kind(t)));
     match &t.file {
         Some(f) => println!(
             "{}",
             tr!(
-                "改 {},只写跟 base 不一样的;存盘后开着的 aca 一秒内换上",
+                "修改 {}:只写与 base 不同的项;保存后,运行中的 aca 会在一秒内更新",
                 "edit {}, writing only what differs from base; open aca windows switch within a second of saving",
                 tilde(f)
             )
@@ -722,7 +722,7 @@ fn show(t: &Theme, now: &str, color: bool) {
         None => println!(
             "{}",
             tr!(
-                "内置的不能改:aca theme new 我的 {} 复制一份出来改,再 aca theme use 我的",
+                "内置主题不能修改:用 aca theme new 我的 {} 复制一份再改,然后 aca theme use 我的",
                 "built-ins can't be edited: aca theme new mine {} makes a copy to edit, then aca theme use mine",
                 t.name
             )
@@ -747,19 +747,19 @@ fn show(t: &Theme, now: &str, color: bool) {
     println!(
         "{}",
         tr!(
-            "\n计费 · 账号的颜色 series{}:一个账号一个位子,第一次见到时给、之后不换;有几个颜色就有几个位子,多的账号画 other 的灰",
+            "\n计费 · 账号颜色 series{}:每个账号占一个位置,首次出现时分配、之后不变;位置数等于颜色数,超出的账号用 other 的灰色",
             "\nBilling · account colors series{}: one slot per account, given when first seen and then kept; as many slots as colors, extra accounts are drawn in other's gray",
             if changed { " *" } else { "" }
         )
     );
     for (i, &c) in p.series.iter().enumerate() {
-        let who = owner(i).unwrap_or_else(|| t!("(空着)", "(free)").into());
+        let who = owner(i).unwrap_or_else(|| t!("(未设置)", "(free)").into());
         println!("{}", row(color, &format!("series {}", i + 1), c, None, &who));
     }
     if changed {
-        println!("{}", tr!("  {bname} 里:{}", "  in {bname}: {}", base.series.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")));
+        println!("{}", tr!("  {bname} 中:{}", "  in {bname}: {}", base.series.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")));
     }
-    println!("{}", tr!("\n计费 · 钱花在哪那根条 parts", "\nBilling · the where-the-money-went bar, parts"));
+    println!("{}", tr!("\n计费 · 费用构成条 parts", "\nBilling · the where-the-money-went bar, parts"));
     for (i, (&c, name)) in p.parts.iter().zip(PARTS).enumerate() {
         println!("{}", row(color, &format!("parts {}", i + 1), c, t.parent.as_ref().map(|_| (bname, base.parts[i])), &name));
     }
@@ -774,7 +774,7 @@ fn show_list(v: &[Theme], now: &str, color: bool) {
     println!(
         "{}",
         tr!(
-            "\n有这些(aca theme use 名字 换过去,aca theme 名字 看它的颜色):",
+            "\n可用主题(aca theme use 名字 切换,aca theme 名字 查看颜色):",
             "\nThemes (aca theme use NAME switches, aca theme NAME shows its colors):"
         )
     );
@@ -821,14 +821,14 @@ pub fn run(args: &[String], color: bool) -> i32 {
                 Ok(()) => {
                     let over = env().map_or(String::new(), |e| {
                         tr!(
-                            "(这个终端设了 ACA_THEME={e},在这里打开的 aca 还是听它的)",
+                            "(当前终端设置了 ACA_THEME={e},在此打开的 aca 仍以它为准)",
                             " (this terminal sets ACA_THEME={e}, so aca opened here still follows it)"
                         )
                     });
                     println!(
                         "{}",
                         tr!(
-                            "换成 {}({});开着的 aca 一秒内换上{over}",
+                            "已切换到 {}({});运行中的 aca 会在一秒内更新{over}",
                             "switched to {} ({}); open aca windows switch within a second{over}",
                             t.name,
                             kind(&t)
@@ -842,7 +842,7 @@ pub fn run(args: &[String], color: bool) -> i32 {
                 }
             },
             Some((n, None)) => {
-                eprintln!("{}", tr!("没有叫 {n} 的主题", "no theme named {n}"));
+                eprintln!("{}", tr!("主题 {n} 不存在", "no theme named {n}"));
                 show_list(&all, &cur.name, color);
                 1
             }
@@ -856,19 +856,19 @@ pub fn run(args: &[String], color: bool) -> i32 {
             let Some(name) = args.get(1).filter(|n| valid_name(n)) else {
                 eprintln!(
                     "{}",
-                    tr!("aca theme new <名字> [从哪套改起,默认现在用的]", "aca theme new <NAME> [FROM, default: the current one]")
+                    tr!("aca theme new <名字> [基于哪个主题,默认当前主题]", "aca theme new <NAME> [FROM, default: the current one]")
                 );
                 return 2;
             };
             let from = args.get(2).cloned().unwrap_or_else(|| cur.name.clone());
             let Some(base) = find(&from) else {
-                eprintln!("{}", tr!("没有叫 {from} 的主题", "no theme named {from}"));
+                eprintln!("{}", tr!("主题 {from} 不存在", "no theme named {from}"));
                 show_list(&all, &cur.name, color);
                 return 1;
             };
             let path = dir.join(format!("{name}.toml"));
             if path.exists() {
-                eprintln!("{}", tr!("{} 已经有了,直接改它", "{} already exists; edit it directly", tilde(&path)));
+                eprintln!("{}", tr!("{} 已存在,可直接修改", "{} already exists; edit it directly", tilde(&path)));
                 return 1;
             }
             match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, template(name, &base))) {
@@ -876,7 +876,7 @@ pub fn run(args: &[String], color: bool) -> i32 {
                     println!(
                         "{}",
                         tr!(
-                            "写好了 {}:把要改的那行前面的 # 去掉再改;用它:aca theme use {name}",
+                            "已写入 {}:去掉要改那行前面的 # 再修改;启用:aca theme use {name}",
                             "wrote {}: remove the # in front of a line to change it; use it: aca theme use {name}",
                             tilde(&path)
                         )
@@ -884,7 +884,7 @@ pub fn run(args: &[String], color: bool) -> i32 {
                     0
                 }
                 Err(e) => {
-                    eprintln!("{}", tr!("写不了 {}:{e}", "can't write {}: {e}", tilde(&path)));
+                    eprintln!("{}", tr!("无法写入 {}:{e}", "can't write {}: {e}", tilde(&path)));
                     1
                 }
             }
@@ -898,7 +898,7 @@ pub fn run(args: &[String], color: bool) -> i32 {
                 eprintln!(
                     "{}",
                     tr!(
-                        "没有叫 {n} 的主题(aca theme use / new 是换主题、建主题)",
+                        "主题 {n} 不存在(aca theme use / new 用于切换、新建主题)",
                         "no theme named {n} (aca theme use / new switch and create themes)"
                     )
                 );
@@ -909,7 +909,7 @@ pub fn run(args: &[String], color: bool) -> i32 {
     };
     bad.dedup();
     if !bad.is_empty() {
-        println!("{}", tr!("\n没用上(当没写):", "\nNot used (ignored):"));
+        println!("{}", tr!("\n未生效(已忽略):", "\nNot used (ignored):"));
         for b in &bad {
             println!("  {b}");
         }
@@ -922,9 +922,9 @@ fn template(name: &str, base: &Theme) -> String {
     let q = |c: Color| format!("\"{c}\"");
     let mut p = base.pal;
     let mut s = tr!(
-        "# aca 的主题「{name}」:只写跟 base 不一样的 —— 把要改的那行前面的 # 去掉再改,存盘后开着的 aca 一秒内换上。\n\
-         # 颜色写 \"#RRGGBB\"、终端的颜色名(red、lightblue、darkgray…)、0~255 的色号,或 \"reset\"。\n\
-         # 用它:aca theme use {name};每种颜色现在是什么:aca theme {name}\n\n\
+        "# aca 主题「{name}」:只需写出与 base 不同的颜色。去掉要修改的那一行前面的 #,再改值;保存后,已打开的 aca 会在一秒内应用。\n\
+         # 颜色可以写 \"#RRGGBB\"、终端颜色名(red、lightblue、darkgray…)、0~255 的色号,或 \"reset\"。\n\
+         # 启用:aca theme use {name};查看每种颜色的当前值:aca theme {name}\n\n\
          base = {}\n# dark = {}\n",
         "# aca theme “{name}”: write only what differs from base — remove the # in front of a line to change it;\n\
          # open aca windows switch within a second of saving.\n\
@@ -945,9 +945,9 @@ fn template(name: &str, base: &Theme) -> String {
     let arr = |v: &[Color]| v.iter().map(|&c| q(c)).collect::<Vec<_>>().join(", ");
     let names = |v: &[Tr]| v.iter().map(|x| x.get()).collect::<Vec<_>>().join(t!("、", ", "));
     s.push_str(&tr!(
-        "\n# 账号的颜色,一个账号一个位子;有几个颜色就有几个位子,多的账号画 other 的灰\n# series = [{}]\n\
-         # 钱花在哪那根条:{}\n# parts = [{}]\n\
-         # 星期 × 钟点,花得越多越深:{}\n# heat = [{}]\n",
+        "\n# 账号颜色,每个账号占一个位置;颜色有几个就有几个位置,超出的账号用 other 的灰色\n# series = [{}]\n\
+         # 计费页「用量」中的费用构成条,各段依次为:{}\n# parts = [{}]\n\
+         # 计费页「按星期和钟点」的色块,花费越多颜色越深,依次为:{}\n# heat = [{}]\n",
         "\n# Account colors, one slot per account; as many slots as colors, extra accounts are drawn in other's gray\n\
          # series = [{}]\n\
          # The where-the-money-went bar: {}\n# parts = [{}]\n\

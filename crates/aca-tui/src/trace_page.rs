@@ -69,7 +69,7 @@ fn change_paras(ch: &[&Change], pre: &Styled, path: &str) -> Vec<Para> {
 }
 
 fn more(pre: &Styled, k: usize) -> Para {
-    Para::under(pre.clone(), vec![seg(tr!("… 另 {} 行", "… {} more lines", thousands(k as u64)), theme::faint())])
+    Para::under(pre.clone(), vec![seg(tr!("… 还有 {} 行", "… {} more lines", thousands(k as u64)), theme::faint())])
 }
 
 /// 几个文件的改动:改了不止一个文件时,每个文件先写一行路径。open = 带上下文全露(最多 200 行),
@@ -146,11 +146,11 @@ fn tool_head(t: &Trace, i: usize, live: bool, now: i64, mark: &str, extra: Style
     ];
     let body = vec![seg(n.label.clone(), if n.copied { dim() } else { Style::new() })];
     let state = match (running, n.state, n.t1) {
-        (true, ..) => Some((t!("在跑", "running"), Style::new().fg(p.green).add_modifier(Modifier::BOLD))),
-        (_, St::Denied, _) => Some((t!("被拒", "denied"), Style::new().fg(p.red))),
+        (true, ..) => Some((t!("运行中", "running"), Style::new().fg(p.green).add_modifier(Modifier::BOLD))),
+        (_, St::Denied, _) => Some((t!("已拒绝", "denied"), Style::new().fg(p.red))),
         (_, St::Err, _) => Some((t!("出错", "error"), Style::new().fg(p.red))),
-        (_, St::Stopped, _) => Some((t!("被打断", "interrupted"), dim())),
-        (_, _, 0) => Some((t!("没有结果", "no result"), dim())),
+        (_, St::Stopped, _) => Some((t!("已中断", "interrupted"), dim())),
+        (_, _, 0) => Some((t!("无结果", "no result"), dim())),
         _ => None,
     };
     let mut parts: Vec<Styled> = vec![];
@@ -269,9 +269,9 @@ fn sub_numbers(t: &Trace, i: usize, live: bool, now: i64) -> Styled {
     let sum = s.t.total(false, 0).2;
     let mut parts: Vec<crate::ansi::Seg> = vec![];
     match (t.sub_live(i, live, now), t.sub_state(i)) {
-        (true, _) => parts.push(seg(t!("在跑", "running"), Style::new().fg(p.green).add_modifier(Modifier::BOLD))),
+        (true, _) => parts.push(seg(t!("运行中", "running"), Style::new().fg(p.green).add_modifier(Modifier::BOLD))),
         (_, St::Err) => parts.push(seg(t!("出错", "error"), Style::new().fg(p.red))),
-        (_, St::Stopped) => parts.push(seg(t!("被打断", "interrupted"), dim())),
+        (_, St::Stopped) => parts.push(seg(t!("已中断", "interrupted"), dim())),
         _ => {}
     }
     if sum.calls > 0 {
@@ -343,7 +343,7 @@ fn call_rule(t: &Trace, i: usize) -> Para {
 /// (头一次调用跟出现最多的那个比)
 fn call_numbers(t: &Trace, i: usize) -> String {
     let n = &t.nodes[i];
-    let cost = if n.copied { t!("不计", "not counted").to_string() } else { t.cost(i).map_or("–".into(), fmt_cost) };
+    let cost = if n.copied { t!("不计入", "not counted").to_string() } else { t.cost(i).map_or("–".into(), fmt_cost) };
     let mut s = format!("{} · {} · {cost}", fmt_dur(t.dur(i, false, 0)), fmt_tok(n.context()));
     let prev = t.nodes[..i].iter().rev().find(|x| x.kind == Kind::Call).map_or_else(|| t.main_model(), |x| x.model);
     if n.model != prev {
@@ -457,9 +457,9 @@ fn flow_item(t: &Trace, turn: usize, list: &[usize], k: usize, live: bool, now: 
     }
     if k + 1 == list.len() {
         let end = if t.running(turn, live) {
-            Some(Para::new(vec![seg(t!("● 在跑…", "● running…"), Style::new().fg(theme::pal().green).add_modifier(Modifier::BOLD))]))
+            Some(Para::new(vec![seg(t!("● 运行中…", "● running…"), Style::new().fg(theme::pal().green).add_modifier(Modifier::BOLD))]))
         } else if n.state == St::Stopped {
-            Some(Para::new(vec![seg(t!("■ 被打断", "■ interrupted"), dim())]))
+            Some(Para::new(vec![seg(t!("■ 已中断", "■ interrupted"), dim())]))
         } else {
             None
         };
@@ -482,12 +482,12 @@ fn turn_head(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
             nums += &tr!(" · 子代理 {}", " · subagents {}", fmt_cost(s.sub_cost));
         }
         if s.unpriced {
-            nums += t!(" · 有模型没算钱", " · some models not priced");
+            nums += t!(" · 部分模型未计价", " · some models not priced");
         }
         out.push(minor(nums));
     }
     if n.copied {
-        out.push(minor(t!("上一段 · 不计", "earlier · not counted")));
+        out.push(minor(t!("上一段 · 不计入", "earlier · not counted")));
     }
     out
 }
@@ -499,12 +499,12 @@ fn side_head(t: &Trace, i: usize) -> Vec<Para> {
     if s.calls > 0 {
         let mut nums = turn_counts(&s);
         if s.unpriced {
-            nums += t!(" · 有模型没算钱", " · some models not priced");
+            nums += t!(" · 部分模型未计价", " · some models not priced");
         }
         out.push(minor(nums));
     }
     if t.nodes[i].copied {
-        out.push(minor(t!("上一段 · 不计", "earlier · not counted")));
+        out.push(minor(t!("上一段 · 不计入", "earlier · not counted")));
     }
     out
 }
@@ -532,7 +532,7 @@ fn turn_span(t: &Trace, i: usize, live: bool, now: i64) -> String {
     let dur = t.dur(i, running, now);
     // 记录里没写一轮到哪结束的(子代理、记录断在半截的):到最后一次有动静
     let end = if running {
-        t!("在跑", "running").to_string()
+        t!("运行中", "running").to_string()
     } else if n.t1 > 0 {
         clock(n.t1, t.tz, true)
     } else {
@@ -542,11 +542,11 @@ fn turn_span(t: &Trace, i: usize, live: bool, now: i64) -> String {
     let mut first = format!("{} → {end} · {d}", clock(n.t0, t.tz, true));
     match n.state {
         St::Err => first += t!(" · 出错", " · error"),
-        St::Stopped => first += t!(" · 被打断", " · interrupted"),
+        St::Stopped => first += t!(" · 已中断", " · interrupted"),
         _ => {}
     }
     if n.rolled {
-        first += t!(" · 回退掉了", " · rolled back");
+        first += t!(" · 已回退", " · rolled back");
     }
     first
 }
@@ -585,7 +585,7 @@ pub(crate) fn chat(t: &Trace, i: usize, live: bool, now: i64) -> Chat {
     let s = t.sum(i);
     let mut parts = vec![clock(n.t0, t.tz, false), fmt_dur(t.dur(i, running, now))];
     parts.push(if n.copied {
-        t!("不计", "not counted").into()
+        t!("不计入", "not counted").into()
     } else if s.calls > 0 {
         fmt_cost(s.cost)
     } else {
@@ -596,11 +596,11 @@ pub(crate) fn chat(t: &Trace, i: usize, live: bool, now: i64) -> Chat {
     // 这一轮起的后台子代理还在干活
     let busy = !running && t.subs_in(i).iter().any(|&k| t.sub_live(k, live, now));
     match (running, n.state) {
-        _ if n.rolled => foot.push(seg(t!("↶ 回退掉了 · ", "↶ rolled back · "), dim())),
-        (true, _) => foot.push(seg(t!("● 在跑 · ", "● running · "), bold(p.green))),
-        _ if busy => foot.push(seg(t!("● 子代理在跑 · ", "● subagent running · "), bold(p.green))),
+        _ if n.rolled => foot.push(seg(t!("↶ 已回退 · ", "↶ rolled back · "), dim())),
+        (true, _) => foot.push(seg(t!("● 运行中 · ", "● running · "), bold(p.green))),
+        _ if busy => foot.push(seg(t!("● 子代理运行中 · ", "● subagent running · "), bold(p.green))),
         (_, St::Err) => foot.push(seg(t!("✕ 出错 · ", "✕ error · "), Style::new().fg(p.red))),
-        (_, St::Stopped) => foot.push(seg(t!("■ 被打断 · ", "■ interrupted · "), dim())),
+        (_, St::Stopped) => foot.push(seg(t!("■ 已中断 · ", "■ interrupted · "), dim())),
         _ => {}
     }
     foot.push(seg(parts.join(" · "), dim()));
@@ -665,10 +665,10 @@ fn edits_detail(t: &Trace, out: &mut Vec<Para>, edits: &[(String, Vec<Change>)])
 fn stop_why(stop: &str) -> Option<String> {
     Some(match stop {
         "" | "tool_use" | "end_turn" | "stop_sequence" | "pause_turn" => return None,
-        "max_tokens" => t!("输出到上限,截断了", "hit the output limit, cut off").into(),
-        "model_context_window_exceeded" => t!("上下文满了", "the context is full").into(),
+        "max_tokens" => t!("输出达到上限,已截断", "hit the output limit, cut off").into(),
+        "model_context_window_exceeded" => t!("上下文已满", "the context is full").into(),
         "refusal" => t!("模型拒绝回答", "the model refused").into(),
-        x => tr!("停在 {x}", "stopped at {x}"),
+        x => tr!("停止于 {x}", "stopped at {x}"),
     })
 }
 
@@ -679,7 +679,7 @@ pub(crate) fn detail(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
     let mut out: Vec<Para> = vec![];
     let span = |exact: bool| {
         let end = match n.t1 {
-            _ if running => t!("在跑", "running").to_string(),
+            _ if running => t!("运行中", "running").to_string(),
             0 if n.kind == Kind::Turn => clock(t.last_at(i), t.tz, true),
             0 => "?".into(),
             x => clock(x, t.tz, true),
@@ -690,8 +690,8 @@ pub(crate) fn detail(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
     let state = |st: St| match st {
         St::Ok => None,
         St::Err => Some(t!("出错", "error")),
-        St::Denied => Some(t!("被拒", "denied")),
-        St::Stopped => Some(t!("被打断", "interrupted")),
+        St::Denied => Some(t!("已拒绝", "denied")),
+        St::Stopped => Some(t!("已中断", "interrupted")),
     };
     match n.kind {
         Kind::Turn => {
@@ -723,12 +723,12 @@ pub(crate) fn detail(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
             if n.think > 0 {
                 outs += &tr!("(思考 {})", " (thinking {})", thousands(n.think));
             }
-            outs += &format!(" · {}", t.cost(i).map_or(t!("没算钱", "not priced").into(), fmt_cost));
+            outs += &format!(" · {}", t.cost(i).map_or(t!("未计价", "not priced").into(), fmt_cost));
             if n.searches > 0 {
                 outs += &tr!(" · 搜索 {} 次", " · {} searches", n.searches);
             }
             if n.copied {
-                outs += t!(" · 上一段 · 不计", " · earlier · not counted");
+                outs += t!(" · 上一段 · 不计入", " · earlier · not counted");
             }
             out.push(minor(outs));
             if let Some(note) = call_note(t, i) {
@@ -769,7 +769,7 @@ pub(crate) fn detail(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
             if let Some(w) = state(n.state) {
                 first += &format!(" · {w}");
             } else if n.t1 == 0 && !running {
-                first += t!(" · 没有结果", " · no result");
+                first += t!(" · 无结果", " · no result");
             }
             if let Some(x) = io.exit.filter(|&x| x != 0) {
                 first += &tr!(" · 退出码 {x}", " · exit code {x}");
@@ -887,10 +887,10 @@ fn tool_md(t: &Trace, i: usize, level: &str, live: bool, now: i64) -> String {
         head += &format!(" · {}", fmt_dur(dur));
     }
     match (running, n.state) {
-        (true, _) => head += t!(" · 在跑", " · running"),
+        (true, _) => head += t!(" · 运行中", " · running"),
         (_, St::Err) => head += t!(" · 出错", " · error"),
         (_, St::Denied) => head += t!(" · 被拒", " · denied"),
-        (_, St::Stopped) => head += t!(" · 被打断", " · interrupted"),
+        (_, St::Stopped) => head += t!(" · 已中断", " · interrupted"),
         _ => {}
     }
     let mut s = format!("{head}\n\n");

@@ -29,7 +29,9 @@ pub fn run(args: &[String]) -> i32 {
         Some("install") => install(),
         Some("uninstall") => uninstall(),
         Some("key") => key(&args[1..]),
-        Some(other) => Err(tr!("aca tmux 没有 {other}(install / uninstall / key)", "aca tmux has no {other} (install / uninstall / key)")),
+        Some(other) => {
+            Err(tr!("aca tmux 不支持 {other}(可用:install / uninstall / key)", "aca tmux has no {other} (install / uninstall / key)"))
+        }
     };
     match r {
         Ok(text) => {
@@ -99,12 +101,12 @@ fn content(aca: &str) -> String {
     let side = popup("-E -x R -y 0 -w 56 -h 100%", " --follow");
     let head = t!(
         "\
-# aca 的 tmux 设置。aca tmux install 写的这份,升级 aca 时照新的重写:别在这里改 ——
-# 要换键,在你的 tmux.conf 里 source 这份的那一行后面自己 unbind / bind。不要了:aca tmux uninstall
+# aca 的 tmux 设置。此文件由 aca tmux install 生成,升级 aca 时会重新生成,请勿在此修改 ——
+# 如需更换按键,在你的 tmux.conf 中 source 本文件的那一行之后自行 unbind / bind。卸载:aca tmux uninstall
 
-# 会话切换器(aca help keys「当切换器用」):prefix + a 整屏开;不按前缀 Ctrl+\\ 贴在右边开(宽 56 列,
-# 高亮挪到哪旁边就换成哪个会话)。窗口不到 120 列(手机)时 Ctrl+\\ 也整屏开:弹窗比窗口宽 tmux 弹不出来。
-# 回车只切按键的这台客户端(手机、桌面各切各的)",
+# 会话切换器(aca help keys「作为切换器使用」):prefix + a 全屏打开;不按前缀直接按 Ctrl+\\ 在右侧打开(宽 56 列,
+# 旁边的窗格跟随高亮切换会话)。窗口不足 120 列(如手机)时 Ctrl+\\ 也全屏打开:tmux 无法打开比窗口更宽的弹窗。
+# 回车只切换按键所在的客户端(手机和桌面互不影响)",
         "\
 # aca's tmux settings. Written by aca tmux install and rewritten when aca is upgraded: don't edit here —
 # to change a key, unbind / bind after the line in your tmux.conf that sources this. Not wanted: aca tmux uninstall
@@ -115,8 +117,8 @@ fn content(aca: &str) -> String {
 # Enter switches only the client you pressed it on (phone and desktop each their own)"
     );
     let status = t!(
-        "# 状态栏:哪些会话在等你(aca help tmux-status),接在你的 status-right 后面。已经接上的不再接:重载配置不会接两遍。\n\
-         # 看的是全局那份(show-options -g):#{status-right} 在自己设了 status-right 的会话里拿到的是那个会话的",
+        "# 状态栏:显示待处理的会话(aca help tmux-status),追加在你的 status-right 之后。已追加的不会重复追加,重新加载配置也不会出现两份。\n\
+         # 判断依据是全局值(show-options -g):在自己设置了 status-right 的会话中,#{status-right} 取到的是该会话的值",
         "# Status bar: which sessions wait for you (aca help tmux-status), after your status-right. Not added twice:\n\
          # reloading the config doesn't append it again. It looks at the global value (show-options -g): in a session\n\
          # with a status-right of its own, #{status-right} is that session's"
@@ -154,7 +156,7 @@ fn add(text: &str, p: &Path) -> Option<(String, usize)> {
     let note = format!(
         "{MARK}{}",
         t!(
-            "会话切换器(prefix + a、Ctrl+\\)、状态栏上谁在等你,都在 aca 自己那份里。卸:aca tmux uninstall",
+            "会话切换器(prefix + a、Ctrl+\\)和状态栏的待处理提示都在 aca 的配置文件中。卸载:aca tmux uninstall",
             " the session switcher (prefix + a, Ctrl+\\) and who waits for you in the status bar live in aca's own file. To remove: aca tmux uninstall"
         )
     );
@@ -220,7 +222,7 @@ fn handwritten(text: &str, p: &Path) -> Vec<usize> {
 /// 写你的 tmux.conf:是链接就写它指着的那个
 fn write_theirs(path: &Path, text: &str) -> Res<()> {
     let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    paths::write_atomic(&real, text).map_err(|e| tr!("写不了 {}:{e}", "can't write {}: {e}", shown(path)))
+    paths::write_atomic(&real, text).map_err(|e| tr!("无法写入 {}:{e}", "can't write {}: {e}", shown(path)))
 }
 
 type Res<T> = Result<T, String>;
@@ -233,9 +235,9 @@ fn live() -> bool {
 fn install() -> Res<String> {
     let aca = aca_core::agent::self_exe();
     let (file, conf) = (ours(), theirs());
-    paths::write_atomic(&file, &content(&aca)).map_err(|e| tr!("写不了 {}:{e}", "can't write {}: {e}", shown(&file)))?;
+    paths::write_atomic(&file, &content(&aca)).map_err(|e| tr!("无法写入 {}:{e}", "can't write {}: {e}", shown(&file)))?;
     let mut say = vec![tr!(
-        "写好了 {}:切换器 prefix + a、Ctrl+\\,状态栏上谁在等你",
+        "已写入 {}:切换器 prefix + a、Ctrl+\\,状态栏待处理提示",
         "wrote {}: the switcher on prefix + a and Ctrl+\\, who waits for you in the status bar",
         shown(&file)
     )];
@@ -243,18 +245,18 @@ fn install() -> Res<String> {
     match add(&text, &file) {
         Some((new, n)) => {
             write_theirs(&conf, &new)?;
-            say.push(tr!("{} 第 {n} 行加了:{}", "{} line {n} now has: {}", shown(&conf), source_line(&file)));
+            say.push(tr!("已在 {} 第 {n} 行添加:{}", "{} line {n} now has: {}", shown(&conf), source_line(&file)));
         }
-        None => say.push(tr!("{} 里已经有 source 它的那一行了", "{} already sources it", shown(&conf))),
+        None => say.push(tr!("{} 中已有 source 它的行", "{} already sources it", shown(&conf))),
     }
     if live() {
         match aca_core::tmux::run(&["source-file", &file.display().to_string()]) {
-            Ok(_) => say.push(t!("开着的 tmux 已经用上了", "the running tmux uses it now").into()),
-            Err(e) => say.push(tr!("开着的 tmux 没换上:{e}", "the running tmux didn't take it: {e}")),
+            Ok(_) => say.push(t!("运行中的 tmux 已生效", "the running tmux uses it now").into()),
+            Err(e) => say.push(tr!("运行中的 tmux 未能更新:{e}", "the running tmux didn't take it: {e}")),
         }
         if let Some(n) = dedupe(&aca) {
             say.push(tr!(
-                "状态栏上谁在等你那一段原来接了 {n} 遍,只留了一遍",
+                "状态栏待处理提示原先重复了 {n} 次,已去重",
                 "the who-waits-for-you segment was in the status bar {n} times: kept one"
             ));
         }
@@ -262,7 +264,7 @@ fn install() -> Res<String> {
     let mine = handwritten(&std::fs::read_to_string(&conf).unwrap_or_default(), &file);
     if !mine.is_empty() {
         say.push(tr!(
-            "提醒:{} 第 {} 行是你自己写的 aca 的键 / 状态栏,和 aca 那份重复了(aca 那份排在后面,现在用的是它),删掉它们就行",
+            "注意:{} 第 {} 行是你自己添加的 aca 按键 / 状态栏,与 aca 的配置重复(当前生效的是 aca 的配置),可以删除",
             "note: lines {1} of {0} are aca keys / status you wrote yourself and duplicate aca's file (which comes later and wins): delete them",
             shown(&conf),
             lines_text(&mine)
@@ -295,19 +297,19 @@ fn uninstall() -> Res<String> {
     match remove(&text, &file) {
         Some(new) => {
             write_theirs(&conf, &new)?;
-            say.push(tr!("{} 里 source aca 那份的两行拿掉了", "removed the two lines sourcing aca's file from {}", shown(&conf)));
+            say.push(tr!("已从 {} 中移除 source aca 配置的两行", "removed the two lines sourcing aca's file from {}", shown(&conf)));
         }
-        None => say.push(tr!("{} 里没有 source aca 那份的行", "{} doesn't source aca's file", shown(&conf))),
+        None => say.push(tr!("{} 中没有 source aca 配置的行", "{} doesn't source aca's file", shown(&conf))),
     }
     if file.exists() {
-        std::fs::remove_file(&file).map_err(|e| tr!("删不了 {}:{e}", "can't delete {}: {e}", shown(&file)))?;
-        say.push(tr!("删了 {}", "deleted {}", shown(&file)));
+        std::fs::remove_file(&file).map_err(|e| tr!("无法删除 {}:{e}", "can't delete {}: {e}", shown(&file)))?;
+        say.push(tr!("已删除 {}", "deleted {}", shown(&file)));
     }
     if live() {
         let undone = unapply(&aca_core::agent::self_exe());
         if undone {
             say.push(
-                t!("开着的 tmux 里 aca 的键和状态栏那一段也撤了", "aca's keys and status segment are gone from the running tmux too")
+                t!("运行中的 tmux 已同时移除 aca 的按键和状态栏", "aca's keys and status segment are gone from the running tmux too")
                     .into(),
             );
         }
@@ -343,17 +345,17 @@ fn status() -> Res<String> {
     let text = std::fs::read_to_string(&conf).unwrap_or_default();
     let on = text.lines().any(|l| is_ours(l, &file));
     let mut say = vec![if on && file.exists() {
-        tr!("装了:{} source 着 {}", "installed: {} sources {}", shown(&conf), shown(&file))
+        tr!("已安装:{} 引用了 {}", "installed: {} sources {}", shown(&conf), shown(&file))
     } else if on {
         tr!(
-            "{} 里有 source 的那一行,但 {} 不在了:aca tmux install 再写一份",
+            "{} 中有 source 行,但 {} 已不存在:运行 aca tmux install 重新生成",
             "{} sources {}, which is gone: aca tmux install writes it again",
             shown(&conf),
             shown(&file)
         )
     } else {
         tr!(
-            "没装。aca tmux install:切换器的键(prefix + a、Ctrl+\\)和状态栏上谁在等你写进 {},{} 里只加一行 source-file",
+            "未安装。运行 aca tmux install 会把切换器按键(prefix + a、Ctrl+\\)和状态栏待处理提示写入 {},并在 {} 中添加一行 source-file",
             "not installed. aca tmux install puts the switcher keys (prefix + a, Ctrl+\\) and who waits for you in the status bar into {}, and adds one source-file line to {}",
             shown(&file),
             shown(&conf)
@@ -362,7 +364,7 @@ fn status() -> Res<String> {
     let mine = handwritten(&text, &file);
     if !mine.is_empty() {
         say.push(tr!(
-            "{} 第 {} 行是你自己写的 aca 的键 / 状态栏",
+            "{} 第 {} 行是你自己添加的 aca 按键 / 状态栏",
             "lines {1} of {0} are aca keys / status you wrote yourself",
             shown(&conf),
             lines_text(&mine)
@@ -385,7 +387,7 @@ fn key(args: &[String]) -> Res<String> {
                 crate::config::set("keys", "next", toml::Value::String(k.into()))?;
             }
         }
-        [other, ..] => return Err(tr!("aca tmux key 没有 {other}(只有 next)", "aca tmux key has no {other} (only next)")),
+        [other, ..] => return Err(tr!("aca tmux key 不支持 {other}(仅支持 next)", "aca tmux key has no {other} (only next)")),
     }
     Ok(next_key().join("\n"))
 }
@@ -395,12 +397,12 @@ fn next_key() -> Vec<String> {
     let notes = aca_core::plugin::bind_hotkeys();
     let mut say = vec![match aca_core::config::load().keys.next_key() {
         Ok(Some(k)) => tr!(
-            "下一个在等你的:在会话里按 {}(aca next;换一个:aca tmux key next <键>,不要:--none)",
+            "跳到下一个待处理会话:在会话中按 {}(aca next;更换:aca tmux key next <键>,取消:--none)",
             "the next one waiting: press {} inside a session (aca next; another key: aca tmux key next <key>, none: --none)",
             human(&k)
         ),
         _ => t!(
-            "下一个在等你的:没绑键(aca tmux key next <键> 绑一个;aca next 照样能敲)",
+            "跳到下一个待处理会话:未绑定按键(用 aca tmux key next <键> 绑定;也可直接运行 aca next)",
             "the next one waiting: no key (aca tmux key next <key> binds one; aca next still works typed)"
         )
         .into(),

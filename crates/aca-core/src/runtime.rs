@@ -18,6 +18,11 @@ pub struct Token {
     pub until: u64,
 }
 
+/// 行上怎么写一个挂的字:「[pr #12]」;名字以 _ 开头的只写值,给图标、数字这种一看就懂的(「▣2」)
+pub fn mark(name: &str, value: &str) -> String {
+    if name.starts_with('_') { value.into() } else { format!("[{name} {value}]") }
+}
+
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
@@ -76,6 +81,12 @@ pub struct Run {
     /// 这次 agent 是什么时候起的(`session::launch`):刚起的那一会儿,启动时的关有人替你答(见 [`crate::trust`])
     #[serde(skip_serializing_if = "is_zero")]
     pub started: u64,
+    /// 起的那一刻对话记录是哪一份、已经有多长(`session::launch`):这次定的只会写在后面,找定时时从这往后读就够
+    /// ([`crate::schedule::due`])。/clear 换的新对话是新文件,照旧从头
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub started_file: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub started_len: u64,
     /// 闲着被 aca 停掉的时刻([`crate::session::stop_idle`]):列表里画 ☾,和人停的 ■ 分开。再起、人再停一次就清掉
     #[serde(skip_serializing_if = "is_zero")]
     pub idle_stopped: u64,
@@ -137,12 +148,12 @@ impl Run {
     pub fn error_kind_said(&self) -> &'static str {
         match self.error_kind.as_str() {
             "transient" => crate::t!(
-                "临时的:限流、过载或断流,过一会儿让它接着干多半就好",
+                "临时错误:限流、过载或连接中断,稍后让它继续通常即可恢复",
                 "transient: rate limit, overload or a dropped stream; letting it carry on in a while usually works"
             ),
-            "account" => crate::t!("账号的:额度、登录或欠费,要人处理", "account: quota, login or billing; needs a person"),
+            "account" => crate::t!("账号问题:额度、登录或欠费,需要人工处理", "account: quota, login or billing; needs a person"),
             "fatal" => {
-                crate::t!("再试也一样:上下文、请求或内容策略的问题", "fatal: context, request or content policy; retrying won't help")
+                crate::t!("重试无效:上下文、请求或内容策略问题", "fatal: context, request or content policy; retrying won't help")
             }
             _ => "",
         }
@@ -216,6 +227,11 @@ mod tests {
         r.tokens.insert("ci".into(), Token { value: "红".into(), until: 100 });
         assert_eq!(r.live_tokens(99).len(), 2);
         assert_eq!(r.live_tokens(100).keys().collect::<Vec<_>>(), ["pr"]);
+    }
+
+    #[test]
+    fn a_name_starting_with_underscore_shows_only_the_value() {
+        assert_eq!((mark("pr", "#12").as_str(), mark("_float", "▣2").as_str()), ("[pr #12]", "▣2"));
     }
 
     #[test]

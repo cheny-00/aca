@@ -51,7 +51,7 @@ impl Args {
         let Some(i) = self.0.iter().position(|a| a == name) else { return Ok(None) };
         if i + 1 >= self.0.len() {
             SHORT.store(true, Ordering::Relaxed);
-            return Err(tr!("{name} 后面要跟一个值", "{name} needs a value after it"));
+            return Err(tr!("{name} 后面需要一个值", "{name} needs a value after it"));
         }
         self.0.remove(i);
         Ok(Some(self.0.remove(i)))
@@ -61,7 +61,7 @@ impl Args {
     fn next(&mut self, what: Tr) -> Res<String> {
         if self.0.is_empty() {
             SHORT.store(true, Ordering::Relaxed);
-            return Err(tr!("要给{what}", "missing {what}"));
+            return Err(tr!("缺少{what}", "missing {what}"));
         }
         Ok(self.0.remove(0))
     }
@@ -99,11 +99,11 @@ fn print_rows_zh(rows: &[Row]) {
     let mut group = None;
     for r in rows {
         if group != Some(&r.group) {
-            println!("{}", if r.group.is_empty() { "(没分组)" } else { &r.group });
+            println!("{}", if r.group.is_empty() { "(未分组)" } else { &r.group });
             group = Some(&r.group);
         }
         let who = if r.account.is_empty() { r.tool.clone() } else { format!("{}:{}", r.tool, agent::account_label(&r.account)) };
-        let tokens: String = r.tokens.iter().map(|(k, v)| format!(" [{k} {v}]")).collect();
+        let tokens: String = r.tokens.iter().map(|(k, v)| format!(" {}", runtime::mark(k, v))).collect();
         println!("  {} {}  {}  {}  {}{}", r.glyph(), r.id, r.title, who, print::age(now.saturating_sub(r.active)), tokens);
         if !r.ask.is_empty() {
             println!("      └ {}", r.ask);
@@ -128,7 +128,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             println!(
                 "{}",
                 tr!(
-                    "链接了 {}({} {}):{} 个动作、{} 个事件钩子、{} 个窗格",
+                    "已链接 {}({} {}):{} 个能力、{} 个事件钩子、{} 个窗格",
                     "linked {} ({} {}): actions {}, event hooks {}, panes {}",
                     m.id,
                     m.name,
@@ -144,7 +144,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             let rev = a.opt("--ref")?;
             let what = Tr::new("来源(git 地址、owner/repo 或本地目录)", "a source (a git URL, owner/repo or a local directory)");
             let (m, warn) = plugin::install(&a.next(what)?, rev.as_deref())?;
-            println!("{}", tr!("装好了 {}({} {})", "installed {} ({} {})", m.id, m.name, m.version));
+            println!("{}", tr!("已安装 {}({} {})", "installed {} ({} {})", m.id, m.name, m.version));
             m.brings().iter().for_each(|l| println!("  {l}"));
             warn.iter().for_each(|w| println!("{}", tr!("  提醒:{w}", "  note: {w}")));
         }
@@ -175,17 +175,17 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                         }
                         format!("{} {}", m.name, m.version)
                     }
-                    Err(err) => tr!("清单有问题:{err}", "manifest problem: {err}"),
+                    Err(err) => tr!("清单有误:{err}", "manifest problem: {err}"),
                 };
                 let from = match e.source.as_str() {
-                    "" => tr!("链接 {}", "linked {}", e.path),
+                    "" => tr!("链接自 {}", "linked {}", e.path),
                     plugin::first_party::SOURCE => t!("aca 自带", "ships with aca").to_string(),
                     plugin::user::SOURCE => tr!("你自己的 {}", "your own, {}", e.path),
-                    src => tr!("装自 {}", "installed from {}", src),
+                    src => tr!("安装自 {}", "installed from {}", src),
                 };
                 let agents = e.agents.keys().map(String::as_str).collect::<Vec<_>>();
                 let gives =
-                    if agents.is_empty() { String::new() } else { tr!("  带给 {}", "  brings to {}", agents.join(t!("、", ", "))) };
+                    if agents.is_empty() { String::new() } else { tr!("  提供给 {}", "  brings to {}", agents.join(t!("、", ", "))) };
                 println!("{} {}  {}  {from}{gives}", if e.enabled { "●" } else { "○" }, e.id, note);
             }
             for n in plugin::key_notes().into_iter().map(|(_, n)| n).chain(lacks) {
@@ -202,7 +202,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 println!(
                     "{}",
                     tr!(
-                        "开着的 {} 起来时带的插件和现在不一样:重启它们才带上(aca restart <id>)",
+                        "{} 启动时加载的插件与现在不同:重启后才会生效(aca restart <id>)",
                         "{} still run with what plugins gave them at start: restart them to pick up the change (aca restart <id>)",
                         names.join(t!("、", ", "))
                     )
@@ -236,7 +236,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             println!(
                 "{}",
                 tr!(
-                    "建好了 {dir}({id}):aca-plugin.toml 是清单,hello.sh 是它跑的脚本。接着:",
+                    "已创建 {dir}({id}):aca-plugin.toml 是清单,hello.sh 是它运行的脚本。接下来:",
                     "created {dir} ({id}): aca-plugin.toml is the manifest, hello.sh the script it runs. Next:"
                 )
             );
@@ -244,21 +244,21 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 (
                     format!("aca plugin link {dir}"),
                     t!(
-                        "链接上(改了脚本马上生效;改了清单再 link 一次)",
+                        "链接(修改脚本后立即生效;修改清单后需重新 link)",
                         "link it (script changes apply at once; link again after changing the manifest)"
                     ),
                 ),
                 (
                     format!("aca plugin run {id}.hello"),
-                    t!("跑一下(界面里:会话列表上按 : 再按 h)", "run it (in the interface: : on the session list, then h)"),
+                    t!("运行(界面中:在会话列表按 : 再按 h)", "run it (in the interface: : on the session list, then h)"),
                 ),
-                (format!("aca plugin check {dir}"), t!("查清单", "check the manifest")),
+                (format!("aca plugin check {dir}"), t!("检查清单", "check the manifest")),
             ];
             let w = next.iter().map(|(c, _)| c.chars().count()).max().unwrap_or(0);
             for (c, what) in next {
                 println!("  {c:<w$}  {what}");
             }
-            println!("{}", t!("写法:docs/plugins.zh-CN.md(aca help plugin)", "How to write one: docs/plugins.md (aca help plugin)"));
+            println!("{}", t!("文档:docs/plugins.zh-CN.md(aca help plugin)", "How to write one: docs/plugins.md (aca help plugin)"));
         }
         "check" => {
             let target = a.maybe().unwrap_or_else(|| ".".into());
@@ -270,7 +270,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             r.errors.iter().for_each(|e| println!("✕ {e}"));
             r.warns.iter().for_each(|w| println!("⚠ {w}"));
             if r.errors.is_empty() && r.warns.is_empty() {
-                println!("{}", t!("✓ 没发现问题", "✓ no problems found"));
+                println!("{}", t!("✓ 未发现问题", "✓ no problems found"));
             }
             return Ok(i32::from(!r.errors.is_empty()));
         }
@@ -280,7 +280,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             let event = a.next(Tr::new("事件", "an event"))?;
             let mut fields = serde_json::Map::new();
             while let Some(kv) = a.maybe() {
-                let (k, v) = kv.split_once('=').ok_or_else(|| tr!("字段要写成 名字=值:{kv}", "fields are NAME=VALUE: {kv}"))?;
+                let (k, v) = kv.split_once('=').ok_or_else(|| tr!("字段应写为 名称=值:{kv}", "fields are NAME=VALUE: {kv}"))?;
                 fields.insert(k.to_string(), plugin::dev::field_value(v));
             }
             let ran = plugin::dev::emit(&event, &context(store, session, "event")?, fields, only.as_deref())?;
@@ -288,14 +288,14 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 println!(
                     "{}",
                     tr!(
-                        "没有开着的插件订了 {event},或者它们的 if 对不上(aca plugin ls 看谁开着)",
+                        "没有已开启的插件订阅 {event},或它们的 if 条件不匹配(aca plugin ls 查看已开启的插件)",
                         "no plugin that's on subscribes to {event}, or their if doesn't match (aca plugin ls shows which are on)"
                     )
                 );
                 return Ok(0);
             }
             for r in &ran {
-                let code = r.code.map_or_else(|| t!("被打断", "killed").to_string(), |c| c.to_string());
+                let code = r.code.map_or_else(|| t!("被中断", "killed").to_string(), |c| c.to_string());
                 println!("{}", tr!("--- {} · {} · 退出码 {code}", "--- {} · {} · exit {code}", r.plugin, r.command));
                 print!("{}", r.out);
                 if !r.out.is_empty() && !r.out.ends_with('\n') {
@@ -306,11 +306,11 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
         }
         "run" => {
             let session = a.opt("--session")?;
-            let what = a.next(Tr::new("插件.动作", "PLUGIN.ACTION"))?;
+            let what = a.next(Tr::new("插件.能力", "PLUGIN.ACTION"))?;
             // 剩下的是参数:名字=值
             let mut given = vec![];
             while let Some(kv) = a.maybe() {
-                let (k, v) = kv.split_once('=').ok_or_else(|| tr!("参数要写成 名字=值:{kv}", "arguments are NAME=VALUE: {kv}"))?;
+                let (k, v) = kv.split_once('=').ok_or_else(|| tr!("参数应写为 名称=值:{kv}", "arguments are NAME=VALUE: {kv}"))?;
                 given.push((k.to_string(), v.to_string()));
             }
             return plugin::invoke(&what, &context(store, session, "cli")?, &given);
@@ -325,7 +325,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                         return Ok(0);
                     }
                     if rows.is_empty() {
-                        println!("{}", t!("没有插件写了定时([[timers]])", "no plugin has timers ([[timers]])"));
+                        println!("{}", t!("没有插件设置定时任务([[timers]])", "no plugin has timers ([[timers]])"));
                     }
                     let now = paths::now();
                     rows.iter().for_each(|r| println!("{}", r.text(now)));
@@ -338,7 +338,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 Some("tick") => return Ok(plugin::timer::tick(&a.next(what)?)),
                 Some(other) => {
                     SHORT.store(true, Ordering::Relaxed);
-                    return Err(tr!("aca plugin timer 没有 {other}", "aca plugin timer has no {other}"));
+                    return Err(tr!("aca plugin timer 没有子命令 {other}", "aca plugin timer has no {other}"));
                 }
             }
         }
@@ -357,18 +357,18 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             }
             let all = plugin::yours::tool_choices(&id)?;
             if all.is_empty() {
-                println!("{}", tr!("{id} 没有能给 agent 的能力", "{id} has nothing it can give agents"));
+                println!("{}", tr!("{id} 没有可提供给 agent 的能力", "{id} has nothing it can give agents"));
                 return Ok(0);
             }
             for (t, on, ask) in &all {
-                let note = if *ask && !on { t!("  要你点名才给", "  only if you allow it") } else { "" };
+                let note = if *ask && !on { t!("  需明确允许", "  only if you allow it") } else { "" };
                 println!("{} {t}{note}", if *on { "✓" } else { "○" });
             }
             if reset || !names.is_empty() {
                 println!(
                     "{}",
                     t!(
-                        "开着的会话要重启才变(Codex 只在启动时读工具);gateway 开着时 Claude 当场换",
+                        "运行中的会话需重启才会生效(Codex 只在启动时读取工具);gateway 开启时 Claude 会立即更新",
                         "running sessions change after a restart (Codex reads tools only at start); with the gateway on, Claude switches at once"
                     )
                 );
@@ -391,13 +391,15 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             } else if a.flag("--none") {
                 Some(String::new())
             } else {
-                Some(a.next(Tr::new("一个键(--none 不要键,--reset 回到清单的)", "a key (--none for no key, --reset for the manifest's)"))?)
+                Some(
+                    a.next(Tr::new("按键(--none 不设键,--reset 恢复为清单中的)", "a key (--none for no key, --reset for the manifest's)"))?,
+                )
             };
             plugin::yours::set_key(&id, &target, key.as_deref())?;
             let now = plugin::menu().into_iter().find(|i| i.plugin == id && i.id == target).and_then(|i| i.key);
             match now {
-                Some(k) => println!("{}", tr!("{id}.{target}:: 菜单里按 {k}", "{id}.{target}: press {k} in the : menu")),
-                None => println!("{}", tr!("{id}.{target}:没有键(: 菜单里挑)", "{id}.{target}: no key (pick it in the : menu)")),
+                Some(k) => println!("{}", tr!("{id}.{target}:在 : 菜单中按 {k}", "{id}.{target}: press {k} in the : menu")),
+                None => println!("{}", tr!("{id}.{target}:未设键(在 : 菜单中选择)", "{id}.{target}: no key (pick it in the : menu)")),
             }
             for (_, n) in plugin::key_notes().into_iter().filter(|(p, _)| *p == id) {
                 println!("⚠ {n}");
@@ -423,7 +425,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 Some(String::new())
             } else {
                 Some(a.next(Tr::new(
-                    "一个键(tmux 的键名:C-]、M-y;--none 不要,--reset 回到清单的)",
+                    "按键(tmux 键名:C-]、M-y;--none 不设键,--reset 恢复为清单中的)",
                     "a key (a tmux key name: C-], M-y; --none for none, --reset for the manifest's)",
                 ))?)
             };
@@ -431,8 +433,8 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             let held = plugin::bind_hotkeys();
             let (items, notes) = plugin::hotkeys();
             match items.iter().find(|h| h.plugin == id && h.pane == pane) {
-                Some(h) => println!("{}", tr!("{id}.{pane}:在会话里按 {}", "{id}.{pane}: press {} inside a session", h.key)),
-                None => println!("{}", tr!("{id}.{pane}:没有热键", "{id}.{pane}: no hotkey")),
+                Some(h) => println!("{}", tr!("{id}.{pane}:在会话中按 {}", "{id}.{pane}: press {} inside a session", h.key)),
+                None => println!("{}", tr!("{id}.{pane}:未设热键", "{id}.{pane}: no hotkey")),
             }
             for (_, n) in notes.into_iter().chain(held).filter(|(p, _)| *p == id) {
                 println!("⚠ {n}");
@@ -446,14 +448,14 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 (None, _) => {
                     // secret 的打码;要原样的值点名读它(给脚本用)
                     for s in plugin::settings_of(&id)? {
-                        let changed = if s.changed { t!("(改过)", " (changed)") } else { "" };
+                        let changed = if s.changed { t!("(已修改)", " (changed)") } else { "" };
                         println!("{} = {}{changed}  {}", s.name, s.shown(), s.desc);
                     }
                 }
                 (Some(k), None) if reset => plugin::set_setting(&id, &k, None)?,
                 (Some(k), None) => {
                     let all = plugin::settings_of(&id)?;
-                    let s = all.iter().find(|s| s.name == k).ok_or_else(|| tr!("{id} 没有 {k} 这个设置", "{id} has no setting {k}"))?;
+                    let s = all.iter().find(|s| s.name == k).ok_or_else(|| tr!("{id} 没有设置项 {k}", "{id} has no setting {k}"))?;
                     println!("{}", plugin::plain(&s.value));
                 }
                 (Some(k), Some(v)) => plugin::set_setting(&id, &k, Some(&v))?,
@@ -478,7 +480,10 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 gateway::ctl(json!({ "cmd": "stop" }))?;
                 println!(
                     "{}",
-                    t!("停了 gateway(下一个 agent 连上来时会再起)", "stopped the gateway (it starts again when the next agent connects)")
+                    t!(
+                        "已停止 gateway(下一个 agent 连接时会重新启动)",
+                        "stopped the gateway (it starts again when the next agent connects)"
+                    )
                 );
             }
             "restart" => {
@@ -486,7 +491,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 let r = gateway::ctl(json!({ "cmd": "restart", "server": name }))?;
                 println!(
                     "{}",
-                    tr!("重启了 {} 个服务(下次有人要时再起)", "restarted {} servers (they start again when needed)", r["restarted"])
+                    tr!("已重启 {} 个服务(下次需要时启动)", "restarted {} servers (they start again when needed)", r["restarted"])
                 );
             }
             "log" => {
@@ -501,7 +506,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 }
                 let found = gateway::import::scan();
                 if found.is_empty() {
-                    println!("{}", t!("各账号里没有 MCP", "no MCPs in any account"));
+                    println!("{}", t!("各账号中都没有 MCP", "no MCPs in any account"));
                     return Ok(0);
                 }
                 for f in &found {
@@ -518,7 +523,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                     };
                     let note = match (&f.problem, f.known) {
                         (Some(p), _) => tr!("  ✕ {p}", "  ✕ {p}"),
-                        (None, true) => t!("  ([mcps] 里已经有)", "  (already in [mcps])").to_string(),
+                        (None, true) => t!("  ([mcps] 中已有)", "  (already in [mcps])").to_string(),
                         (None, false) => String::new(),
                     };
                     println!("{}  [{}]  {cmd}{env}{note}", f.name, f.from.join(" "));
@@ -527,31 +532,31 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                     println!(
                         "{}",
                         t!(
-                            "加 --apply 收进 gateway(只写 aca 的 config.toml 和 plugins.toml,账号里的不动);后面可以只写几个名字",
+                            "加 --apply 导入 gateway(只写入 aca 的 config.toml 和 plugins.toml,不修改账号中的配置);后面可只写部分名称",
                             "add --apply to serve them through the gateway (writes only aca's config.toml and plugins.toml, not the accounts); you can name just some"
                         )
                     );
                     return Ok(0);
                 }
                 let done = gateway::import::apply(&found, &only)?;
-                println!("{}", tr!("收进了 gateway:{}", "now served through the gateway: {}", done.join(" ")));
+                println!("{}", tr!("已导入 gateway:{}", "now served through the gateway: {}", done.join(" ")));
                 println!(
                     "{}",
                     t!(
-                        "账号里的那份还在:gateway 开着时 agent 会两份都看到。确认经 gateway 用着没问题,再去各账号里删掉(删不删你定)",
+                        "账号中的配置仍保留:gateway 开启时 agent 会同时看到两份。确认通过 gateway 使用正常后,可再到各账号中删除(由你决定)",
                         "the accounts still have their copies: with the gateway on, agents see both. Once it works through the gateway, remove them from the accounts (your call)"
                     )
                 );
             }
             sub @ ("add" | "drop") => {
-                let name = a.next(Tr::new("[mcps] 里的名字", "a name under [mcps]"))?;
+                let name = a.next(Tr::new("[mcps] 中的名称", "a name under [mcps]"))?;
                 gateway::set_served(&name, sub == "add")?;
                 println!(
                     "{}",
                     if sub == "add" {
-                        tr!("{name} 经 gateway 给 agent 了(只起一份)", "{name} now reaches agents through the gateway (one copy)")
+                        tr!("{name} 已通过 gateway 提供给 agent(只启动一份)", "{name} now reaches agents through the gateway (one copy)")
                     } else {
-                        tr!("{name} 不再经 gateway 给", "{name} no longer goes through the gateway")
+                        tr!("{name} 不再通过 gateway 提供", "{name} no longer goes through the gateway")
                     }
                 );
             }
@@ -568,21 +573,21 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 println!(
                     "{}",
                     if sub == "off" {
-                        tr!("这个会话不再从 gateway 看到 {name}", "this session no longer sees {name} through the gateway")
+                        tr!("此会话不再从 gateway 获取 {name}", "this session no longer sees {name} through the gateway")
                     } else {
-                        tr!("这个会话又能从 gateway 用 {name} 了", "this session can use {name} through the gateway again")
+                        tr!("此会话已恢复从 gateway 使用 {name}", "this session can use {name} through the gateway again")
                     }
                 );
             }
             other => {
                 SHORT.store(true, Ordering::Relaxed);
-                return Err(tr!("aca plugin gateway 没有 {other}", "aca plugin gateway has no {other}"));
+                return Err(tr!("aca plugin gateway 没有子命令 {other}", "aca plugin gateway has no {other}"));
             }
         },
         "sync" => {
             let said = plugin::sync()?;
             if said.is_empty() {
-                println!("{}", t!("跟 plugins.toml 一致,没什么要做的", "matches plugins.toml; nothing to do"));
+                println!("{}", t!("与 plugins.toml 一致,无需更改", "matches plugins.toml; nothing to do"));
             }
             said.iter().for_each(|l| println!("{l}"));
         }
@@ -600,7 +605,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
         "log" => print!("{}", std::fs::read_to_string(plugin::log_file(&a.next(PLUGIN_ID)?)).unwrap_or_default()),
         other => {
             SHORT.store(true, Ordering::Relaxed);
-            return Err(tr!("aca plugin 没有 {other}", "aca plugin has no {other}"));
+            return Err(tr!("aca plugin 没有子命令 {other}", "aca plugin has no {other}"));
         }
     }
     Ok(0)
@@ -665,20 +670,20 @@ fn group_cmd(store: &Store, mut a: Args) -> Res<i32> {
         "rm" => {
             let n = store.group_remove(&a.next(GROUP_PATH)?)?;
             let s = if n == 1 { "" } else { "s" };
-            println!("{}", tr!("删了,{n} 个会话挪到了上一级", "deleted; {n} session{s} moved up a level"));
+            println!("{}", tr!("已删除,{n} 个会话已移到上一级", "deleted; {n} session{s} moved up a level"));
         }
         // 目录登记成分组:名字按目录定(见 Store::dir_group),打出组名
         "add" => println!("{}", store.group_claim(&real_dir(&a.maybe().unwrap_or_else(|| ".".into()))?)?.0),
         "rename" => {
             let from = a.next(GROUP_PATH)?;
-            let to = a.next(Tr::new("新的分组路径", "the new group path"))?;
+            let to = a.next(Tr::new("新分组路径", "the new group path"))?;
             let n = aca_tui::rename_group(store, &from, &to)?;
             let s = if n == 1 { "" } else { "s" };
             println!(
                 "{} → {}{}",
                 from.trim_matches('/'),
                 to.trim_matches('/'),
-                if n > 0 { tr!(",{n} 个会话跟过去", ", {n} session{s} moved along") } else { String::new() }
+                if n > 0 { tr!(",{n} 个会话一并移动", ", {n} session{s} moved along") } else { String::new() }
             );
         }
         "dir" => {
@@ -686,7 +691,7 @@ fn group_cmd(store: &Store, mut a: Args) -> Res<i32> {
             match a.maybe() {
                 None => match store.groups()?.into_iter().find(|g| g.path == path) {
                     Some(g) => println!("{}", g.default_path),
-                    None => return Err(tr!("没有 {path} 这个分组", "no group {path}")),
+                    None => return Err(tr!("没有分组 {path}", "no group {path}")),
                 },
                 Some(d) if d.is_empty() => store.group_set_dir(&path, "")?,
                 Some(d) => store.group_set_dir(&path, &real_dir(&d)?)?,
@@ -694,11 +699,11 @@ fn group_cmd(store: &Store, mut a: Args) -> Res<i32> {
         }
         "order" => {
             let path = a.next(GROUP_PATH)?;
-            store.group_order(&path, a.next(POS)?.parse().map_err(|_| tr!("位置要是个数", "the position must be a number"))?)?;
+            store.group_order(&path, a.next(POS)?.parse().map_err(|_| tr!("位置应为数字", "the position must be a number"))?)?;
         }
         other => {
             SHORT.store(true, Ordering::Relaxed);
-            return Err(tr!("aca group 没有 {other}", "aca group has no {other}"));
+            return Err(tr!("aca group 没有子命令 {other}", "aca group has no {other}"));
         }
     }
     Ok(0)
@@ -706,11 +711,11 @@ fn group_cmd(store: &Store, mut a: Args) -> Res<i32> {
 
 fn meta_cmd(store: &Store, mut a: Args) -> Res<i32> {
     let sub = a.next(SUB)?;
-    let ttl: u64 = a.opt("--ttl")?.map(|t| t.parse().map_err(|_| tr!("--ttl 要是秒数", "--ttl takes seconds"))).transpose()?.unwrap_or(0);
+    let ttl: u64 = a.opt("--ttl")?.map(|t| t.parse().map_err(|_| tr!("--ttl 应为秒数", "--ttl takes seconds"))).transpose()?.unwrap_or(0);
     let s = store.get(&a.next(ID)?)?;
-    let name = a.next(Tr::new("名字", "a name"))?;
+    let name = a.next(Tr::new("名称", "a name"))?;
     if name.is_empty() || name.len() > 32 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err(tr!("名字只能是 1–32 个字母、数字、_ -", "a name is 1–32 letters, digits, _ -"));
+        return Err(tr!("名称只能由 1–32 个字母、数字、_ - 组成", "a name is 1–32 letters, digits, _ -"));
     }
     match sub.as_str() {
         "set" => {
@@ -727,7 +732,7 @@ fn meta_cmd(store: &Store, mut a: Args) -> Res<i32> {
         }
         other => {
             SHORT.store(true, Ordering::Relaxed);
-            return Err(tr!("aca meta 没有 {other}", "aca meta has no {other}"));
+            return Err(tr!("aca meta 没有子命令 {other}", "aca meta has no {other}"));
         }
     }
     Ok(0)
@@ -736,7 +741,7 @@ fn meta_cmd(store: &Store, mut a: Args) -> Res<i32> {
 /// 「对话 3f2a9c1e」:id 只打开头,够认了
 fn short_conv(conv: &str) -> String {
     if conv.is_empty() {
-        tr!("对话没认出", "conversation not recognized")
+        tr!("未识别对话", "conversation not recognized")
     } else {
         tr!("对话 {}", "conv {}", conv.chars().take(8).collect::<String>())
     }
@@ -752,7 +757,7 @@ fn adopt_line(store: &Store, p: &adopt::Plan) -> String {
         }
         g => tr!("  分组 {g}", "  group {g}"),
     };
-    let args = if p.s.args.is_empty() { String::new() } else { tr!("  带 {}", "  with {}", p.s.args.join(" ")) };
+    let args = if p.s.args.is_empty() { String::new() } else { tr!("  参数 {}", "  with {}", p.s.args.join(" ")) };
     tr!("{}  →  「{}」 {}{group}  {}{args}", "{}  →  “{}” {}{group}  {}{args}", p.tmux, p.title(), p.who(), short_conv(&p.s.conv))
 }
 
@@ -776,12 +781,12 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
     let targets = std::mem::take(&mut a.0);
     if let Some(odd) = targets.iter().find(|t| t.starts_with('-')) {
         SHORT.store(true, Ordering::Relaxed);
-        return Err(tr!("aca adopt 不认 {odd}", "aca adopt doesn't take {odd}"));
+        return Err(tr!("aca adopt 无法识别 {odd}", "aca adopt doesn't take {odd}"));
     }
     let one_only = !opts.title.is_empty() || !opts.conv.is_empty() || !opts.spec.is_empty() || opts.args.is_some();
     if one_only && (all || targets.len() != 1) {
         return Err(tr!(
-            "-t / --as / --conv / -- 参数 是给一个会话的:一次接管一个时才能用",
+            "-t / --as / --conv / -- 参数 只针对单个会话:仅在一次接管一个会话时可用",
             "-t / --as / --conv / -- ARGS are for one session: only when adopting exactly one"
         ));
     }
@@ -802,7 +807,7 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
                 println!(
                     "{}",
                     tr!(
-                        "没有能直接接管的 tmux 会话(要没登记过、第一格里跑着认得出的 claude / codex / pi / opencode)",
+                        "没有可直接接管的 tmux 会话(需未登记过,且第一个窗格中运行着可识别的 claude / codex / pi / opencode)",
                         "no tmux session to adopt as is (it must be unregistered, a recognizable claude / codex / pi / opencode in the first pane)"
                     )
                 );
@@ -810,7 +815,7 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
                 println!(
                     "{}",
                     tr!(
-                        "能接管的(接一个:aca adopt <tmux 会话名或里面的一段>;全接:aca adopt --all):",
+                        "可接管的会话(接管一个:aca adopt <tmux 会话名或其中一段>;全部接管:aca adopt --all):",
                         "can be adopted (one: aca adopt <tmux session name or part of it>; all: aca adopt --all):"
                     )
                 );
@@ -821,14 +826,14 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
                 println!(
                     "{}",
                     tr!(
-                        "另有 {n} 个 tmux 会话没认出 agent、或者 agent 不在第一格:{list}",
+                        "另有 {n} 个 tmux 会话未识别到 agent,或 agent 不在第一个窗格:{list}",
                         "{n} more tmux session(s) with no recognized agent, or the agent not in the first pane: {list}"
                     )
                 );
                 println!(
                     "{}",
                     tr!(
-                        "  要接管得指名:aca adopt <会话 | %窗格> [--as 工具[:账号]]",
+                        "  需指定后接管:aca adopt <会话 | %窗格> [--as 工具[:账号]]",
                         "  name it to adopt it: aca adopt <SESSION | %PANE> [--as TOOL[:ACCOUNT]]"
                     )
                 );
@@ -840,7 +845,7 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
     let mut out = vec![];
     for p in &plans {
         if dry {
-            println!("{}", tr!("会接管  {}", "would adopt  {}", adopt_line(store, p)));
+            println!("{}", tr!("将接管  {}", "would adopt  {}", adopt_line(store, p)));
             p.notes.iter().for_each(|n| println!("  · {n}"));
             continue;
         }
@@ -850,13 +855,13 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
             out.push(adopt_json(&adopt::Plan { s: s.clone(), ..p.clone() }, &name));
             continue;
         }
-        println!("{}", tr!("接管了「{}」 {}  {}", "adopted “{}” {}  {}", p.title(), s.id, p.who()));
+        println!("{}", tr!("已接管「{}」 {}  {}", "adopted “{}” {}  {}", p.title(), s.id, p.who()));
         if name != p.tmux {
             println!("{}", tr!("  tmux 会话名:{} → {name}", "  tmux session name: {} → {name}", p.tmux));
         }
-        let group = if s.group.is_empty() { tr!("没分组", "no group") } else { tr!("分组 {}", "group {}", s.group) };
+        let group = if s.group.is_empty() { tr!("未分组", "no group") } else { tr!("分组 {}", "group {}", s.group) };
         let args =
-            if s.args.is_empty() { String::new() } else { tr!(" · 每次启动带 {}", " · every start adds {}", s.args.join(" ")) };
+            if s.args.is_empty() { String::new() } else { tr!(" · 每次启动附带 {}", " · every start adds {}", s.args.join(" ")) };
         println!("  {group} · {}{args}", short_conv(&s.conv));
         p.notes.iter().for_each(|n| println!("  · {n}"));
     }
@@ -864,7 +869,7 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
         println!("{}", serde_json::Value::Array(out));
     }
     if all && plans.is_empty() {
-        println!("{}", tr!("没有能直接接管的 tmux 会话", "no tmux session to adopt as is"));
+        println!("{}", tr!("没有可直接接管的 tmux 会话", "no tmux session to adopt as is"));
     }
     Ok(0)
 }
@@ -878,19 +883,25 @@ fn one_line(s: &str, n: usize) -> String {
 fn wait_line(s: &aca_core::store::Session, o: inbox::Outcome) -> String {
     let r = runtime::load(&s.id);
     match o {
-        inbox::Outcome::Done if r.last.trim().is_empty() => format!("{} 空下来了", s.id),
-        inbox::Outcome::Done => format!("{} 跑完一轮:「{}」", s.id, one_line(&r.last, 120)),
-        inbox::Outcome::Asking => format!("{} 在等确认:「{}」  看选项:aca answer {}", s.id, one_line(&r.ask, 120), s.id),
-        inbox::Outcome::Failed if r.error_kind.is_empty() => format!("{} 出错:{}", s.id, one_line(&r.error, 200)),
-        inbox::Outcome::Failed => format!("{} 出错({}):{}", s.id, r.error_kind_said(), one_line(&r.error, 200)),
-        inbox::Outcome::Exited => format!("{} 退出了", s.id),
-        inbox::Outcome::Timeout => format!("{} 还没完(到时间了)", s.id),
+        inbox::Outcome::Done if r.last.trim().is_empty() => tr!("{} 已空闲", "{} is idle", s.id),
+        inbox::Outcome::Done => tr!("{} 完成一轮:「{}」", "{} finished a turn: “{}”", s.id, one_line(&r.last, 120)),
+        inbox::Outcome::Asking => tr!(
+            "{} 正在等待确认:「{}」  查看选项:aca answer {}",
+            "{} is waiting for a confirmation: “{}”  options: aca answer {}",
+            s.id,
+            one_line(&r.ask, 120),
+            s.id
+        ),
+        inbox::Outcome::Failed if r.error_kind.is_empty() => tr!("{} 出错:{}", "{} failed: {}", s.id, one_line(&r.error, 200)),
+        inbox::Outcome::Failed => tr!("{} 出错({}):{}", "{} failed ({}): {}", s.id, r.error_kind_said(), one_line(&r.error, 200)),
+        inbox::Outcome::Exited => tr!("{} 已退出", "{} exited", s.id),
+        inbox::Outcome::Timeout => tr!("{} 尚未完成(已超时)", "{} not finished yet (timed out)", s.id),
     }
 }
 
 /// `aca inbox [会话]`:一个会话收到的(最近几条,带着送到没有);不给会话、也不在会话里:哪些会话有没送的
 fn inbox_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
-    let n: usize = a.opt("-n")?.map(|n| n.parse().map_err(|_| "-n 要是条数")).transpose()?.unwrap_or(20);
+    let n: usize = a.opt("-n")?.map(|n| n.parse().map_err(|_| t!("-n 应为条数", "-n takes a count"))).transpose()?.unwrap_or(20);
     let key = a.maybe().or_else(|| std::env::var("ACA_SESSION_ID").ok().filter(|s| !s.is_empty())).or_else(here);
     let Some(key) = key else {
         let mut any = false;
@@ -898,11 +909,14 @@ fn inbox_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             let waiting = inbox::pending(&s.id).len();
             if waiting > 0 {
                 any = true;
-                println!("{}  {}  {waiting} 条没送", s.id, status::title(&s, &runtime::load(&s.id)));
+                println!(
+                    "{}",
+                    tr!("{}  {}  {waiting} 条未送达", "{}  {}  {waiting} not delivered", s.id, status::title(&s, &runtime::load(&s.id)))
+                );
             }
         }
         if !any {
-            println!("没有没送的消息");
+            println!("{}", t!("没有未送达的消息", "no undelivered messages"));
         }
         return Ok(0);
     };
@@ -922,13 +936,17 @@ fn inbox_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
         return Ok(0);
     }
     if tail.is_empty() {
-        println!("{} 的收件箱是空的", s.id);
+        println!("{}", tr!("{} 的收件箱为空", "{}'s inbox is empty", s.id));
     }
     let now = paths::now();
     for (m, st) in tail {
-        let who = if m.from == "you" { "你".to_string() } else { m.who.clone() };
-        let what = if m.kind == "notice" { m.what.clone() } else { "说".into() };
-        println!("[{}] {}  {}前  {who} · {what}:{}", st.said(), m.id, print::age(now.saturating_sub(m.ts)), one_line(&m.text, 120));
+        let who = if m.from == "you" { t!("你", "you").to_string() } else { m.who.clone() };
+        let what = if m.kind == "notice" { m.what.clone() } else { t!("说", "said").into() };
+        let ago = print::age(now.saturating_sub(m.ts));
+        println!(
+            "{}",
+            tr!("[{}] {}  {}前  {who} · {what}:{}", "[{}] {}  {} ago  {who} · {what}: {}", st.said(), m.id, ago, one_line(&m.text, 120))
+        );
     }
     Ok(0)
 }
@@ -949,15 +967,15 @@ fn unknown(name: &str) -> String {
     // 挪进插件的老命令:指路
     if name == "mounts" {
         return t!(
-            "aca mounts 挪进了插件 aca.tailnet:aca plugin run aca.tailnet.list(add port=3000、drop target=<地址>、publish to=on|off);没装的先 aca plugin install aca.tailnet",
+            "aca mounts 已移到插件 aca.tailnet:aca plugin run aca.tailnet.list(add port=3000、drop target=<地址>、publish to=on|off);未安装时先运行 aca plugin install aca.tailnet",
             "aca mounts moved into the aca.tailnet plugin: aca plugin run aca.tailnet.list (add port=3000, drop target=<address>, publish to=on|off); install it first with aca plugin install aca.tailnet"
         )
         .into();
     }
     if name == "remote" {
         return t!(
-            "aca remote 挪进了插件 aca.remote:aca plugin run aca.remote.run host=<机器> command='<命令>' [note=… within=6h](list、rm id=…、collect、check);\
-             server 的地址和口令是它的设置(aca plugin setting aca.remote url …);没装的先 aca plugin install aca.remote",
+            "aca remote 已移到插件 aca.remote:aca plugin run aca.remote.run host=<机器> command='<命令>' [note=… within=6h](list、rm id=…、collect、check);\
+             server 的地址和口令在它的设置中(aca plugin setting aca.remote url …);未安装时先运行 aca plugin install aca.remote",
             "aca remote moved into the aca.remote plugin: aca plugin run aca.remote.run host=<host> command='<command>' [note=… within=6h] (list, rm id=…, collect, check); \
              the server's address and token are its settings (aca plugin setting aca.remote url …); install it first with aca plugin install aca.remote"
         )
@@ -965,9 +983,12 @@ fn unknown(name: &str) -> String {
     }
     match help::guess(name) {
         Some(near) => {
-            tr!("没有 {name} 这个命令,是不是 {near}?(aca help 看全部)", "no command {name}; did you mean {near}? (aca help lists them all)")
+            tr!(
+                "没有命令 {name},是不是 {near}?(aca help 查看全部)",
+                "no command {name}; did you mean {near}? (aca help lists them all)"
+            )
         }
-        None => tr!("没有 {name} 这个命令(aca help 看全部)", "no command {name} (aca help lists them all)"),
+        None => tr!("没有命令 {name}(aca help 查看全部)", "no command {name} (aca help lists them all)"),
     }
 }
 
@@ -980,18 +1001,18 @@ fn run(mut a: Args) -> Res<i32> {
     }
     // hook 最常跑:排在最前面,不开登记表
     match cmd.as_str() {
-        "hook" if !help::asked(&a.0) => return Ok(hook::run(&a.next(Tr::new("哪个工具", "which tool"))?)),
+        "hook" if !help::asked(&a.0) => return Ok(hook::run(&a.next(Tr::new("工具", "which tool"))?)),
         // Claude 起来、每发一句时并排跑的那条:把会话的名字交给它(见 aca_core::hook::name_cmd)
         "hook-name" => return Ok(hook::name_cmd()),
         // hook 自己留的后手:过几秒再看一次标题
         "retitle" => {
-            let (id, tool) = (a.next(ID)?, a.next(Tr::new("哪个工具", "which tool"))?);
+            let (id, tool) = (a.next(ID)?, a.next(Tr::new("工具", "which tool"))?);
             return Ok(hook::retitle_later(&id, &tool, a.next(Tr::new("秒数", "seconds"))?.parse().unwrap_or(3)));
         }
         // 起 agent 的那一步(见 aca_core::agent::launch):文件里的开场那句话接在后面那条命令的最后,换成它
         "exec-saying" => {
             let file = a.next(Tr::new("文件", "a file"))?;
-            return Err(tr!("起不来:{}", "couldn't start it: {}", agent::exec_saying(&file, &a.0)));
+            return Err(tr!("无法启动:{}", "couldn't start it: {}", agent::exec_saying(&file, &a.0)));
         }
         // 起会话时留的后手(见 aca_core::trust):「信不信任这个目录」出来就替你选信任
         "trust-watch" => {
@@ -1075,15 +1096,15 @@ fn run(mut a: Args) -> Res<i32> {
     }
     // 写坏了的配置是当成没写的(hook 不能因为它出错),人敲的命令这里提醒一句
     if let Some(e) = config::problem() {
-        eprintln!("{}", tr!("config.toml 写法有问题,当成没写:{e}", "config.toml has a problem and is ignored: {e}"));
+        eprintln!("{}", tr!("config.toml 格式有误,已忽略:{e}", "config.toml has a problem and is ignored: {e}"));
     }
     if let Some(e) = config::login_problem() {
-        eprintln!("{}", tr!("config.toml 的 [login] 写法有问题,这一节当成没写:{e}", "config.toml's [login] has a problem and is ignored: {e}"));
+        eprintln!("{}", tr!("config.toml 的 [login] 格式有误,已忽略此节:{e}", "config.toml's [login] has a problem and is ignored: {e}"));
     }
     if let Some(e) = config::idle_problem() {
         eprintln!(
             "{}",
-            tr!("config.toml 的 [idle] 写法有问题,不自动停:{e}", "config.toml's [idle] has a problem; nothing is auto-stopped: {e}")
+            tr!("config.toml 的 [idle] 格式有误,不会自动停止:{e}", "config.toml's [idle] has a problem; nothing is auto-stopped: {e}")
         );
     }
     let cfg = config::load();
@@ -1093,7 +1114,7 @@ fn run(mut a: Args) -> Res<i32> {
         let args = if a.0.first().is_some_and(|x| x == "--") { &a.0[1..] } else { &a.0[..] };
         let l = agent::direct(&cfg, &spec, args)?;
         return Err(tr!(
-            "起不来:{}",
+            "无法启动:{}",
             "couldn't start it: {}",
             std::process::Command::new(&l.argv[0]).args(&l.argv[1..]).envs(l.env).exec()
         ));
@@ -1110,7 +1131,10 @@ fn run(mut a: Args) -> Res<i32> {
             if let Some(odd) =
                 notify.split(',').map(str::trim).find(|x| !matches!(*x, "" | "done" | "failed" | "exited" | "waiting" | "all" | "none"))
             {
-                return Err(format!("--notify 认 done、failed、exited、waiting(逗号隔开)、all 或者 none,不认 {odd}"));
+                return Err(tr!(
+                    "--notify 只能为 done、failed、exited、waiting(逗号分隔)、all 或 none,无法识别 {odd}",
+                    "--notify takes done, failed, exited, waiting (comma-separated), all or none, not {odd}"
+                ));
             }
             let n = New {
                 title: a.opt("-t")?.unwrap_or_default(),
@@ -1119,7 +1143,7 @@ fn run(mut a: Args) -> Res<i32> {
                 hold: a.flag("--hold"),
                 notify,
                 worktree: a.opt("--worktree")?.or(a.opt("-w")?).unwrap_or_default(),
-                tool: a.next(Tr::new("工具(aca names 看有哪些)", "a tool (aca names lists them)"))?,
+                tool: a.next(Tr::new("工具(aca names 查看可用工具)", "a tool (aca names lists them)"))?,
                 dir: a.maybe().unwrap_or_else(|| ".".into()),
                 args: pass,
             };
@@ -1134,7 +1158,7 @@ fn run(mut a: Args) -> Res<i32> {
             }
             // 会话已经建好了:话没发进去不算新建失败,说一声,id 照样打出来
             if let Some(e) = unsaid {
-                eprintln!("{}", tr!("建好了,但第一句话没发进去:{e}", "created, but the first message wasn't sent: {e}"));
+                eprintln!("{}", tr!("已创建,但开场消息未发送:{e}", "created, but the first message wasn't sent: {e}"));
             }
             if json_out {
                 println!("{}", serde_json::to_string(&status::one(&cfg, &s, false)).unwrap());
@@ -1167,13 +1191,19 @@ fn run(mut a: Args) -> Res<i32> {
             }
         }
         "attach" => {
+            let client = a.opt("--client")?;
             let s = store.get(&a.next(ID)?)?;
-            let p = tmux::find(&s.id).ok_or_else(|| tr!("会话没在跑(aca start)", "the session isn't running (aca start)"))?;
+            let p = tmux::find(&s.id).ok_or_else(|| tr!("会话未运行(aca start)", "the session isn't running (aca start)"))?;
             runtime::update(&s.id, |r| r.seen = paths::now());
             tmux::bind_detach();
+            // tmux 绑定里跑的(点了通知、按了键):没有终端,切那台客户端,落在 agent 那一格(同 aca next)
+            if let Some(c) = client {
+                tmux::run(&["switch-client", "-c", &c, "-t", &p.pane])?;
+                return Ok(0);
+            }
             let verb = if std::env::var_os("TMUX").is_some() { "switch-client" } else { "attach-session" };
             return Err(tr!(
-                "tmux 起不来:{}",
+                "无法启动 tmux:{}",
                 "couldn't run tmux: {}",
                 tmux::cmd().args([verb, "-t", &p.sid]).stdin(std::process::Stdio::inherit()).exec()
             ));
@@ -1182,14 +1212,14 @@ fn run(mut a: Args) -> Res<i32> {
         "stop" => match a.opt("--idle")? {
             Some(span) => {
                 let after = config::span(&span).filter(|n| *n > 0).ok_or_else(|| {
-                    tr!("--idle 写成 30m、3h、1d、1h30m 这样,不认 {span}", "write --idle like 30m, 3h, 1d or 1h30m, not {span}")
+                    tr!("--idle 应写为 30m、3h、1d、1h30m 等格式,无法识别 {span}", "write --idle like 30m, 3h, 1d or 1h30m, not {span}")
                 })?;
                 let stopped = session::stop_idle(&store, &cfg, after, &|_| false)?;
                 if stopped.is_empty() {
-                    println!("{}", tr!("没有空闲了 {span} 以上、能停的会话", "no session idle for {span} or more to stop"));
+                    println!("{}", tr!("没有空闲超过 {span} 且可停止的会话", "no session idle for {span} or more to stop"));
                 }
                 for s in stopped {
-                    println!("{} {}  {}", status::IDLE_STOPPED, s.id, tr!("{}(空闲了 {})", "{} (idle {})", s.title, print::age(s.idle)));
+                    println!("{} {}  {}", status::IDLE_STOPPED, s.id, tr!("{}(已空闲 {})", "{} (idle {})", s.title, print::age(s.idle)));
                 }
             }
             None => session::stop(&store, &a.next(ID)?)?,
@@ -1201,7 +1231,7 @@ fn run(mut a: Args) -> Res<i32> {
             match to {
                 Some(_) if fresh => {
                     return Err(t!(
-                        "--as 是换账号接着原来的对话,和 --fresh 不能一起用",
+                        "--as 用于切换账号并继续原对话,不能与 --fresh 同时使用",
                         "--as carries the conversation over to another account; it doesn't go with --fresh"
                     )
                     .into());
@@ -1209,11 +1239,11 @@ fn run(mut a: Args) -> Res<i32> {
                 Some(to) => {
                     let r = session::rehome(&store, &cfg, &key, &to)?;
                     match r.copied {
-                        0 => println!("{}", tr!("换到了 {},在原地重启", "moved to {}, restarted in place", r.to)),
+                        0 => println!("{}", tr!("已切换到 {},已原地重启", "moved to {}, restarted in place", r.to)),
                         n => println!(
                             "{}",
                             tr!(
-                                "换到了 {},接着原来的对话(对话记录拷过去 {n} 个文件)",
+                                "已切换到 {},继续原对话(对话记录已复制,共 {n} 个文件)",
                                 "moved to {}, resuming the conversation ({n} files of it copied over)",
                                 r.to
                             )
@@ -1235,7 +1265,7 @@ fn run(mut a: Args) -> Res<i32> {
             let key = a.next(ID)?;
             match auto {
                 true => session::unlock(&store, &key)?,
-                false => println!("{}", session::rename(&store, &key, &a.next(Tr::new("新名字", "the new name"))?)?),
+                false => println!("{}", session::rename(&store, &key, &a.next(Tr::new("新标题", "the new name"))?)?),
             }
         }
         "move" => {
@@ -1249,19 +1279,22 @@ fn run(mut a: Args) -> Res<i32> {
         }
         "order" => {
             let s = store.get(&a.next(ID)?)?;
-            store.set_order(&s.id, a.next(POS)?.parse().map_err(|_| tr!("位置要是个数", "the position must be a number"))?)?;
+            store.set_order(&s.id, a.next(POS)?.parse().map_err(|_| tr!("位置应为数字", "the position must be a number"))?)?;
         }
         "adopt" => return adopt_cmd(&store, &cfg, a, passed, json_out),
         "release" => {
             let (title, name) = session::release(&store, &a.next(ID)?)?;
             match name.is_empty() {
                 true => {
-                    println!("{}", tr!("放手了「{title}」:登记删了(它没在跑)", "let go of “{title}”: unregistered (it wasn't running)"))
+                    println!(
+                        "{}",
+                        tr!("已将「{title}」移出 aca:已删除登记(会话未运行)", "let go of “{title}”: unregistered (it wasn't running)")
+                    )
                 }
                 false => println!(
                     "{}",
                     tr!(
-                        "放手了「{title}」:登记删了,tmux 会话 {name} 和里面的进程照留",
+                        "已将「{title}」移出 aca:已删除登记,tmux 会话 {name} 及其中的进程保留",
                         "let go of “{title}”: unregistered; tmux session {name} and its processes keep running"
                     )
                 ),
@@ -1271,7 +1304,7 @@ fn run(mut a: Args) -> Res<i32> {
         "unarchive" => session::archive(&store, &a.next(ID)?, false)?,
         "rm" => {
             let (title, worktree) = session::remove(&store, &a.next(ID)?)?;
-            println!("{}", tr!("删了「{title}」", "deleted “{title}”"));
+            println!("{}", tr!("已删除「{title}」", "deleted “{title}”"));
             if let Some(w) = worktree {
                 println!("{w}");
             }
@@ -1279,7 +1312,7 @@ fn run(mut a: Args) -> Res<i32> {
         "send" => {
             let wait = a
                 .opt("--wait")?
-                .map(|w| w.parse::<u64>().map(Duration::from_secs).map_err(|_| tr!("--wait 要是秒数", "--wait takes seconds")))
+                .map(|w| w.parse::<u64>().map(Duration::from_secs).map_err(|_| tr!("--wait 应为秒数", "--wait takes seconds")))
                 .transpose()?;
             let text = match a.opt("-m")? {
                 Some(m) => m,
@@ -1290,12 +1323,12 @@ fn run(mut a: Args) -> Res<i32> {
                 }
             };
             if text.trim().is_empty() {
-                return Err(tr!("没有要发的话", "nothing to send"));
+                return Err(tr!("没有要发送的内容", "nothing to send"));
             }
             session::send(&store, &cfg, &a.id()?, text.trim_end_matches('\n'), wait)?;
         }
         "msg" => {
-            let to = a.next(Tr::new("发给谁(会话 id、名字,或者 parent)", "who to (a session id, a name, or parent)"))?;
+            let to = a.next(Tr::new("接收方(会话 id、名称或 parent)", "who to (a session id, a name, or parent)"))?;
             let text = if a.0.is_empty() {
                 let mut t = String::new();
                 std::io::stdin().read_to_string(&mut t).map_err(|e| e.to_string())?;
@@ -1304,24 +1337,26 @@ fn run(mut a: Args) -> Res<i32> {
                 std::mem::take(&mut a.0).join(" ")
             };
             if text.trim().is_empty() {
-                return Err("没有要发的话".into());
+                return Err(t!("没有要发送的内容", "nothing to send").into());
             }
             let (m, sent) = inbox::send(&store, &cfg, &to, &text)?;
-            println!("放进了 {} 的收件箱({}):{}", m.to, m.id, sent.said());
+            println!("{}", tr!("已放入 {} 的收件箱({}):{}", "put into {}'s inbox ({}): {}", m.to, m.id, sent.said()));
         }
         "inbox" => return inbox_cmd(&store, a, json_out),
         "wait" => {
             let any = a.flag("--any");
-            let timeout =
-                a.opt("--timeout")?.map(|w| w.parse::<u64>().map(Duration::from_secs).map_err(|_| "--timeout 要是秒数")).transpose()?;
+            let timeout = a
+                .opt("--timeout")?
+                .map(|w| w.parse::<u64>().map(Duration::from_secs).map_err(|_| t!("--timeout 应为秒数", "--timeout takes seconds")))
+                .transpose()?;
             let keys = std::mem::take(&mut a.0);
             if keys.is_empty() {
                 SHORT.store(true, Ordering::Relaxed);
-                return Err("要给会话 id".into());
+                return Err(t!("需要会话 id", "needs a session id").into());
             }
             let out = inbox::wait(&store, &cfg, &keys, any, timeout)?;
             if out.is_empty() {
-                println!("等了 {} 秒,一个都没等到", timeout.map_or(0, |t| t.as_secs()));
+                println!("{}", tr!("已等待 {} 秒,未等到任何会话", "waited {} seconds, none came back", timeout.map_or(0, |t| t.as_secs())));
                 return Ok(inbox::Outcome::Timeout.code());
             }
             out.iter().for_each(|(s, o)| println!("{}", wait_line(s, *o)));
@@ -1338,7 +1373,7 @@ fn run(mut a: Args) -> Res<i32> {
                             let screen = aca_core::tmux::find(&s.id).map(|p| aca_core::tmux::capture(&p.pane)).unwrap_or_default();
                             println!("{}", answer::show(&s, &runtime::load(&s.id), &screen))
                         }
-                        _ => println!("{} 现在没在等确认", s.id),
+                        _ => println!("{}", tr!("{} 当前未在等待确认", "{} isn't waiting for a confirmation", s.id)),
                     }
                 }
             }
@@ -1354,9 +1389,9 @@ fn run(mut a: Args) -> Res<i32> {
         "group" => return group_cmd(&store, a),
         "meta" => return meta_cmd(&store, a),
         "plugin" => return plugin_cmd(&store, a, json_out),
-        "import" => match a.next(Tr::new("从哪搬(agent-deck)", "where from (agent-deck)"))?.as_str() {
+        "import" => match a.next(Tr::new("导入来源(agent-deck)", "where from (agent-deck)"))?.as_str() {
             "agent-deck" => import::agent_deck(&store, &cfg, a.flag("--apply"), a.flag("--all"))?,
-            other => return Err(tr!("不会从 {other} 搬", "can't import from {other}")),
+            other => return Err(tr!("不支持从 {other} 导入", "can't import from {other}")),
         },
         "names" => {
             let names = cfg.names();
@@ -1364,12 +1399,12 @@ fn run(mut a: Args) -> Res<i32> {
                 names.iter().for_each(|n| println!("{n}"));
             }
         }
-        "completion" => match a.next(Tr::new("哪种 shell(zsh)", "which shell (zsh)"))?.as_str() {
+        "completion" => match a.next(Tr::new("shell 类型(zsh)", "which shell (zsh)"))?.as_str() {
             "zsh" => print!("{}", crate::complete::zsh()),
-            other => return Err(tr!("还不会 {other} 的补全(只有 zsh)", "no completion for {other} yet (only zsh)")),
+            other => return Err(tr!("暂不支持 {other} 补全(仅支持 zsh)", "no completion for {other} yet (only zsh)")),
         },
         // help.rs 的表里有、这里还没写分支
-        other => return Err(tr!("{other} 还没接上", "{other} isn't wired up yet")),
+        other => return Err(tr!("{other} 尚未实现", "{other} isn't wired up yet")),
     }
     Ok(0)
 }
@@ -1384,9 +1419,26 @@ pub fn main(args: Vec<String>) -> i32 {
             if SHORT.load(Ordering::Relaxed)
                 && let Some(u) = help::usage(&cmd)
             {
-                eprintln!("{}{u}\n{}", help::USAGE, tr!("细节:aca help {cmd}", "details: aca help {cmd}"));
+                eprintln!("{}{u}\n{}", help::USAGE, tr!("详情:aca help {cmd}", "details: aca help {cmd}"));
             }
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wait_line_follows_the_interface_language() {
+        // 没有这个会话的运行记录:当它刚空下来、没有最后一句
+        let s = aca_core::store::Session { id: "aca-test-wait-lang".into(), ..Default::default() };
+        assert_eq!(wait_line(&s, inbox::Outcome::Timeout), "aca-test-wait-lang 尚未完成(已超时)");
+        i18n::with(Lang::En, || {
+            assert_eq!(wait_line(&s, inbox::Outcome::Timeout), "aca-test-wait-lang not finished yet (timed out)");
+            assert_eq!(wait_line(&s, inbox::Outcome::Exited), "aca-test-wait-lang exited");
+            assert_eq!(wait_line(&s, inbox::Outcome::Done), "aca-test-wait-lang is idle");
+        });
     }
 }
