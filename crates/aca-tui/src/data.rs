@@ -296,7 +296,8 @@ pub fn prepare(name: &str) -> Entry {
     Entry { name: name.to_string(), back, been }
 }
 
-/// attach 进去,detach 回来时返回 tmux 说最后停在哪个会话(会话名,里面可能切过;没说是空的)。None = 没进去。
+/// attach 进去,detach 回来时返回最后停在哪个会话(会话号;里面可能切过,比如点了通知;tmux 没说、已经没了是空的)。
+/// None = 没进去。
 /// 有刚离开的那个就先路过它(进去之后 ^` 回得去),路过不算看过(见 `tmux::attach_via`)
 pub fn go_in(e: &Entry) -> Option<String> {
     let run = |back: Option<&String>| {
@@ -314,14 +315,14 @@ pub fn go_in(e: &Entry) -> Option<String> {
     }
     let o = out.filter(|o| o.status.success())?;
     let text = String::from_utf8_lossy(&o.stdout);
-    Some(text.lines().find_map(|l| l.strip_prefix("[detached (from session ")?.strip_suffix(")]")).unwrap_or_default().to_string())
+    // tmux 说的是会话名(= 标题,会变),换成会话号
+    let left = text.lines().find_map(|l| l.strip_prefix("[detached (from session ")?.strip_suffix(")]")).unwrap_or_default();
+    Some((!left.is_empty()).then(|| session_id(left)).flatten().unwrap_or_default())
 }
 
-/// 回来之后记下这个终端先后待过的会话(两条 tmux 命令):界面画完回来的第一帧再调
+/// 回来之后记下这个终端先后待过的会话(一条 tmux 命令):界面画完回来的第一帧再调。left 是 [`go_in`] 给的
 pub fn remember_left(e: &Entry, left: &str) {
-    // tmux 说的是会话名(= 标题,会变);记的是会话号
-    let left = (!left.is_empty()).then(|| session_id(left)).flatten();
-    remember(left.as_deref().unwrap_or(&e.name), &e.name, &e.been);
+    remember(if left.is_empty() { &e.name } else { left }, &e.name, &e.been);
 }
 
 /// 会话名 → 会话号(`$3`)

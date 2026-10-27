@@ -4421,6 +4421,24 @@ impl App {
         let _ = self.reads.mark_read(&key, epoch(), &self.keep_marks());
     }
 
+    /// 从会话里回来(name 是进去的那个,left 是最后停在的会话号,见 `data::go_in`):待过的都算看过。
+    /// 高亮停在最后待的那个:里面切到别的会话(点了通知、^`)的是切到的那个,不然是进去的那个
+    /// (新建的、交接出来的还没被选中过);本来就停在它或它的窗口上的不动。还没读进列表的,后台重读的送到了才挪过去
+    fn came_back(&mut self, name: &str, left: &str) {
+        self.mark_seen(name);
+        let last = self.all.iter().find(|s| !left.is_empty() && s.sub.is_none() && s.tmux == left).map(|s| s.name.clone());
+        let last = match last {
+            Some(l) if l != name => {
+                self.mark_seen(&l);
+                l
+            }
+            _ => name.to_string(),
+        };
+        if !last.starts_with('$') && self.current().is_none_or(|s| s.family() != last) {
+            self.selected = Some(last);
+        }
+    }
+
     /// 已读文件里留哪些:还列着的会话,和删了还能撤回的。一个都没读到(采集失败)时全留
     fn keep_marks(&self) -> impl Fn(&str) -> bool + use<> {
         let mut keys: HashSet<String> = self.all.iter().filter(|s| s.sub.is_none() && !s.blank).map(notes::key).collect();
@@ -10756,12 +10774,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 paused.store(true, Ordering::Relaxed);
                 suspend()?;
                 let left = crate::data::go_in(&entry);
-                app.mark_seen(&name);
-                // 回来时高亮停在刚进去的那个(新建的、交接出来的还没被选中过);本来就停在它或它的窗口上的不动。
-                // 还没读进列表的,后台重读的送到了才挪过去
-                if !name.starts_with('$') && app.current().is_none_or(|s| s.family() != name) {
-                    app.selected = Some(name.clone());
-                }
+                app.came_back(&name, left.as_deref().unwrap_or_default());
                 if left.is_none() {
                     app.flash(t!("无法进入:会话可能刚结束", "can't go in: the session may have just ended"));
                 }
@@ -12458,6 +12471,28 @@ mod tests {
         // p:置顶它所在的会话,窗口跟着一起上去
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(order(&app)[..2], ["闲", "htop"]);
+    }
+
+    #[test]
+    fn back_from_a_session_the_highlight_is_on_the_one_you_were_last_in() {
+        let mut app = with_windows();
+        // 从「跑」进去,在里面点了通知切到「闲」,Ctrl+Q 出来:停在「闲」
+        select(&mut app, "跑");
+        app.came_back("跑", "$闲");
+        app.rebuild();
+        assert_eq!(app.current().map(|s| s.title.as_str()), Some("闲"));
+        // 没切过、tmux 没说、切到的不在列表里:停在进去的那个
+        for left in ["$跑", "", "$99"] {
+            select(&mut app, "问");
+            app.came_back("跑", left);
+            app.rebuild();
+            assert_eq!(app.current().map(|s| s.title.as_str()), Some("跑"), "{left:?}");
+        }
+        // 本来停在它的窗口上:不动
+        select(&mut app, "zsh");
+        app.came_back("跑", "$闲");
+        app.rebuild();
+        assert_eq!(app.current().map(|s| s.title.as_str()), Some("zsh"));
     }
 
     #[test]
