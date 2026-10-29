@@ -1,6 +1,8 @@
-//! 命令行。界面、插件、agent 自己都走这一套:能在界面里做的事,这里都有一条命令,`--json` 给程序读。
-//! 不带参数的 `aca` 是界面(aca-tui);`cost` / `limits` / `theme` / `mounts` / `remote` 和界面共用代码,也在那边。
-//! 每条命令怎么写、是干什么的,记在 `help.rs` 的表里(`aca help`)。
+//! The command line. The UI, plugins and agents themselves all go through it: everything the UI can do has a command here, and
+//! `--json` is for programs to read.
+//! `aca` with no arguments is the UI (aca-tui); `cost` / `limits` / `theme` / `mounts` / `remote` share code with the UI and
+//! live there too.
+//! How each command is written and what it does is recorded in the table in `help.rs` (`aca help`).
 
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
@@ -22,10 +24,11 @@ use aca_tui::print;
 
 use crate::help;
 
-/// 有参数没给全(少了位置参数、选项后面没跟值):出错时在那句话后面补上这条命令的用法
+/// An argument was left incomplete (a positional argument missing, no value after an option): on error, append this command's
+/// usage after the message
 static SHORT: AtomicBool = AtomicBool::new(false);
 
-/// 最常要的几个位置参数(「要给会话 id」)
+/// The positional arguments asked for most often ("missing a session id")
 const ID: Tr = Tr::new("会话 id", "a session id");
 const SUB: Tr = Tr::new("子命令", "a subcommand");
 const GROUP_PATH: Tr = Tr::new("分组路径", "a group path");
@@ -35,7 +38,7 @@ const POS: Tr = Tr::new("位置", "a position");
 struct Args(Vec<String>);
 
 impl Args {
-    /// 有没有这个开关(有就拿掉)
+    /// Whether this switch is there (and take it out if so)
     fn flag(&mut self, name: &str) -> bool {
         match self.0.iter().position(|a| a == name) {
             Some(i) => {
@@ -46,7 +49,7 @@ impl Args {
         }
     }
 
-    /// 带值的参数(拿掉它和它的值)
+    /// An argument with a value (take out both it and its value)
     fn opt(&mut self, name: &str) -> Res<Option<String>> {
         let Some(i) = self.0.iter().position(|a| a == name) else { return Ok(None) };
         if i + 1 >= self.0.len() {
@@ -57,7 +60,7 @@ impl Args {
         Ok(Some(self.0.remove(i)))
     }
 
-    /// 下一个位置参数;what 是缺了它时说的「要给…」
+    /// The next positional argument; `what` is what to name when it's missing ("missing …")
     fn next(&mut self, what: Tr) -> Res<String> {
         if self.0.is_empty() {
             SHORT.store(true, Ordering::Relaxed);
@@ -70,7 +73,7 @@ impl Args {
         (!self.0.is_empty()).then(|| self.0.remove(0))
     }
 
-    /// 会话 id;没写就是你所在的那个会话(见 [`here`])
+    /// A session id; when not given, the session you're in (see [`here`])
     fn id(&mut self) -> Res<String> {
         match self.0.is_empty().then(here).flatten() {
             Some(id) => Ok(id),
@@ -79,9 +82,11 @@ impl Args {
     }
 }
 
-/// 没写会话时冲着谁:你在 aca 的某个 tmux 会话里另开的窗口,就是那个会话(看这一格那儿的 `@aca_id`)。
-/// 只用来补上没写的 id,不是「我是谁」—— 那是 agent 自己环境里的 `ACA_SESSION_ID`(父会话、消息的发件人看它);
-/// agent 自己调的不补(省得它不写 id 就冲着自己发、中止自己)
+/// Which session is meant when none is given: in a window you opened inside one of aca's tmux sessions, it's that session (read
+/// from the `@aca_id` there).
+/// Only fills in an id that wasn't given; it isn't "who am I" — that's `ACA_SESSION_ID` in the agent's own environment (what
+/// parent sessions and message senders go by);
+/// not filled in when an agent calls it itself (so that leaving out the id doesn't make it send to, or interrupt, itself)
 fn here() -> Option<String> {
     if std::env::var("ACA_SESSION_ID").is_ok_and(|s| !s.is_empty()) || std::env::var_os("TMUX").is_none() {
         return None;
@@ -89,7 +94,8 @@ fn here() -> Option<String> {
     tmux::session_of(&std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty())?)
 }
 
-/// 列表不在终端里打的样子(脚本、agent 读的):一个字不能变,也不随语言变。终端里的归 aca-tui 的 print 排
+/// How the list looks when not printed to a terminal (read by scripts and agents): not a character may change, nor follow the
+/// language. Terminal output is laid out by aca-tui's print
 fn print_rows(rows: &[Row]) {
     i18n::with(Lang::Zh, || print_rows_zh(rows))
 }
@@ -112,7 +118,7 @@ fn print_rows_zh(rows: &[Row]) {
 }
 
 fn context(store: &Store, key: Option<String>, source: &str) -> Res<Context> {
-    // 没指定就是「我现在所在的会话」:agent 自己调的,或者你在它的 tmux 会话里另开的窗口
+    // When not given, it's "the session I'm in now": called by an agent itself, or from a window you opened in its tmux session
     let key = key.or_else(|| std::env::var("ACA_SESSION_ID").ok().filter(|s| !s.is_empty())).or_else(here);
     let Some(key) = key else { return Ok(Context { source: source.into(), ..Default::default() }) };
     let s = store.get(&key)?;
@@ -120,7 +126,7 @@ fn context(store: &Store, key: Option<String>, source: &str) -> Res<Context> {
     Ok(Context { session: s.id, dir: s.dir, tmux, pane, parent: s.parent, source: source.into() })
 }
 
-/// `json_out`:`--json`(在分到这里之前已经从参数里拿走了)
+/// `json_out`: `--json` (already taken out of the arguments before getting here)
 fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
     match a.next(SUB)?.as_str() {
         "link" => {
@@ -191,7 +197,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             for n in plugin::key_notes().into_iter().map(|(_, n)| n).chain(lacks) {
                 println!("⚠ {n}");
             }
-            // 钩子、定时上次没跑成,gateway 的服务停下了
+            // Hooks or timers that failed to run last time, gateway services that stopped
             let now = paths::now();
             for p in plugin::health::problems() {
                 println!("⚠ {}:{}(aca plugin log {})", p.plugin, p.text(now), p.plugin);
@@ -258,7 +264,13 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             for (c, what) in next {
                 println!("  {c:<w$}  {what}");
             }
-            println!("{}", t!("文档:docs/plugins.zh-CN.md(aca help plugin)", "How to write one: docs/plugins.md (aca help plugin)"));
+            println!(
+                "{}",
+                t!(
+                    "文档:aca help plugin,以及 https://github.com/cheny-00/aca/blob/main/docs/plugins.zh-CN.md",
+                    "How to write one: aca help plugin, and https://github.com/cheny-00/aca/blob/main/docs/plugins.md"
+                )
+            );
         }
         "check" => {
             let target = a.maybe().unwrap_or_else(|| ".".into());
@@ -307,7 +319,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
         "run" => {
             let session = a.opt("--session")?;
             let what = a.next(Tr::new("插件.能力", "PLUGIN.ACTION"))?;
-            // 剩下的是参数:名字=值
+            // What's left are the arguments: name=value
             let mut given = vec![];
             while let Some(kv) = a.maybe() {
                 let (k, v) = kv.split_once('=').ok_or_else(|| tr!("参数应写为 名称=值:{kv}", "arguments are NAME=VALUE: {kv}"))?;
@@ -334,7 +346,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 Some("on") => println!("{}", plugin::timer::on(&a.next(what)?)?),
                 Some("off") => println!("{}", plugin::timer::off(&a.next(what)?)?),
                 Some("run") => return plugin::timer::run_now(&a.next(what)?),
-                // launchd 到点跑的
+                // Run by launchd when the time comes
                 Some("tick") => return Ok(plugin::timer::tick(&a.next(what)?)),
                 Some(other) => {
                     SHORT.store(true, Ordering::Relaxed);
@@ -407,7 +419,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
         }
         "hotkey" | "hotkeys" => {
             let Some(id) = a.maybe() else {
-                // 顺手让 tmux 上的跟现在要的一致;被你自己的绑定占着的在这点名
+                // Along the way, bring tmux in line with what's wanted now; keys held by bindings of your own are named here
                 let held = plugin::bind_hotkeys();
                 let (items, notes) = plugin::hotkeys();
                 for h in &items {
@@ -442,11 +454,11 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
         }
         "setting" | "settings" => {
             let id = a.next(PLUGIN_ID)?;
-            // 先拿掉 --reset:不然它会被当成要写进去的值
+            // Take out --reset first: otherwise it would be taken as a value to write
             let reset = a.flag("--reset");
             match (a.maybe(), a.maybe()) {
                 (None, _) => {
-                    // secret 的打码;要原样的值点名读它(给脚本用)
+                    // secret ones are masked; to get the value as is, name it explicitly (for scripts)
                     for s in plugin::settings_of(&id)? {
                         let changed = if s.changed { t!("(已修改)", " (changed)") } else { "" };
                         println!("{} = {}{changed}  {}", s.name, s.shown(), s.desc);
@@ -466,7 +478,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             let raw = json_out;
             let what = a.next(Tr::new("插件.视图", "PLUGIN.VIEW"))?;
             let (ok, out) = plugin::capture(&what, &context(store, session, "cli")?, &[])?;
-            // 列表视图打成一行一条(要原样的 JSON 加 --json)
+            // A list view prints one row per line (for the raw JSON add --json)
             let rows = plugin::menu().into_iter().any(|i| i.qualified() == what && i.rows);
             match plugin::ViewRows::parse(&out) {
                 Ok(l) if ok && rows && !raw => println!("{}", l.text()),
@@ -510,7 +522,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                     return Ok(0);
                 }
                 for f in &found {
-                    // env 只列名字,值不打出来(多半是 key)
+                    // env lists only the names, the values aren't printed (they're mostly keys)
                     let mut cmd =
                         std::iter::once(f.command.as_str()).chain(f.args.iter().take(3).map(String::as_str)).collect::<Vec<_>>().join(" ");
                     if f.args.len() > 3 {
@@ -593,7 +605,8 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
         }
         "pane" => {
             let (session, placement, client) = (a.opt("--session")?, a.opt("--placement")?, a.opt("--client")?);
-            // 热键按出来的(tmux 上绑的那条命令带着它)。插件已经停了、删了,这个键是上回留下的:解掉,不报错
+            // Opened by a hotkey (the command bound in tmux carries it). If the plugin has since been stopped or deleted, the key is left
+            // over from before: unbind it, no error
             let hotkey = a.opt("--hotkey")?;
             let (p, pane) = (a.next(PLUGIN_ID)?, a.next(Tr::new("窗格 id", "a pane id"))?);
             if hotkey.is_some() && !plugin::hotkeys().0.iter().any(|h| h.plugin == p && h.pane == pane) {
@@ -625,14 +638,14 @@ fn events(mut a: Args) -> Res<i32> {
     loop {
         std::thread::sleep(Duration::from_millis(100));
         let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        // 变小了 = 换了新文件,从头读
+        // Got smaller = a new file, read from the start
         at = at.min(len);
         if len > at {
             let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
             f.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
             let mut more = String::new();
             f.read_to_string(&mut more).map_err(|e| e.to_string())?;
-            // 只吐完整的行
+            // Only emit whole lines
             let whole = more.rfind('\n').map_or(0, |i| i + 1);
             print!("{}", &more[..whole]);
             at += whole as u64;
@@ -640,7 +653,7 @@ fn events(mut a: Args) -> Res<i32> {
     }
 }
 
-/// 命令行给的目录:展开 ~、解析成真实路径,要是个已有的目录
+/// A directory given on the command line: expand ~, resolve to a real path, and it must be an existing directory
 fn real_dir(d: &str) -> Res<String> {
     let p = std::path::Path::new(&paths::expand(d)).canonicalize().map_err(|e| format!("{d}:{e}"))?;
     if !p.is_dir() {
@@ -662,7 +675,7 @@ fn group_cmd(store: &Store, mut a: Args) -> Res<i32> {
             let path = a.next(GROUP_PATH)?;
             let path = path.trim_matches('/');
             store.group_create(path, "")?;
-            // 一个目录只当一个组的默认目录
+            // A directory is the default directory of only one group
             if let Some(d) = a.maybe().filter(|d| !d.is_empty()).map(|d| paths::expand(&d)) {
                 store.group_set_dir(path, &d)?;
             }
@@ -672,7 +685,7 @@ fn group_cmd(store: &Store, mut a: Args) -> Res<i32> {
             let s = if n == 1 { "" } else { "s" };
             println!("{}", tr!("已删除,{n} 个会话已移到上一级", "deleted; {n} session{s} moved up a level"));
         }
-        // 目录登记成分组:名字按目录定(见 Store::dir_group),打出组名
+        // Register a directory as a group: the name follows from the directory (see Store::dir_group); print the group name
         "add" => println!("{}", store.group_claim(&real_dir(&a.maybe().unwrap_or_else(|| ".".into()))?)?.0),
         "rename" => {
             let from = a.next(GROUP_PATH)?;
@@ -719,7 +732,7 @@ fn meta_cmd(store: &Store, mut a: Args) -> Res<i32> {
     }
     match sub.as_str() {
         "set" => {
-            // 一行里放得下的一小段:去掉控制字符,截到 80 个字
+            // A short piece that fits on one line: strip control characters, cut to 80 characters
             let value: String = a.next(Tr::new("值", "a value"))?.chars().filter(|c| !c.is_control()).take(80).collect();
             runtime::update(&s.id, |r| {
                 r.tokens.insert(name, Token { value, until: if ttl == 0 { 0 } else { paths::now() + ttl } });
@@ -738,7 +751,7 @@ fn meta_cmd(store: &Store, mut a: Args) -> Res<i32> {
     Ok(0)
 }
 
-/// 「对话 3f2a9c1e」:id 只打开头,够认了
+/// "conv 3f2a9c1e": print only the start of the id, enough to recognize it
 fn short_conv(conv: &str) -> String {
     if conv.is_empty() {
         tr!("未识别对话", "conversation not recognized")
@@ -747,11 +760,11 @@ fn short_conv(conv: &str) -> String {
     }
 }
 
-/// 一个能接管的会话认成了什么,一行
+/// What an adoptable session was recognized as, in one line
 fn adopt_line(store: &Store, p: &adopt::Plan) -> String {
     let group = match p.s.group.as_str() {
         "" => String::new(),
-        // -g .:真接管时才定,这里写现在会定成哪个
+        // -g .: decided only on the real adopt; this shows what it would be decided as now
         session::BY_DIR => {
             tr!("  分组 {}(按目录)", "  group {} (by directory)", store.dir_group(&p.s.dir).map(|g| g.0).unwrap_or_else(|e| e))
         }
@@ -768,7 +781,7 @@ fn adopt_json(p: &adopt::Plan, tmux: &str) -> serde_json::Value {
     })
 }
 
-/// `aca adopt`:不带参数列出能接管的;给了会话就接管(`-n` 只看)
+/// `aca adopt`: with no arguments, list what can be adopted; given sessions, adopt them (`-n` only looks)
 fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<String>>, json_out: bool) -> Res<i32> {
     let (all, dry) = (a.flag("--all"), a.flag("-n"));
     let opts = adopt::Opts {
@@ -798,7 +811,7 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
             plans.iter_mut().for_each(|p| p.s.group = g.trim_matches('/').to_string());
         }
         if !all {
-            // 只列出来看
+            // Only list them, to look at
             if json_out {
                 println!("{}", serde_json::Value::Array(plans.iter().map(|p| adopt_json(p, &p.tmux)).collect()));
                 return Ok(0);
@@ -851,7 +864,7 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
         }
         let (s, name) = adopt::apply(store, p)?;
         if json_out {
-            // 分组是登记时才定的(-g .):照登记好的写
+            // The group is decided only at registration (-g .): write it as registered
             out.push(adopt_json(&adopt::Plan { s: s.clone(), ..p.clone() }, &name));
             continue;
         }
@@ -874,12 +887,12 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
     Ok(0)
 }
 
-/// 一行里放得下的一段:换行、连着的空白收成一个空格,截到 n 个字
+/// A piece that fits on one line: newlines and runs of whitespace become one space, cut to n characters
 fn one_line(s: &str, n: usize) -> String {
     runtime::clip(&s.split_whitespace().collect::<Vec<_>>().join(" "), n)
 }
 
-/// `aca wait` 等到一个,打一行
+/// `aca wait` got one: print a line
 fn wait_line(s: &aca_core::store::Session, o: inbox::Outcome) -> String {
     let r = runtime::load(&s.id);
     match o {
@@ -899,7 +912,18 @@ fn wait_line(s: &aca_core::store::Session, o: inbox::Outcome) -> String {
     }
 }
 
-/// `aca inbox [会话]`:一个会话收到的(最近几条,带着送到没有);不给会话、也不在会话里:哪些会话有没送的
+/// How long until a scheduled message is delivered (`aca msg --in`): `90s`, `10m`, `1h30m`, 7 days at most
+fn in_secs(v: &str) -> Res<u64> {
+    config::span(v).filter(|n| (1..=7 * 86400).contains(n)).ok_or_else(|| {
+        tr!(
+            "--in 应写为 90s、10m、1h30m 这样的时长(最长 7 天),无法识别 \"{v}\"",
+            "write --in like 90s, 10m or 1h30m (7 days at most), not \"{v}\""
+        )
+    })
+}
+
+/// `aca inbox [SESSION]`: what a session has received (the last few, with whether each was delivered); with no session given
+/// and not inside one: which sessions have undelivered messages
 fn inbox_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
     let n: usize = a.opt("-n")?.map(|n| n.parse().map_err(|_| t!("-n 应为条数", "-n takes a count"))).transpose()?.unwrap_or(20);
     let key = a.maybe().or_else(|| std::env::var("ACA_SESSION_ID").ok().filter(|s| !s.is_empty())).or_else(here);
@@ -943,20 +967,24 @@ fn inbox_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
         let who = if m.from == "you" { t!("你", "you").to_string() } else { m.who.clone() };
         let what = if m.kind == "notice" { m.what.clone() } else { t!("说", "said").into() };
         let ago = print::age(now.saturating_sub(m.ts));
+        let st = match st {
+            inbox::Stage::Scheduled => format!("{} {}", st.said(), aca_core::schedule::clock(m.at, now)),
+            _ => st.said().to_string(),
+        };
         println!(
             "{}",
-            tr!("[{}] {}  {}前  {who} · {what}:{}", "[{}] {}  {} ago  {who} · {what}: {}", st.said(), m.id, ago, one_line(&m.text, 120))
+            tr!("[{}] {}  {}前  {who} · {what}:{}", "[{}] {}  {} ago  {who} · {what}: {}", st, m.id, ago, one_line(&m.text, 120))
         );
     }
     Ok(0)
 }
 
-/// 界面那边出的错(终端开不了…)也照这里的规矩:说一句,退出码 1
+/// Errors from the UI side (the terminal won't open …) follow the rules here too: say one line, exit code 1
 fn ui(args: Vec<String>) -> Res<i32> {
     aca_tui::main(args).map(|()| 0).map_err(|e| e.to_string())
 }
 
-/// help 的一页:终端里上色,接到别处照原样
+/// One page of help: colored in a terminal, as is when piped elsewhere
 fn page(text: &str) {
     if !print::help(text) {
         println!("{text}");
@@ -964,7 +992,7 @@ fn page(text: &str) {
 }
 
 fn unknown(name: &str) -> String {
-    // 挪进插件的老命令:指路
+    // Old commands that moved into plugins: point the way
     if name == "mounts" {
         return t!(
             "aca mounts 已移到插件 aca.tailnet:aca plugin run aca.tailnet.list(add port=3000、drop target=<地址>、publish to=on|off);未安装时先运行 aca plugin install aca.tailnet",
@@ -993,39 +1021,42 @@ fn unknown(name: &str) -> String {
 }
 
 fn run(mut a: Args) -> Res<i32> {
-    // 什么都不带:界面
+    // Nothing given: the UI
     let Some(cmd) = a.maybe() else { return ui(vec![]) };
-    // 登录时工具拿 aca 当浏览器(见 aca_core::agent::quiet_login):链接交给界面或者不开,不开登记表
+    // At login a tool uses aca as its browser (see aca_core::agent::quiet_login): the link goes to the UI or isn't opened; the
+    // registry isn't opened
     if cmd.starts_with("https://") || cmd.starts_with("http://") {
         return Ok(agent::login_link(&cmd));
     }
-    // hook 最常跑:排在最前面,不开登记表
+    // hook runs most often: first in line, the registry isn't opened
     match cmd.as_str() {
         "hook" if !help::asked(&a.0) => return Ok(hook::run(&a.next(Tr::new("工具", "which tool"))?)),
-        // Claude 起来、每发一句时并排跑的那条:把会话的名字交给它(见 aca_core::hook::name_cmd)
+        // The one run alongside when Claude starts and on every message sent: hands it the session's name (see aca_core::hook::name_cmd)
         "hook-name" => return Ok(hook::name_cmd()),
-        // hook 自己留的后手:过几秒再看一次标题
+        // A fallback the hook leaves itself: look at the title again in a few seconds
         "retitle" => {
             let (id, tool) = (a.next(ID)?, a.next(Tr::new("工具", "which tool"))?);
             return Ok(hook::retitle_later(&id, &tool, a.next(Tr::new("秒数", "seconds"))?.parse().unwrap_or(3)));
         }
-        // 起 agent 的那一步(见 aca_core::agent::launch):文件里的开场那句话接在后面那条命令的最后,换成它
+        // The step that starts the agent (see aca_core::agent::launch): append the opening message from the file to the end of the
+        // command that follows, and exec that
         "exec-saying" => {
             let file = a.next(Tr::new("文件", "a file"))?;
             return Err(tr!("无法启动:{}", "couldn't start it: {}", agent::exec_saying(&file, &a.0)));
         }
-        // 起会话时留的后手(见 aca_core::trust):「信不信任这个目录」出来就替你选信任
+        // A fallback left when starting a session (see aca_core::trust): when "do you trust this directory" comes up, choose trust for you
         "trust-watch" => {
             let _ = aca_core::trust::watch(&Store::open()?, &config::load(), &a.next(ID)?);
             return Ok(0);
         }
-        // zsh 补全每按一次 Tab 问一次(见 complete.rs):不在 help 的表里
+        // zsh completion asks once on every Tab press (see complete.rs): not in the help table
         "__complete" => {
             let words = if a.0.first().is_some_and(|w| w == "--") { &a.0[1..] } else { &a.0[..] };
             crate::complete::print(words);
             return Ok(0);
         }
-        // 门铃的两条 hook(Claude 的 SessionStart、FileChanged)和送信的后手:跟 hook 一样不开登记表、不说话
+        // The two doorbell hooks (Claude's SessionStart, FileChanged) and the delivery fallback: like hook, they don't open the
+        // registry and say nothing
         "inbox" if matches!(a.0.first().map(String::as_str), Some("take" | "watch" | "deliver")) => {
             return Ok(match a.next(SUB)?.as_str() {
                 "take" => inbox::take_cmd(),
@@ -1033,12 +1064,14 @@ fn run(mut a: Args) -> Res<i32> {
                 _ => {
                     let id = a.next(ID)?;
                     let after = a.opt("--after")?.and_then(|n| n.parse().ok()).unwrap_or(0);
+                    let at = a.opt("--at")?.and_then(|n| n.parse().ok()).unwrap_or(0);
                     let check: Vec<String> = a.opt("--check")?.map(|c| c.split(',').map(String::from).collect()).unwrap_or_default();
-                    inbox::deliver_cmd(&id, after, a.flag("--retry"), &check)
+                    inbox::deliver_cmd(&id, after, at, a.flag("--retry"), &check)
                 }
             });
         }
-        // agent 起的插件 MCP 服务(见 aca_core::plugin::mount):标准输出是协议,不开登记表、不说别的
+        // A plugin MCP server started by an agent (see aca_core::plugin::mount): stdout is the protocol; the registry isn't opened and
+        // nothing else is said
         "plugin" if matches!(a.0.first().map(String::as_str), Some("mcp" | "tools")) => {
             return match a.next(SUB)?.as_str() {
                 "mcp" => plugin::exec_mcp(&a.next(PLUGIN_ID)?),
@@ -1067,7 +1100,7 @@ fn run(mut a: Args) -> Res<i32> {
             };
         }
         "version" | "--version" | "-V" => {
-            // 后面带上编的是哪一个提交(build.rs;没有 git 编的就没有)
+            // Append which commit it was built from (build.rs; not there when built without git)
             match option_env!("ACA_COMMIT") {
                 Some(c) => println!("aca {} ({c})", env!("CARGO_PKG_VERSION")),
                 None => println!("aca {}", env!("CARGO_PKG_VERSION")),
@@ -1076,11 +1109,11 @@ fn run(mut a: Args) -> Res<i32> {
         }
         _ => {}
     }
-    // 表里没有的名字不认:加命令要在 help.rs 里写上它,不然到不了下面的分支
+    // Names not in the table aren't accepted: a new command has to be written into help.rs, or it never reaches the branches below
     if help::find(&cmd).is_none() {
         return Err(unknown(&cmd));
     }
-    // `aca <命令> --help`:只说明,不做
+    // `aca <COMMAND> --help`: only explain, don't do it
     if help::asked(&a.0) {
         page(&help::of(&cmd).unwrap_or_default());
         return Ok(0);
@@ -1094,7 +1127,7 @@ fn run(mut a: Args) -> Res<i32> {
     if cmd == "events" {
         return events(a);
     }
-    // 写坏了的配置是当成没写的(hook 不能因为它出错),人敲的命令这里提醒一句
+    // A broken config is treated as if not written (hooks mustn't fail because of it); for commands people type, a reminder here
     if let Some(e) = config::problem() {
         eprintln!("{}", tr!("config.toml 格式有误,已忽略:{e}", "config.toml has a problem and is ignored: {e}"));
     }
@@ -1108,7 +1141,7 @@ fn run(mut a: Args) -> Res<i32> {
         );
     }
     let cfg = config::load();
-    // 不建会话,带着账号原样跑工具自己的命令:换成它,终端直接是它的
+    // No session is created; run the tool's own command as is, with the account: exec it, so the terminal is directly its own
     if cmd == "run" {
         let spec = a.next(Tr::new("工具[:账号]", "TOOL[:ACCOUNT]"))?;
         let args = if a.0.first().is_some_and(|x| x == "--") { &a.0[1..] } else { &a.0[..] };
@@ -1120,7 +1153,7 @@ fn run(mut a: Args) -> Res<i32> {
         ));
     }
     let store = Store::open()?;
-    // `--` 后面的原样交给 agent,不当成 aca 自己的参数
+    // What follows `--` goes to the agent as is, not taken as aca's own arguments
     let passed = a.0.iter().position(|x| x == "--").map(|i| a.0.split_off(i).split_off(1));
     let pass = passed.clone().unwrap_or_default();
     let json_out = a.flag("--json");
@@ -1153,10 +1186,10 @@ fn run(mut a: Args) -> Res<i32> {
                 None => (session::create(&store, &cfg, n)?, None),
             };
             if wt {
-                // id 照旧是标准输出的唯一一行(脚本要读),在哪个 worktree 写到标准错误
+                // The id is still the only line on stdout (scripts read it); which worktree it's in goes to stderr
                 eprintln!("{}", aca_core::worktree::note(Path::new(&s.dir)).unwrap_or_else(|| s.dir.clone()));
             }
-            // 会话已经建好了:话没发进去不算新建失败,说一声,id 照样打出来
+            // The session is already created: the message not getting in doesn't fail the creation; say so, and print the id anyway
             if let Some(e) = unsaid {
                 eprintln!("{}", tr!("已创建,但开场消息未发送:{e}", "created, but the first message wasn't sent: {e}"));
             }
@@ -1181,6 +1214,7 @@ fn run(mut a: Args) -> Res<i32> {
                 let mut v = serde_json::to_value(&row).unwrap();
                 v["run"] = serde_json::to_value(&r).unwrap();
                 v["args"] = json!(s.args);
+                v["work"] = json!(aca_tui::work_dir(&cfg, &s));
                 println!("{v}");
             } else if !print::show(&cfg, &store, &row, &r) {
                 print_rows(std::slice::from_ref(&row));
@@ -1196,7 +1230,8 @@ fn run(mut a: Args) -> Res<i32> {
             let p = tmux::find(&s.id).ok_or_else(|| tr!("会话未运行(aca start)", "the session isn't running (aca start)"))?;
             runtime::update(&s.id, |r| r.seen = paths::now());
             tmux::bind_detach();
-            // tmux 绑定里跑的(点了通知、按了键):没有终端,切那台客户端,落在 agent 那一格(同 aca next)
+            // Run from a tmux binding (a clicked notification, a pressed key): there's no terminal, so switch that client, landing on
+            // the agent's pane (same as aca next)
             if let Some(c) = client {
                 tmux::run(&["switch-client", "-c", &c, "-t", &p.pane])?;
                 return Ok(0);
@@ -1272,7 +1307,7 @@ fn run(mut a: Args) -> Res<i32> {
             let key = a.next(ID)?;
             let to = a.next(Tr::new("分组", "a group"))?;
             let got = session::move_to(&store, &key, &to)?;
-            // 按目录定的:说一声进了哪个
+            // Decided by directory: say which one it went into
             if to.trim_matches('/') == session::BY_DIR {
                 println!("{got}");
             }
@@ -1328,6 +1363,7 @@ fn run(mut a: Args) -> Res<i32> {
             session::send(&store, &cfg, &a.id()?, text.trim_end_matches('\n'), wait)?;
         }
         "msg" => {
+            let at = a.opt("--in")?.map(|v| in_secs(&v).map(|n| paths::now() + n)).transpose()?.unwrap_or(0);
             let to = a.next(Tr::new("接收方(会话 id、名称或 parent)", "who to (a session id, a name, or parent)"))?;
             let text = if a.0.is_empty() {
                 let mut t = String::new();
@@ -1339,7 +1375,7 @@ fn run(mut a: Args) -> Res<i32> {
             if text.trim().is_empty() {
                 return Err(t!("没有要发送的内容", "nothing to send").into());
             }
-            let (m, sent) = inbox::send(&store, &cfg, &to, &text)?;
+            let (m, sent) = inbox::send(&store, &cfg, &to, &text, at)?;
             println!("{}", tr!("已放入 {} 的收件箱({}):{}", "put into {}'s inbox ({}): {}", m.to, m.id, sent.said()));
         }
         "inbox" => return inbox_cmd(&store, a, json_out),
@@ -1403,7 +1439,7 @@ fn run(mut a: Args) -> Res<i32> {
             "zsh" => print!("{}", crate::complete::zsh()),
             other => return Err(tr!("暂不支持 {other} 补全(仅支持 zsh)", "no completion for {other} yet (only zsh)")),
         },
-        // help.rs 的表里有、这里还没写分支
+        // In the help.rs table, but no branch written here yet
         other => return Err(tr!("{other} 尚未实现", "{other} isn't wired up yet")),
     }
     Ok(0)
@@ -1415,7 +1451,7 @@ pub fn main(args: Vec<String>) -> i32 {
         Ok(code) => code,
         Err(e) => {
             eprintln!("{e}");
-            // 参数没给全:把这条命令怎么写接在后面
+            // Arguments incomplete: append how this command is written
             if SHORT.load(Ordering::Relaxed)
                 && let Some(u) = help::usage(&cmd)
             {
@@ -1432,7 +1468,7 @@ mod tests {
 
     #[test]
     fn a_wait_line_follows_the_interface_language() {
-        // 没有这个会话的运行记录:当它刚空下来、没有最后一句
+        // No run record for this session: treat it as just gone idle, with no last message
         let s = aca_core::store::Session { id: "aca-test-wait-lang".into(), ..Default::default() };
         assert_eq!(wait_line(&s, inbox::Outcome::Timeout), "aca-test-wait-lang 尚未完成(已超时)");
         i18n::with(Lang::En, || {

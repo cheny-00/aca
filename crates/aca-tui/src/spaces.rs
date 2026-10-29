@@ -1,39 +1,45 @@
-//! 工作区:会话分到几个用一个键(小写字母 / 数字)命名的工作区里,一次只看一个 —— 工作和生活分开。
-//! `q`+键 切过去,`Q`+键 把会话(折叠行上 = 整组)送过去,`[` `]` 前后换,`` ` `` 回刚才那个,`S` 列出来(`^R` 改名)。
-//! `h` 是隐藏的:`S` 里不列、`[` `]` 跳过,要 `q h` 进(出来以后 `` ` `` 也回得去)。
-//! 会话在哪:自己分过的 → 子会话跟父会话 → 跟它的组(折叠行上 `Q` 记下的)→ `1`(见 `ui::space_of`)。
-//! 组也记,是为了以后这个组里新开的(终端里 `aca new` 开的也算)直接落在那边,藏进 h 的组不会漏出来。
-//! 按 `notes::key` 记(登记的会话按 id,改名、重启都跟着)。
-//! 存在 ~/.local/state/aca/ui/spaces,一行一条:`in\t<会话的键>\t<工作区>`、`group\t<profile>\t<分组>\t<工作区>`、
-//! `name\t<工作区>\t<名字>`(改过名的)。认不出的行原样留着(以后的版本写的,存的时候不丢)。
-//! 和置顶一样每次刷新都重读、改之前先重读,手机和桌面各开一个 aca 不会互相覆盖。
+//! Workspaces: sessions are split across a few workspaces, each named by one key (a lowercase letter / digit), and you see one
+//! at a time: work and life kept apart.
+//! `q`+key switches there, `Q`+key sends the session there (on a fold row = the whole group), `[` `]` go back and forth,
+//! `` ` `` returns to the previous one, `S` lists them (`^R` renames).
+//! `h` is hidden: not listed in `S`, skipped by `[` `]`; you enter it with `q h` (after leaving, `` ` `` gets back too).
+//! Where a session is: its own assignment → a subsession follows its parent session → its group's (recorded by `Q` on a fold
+//! row) → `1` (see `ui::space_of`).
+//! Groups are recorded too so that sessions opened later in that group (including ones opened by `aca new` in a terminal) land
+//! there directly, and a group hidden in h doesn't leak out.
+//! Keyed by `notes::key` (registered sessions by id, so renames and restarts follow along).
+//! Stored in ~/.local/state/aca/ui/spaces, one entry per line: `in\t<session key>\t<workspace>`,
+//! `group\t<profile>\t<group>\t<workspace>`, `name\t<workspace>\t<name>` (renamed ones). Unrecognized lines are kept as they
+//! are (written by a later version, not lost on save).
+//! Like pins, reread on every refresh and before every change, so an aca open on the phone and one on the desktop don't
+//! overwrite each other.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::state::{state_file, write_atomic};
 
-/// 没分过的会话在这
+/// Sessions never assigned go here
 pub const HOME: char = '1';
-/// 隐藏的工作区
+/// The hidden workspace
 pub const HIDDEN: char = 'h';
 
-/// 能当工作区的键:小写字母和数字。q 不算(`q q` 是退出)
+/// Keys that can name a workspace: lowercase letters and digits. Not q (`q q` quits)
 pub fn is_key(c: char) -> bool {
     (c.is_ascii_lowercase() || c.is_ascii_digit()) && c != 'q'
 }
 
-/// 组:(profile, 分组)。登记的会话 profile 都是 `data::REGISTERED`;普通 tmux 会话是 ("", "-")
+/// A group: (profile, group). Registered sessions all have profile `data::REGISTERED`; plain tmux sessions are ("", "-")
 pub type Group = (String, String);
 
 #[derive(Clone, Default)]
 pub struct Spaces {
-    /// None = 只在内存里(单元测试、--snapshot)
+    /// None = in memory only (unit tests, --snapshot)
     path: Option<PathBuf>,
     of: BTreeMap<String, char>,
     groups: BTreeMap<Group, char>,
     names: BTreeMap<char, String>,
-    /// 认不出的行
+    /// Unrecognized lines
     other: Vec<String>,
 }
 
@@ -48,7 +54,7 @@ impl Spaces {
         s
     }
 
-    /// 读完就和文件断开,之后的改动只在内存里(--snapshot 喂按键时不能写真文件)
+    /// Cut loose from the file after reading; later changes stay in memory only (--snapshot feeding keys mustn't write the real file)
     pub fn detached(mut self) -> Self {
         self.path = None;
         self
@@ -79,7 +85,7 @@ impl Spaces {
                         names.insert(c, n.to_string());
                     }
                 }
-                // 认得的行写坏了就扔掉;不认得的留着
+                // A recognized line that's malformed is dropped; unrecognized ones are kept
                 ["in" | "group" | "name", ..] | [""] => {}
                 _ => other.push(l.to_string()),
             }
@@ -87,17 +93,18 @@ impl Spaces {
         (self.of, self.groups, self.names, self.other) = (of, groups, names, other);
     }
 
-    /// 会话自己分到了哪(没分过 = None,由调用方决定跟父会话、跟组还是在 1)
+    /// Where the session itself was assigned (never = None; the caller decides whether it follows the parent session, the group,
+    /// or stays in 1)
     pub fn of(&self, key: &str) -> Option<char> {
         self.of.get(key).copied()
     }
 
-    /// 组记在哪(没记过 = None)
+    /// Where the group is recorded (never recorded = None)
     pub fn group_of(&self, profile: &str, group: &str) -> Option<char> {
         self.groups.get(&(profile.to_string(), group.to_string())).copied()
     }
 
-    /// 只改内存(算「改完之后各在哪」用):Some = 记到那,None = 不记
+    /// Changes memory only (to work out "where each one is after the change"): Some = record it there, None = don't record
     pub fn set(&mut self, key: &str, c: Option<char>) {
         match c {
             Some(c) => self.of.insert(key.to_string(), c),
@@ -112,7 +119,7 @@ impl Spaces {
         };
     }
 
-    /// 显示的名字:改过的,没改过就是键本身
+    /// The name shown: the new name if renamed, otherwise the key itself
     pub fn name(&self, c: char) -> String {
         self.names.get(&c).cloned().unwrap_or_else(|| c.to_string())
     }
@@ -121,8 +128,9 @@ impl Spaces {
         self.names.contains_key(&c)
     }
 
-    /// 改会话和组的记录(Some = 记到那,None = 不记),先重读再存。
-    /// keep:还在的会话,别的会话的记录顺手清掉(删掉的会话不留在文件里);组的不清,组空了以后新开的还要落回去
+    /// Change the sessions' and groups' records (Some = record it there, None = don't record); reread first, then save.
+    /// keep: the sessions still around; other sessions' records are cleared along the way (deleted sessions don't stay in the
+    /// file); groups' aren't, since sessions opened later in a group that went empty still need to land back there
     pub fn assign(
         &mut self,
         sessions: &[(String, Option<char>)],
@@ -140,7 +148,8 @@ impl Spaces {
         self.save()
     }
 
-    /// 这些组删掉了:记录不留(以后再建个同名的不该还落在老地方),先重读再存
+    /// These groups were deleted: their records go (a group created later with the same name shouldn't land in the old place);
+    /// reread first, then save
     pub fn forget_groups(&mut self, gone: &dyn Fn(&str, &str) -> bool) -> std::io::Result<()> {
         self.reload();
         let n = self.groups.len();
@@ -151,7 +160,7 @@ impl Spaces {
         self.save()
     }
 
-    /// 分组改了名(连子分组):记的组跟过去,先重读再存
+    /// A group was renamed (with its subgroups): the recorded groups follow; reread first, then save
     pub fn rename_group(&mut self, profile: &str, from: &str, to: &str) -> std::io::Result<()> {
         self.reload();
         let moved: Vec<(Group, char)> = self
@@ -170,14 +179,14 @@ impl Spaces {
         self.save()
     }
 
-    /// 改名;空 = 改回用键当名字
+    /// Rename; empty = back to using the key as the name
     pub fn rename(&mut self, c: char, name: &str) -> std::io::Result<()> {
         self.reload();
         let name = name.trim();
         if name.is_empty() || name == c.to_string() {
             self.names.remove(&c);
         } else {
-            // 名字里不能有换行 / tab(一行一条)
+            // A name can't contain newlines / tabs (one entry per line)
             self.names.insert(c, name.replace(['\t', '\n'], " "));
         }
         self.save()
@@ -216,17 +225,17 @@ mod tests {
         let mut desk = Spaces::open(Some(path.clone()));
         let fun: Group = ("default".into(), "fun".into());
         phone.assign(&[("a".into(), Some('l')), ("b".into(), Some('l'))], &[(fun.clone(), Some('h'))], &all).unwrap();
-        desk.rename('l', "生活").unwrap(); // desk 内存里还没有 a b,写之前重读所以不丢
+        desk.rename('l', "生活").unwrap(); // desk doesn't have a b in memory yet; it rereads before writing, so they aren't lost
         let s = Spaces::open(Some(path.clone()));
         assert_eq!((s.of("a"), s.of("b"), s.of("c")), (Some('l'), Some('l'), None));
         assert_eq!((s.group_of("default", "fun"), s.group_of("other", "fun")), (Some('h'), None));
         assert_eq!((s.name('l'), s.name('2')), ("生活".to_string(), "2".to_string()));
-        phone.assign(&[("a".into(), None)], &[], &|k| k != "b").unwrap(); // a 不记了;b 删掉了;组的留着
+        phone.assign(&[("a".into(), None)], &[], &|k| k != "b").unwrap(); // a no longer recorded; b deleted; the group's record stays
         let s = Spaces::open(Some(path.clone()));
         assert_eq!((s.of("a"), s.of("b"), s.group_of("default", "fun")), (None, None, Some('h')));
-        phone.rename('l', " ").unwrap(); // 空名字 = 改回用键
+        phone.rename('l', " ").unwrap(); // empty name = back to the key
         assert!(!Spaces::open(Some(path.clone())).renamed('l'));
-        // 组删了:它的记录不留,别的组的还在
+        // A group deleted: its records go, other groups' stay
         phone
             .assign(&[], &[(("default".into(), "fun/app".into()), Some('h')), (("default".into(), "life".into()), Some('l'))], &all)
             .unwrap();
@@ -237,7 +246,7 @@ mod tests {
             (s.group_of("default", "fun"), s.group_of("default", "fun/app"), s.group_of("default", "life")),
             (None, None, Some('l'))
         );
-        // 写坏的行扔掉;不认得的(以后的版本写的)存的时候原样留着
+        // Malformed lines are dropped; unrecognized ones (written by a later version) are kept as they are on save
         std::fs::write(&path, "in\tx\tq\nin\ty\tAB\nname\t9\t\ngroup\tp\t\t2\nin\tz\t3\nlater\tv\t1\n").unwrap();
         let mut s = Spaces::open(Some(path.clone()));
         assert_eq!((s.of("x"), s.of("y"), s.of("z"), s.renamed('9')), (None, None, Some('3'), false));

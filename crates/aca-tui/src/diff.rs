@@ -1,11 +1,12 @@
-//! `x` 看改动:会话真正干活的目录(见 `workdir`)所在 git 仓库的 diff(像 Claude Squad 的 Diff 页)。
-//! 预览顶上的改动统计(`glance`)也在这。
+//! `x` the diff page: the diff of the git repository holding the directory the session is really working in (see `workdir`),
+//! like Claude Squad's Diff page. The change stats atop the preview (`glance`) live here too.
 //!
-//! 默认看还没提交的(工作区 + 暂存区对 HEAD,没 git add 的新文件也算);`m` 换成连同提交一起、
-//! 对比主干的分叉点 —— 这个分支一共改了什么。git 在后台线程里跑(见 ui 的 run 循环),大仓库也不卡界面。
+//! By default it shows what's not committed yet (working tree + index vs HEAD, new files never git-added included); `m` switches
+//! to including commits, against the fork point from the main branch: everything this branch changed. git runs on a background
+//! thread (see the run loop in ui), so a big repository doesn't stall the interface.
 //!
-//! 只读:不碰 index(`GIT_OPTIONAL_LOCKS=0`,不跟会话里的 agent 抢 index.lock),不跑外部 diff / textconv。
-//! 文件内容里的控制字符换成 �,免得往终端里吐转义序列。
+//! Read-only: never touches the index (`GIT_OPTIONAL_LOCKS=0`, so it doesn't fight the session's agent for index.lock), runs no
+//! external diff / textconv. Control characters in file contents become �, so no escape sequences get spat into the terminal.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -20,42 +21,43 @@ use crate::workdir::{self, Where};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
-    /// 还没提交的:工作区对 HEAD
+    /// Not committed yet: working tree vs HEAD
     Uncommitted,
-    /// 连同提交:工作区对主干的分叉点
+    /// Including commits: working tree vs the fork point from the main branch
     Branch,
 }
 
 #[derive(Debug, Default)]
 pub struct Diff {
     pub lines: Vec<Styled>,
-    /// 每个文件的标题行在 lines 里的下标(n / p 跳)
+    /// Index in lines of each file's heading line (n / p jump there)
     pub files: Vec<usize>,
-    /// 每行对应 (第几个文件, 新文件里第几行):`e` 在编辑器里打开那里。清单、文件标题指向它第一处改动
+    /// Per line: (which file, which line in the new file); `e` opens that spot in the editor. The file list and file headings
+    /// point at the file's first change
     pub at: Vec<Option<(usize, usize)>>,
-    /// 按文件:相对仓库根的路径;删掉了的是 None
+    /// Per file: path relative to the repository root; None for deleted ones
     pub paths: Vec<Option<String>>,
-    /// 仓库根(`l` 开 lazygit、`e` 拼路径);不是仓库时空
+    /// Repository root (`l` opens lazygit, `e` builds paths on it); empty when not a repository
     pub top: String,
 }
 
-/// 预览顶上那几样:真正干活的目录、它的分支和未提交的改动
+/// What sits atop the preview: the directory really being worked in, its branch and uncommitted changes
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Glance {
     pub work: workdir::Found,
-    /// None = 不是 git 仓库
+    /// None = not a git repository
     pub repo: Option<Stat>,
-    /// 目录里有什么:分组的预览才读(见 `glance_dir`),会话的是 None
+    /// What's in the directory: read only for a group's preview (see `glance_dir`); None for a session's
     pub files: Option<Files>,
 }
 
-/// 目录里有什么:子目录、文件各自按名字排(不分大小写),点开头的只数个数
+/// What's in a directory: subdirectories and files, each sorted by name (case-insensitive); dot entries are only counted
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Files {
     pub dirs: Vec<String>,
     pub files: Vec<String>,
     pub hidden: usize,
-    /// 读不了:不在了、没权限
+    /// Couldn't read it: gone, no permission
     pub err: Option<String>,
 }
 
@@ -67,16 +69,16 @@ pub struct Stat {
     pub del: usize,
 }
 
-/// git 的输出最多读这么多,再多的不要了(比如误改了个几百 MB 的生成文件)
+/// Read at most this much git output and drop the rest (e.g. a generated file of a few hundred MB changed by mistake)
 const MAX_BYTES: usize = 8 << 20;
-/// 摆出来的最多这么多行
+/// Show at most this many lines
 const MAX_LINES: usize = 20_000;
-/// 一行太长(压缩过的 js 之类)截掉
+/// Cut lines that are too long (minified js and the like)
 const MAX_COLS: usize = 1_000;
-/// 没 git add 的新文件:最多摆几个的内容、每个最多几行
+/// New files never git-added: show the contents of at most this many, at most this many lines each
 const NEW_FILES: usize = 30;
 const NEW_FILE_LINES: usize = 300;
-/// 空树:还没有提交的仓库拿它当 HEAD
+/// The empty tree: a repository with no commits yet uses it as HEAD
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 fn git(dir: &str, args: &[&str]) -> Command {
@@ -94,13 +96,13 @@ fn git(dir: &str, args: &[&str]) -> Command {
     c
 }
 
-/// 跑一条 git,成功才要输出(去掉结尾换行)
+/// Run one git command; take the output only on success (trailing newline trimmed)
 fn run(dir: &str, args: &[&str]) -> Option<String> {
     let out = git(dir, args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
-/// 读到 MAX_BYTES 为止;第二个值 = 是不是截断了
+/// Read up to MAX_BYTES; second value = whether it was cut
 fn run_capped(dir: &str, args: &[&str]) -> Option<(String, bool)> {
     let mut child = git(dir, args).stdout(Stdio::piped()).spawn().ok()?;
     let mut buf = vec![];
@@ -109,7 +111,7 @@ fn run_capped(dir: &str, args: &[&str]) -> Option<(String, bool)> {
     if cut {
         let _ = child.kill();
         buf.truncate(MAX_BYTES);
-        // 截在一行中间:丢掉这半行
+        // Cut mid-line: drop the partial line
         if let Some(p) = buf.iter().rposition(|&b| b == b'\n') {
             buf.truncate(p + 1);
         }
@@ -118,7 +120,7 @@ fn run_capped(dir: &str, args: &[&str]) -> Option<(String, bool)> {
     (ok || cut).then(|| (String::from_utf8_lossy(&buf).into_owned(), cut))
 }
 
-/// 主干:origin/HEAD 指向的,没有就 origin/main、origin/master、main、master 里第一个有的
+/// The main branch: what origin/HEAD points to, else the first that exists of origin/main, origin/master, main, master
 fn trunk(top: &str) -> Option<String> {
     let head = run(top, &["rev-parse", "--abbrev-ref", "origin/HEAD"]).filter(|s| !s.is_empty() && s != "origin/HEAD");
     head.into_iter()
@@ -132,7 +134,7 @@ fn branch_of(top: &str) -> String {
         .unwrap_or_default()
 }
 
-/// 还没有提交的仓库拿空树当 HEAD
+/// A repository with no commits yet uses the empty tree as HEAD
 fn head_or_empty(top: &str) -> (bool, String) {
     let has = run(top, &["rev-parse", "--verify", "-q", "HEAD"]).is_some();
     (has, if has { "HEAD".to_string() } else { EMPTY_TREE.to_string() })
@@ -144,12 +146,13 @@ fn untracked(top: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 和会话开的不是一个目录时,在顶上说一声
+/// When it's not the directory the session was opened in, say so at the top
 fn moved(w: &Where, found: &workdir::Found) -> Option<String> {
     (!found.how.is_empty() && found.dir != w.dir).then(|| tr!("会话启动目录:{}", "session opened in {}", crate::create::tilde(&w.dir)))
 }
 
-/// 预览顶上的:找目录、数改动(同 `x` 默认看的:未提交的,没 git add 的新文件也算)
+/// For the top of the preview: find the directory, count changes (same as `x` shows by default: uncommitted, new files never
+/// git-added included)
 pub fn glance(w: &Where) -> Glance {
     let work = workdir::find(w);
     let top = (!work.dir.is_empty() && std::path::Path::new(&work.dir).is_dir())
@@ -176,7 +179,7 @@ pub fn glance(w: &Where) -> Glance {
     Glance { work, repo: Some(st), files: None }
 }
 
-/// 分组的预览:和会话一样读目录、分支、改动,再列出目录里的东西
+/// A group's preview: read the directory, branch and changes as for a session, then list what's in the directory
 pub fn glance_dir(w: &Where) -> Glance {
     let mut g = glance(w);
     g.files = Some(list_dir(&g.work.dir));
@@ -198,7 +201,7 @@ pub fn list_dir(dir: &str) -> Files {
             out.hidden += 1;
             continue;
         }
-        // 软链按它指向的算:指向目录的也列在目录里
+        // A symlink counts as what it points to: one pointing to a directory is listed among the directories
         let t = e.file_type().ok();
         let is_dir = t.is_some_and(|t| t.is_dir()) || (t.is_some_and(|t| t.is_symlink()) && e.path().is_dir());
         if is_dir { out.dirs.push(name) } else { out.files.push(name) }
@@ -209,7 +212,7 @@ pub fn list_dir(dir: &str) -> Files {
     out
 }
 
-/// 找到真正干活的目录,读仓库、跑 diff、摆成带颜色的行
+/// Find the directory really being worked in, read the repository, run diff, lay it out as colored lines
 pub fn load(w: &Where, mode: Mode) -> Diff {
     let found = workdir::find(w);
     let dir = found.dir.as_str();
@@ -256,7 +259,7 @@ pub fn load(w: &Where, mode: Mode) -> Diff {
     Diff { top, ..render(&head, &patch, &new_files) }
 }
 
-/// 没 git add 的新文件的内容;二进制、读不了的写一句话
+/// Contents of a new file never git-added; for binary or unreadable ones, one sentence
 fn read_new(p: &std::path::Path) -> String {
     let Ok(f) = std::fs::File::open(p) else { return t!("\0无法读取", "\0unreadable").into() };
     let mut buf = vec![];
@@ -269,37 +272,38 @@ fn read_new(p: &std::path::Path) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// 摆 diff 用到的仓库信息
+/// Repository info used to lay out the diff
 #[derive(Default)]
 pub struct Head {
     pub dir: String,
     pub branch: String,
-    /// Branch 模式对比的主干(origin/main 之类);None = 看的是未提交的
+    /// The main branch Branch mode compares against (origin/main or the like); None = showing uncommitted
     pub against: Option<String>,
-    /// 分叉点之后的提交(一行一个「短 hash 标题」)
+    /// Commits after the fork point (one per line, "short-hash subject")
     pub commits: Vec<String>,
-    /// 想看连同提交的但看不了:为什么
+    /// Wanted to include commits but couldn't: why
     pub note: Option<String>,
-    /// diff 太大,只读了前面一截
+    /// The diff was too big, only the first part was read
     pub cut: bool,
-    /// 目录不是会话开的那个:开在哪
+    /// The directory isn't the one the session was opened in: where that was
     pub moved: Option<String>,
 }
 
-/// 一个文件的改动
+/// One file's changes
 #[derive(Debug, Default)]
 struct File {
     path: String,
-    /// M 改、A 新、D 删、R 改名、? 没 git add
+    /// M modified, A new, D deleted, R renamed, ? never git-added
     kind: char,
     add: usize,
     del: usize,
     body: Vec<String>,
-    /// 二进制 / 只改了权限之类没有内容行的,写一句
+    /// For ones with no content lines (binary, only the mode changed and the like), one sentence
     about: Option<String>,
 }
 
-// 增删用状态的绿 / 红、说明用次要色(见 theme.rs):终端的绿和 DIM 在浅底上太淡
+// Additions / deletions use the status green / red, notes the minor color (see theme.rs): the terminal's green and DIM are
+// too faint on a light background
 fn add_c() -> Style {
     Style::new().fg(theme::pal().green)
 }
@@ -319,7 +323,7 @@ fn notice<S: AsRef<str>>(msg: &[S]) -> Diff {
     Diff { at: vec![None; lines.len()], lines, ..Default::default() }
 }
 
-/// 摆出来的行,和每行对应文件里的哪儿
+/// The lines laid out, and where in the file each one corresponds to
 #[derive(Default)]
 struct Out {
     lines: Vec<Styled>,
@@ -336,16 +340,16 @@ impl Out {
     }
 }
 
-/// `@@ -a,b +c,d @@` 里的 c
+/// The c in `@@ -a,b +c,d @@`
 fn hunk_start(line: &str) -> Option<usize> {
     let plus = line.split_whitespace().find(|w| w.starts_with('+'))?;
     plus[1..].split(',').next()?.parse().ok()
 }
 
-/// 一个文件的 diff 每行落在新文件的第几行
+/// Which line of the new file each line of one file's diff lands on
 struct Pos {
     at: Vec<usize>,
-    /// 各段第一处加 / 删在第几行,按先后
+    /// The line of each hunk's first addition / deletion, in order
     changes: Vec<usize>,
 }
 
@@ -355,7 +359,8 @@ impl Pos {
     }
 }
 
-/// @@ 给起点,加的和没动的往下数,删掉的停在原处;@@ 那行本身指向这一段第一处加 / 删(前面几行是上下文)
+/// @@ gives the start; added and unchanged lines count down, deleted ones stay put; the @@ line itself points at the hunk's
+/// first addition / deletion (the lines before it are context)
 fn positions(body: &[String]) -> Pos {
     let mut at = Vec::with_capacity(body.len());
     let mut changes = vec![];
@@ -388,13 +393,13 @@ fn positions(body: &[String]) -> Pos {
     Pos { at, changes }
 }
 
-/// 按 `diff --git` 切成一个个文件
+/// Split into files at `diff --git`
 fn parse(patch: &str) -> Vec<File> {
     let mut files: Vec<File> = vec![];
     let mut in_hunk = false;
     for line in patch.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
-            // 路径里可能有空格:取最后一个 " b/" 后面的;下面的 +++ / rename to 会再校正
+            // The path may contain spaces: take what follows the last " b/"; the +++ / rename to lines below correct it
             let path = rest.rfind(" b/").map_or(rest, |i| &rest[i + 3..]).to_string();
             files.push(File { path, kind: 'M', ..Default::default() });
             in_hunk = false;
@@ -437,7 +442,7 @@ fn parse(patch: &str) -> Vec<File> {
     files
 }
 
-/// 显示用:tab 展开成 4 格一档,回车去掉,别的控制字符换成 �,太长截掉
+/// For display: tabs expand to 4-column stops, carriage returns go, other control characters become �, too long gets cut
 fn clean(s: &str) -> String {
     let mut out = String::new();
     let mut col = 0;
@@ -486,7 +491,7 @@ fn counts(f: &File) -> Vec<Seg> {
     v
 }
 
-/// 摆出来:顶上是仓库、分支和文件清单,下面一个文件一段
+/// Lay it out: repository, branch and the file list on top, then one block per file
 pub fn render(h: &Head, patch: &str, new_files: &[(String, Option<String>)]) -> Diff {
     let mut files = parse(patch);
     for (path, text) in new_files {
@@ -507,11 +512,11 @@ pub fn render(h: &Head, patch: &str, new_files: &[(String, Option<String>)]) -> 
         files.push(f);
     }
     let bold = Style::new().add_modifier(Modifier::BOLD);
-    // body 每行在新文件里第几行;每个文件第一处改动在哪(清单、标题行按 e 去那)
+    // Which line in the new file each body line is; where each file's first change is (e on the file list or a heading goes there)
     let pos: Vec<Pos> = files.iter().map(|f| positions(&f.body)).collect();
     let first: Vec<usize> = pos.iter().map(|p| p.first().unwrap_or(1)).collect();
     let mut out = Out::default();
-    // 未提交 / 连同提交、几个文件,标题栏写了;这里只加总共加删几行
+    // Uncommitted / including commits and the file count are in the title bar; here only the total lines added / removed
     let mut head = vec![seg(format!(" {}", clean(&h.dir)), Style::new())];
     if !h.branch.is_empty() {
         head.push(seg(format!("  {}", clean(&h.branch)), dim_c()));
@@ -545,7 +550,7 @@ pub fn render(h: &Head, patch: &str, new_files: &[(String, Option<String>)]) -> 
             out.push(vec![seg(format!("  {hash} "), theme::warn()), seg(clean(subject), Style::new())], None);
         }
     }
-    // 文件清单
+    // File list
     if !files.is_empty() {
         out.push(vec![], None);
     }
@@ -554,7 +559,7 @@ pub fn render(h: &Head, patch: &str, new_files: &[(String, Option<String>)]) -> 
         l.extend(counts(f));
         out.push(l, Some((i, first[i])));
     }
-    // 一个文件一段
+    // One block per file
     let mut starts = vec![];
     let mut full = false;
     for (i, f) in files.iter().enumerate() {
@@ -650,11 +655,11 @@ Binary files a/logo.png and b/logo.png differ
                 "  ? pic.bin",
             ]
         );
-        // 每个文件的标题行都记下了位置,n / p 跳这里
+        // Every file's heading line has its position recorded; n / p jump here
         let heads: Vec<&str> = d.files.iter().map(|&i| t[i].as_str()).collect();
         assert_eq!(heads, ["▌M src/a.rs +2 −1", "▌D gone.txt −1", "▌R new name.md +1 −1", "▌M logo.png", "▌? notes.txt +2", "▌? pic.bin"]);
         let a = d.files[0];
-        // tab 展开成空格;+ / - 上色
+        // Tabs expand to spaces; + / - are colored
         assert_eq!(t[a + 1..a + 6], ["@@ -1,3 +1,3 @@ fn main() {", " keep", "-old", "+new", "+   more"]);
         assert_eq!(d.lines[a + 3][0].style.fg, Some(theme::pal().red));
         assert_eq!(d.lines[a + 4][0].style.fg, Some(theme::pal().green));
@@ -669,14 +674,14 @@ Binary files a/logo.png and b/logo.png differ
         let d = render(&Head::default(), PATCH, &[("notes.txt".to_string(), Some("a\nb\n".to_string()))]);
         let t = text(&d);
         let at = |s: &str| d.at[t.iter().position(|l| l == s).unwrap()];
-        // 清单、标题、@@:第一处加 / 删(不是这段开头的上下文)
+        // File list, heading, @@: the first addition / deletion (not the context at the hunk's start)
         assert_eq!(at("  M src/a.rs +2 −1"), Some((0, 2)));
         assert_eq!(at("▌M src/a.rs +2 −1"), Some((0, 2)));
         assert_eq!(at("@@ -1,3 +1,3 @@ fn main() {"), Some((0, 2)));
-        // @@ -1,3 +1,3 @@ 之后: keep=1、-old 停在 2、+new=2、+more=3
+        // After @@ -1,3 +1,3 @@: keep=1, -old stays at 2, +new=2, +more=3
         assert_eq!([at(" keep"), at("-old"), at("+new"), at("+   more")], [Some((0, 1)), Some((0, 2)), Some((0, 2)), Some((0, 3))]);
         assert_eq!(at("+b"), Some((4, 2)));
-        // 删掉的文件打不开
+        // A deleted file can't be opened
         assert_eq!(d.paths, [Some("src/a.rs".into()), None, Some("new name.md".into()), Some("logo.png".into()), Some("notes.txt".into())]);
         assert_eq!(d.at.len(), d.lines.len());
     }
@@ -713,7 +718,7 @@ Binary files a/logo.png and b/logo.png differ
                 .arg(d)
                 .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
                 .args(args)
-                // 不吃本机的 git 配置(签名、钩子之类)
+                // Don't pick up this machine's git config (signing, hooks and the like)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env_remove("GIT_DIR")
@@ -725,7 +730,7 @@ Binary files a/logo.png and b/logo.png differ
                 .success();
             assert!(ok, "{args:?}");
         };
-        // 还没有提交:整个都是新的
+        // No commits yet: everything is new
         sh(&["init", "-q"]);
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         let w = Where { dir: d.into(), ..Default::default() };
@@ -738,19 +743,19 @@ Binary files a/logo.png and b/logo.png differ
         sh(&["commit", "-qam", "second"]);
         std::fs::write(dir.join("a.txt"), "three\n").unwrap();
         let index = std::fs::read(dir.join(".git/index")).unwrap();
-        // 未提交的:只有 two → three
+        // Uncommitted: only two → three
         let t = text(&load(&w, Mode::Uncommitted));
         assert!(t.contains(&"-two".to_string()) && t.contains(&"+three".to_string()) && !t.contains(&"-one".to_string()), "{t:#?}");
-        // 连同提交:从 main 分出来以后的全部
+        // Including commits: everything since branching off main
         let t = text(&load(&w, Mode::Branch));
         assert!(t[1].starts_with(" main 以来 1 个提交"), "{t:#?}");
         assert!(t.iter().any(|l| l.ends_with(" second")));
         assert!(t.contains(&"-one".to_string()) && t.contains(&"+three".to_string()), "{t:#?}");
-        // 预览顶上的统计:同上面未提交的那份
+        // The stats atop the preview: same as the uncommitted ones above
         let g = glance(&w);
         assert_eq!(g.work.dir, d);
         assert_eq!(g.repo, Some(Stat { branch: "feat".into(), files: 1, add: 1, del: 1 }));
-        // 看完 index 原封不动
+        // After all that reading the index is untouched
         assert_eq!(std::fs::read(dir.join(".git/index")).unwrap(), index);
         let root = Where { dir: "/".into(), ..Default::default() };
         assert_eq!(text(&load(&root, Mode::Uncommitted)), [" / · 不是 git 仓库"]);
@@ -775,7 +780,7 @@ Binary files a/logo.png and b/logo.png differ
             (f.dirs.clone(), f.files.clone(), f.hidden, f.err.clone()),
             (vec!["Docs".to_string(), "link".into(), "src".into()], vec!["A.md".to_string(), "b.txt".into()], 2, None)
         );
-        // 分组的预览:目录、改动之外带着它
+        // A group's preview: carries the listing besides the directory and changes
         let g = glance_dir(&Where { dir: d.into(), ..Default::default() });
         assert_eq!((g.repo, g.files), (None, Some(f)));
         assert_eq!(glance(&Where { dir: d.into(), ..Default::default() }).files, None);

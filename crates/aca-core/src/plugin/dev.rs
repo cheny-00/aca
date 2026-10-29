@@ -1,10 +1,12 @@
-//! 写插件时用的三样(`aca plugin new / check / emit`):
+//! Three things for writing plugins (`aca plugin new / check / emit`):
 //!
-//! - **new**:建一个能直接链接、直接跑的插件目录 —— 清单(一条命令、一个键,事件钩子写好了注释着)和它跑的脚本
-//! - **check**:不链接也能查:清单读不读得懂、写得对不对,命令要跑的程序 / 脚本在不在,`needs` 里的程序这台机器上有没有,
-//!   给 agent 的目录像不像样;链接过的再看它的键有没有被别的插件拿走
-//! - **emit**:假装来了一个事件,订了它的钩子在**前台**跑、输出直接打出来(平时钩子在 hook 里起、不等它、输出进日志)。
-//!   测钩子不用真跑一轮 agent
+//! - **new**: creates a plugin directory you can link and run right away — a manifest (one command, one key, an event hook
+//!   written out but commented) and the script it runs
+//! - **check**: checks without linking: does the manifest read and is it right, are the programs / scripts its commands run
+//!   there, are the programs in `needs` on this machine, does the directory for agents look right; for a linked one, also
+//!   whether another plugin took its keys
+//! - **emit**: fakes an event; the hooks subscribed to it run in the **foreground** with their output printed (normally hooks
+//!   start from the hook, aren't waited for, and their output goes to the log). Testing a hook needs no real agent turn
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -15,7 +17,7 @@ use super::{Context, Entry, MANIFEST, Manifest, cond_matches, registry};
 use crate::paths::{self, Res};
 use crate::{t, tr};
 
-/// 清单里的 id:目录名小写,不认的字换成 -,前面加 me.
+/// The manifest's id: the directory name in lowercase, unknown characters turned into -, prefixed with me.
 fn id_from(dir: &Path) -> String {
     let base = dir.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     let s: String = base.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' }).collect();
@@ -26,11 +28,12 @@ fn id_from(dir: &Path) -> String {
 fn manifest_text(id: &str, name: &str) -> String {
     let (zh, en) = (
         format!(
-            r#"# aca 插件的清单(写法:aca help plugin、docs/plugins.zh-CN.md)。改了脚本马上生效,改了清单 aca plugin link 一次
+            r#"# aca 插件的清单。写法:aca help plugin,以及 https://github.com/cheny-00/aca/blob/main/docs/plugins.zh-CN.md
+# 改了脚本马上生效,改了清单 aca plugin link 一次
 id = "{id}"
 name = "{name}"
 version = "0.1.0"
-api = 1                          # 照着插件接口第几版写的(docs/plugins.zh-CN.md「接口约定」)
+api = 1                          # 照着插件接口第几版写的(上面那份文档的「接口约定」)
 description = "一句话说它干什么"
 # needs = ["jq"]                 # 要用到的外面的程序:装的时候、aca plugin check、插件页说缺了哪个
 
@@ -60,11 +63,12 @@ desc = "打招呼用的那句"
 "#
         ),
         format!(
-            r#"# An aca plugin manifest (see aca help plugin, docs/plugins.md). Script changes apply at once; after changing this, aca plugin link again
+            r#"# An aca plugin manifest. How to write one: aca help plugin, and https://github.com/cheny-00/aca/blob/main/docs/plugins.md
+# Script changes apply at once; after changing this, aca plugin link again
 id = "{id}"
 name = "{name}"
 version = "0.1.0"
-api = 1                          # the plugin API version it's written for (docs/plugins.md, "The contract")
+api = 1                          # the plugin API version it's written for ("The contract" in the docs above)
 description = "One line on what it does"
 # needs = ["jq"]                 # outside programs it uses: install, aca plugin check and the plugins page say which are missing
 
@@ -100,21 +104,23 @@ desc = "What to greet with"
 fn script_text() -> &'static str {
     t!(
         r#"#!/bin/sh
-# 环境里有会话、设置、参数(ACA_SESSION_ID、ACA_SETTING_<名字>、ACA_ARG_<名字>…,见 docs/plugins.zh-CN.md「交给命令的环境」);
+# 环境里有会话、设置、参数(ACA_SESSION_ID、ACA_SETTING_<名字>、ACA_ARG_<名字>…),见插件文档的「交给命令的环境」:
+# https://github.com/cheny-00/aca/blob/main/docs/plugins.zh-CN.md
 # 界面用哪种话在 ACA_LANG(zh / en)。要 aca 做什么就调 "$ACA_BIN"(aca show "$ACA_SESSION_ID" --json、aca send …)
 lines=$(wc -l | tr -d ' ')
 echo "${ACA_SETTING_GREETING:-你好}!会话 ${ACA_SESSION_ID:-(没有)} 的最后一条回复有 $lines 行"
 "#,
         r#"#!/bin/sh
-# The environment carries the session, settings and arguments (ACA_SESSION_ID, ACA_SETTING_<NAME>, ACA_ARG_<NAME>…, see
-# docs/plugins.md); the interface language is in ACA_LANG (zh / en). To have aca do something, call "$ACA_BIN"
+# The environment carries the session, settings and arguments (ACA_SESSION_ID, ACA_SETTING_<NAME>, ACA_ARG_<NAME>…),
+# see "The environment a program gets" in https://github.com/cheny-00/aca/blob/main/docs/plugins.md
+# The interface language is in ACA_LANG (zh / en). To have aca do something, call "$ACA_BIN"
 lines=$(wc -l | tr -d ' ')
 echo "${ACA_SETTING_GREETING:-hello}! the last reply of session ${ACA_SESSION_ID:-(none)} has $lines lines"
 "#
     )
 }
 
-/// `aca plugin new <目录>`:建好清单和脚本,返回 id。目录里已经有东西的不动
+/// `aca plugin new <dir>`: creates the manifest and script, returns the id. Leaves alone what's already in the directory
 pub fn scaffold(dir: &str, id: Option<&str>) -> Res<String> {
     let dir = PathBuf::from(paths::expand(dir));
     if dir.read_dir().is_ok_and(|mut d| d.next().is_some()) {
@@ -132,22 +138,23 @@ pub fn scaffold(dir: &str, id: Option<&str>) -> Res<String> {
     Ok(id)
 }
 
-/// `aca plugin check` 查出来的
+/// What `aca plugin check` found
 #[derive(Debug, Default)]
 pub struct Report {
     pub dir: PathBuf,
-    /// 读出来的清单(读不懂是 None)
+    /// The manifest as read (None when unreadable)
     pub manifest: Option<Manifest>,
-    /// 用不了的
+    /// What makes it unusable
     pub errors: Vec<String>,
-    /// 能用,但最好改的
+    /// Usable, but better fixed
     pub warns: Vec<String>,
 }
 
-/// 叫解释器跑脚本的:脚本是下一个参数
+/// Commands that call an interpreter to run a script: the script is the next argument
 const INTERPRETERS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "python", "python3", "node", "deno", "bun", "ruby", "perl"];
 
-/// 一条命令要跑的程序 / 脚本在不在:`./x` 照插件目录找,光名字在 PATH 里找;`sh x.sh` 这种再看脚本在不在
+/// Whether the program / script a command runs is there: `./x` is looked up in the plugin directory, a bare name in PATH;
+/// for `sh x.sh` and the like, also whether the script is there
 fn program_problem(dir: &Path, argv: &[String], cwd: &str) -> Option<String> {
     let prog = argv.first()?;
     if prog.starts_with("./") || prog.starts_with("../") {
@@ -161,13 +168,13 @@ fn program_problem(dir: &Path, argv: &[String], cwd: &str) -> Option<String> {
     if !on_path {
         return Some(tr!("PATH 中找不到 {prog}", "{prog} isn't on PATH"));
     }
-    // 在会话的目录里跑的,脚本相对哪儿说不准:不查
+    // Run in the session's directory, so it's unclear what the script is relative to: not checked
     let script = argv.get(1).filter(|a| INTERPRETERS.contains(&prog.as_str()) && !a.starts_with('-') && cwd != "session")?;
     let p = if Path::new(script).is_absolute() { PathBuf::from(script) } else { dir.join(script) };
     (!p.is_file()).then(|| tr!("插件目录中没有 {script}", "{script} isn't in the plugin directory"))
 }
 
-/// 查一个插件:给目录(或者清单的路径),或者链接过的 id
+/// Checks one plugin: given a directory (or the manifest's path), or a linked id
 pub fn check(target: &str) -> Res<Report> {
     let p = PathBuf::from(paths::expand(target));
     let dir = if p.exists() {
@@ -212,7 +219,7 @@ pub fn check(target: &str) -> Res<Report> {
             r.errors.push(format!("{what} {id}:{why}").replace(" :", ":"));
         }
     }
-    // 链接过的:它的键有没有被别的插件拿走
+    // A linked one: whether another plugin took its keys
     if registry().iter().any(|e| e.id == m.id && Path::new(&e.path) == dir) {
         r.warns.extend(super::key_notes().into_iter().filter(|(p, _)| *p == m.id).map(|(_, n)| n));
     }
@@ -220,19 +227,19 @@ pub fn check(target: &str) -> Res<Report> {
     Ok(r)
 }
 
-/// emit 跑了的一个钩子
+/// A hook emit ran
 #[derive(Debug)]
 pub struct Ran {
     pub plugin: String,
     pub command: String,
-    /// 退出码;被信号打断的是 None
+    /// Exit code; None when killed by a signal
     pub code: Option<i32>,
-    /// 标准输出 + 标准错误
+    /// stdout + stderr
     pub out: String,
 }
 
-/// `aca plugin emit <事件>`:订了它的(开着的)插件、`if` 对得上的钩子,一个个在前台跑完,输出收下来。
-/// `only` = 只跑这个插件的;`fields` 是事件自己的字段(`kind=transient`)
+/// `aca plugin emit <event>`: the hooks of (enabled) plugins subscribed to it whose `if` matches run one by one in the
+/// foreground, with their output collected. `only` = only this plugin's; `fields` are the event's own fields (`kind=transient`)
 pub fn emit(event: &str, ctx: &Context, fields: serde_json::Map<String, Value>, only: Option<&str>) -> Res<Vec<Ran>> {
     if !crate::event::KNOWN.contains(&event) {
         return Err(tr!("没有事件 {event}:{}", "no event {event}; there are: {}", crate::event::KNOWN.join(" ")));
@@ -273,7 +280,7 @@ pub fn emit(event: &str, ctx: &Context, fields: serde_json::Map<String, Value>, 
     Ok(ran)
 }
 
-/// `名字=值`:值是数、true / false、null、JSON 数组 / 对象的照它的类型,别的当字
+/// `name=value`: a number, true / false, null, or a JSON array / object keeps its type; anything else is a string
 pub fn field_value(v: &str) -> Value {
     match serde_json::from_str::<Value>(v) {
         Ok(x @ (Value::Number(_) | Value::Bool(_) | Value::Null | Value::Array(_) | Value::Object(_))) => x,

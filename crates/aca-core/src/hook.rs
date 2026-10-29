@@ -1,14 +1,17 @@
-//! `aca hook <内置那家的名字 | 工具名>`:agent 那边每来一个事件跑一次,事件的 JSON 在标准输入里(hook 协议)。
+//! `aca hook <built-in tool name | tool name>`: runs once for every event from the agent, with the event's JSON on stdin
+//! (the hook protocol).
 //!
-//! 做这几件事:改这个会话的状态文件;标题变了就把 tmux 会话名改过去;把事件发给界面和插件;
-//! 会话之间递话的两头([`inbox`]):它是被派出来的,就在跑完、出错、退出、在等确认时给派它的那个放一条通知;
-//! 它自己收件箱里有没送的,这一轮跑完时起一个不等的送信进程。
-//! 是哪个会话看环境里的 `ACA_SESSION_ID`(起会话时放进去的),没有就什么也不做。
-//! 事件怎么变成状态、标题从哪来,是各家 agent 自己的事(`agent/`),这里只管流程。
-//! 声明式工具的转发脚本用 `"$ACA_BIN" hook "$ACA_TOOL"`:两个都是起会话时放进环境的。
+//! What it does: updates the session's state file; renames the tmux session when the title changes; sends the event to
+//! the interface and plugins; and both ends of passing messages between sessions ([`inbox`]): if this session was
+//! delegated, it leaves a notice for the session that delegated it when it finishes, errors, exits or waits for a
+//! confirmation; if its own inbox has undelivered messages, it starts a detached delivery process when the turn ends.
+//! Which session it is comes from `ACA_SESSION_ID` in the environment (set when the session starts); without it, nothing
+//! happens. How events become states and where titles come from is each agent's business (`agent/`); this only runs the
+//! flow. A declared tool's forwarding script uses `"$ACA_BIN" hook "$ACA_TOOL"`: both are put in the environment when the
+//! session starts.
 //!
-//! 规矩:**永远退出 0、标准输出一个字不写**(权限类 hook 的输出会被当成决定),
-//! 标准输入读完(不读完 agent 那头会 broken pipe),不等任何慢的东西。
+//! Rules: **always exit 0 and never write a byte to stdout** (output from permission hooks is taken as a decision), read
+//! stdin to the end (otherwise the agent gets a broken pipe), and never wait on anything slow.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -20,16 +23,18 @@ use crate::runtime::Run;
 use crate::store::{Session, Store};
 use crate::{config, event, inbox, paths, proc, runtime, tmux};
 
-/// 这一轮结束了(跑完 / 被打断):标题该有了,也要看一眼有没有人连着
+/// The turn is over (finished / interrupted): the title should be there by now, and check whether anyone is attached
 fn turn_ended(v: &Value) -> bool {
     matches!(v["hook_event_name"].as_str(), Some("Stop" | "Interrupt"))
 }
 
-/// 记下 agent 自己起的标题(`pick` 说现在是哪个);没锁名字的话把 tmux 会话名也改过去。返回要发的事件
+/// Records the title the agent made up (`pick` says which one it is now); if the name isn't locked, renames the tmux
+/// session to match. Returns the events to send
 pub(crate) fn retitle(id: &str, pick: impl FnOnce(&Run) -> Option<String>) -> Events {
     let mut title = None;
     runtime::update(id, |r| {
-        // 人改过名的也一直记着,只是不拿它去改会话名(放开锁时马上能用)
+        // A name set by a person is still recorded, just not used to rename the session (so it's ready the moment the lock is
+        // released)
         if let Some(t) = pick(r).filter(|t| *t != r.auto_title) {
             r.auto_title = t.clone();
             title = (!r.locked).then_some(t);
@@ -45,18 +50,19 @@ pub(crate) fn retitle(id: &str, pick: impl FnOnce(&Run) -> Option<String>) -> Ev
 }
 
 pub fn run(tool: &str) -> i32 {
-    // 不管用不用都读完
+    // Read it all, used or not
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let Some(id) = std::env::var("ACA_SESSION_ID").ok().filter(|s| !s.is_empty()) else { return 0 };
     let cfg = config::load();
     let Ok((agent, _)) = agent::resolve(&cfg, tool) else { return 0 };
     let agent: &dyn Agent = &*agent;
-    // Claude 的后台会话继承了原窗格的环境,不是这个会话本人
+    // Claude's background sessions inherit the original pane's environment; they aren't this session itself
     if std::env::var_os("CLAUDE_JOB_DIR").is_some() {
         return 0;
     }
-    // 查载荷长什么样:`touch ~/.local/state/aca/hook-debug` 之后,每个事件原样记进 hook-debug.log
+    // To see what payloads look like: after `touch ~/.local/state/aca/hook-debug`, every event is logged verbatim to
+    // hook-debug.log
     let debug = paths::state_dir().join("hook-debug");
     if debug.exists() {
         use std::io::Write;
@@ -67,7 +73,8 @@ pub fn run(tool: &str) -> i32 {
     let Ok(v) = serde_json::from_str::<Value>(&input) else { return 0 };
     let now = paths::now();
     let ended = turn_ended(&v);
-    // 一条 tmux 命令问两样:有没有人连着这个会话、窗格标题。只在用得上的事件上问
+    // One tmux command asks two things: is anyone attached to this session, and the pane title. Only asked on events that
+    // need it
     let pane = std::env::var("TMUX_PANE").unwrap_or_default();
     let (attached, pane_title) = match !pane.is_empty() && (ended || agent.title_in_pane()) {
         true => tmux::run(&["display-message", "-p", "-t", &pane, "#{session_attached}\t#{pane_title}"])
@@ -79,13 +86,14 @@ pub fn run(tool: &str) -> i32 {
     let mut events: Events = vec![];
     runtime::update(&id, |r| {
         events = agent.on_hook(r, &v, now);
-        // 跑完的那一刻有人正连着这个会话:算看过了
+        // Someone is attached to the session the moment it finishes: counts as read
         if ended && attached {
             r.seen = now;
         }
     });
     events.extend(retitle(&id, |r| agent.title(r, &pane_title)));
-    // 标题常常比「跑完」晚一两秒才有(第一轮尤其):还没有的话,留一个不等它的后手过几秒再看一次
+    // The title often arrives a second or two after "finished" (especially on the first turn): if it isn't there yet, leave
+    // a detached follow-up that looks again in a few seconds
     if ended && runtime::load(&id).auto_title.is_empty() {
         let _ = proc::detach(
             Command::new(agent::self_exe())
@@ -95,7 +103,8 @@ pub fn run(tool: &str) -> i32 {
                 .stderr(Stdio::null()),
         );
     }
-    // Codex 不过状态栏:一轮跑完,留一个不等它的后手看看额度动了没有(动了它往事件流写 limits.changed)
+    // Codex has no status bar to go through: after a turn, leave a detached follow-up that checks whether its limits moved
+    // (if they did, it writes limits.changed to the event stream)
     if ended && agent.name() == "codex" && !cfg!(test) {
         let _ = proc::detach(
             Command::new(agent::self_exe()).args(["limits", "--codex"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()),
@@ -105,21 +114,23 @@ pub fn run(tool: &str) -> i32 {
     0
 }
 
-/// 一个事件的后半截:收件箱、事件流、通知
+/// The second half of an event: inbox, event stream, notices
 fn settle(cfg: &config::Config, id: &str, agent: &dyn Agent, v: &Value, events: Events) {
-    // 收信这一头:aca 送进去的那段话记成送到了;这一轮跑完了还有没送的,补送一次
+    // The receiving end: the text aca typed in is marked delivered; if the turn finished and there's still undelivered mail,
+    // deliver it again
     let ev = v["hook_event_name"].as_str().unwrap_or("");
     inbox::on_hook(id, ev, v["prompt"].as_str().unwrap_or(""), agent.delivery() == Delivery::Bell);
     for (name, data) in events {
         event::emit(name, id, data);
-        // 被派出来的:这件事告诉派它的那个
+        // Delegated: tell the session that delegated it
         inbox::notify(id, name, cfg);
     }
 }
 
-/// aca 替 agent 补的一个事件(它自己不报的那种,比如 Codex 一轮出错,见 [`Agent::unreported_end`]):
-/// 和真的 hook 走同一条路,状态、事件流、给派它的那个的通知、收件箱补送都一样。
-/// 带着 `at` 的记成那个时刻的事:隔了很久才有人看时,「跑完之后进去看过没有」比的是它真跑完的时刻
+/// An event aca fills in for the agent (one it doesn't report itself, e.g. a Codex turn that errored; see
+/// [`Agent::unreported_end`]): it goes the same way as a real hook — state, event stream, the notice to the session that
+/// delegated it, and inbox redelivery all the same. One with `at` is recorded as happening at that moment: when someone
+/// looks only much later, "was it looked at after finishing" compares against when it really finished
 pub fn feed(cfg: &config::Config, id: &str, agent: &dyn Agent, v: &Value) {
     let mut events: Events = vec![];
     let at = v["at"].as_u64().unwrap_or_else(paths::now);
@@ -127,27 +138,30 @@ pub fn feed(cfg: &config::Config, id: &str, agent: &dyn Agent, v: &Value) {
     settle(cfg, id, agent, v, events);
 }
 
-/// `aca retitle <会话> <工具> <秒>`:hook 留的后手。等几秒,再看一次标题
+/// `aca retitle <session> <tool> <secs>`: the follow-up a hook leaves. Waits a few seconds, then looks at the title again
 pub fn retitle_later(id: &str, tool: &str, secs: u64) -> i32 {
     std::thread::sleep(std::time::Duration::from_secs(secs));
     let (Ok((agent, _)), Some(p)) = (agent::resolve(&config::load(), tool), tmux::find(id)) else { return 0 };
-    // 那个事件之后的状态原样拿来问:Claude 的标题看的是最后一个事件是不是「跑完」
+    // Ask with the state exactly as it was after that event: Claude's title checks whether the last event was "finished"
     for (name, data) in retitle(id, |r| agent.title(r, &p.title)) {
         event::emit(name, id, data);
     }
     0
 }
 
-/// `aca hook-name`:Claude 起来(SessionStart)、你每发一句(UserPromptSubmit)时和 `aca hook` 并排跑的一条,
-/// 把会话的名字交给 Claude 当它自己的名字(`sessionTitle`):输入框上、终端标题、ListAgents / SendMessage 按名字找会话都用它,
-/// 不交的话它叫「目录名-编号」。只有这条往标准输出写(那一行 JSON),所以和 `aca hook` 分开。
+/// `aca hook-name`: runs alongside `aca hook` when Claude starts (SessionStart) and on each prompt you send
+/// (UserPromptSubmit), handing the session's name to Claude as its own name (`sessionTitle`): the input box, the terminal
+/// title, and ListAgents / SendMessage finding sessions by name all use it; without it Claude calls the session
+/// `<dir name>-<number>`. Only this one writes to stdout (that one line of JSON), which is why it's separate from
+/// `aca hook`.
 ///
-/// 交哪个、什么时候交见 [`name_for`]。读不到会话、出什么错都是不交,下一句再试
+/// Which name and when: see [`name_for`]. If the session can't be read or anything goes wrong, nothing is handed over;
+/// the next prompt tries again
 pub fn name_cmd() -> i32 {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let Some(id) = std::env::var("ACA_SESSION_ID").ok().filter(|s| !s.is_empty()) else { return 0 };
-    // Claude 的后台会话继承了原窗格的环境,不是这个会话本人
+    // Claude's background sessions inherit the original pane's environment; they aren't this session itself
     if std::env::var_os("CLAUDE_JOB_DIR").is_some() {
         return 0;
     }
@@ -168,9 +182,11 @@ pub fn name_cmd() -> i32 {
     0
 }
 
-/// 交给 Claude 的名字;`has` 是它现在的名字(hook 载荷里的 `session_title`,没有是空的)。
-/// - 交哪个:人起的、改过的名(锁着的)就是它;没锁的交 Claude 自己起的标题(第一轮跑完才有;之后 /clear、重启都还叫这个)
-/// - 什么时候交:它还没有名字;或者还叫着 aca 上次交的那个,而你在 aca 里改了名。名字是在 Claude 里 /rename 起的就不动
+/// The name handed to Claude; `has` is its current name (`session_title` in the hook payload, empty if there is none).
+/// - Which: a name a person gave or changed (locked) is used as is; if not locked, Claude's own title is handed over
+///   (only there after the first turn finishes; it keeps that name after /clear or a restart)
+/// - When: it has no name yet; or it still has the name aca handed it last time and you renamed it in aca. A name set in
+///   Claude with /rename is left alone
 fn name_for(s: &Session, r: &Run, has: &str) -> Option<String> {
     let want: String = if s.title_locked { &s.title } else { &r.auto_title }.chars().filter(|c| !c.is_control()).collect();
     let want = want.trim();
@@ -186,19 +202,20 @@ mod tests {
     fn claude_is_named_after_the_session_once_and_follows_renames_made_in_aca_only() {
         let s = |title: &str, locked: bool| Session { title: title.into(), title_locked: locked, ..Default::default() };
         let r = |auto: &str, named: &str| Run { auto_title: auto.into(), named: named.into(), ..Default::default() };
-        // 你起的名:一起来就交
+        // A name you gave: handed over right at start
         assert_eq!(name_for(&s("修登录", true), &r("", ""), "").as_deref(), Some("修登录"));
-        // 没起名:等它自己起了标题(第一轮跑完)再交;登记时那个目录名不算
+        // No name given: wait until it makes up a title (after the first turn) before handing one over; the dir name from
+        // registration doesn't count
         assert_eq!(name_for(&s("aca", false), &r("", ""), ""), None);
         assert_eq!(name_for(&s("aca", false), &r("Fix login\n", ""), "").as_deref(), Some("Fix login"));
-        // 已经叫这个了:不再交
+        // Already called that: don't hand it over again
         assert_eq!(name_for(&s("修登录", true), &r("", "修登录"), "修登录"), None);
-        // 在 aca 里改了名:它还叫着上次交的那个,跟过去
+        // Renamed in aca: it still has the name handed over last time, so follow along
         assert_eq!(name_for(&s("修登录 2", true), &r("", "修登录"), "修登录").as_deref(), Some("修登录 2"));
-        // 在 Claude 里 /rename 过:不动
+        // Renamed with /rename in Claude: leave it alone
         assert_eq!(name_for(&s("修登录 2", true), &r("", "修登录"), "我起的"), None);
         assert_eq!(name_for(&s("aca", false), &r("Fix login", "Fix login"), "我起的"), None);
-        // /clear 之后新的那段对话还没名字:还叫原来那个
+        // After /clear the new conversation has no name yet: it keeps the old one
         assert_eq!(name_for(&s("aca", false), &r("Fix login", "Fix login"), "").as_deref(), Some("Fix login"));
     }
 }

@@ -1,16 +1,22 @@
-//! 替别的会话按键:`aca answer`(回答确认框)和 `aca interrupt`(中止正在跑的这一轮,见 [`interrupt`])。
+//! Pressing keys for another session: `aca answer` (answering a confirmation prompt) and `aca interrupt` (stopping the
+//! turn it's running, see [`interrupt`]).
 //!
-//! `aca answer`:替一个在等确认的会话回答。普通消息和 `aca send` 都不往确认框里打字(回车可能直接选中默认那一项),
-//! 要回答只走这里:先核对它还在问同一句、是哪种框,再按键,按完记一条 `ask.answered`。
+//! `aca answer`: answers for a session waiting for a confirmation. Plain messages and `aca send` never type into a
+//! confirmation prompt (Enter might pick the default option right away), so answering only goes through here: first check
+//! it's still asking the same question and what kind of prompt it is, then press the keys, then record an `ask.answered`.
 //!
-//! - 选择题(AskUserQuestion):按选项的数字,一按就选上(2.1.294 实测,一次只问一题时)。一次问好几题、能多选的不替它答
-//! - 权限框:选项个数和顺序会变,只做同意和拒绝,按哪两个键看各家([`Agent::permission_keys`])。
-//!   Claude 按 Esc 拒绝后不发任何 hook(连 Stop 都没有):这里自己把它改成空着
-//! - 只在屏幕上认得出的启动关卡(信任这个目录、有更新、hook 要审):屏幕上有一串带编号的选项才认([`gate`]),
-//!   用上下键走到那一项再回车(这类框按数字不一定算选上);按之前再抓一次屏,还是同一个框才按
-//! - 别的看不出是哪种的不替它按
+//! - Multiple choice (AskUserQuestion): press the option's number, which selects it at once (tested on 2.1.294, with one
+//!   question at a time). With several questions at once or multi-select, it isn't answered for you
+//! - Permission prompts: the number and order of options vary, so only approve and deny, with the two keys each tool
+//!   defines ([`Agent::permission_keys`]). Claude sends no hook after Esc denies (not even Stop): this marks it idle itself
+//! - Startup gates recognized only from the screen (trust this folder, an update is available, hooks need review): only
+//!   recognized when the screen has a run of numbered options ([`gate`]); move to the option with the arrow keys, then
+//!   press Enter (pressing a number doesn't always select in these); capture the screen once more before pressing, and
+//!   only press if it's still the same prompt
+//! - Anything else whose kind can't be told isn't pressed for you
 //!
-//! 谁能按:你在外面随便按;agent(在某个会话里调的)只能按自己派出去的那些(parent 是它,或者再往下几层)。
+//! Who may press: from outside, you can press anything; an agent (calling from inside a session) may only press for the
+//! sessions it delegated (whose parent is it, or further down).
 
 use std::sync::LazyLock;
 
@@ -26,20 +32,21 @@ use crate::status::{self, State};
 use crate::store::{Session, Store};
 use crate::{event, t, tmux, tr};
 
-/// 只在屏幕上认得出的框(启动时那几道关)
+/// A prompt recognized only from the screen (the gates at startup)
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gate {
-    /// 选项上面那几行(「Folder access · /p/api · Trust this folder? …」)
+    /// The lines above the options ("Folder access · /p/api · Trust this folder? …")
     pub title: String,
     pub opts: Vec<String>,
-    /// 现在高亮的是第几个(0 起)
+    /// Which one is highlighted now (from 0)
     pub at: usize,
 }
 
-/// 「› 1. Trust and continue」「  2. Quit」:前面可以有个高亮记号
+/// "› 1. Trust and continue", "  2. Quit": there may be a highlight mark in front
 static OPT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*([›❯>▶]\s*)?(\d)\.\s+(\S.*?)\s*$").unwrap());
 
-/// 屏幕最下面一串连着的、从 1 起顺着编号的选项(至少两个),和它上面的几行。认不出就是 None
+/// The run of consecutive options at the very bottom of the screen, numbered in order from 1 (at least two), and the few
+/// lines above it. None if it can't be recognized
 pub fn gate(lines: &[String]) -> Option<Gate> {
     let rows: Vec<&str> = lines.iter().map(|l| l.as_str()).filter(|l| !l.trim().is_empty()).collect();
     let tail = &rows[rows.len().saturating_sub(16)..];
@@ -66,7 +73,7 @@ pub fn gate(lines: &[String]) -> Option<Gate> {
     Some(Gate { title: title.join(" · "), opts, at })
 }
 
-/// 走到第 n 个(1 起)再回车
+/// Move to the nth (from 1), then press Enter
 pub(crate) fn gate_keys(g: &Gate, n: usize) -> Vec<&'static str> {
     let to = n - 1;
     let mut keys = if to > g.at { vec!["Down"; to - g.at] } else { vec!["Up"; g.at - to] };
@@ -74,7 +81,8 @@ pub(crate) fn gate_keys(g: &Gate, n: usize) -> Vec<&'static str> {
     keys
 }
 
-/// 它在问什么(`aca answer <会话>` 不带回答时打出来)。`screen` = 它现在的屏幕(只在屏幕上认得出的框要看)
+/// What it's asking (printed by `aca answer <session>` without an answer). `screen` = its current screen (only needed for
+/// prompts recognized from the screen)
 pub fn show(s: &Session, r: &Run, screen: &[String]) -> String {
     if r.ask_kind.is_empty()
         && let Some(g) = gate(screen)
@@ -115,7 +123,7 @@ pub fn show(s: &Session, r: &Run, screen: &[String]) -> String {
     out
 }
 
-/// 在某个会话里调的:只能答它派出去的那些(往上数 parent,数到它为止)
+/// Called from inside a session: it may only answer the ones it delegated (walk up the parents until reaching it)
 fn may_answer(store: &Store, me: &str, target: &Session) -> bool {
     let mut up = target.parent.clone();
     for _ in 0..32 {
@@ -130,7 +138,7 @@ fn may_answer(store: &Store, me: &str, target: &Session) -> bool {
     false
 }
 
-/// 要按的键和给人看的那一句
+/// The keys to press and the line shown to the person
 fn keys_for(agent: &dyn Agent, r: &Run, reply: &str) -> Res<(&'static str, String)> {
     match r.ask_kind.as_str() {
         "choice" if r.ask_multi => Err(t!(
@@ -168,7 +176,8 @@ fn keys_for(agent: &dyn Agent, r: &Run, reply: &str) -> Res<(&'static str, Strin
     }
 }
 
-/// 谁在按:在外面是 None;在某个会话里调的是它的 id,而且得是自己派出去的那些(`what` 是「回答」「中止」)
+/// Who is pressing: None from outside; from inside a session it's that session's id, and the target must be one it
+/// delegated (`what` is the action: "answer for" / "interrupt")
 fn caller(store: &Store, s: &Session, what: &str) -> Res<Option<String>> {
     let me = std::env::var("ACA_SESSION_ID").ok().filter(|x| !x.is_empty());
     if let Some(me) = &me {
@@ -186,9 +195,10 @@ fn caller(store: &Store, s: &Session, what: &str) -> Res<Option<String>> {
     Ok(me)
 }
 
-/// `aca interrupt`:中止它正在跑的这一轮(按 Esc),比如它往错的方向跑了。只在真在跑时按;
-/// 在等确认的不按(Esc 在确认框里是「拒绝」,要拒绝用 `aca answer … no`)。
-/// 停下以后它空着:要换个说法让它接着干用 `aca send`(打字进去马上开一轮)。Codex 被打断后排着的消息不自己开跑
+/// `aca interrupt`: stops the turn it's running (presses Esc), e.g. when it's heading the wrong way. Only pressed when it
+/// really is running; not when it's waiting for a confirmation (in a confirmation prompt Esc means "deny"; to deny, use
+/// `aca answer … no`). Afterwards it's idle: to have it carry on with different instructions, use `aca send` (typing in
+/// starts a turn right away). After an interrupt, Codex doesn't start on queued messages by itself
 pub fn interrupt(store: &Store, cfg: &Config, key: &str) -> Res<String> {
     let s = store.get(key)?;
     let me = caller(store, &s, t!("中止", "interrupt"))?;
@@ -215,7 +225,7 @@ pub fn interrupt(store: &Store, cfg: &Config, key: &str) -> Res<String> {
         tmux::keys(&pane.pane, &[k])?;
     }
     if !agent.reports_interrupt() {
-        // Claude 被 Esc 停下不发 hook:自己记成空着
+        // Claude sends no hook when stopped with Esc: mark it idle ourselves
         runtime::update(&s.id, |r| {
             r.status = "idle".into();
             r.clear_ask();
@@ -225,13 +235,13 @@ pub fn interrupt(store: &Store, cfg: &Config, key: &str) -> Res<String> {
     Ok(tr!("已中止 {} 正在运行的这一轮", "interrupted the running turn of {}", s.id))
 }
 
-/// 按之前再看一眼,问的已经不是那一句了
+/// Looked again before pressing, and the question isn't the same one any more
 const CHANGED: Tr = Tr::new(
     "询问内容已变化,未回答:请重新查看 aca answer <会话>",
     "the question changed; nothing answered: look again with aca answer <id>",
 );
 
-/// 回答;返回给人看的那一句
+/// Answers; returns the line shown to the person
 pub fn answer(store: &Store, cfg: &Config, key: &str, reply: &str) -> Res<String> {
     let s = store.get(key)?;
     let me = caller(store, &s, t!("回答", "answer for"))?;
@@ -247,7 +257,8 @@ pub fn answer(store: &Store, cfg: &Config, key: &str, reply: &str) -> Res<String
         return answer_gate(&s, &pane.pane, &g, reply.trim(), me);
     }
     let (key, said) = keys_for(&*agent, &r, reply.trim())?;
-    // 按之前再看一眼:还在问同一句(和你同时按、框已经换了的,不按)
+    // Look once more before pressing: still asking the same question (if someone pressed at the same time and the prompt has
+    // changed, don't press)
     let now = runtime::load(&s.id);
     if now.status != "waiting" || now.ask != r.ask || now.ask_kind != r.ask_kind {
         return Err(CHANGED.get().into());
@@ -256,7 +267,8 @@ pub fn answer(store: &Store, cfg: &Config, key: &str, reply: &str) -> Res<String
     box_gone(&*agent, &pane.pane);
     let refused = r.ask_kind == "permission" && reply.starts_with('n');
     runtime::update(&s.id, |r| {
-        // 拒绝了的,Claude 停下来等你说别的,不发 hook;别的接着跑,它自己的 hook 会再报
+        // On a deny, Claude stops and waits for you to say something else, without a hook; otherwise it carries on and its own
+        // hooks report again
         r.status = if refused { "idle".into() } else { "running".into() };
         r.clear_ask();
     });
@@ -265,8 +277,10 @@ pub fn answer(store: &Store, cfg: &Config, key: &str, reply: &str) -> Res<String
     Ok(tr!("已代 {} 回答:{said}", "answered for {}: {said}", s.id))
 }
 
-/// 按完之后等屏幕上那个框收起来,最多 1.5 秒:列表、`aca wait` 以屏幕为准,框还没重画掉的那一下还当它在问
-/// (opencode 重画得慢,答完马上 `aca wait` 会读成又在等确认)。屏幕上认不出框的那几家不等
+/// After pressing, wait for the prompt to leave the screen, at most 1.5 seconds: the list and `aca wait` go by the
+/// screen, and until the prompt is redrawn away they still take it as asking (opencode redraws slowly, so `aca wait` right
+/// after answering would read it as waiting for a confirmation again). Tools whose prompts can't be recognized on the
+/// screen don't wait
 fn box_gone(agent: &dyn Agent, pane: &str) {
     let t = std::time::Instant::now();
     while t.elapsed() < std::time::Duration::from_millis(1500) && matches!(agent.screen(&tmux::capture(pane)), crate::screen::Seen::Ask(_))
@@ -275,7 +289,8 @@ fn box_gone(agent: &dyn Agent, pane: &str) {
     }
 }
 
-/// 启动时的关卡:状态看屏幕(没有 hook 报),按完不改 runtime,它过了关自己会变
+/// A startup gate: the state comes from the screen (no hook reports it), so runtime isn't changed after pressing; it
+/// changes by itself once past the gate
 fn answer_gate(s: &Session, pane: &str, g: &Gate, reply: &str, me: Option<String>) -> Res<String> {
     let n: usize = reply
         .parse()
@@ -283,7 +298,7 @@ fn answer_gate(s: &Session, pane: &str, g: &Gate, reply: &str, me: Option<String
     if n == 0 || n > g.opts.len() {
         return Err(tr!("只有 {} 个选项", "there are only {} options", g.opts.len()));
     }
-    // 按之前再抓一次:框换了(和你同时按了)就不按
+    // Capture once more before pressing: if the prompt changed (someone pressed at the same time), don't press
     if gate(&tmux::capture(pane)).as_ref() != Some(g) {
         return Err(CHANGED.get().into());
     }
@@ -308,13 +323,13 @@ mod tests {
         assert!(keys_for(claude, &q, "3").unwrap_err().contains("只有 2 个"));
         assert!(keys_for(claude, &q, "B").is_err() && keys_for(claude, &q, "0").is_err());
         assert!(keys_for(claude, &Run { ask_multi: true, ..q.clone() }, "1").unwrap_err().contains("界面中回答"));
-        // 权限框:Claude 同意按 1、拒绝按 Esc;Codex 同意按 y、拒绝按 Esc(0.163 上实测)
+        // Permission prompts: Claude approves with 1 and denies with Esc; Codex approves with y and denies with Esc (tested on 0.163)
         let p = Run { ask: "Bash:touch x".into(), ask_kind: "permission".into(), ..Default::default() };
         assert_eq!(keys_for(claude, &p, "yes").unwrap().0, "1");
         assert_eq!(keys_for(claude, &p, "no").unwrap().0, "Escape");
         assert!(keys_for(claude, &p, "2").is_err());
         assert_eq!((keys_for(codex, &p, "yes").unwrap().0, keys_for(codex, &p, "no").unwrap().0), ("y", "Escape"));
-        // 只在屏幕上认出来的:不归这里(走 gate)
+        // Recognized only from the screen: not handled here (goes through gate)
         assert!(keys_for(claude, &Run { ask: "Hooks need review".into(), ..Default::default() }, "1").is_err());
     }
 
@@ -339,7 +354,7 @@ mod tests {
 
     #[test]
     fn a_startup_gate_with_numbered_options_is_read_off_the_screen_and_walked_to_with_arrows() {
-        // Codex 0.159 的信任框(实际抓的),上面还有别的字
+        // Codex 0.159's trust prompt (a real capture), with other text above it
         let trust = "OpenAI Codex\n\n  Folder access\n  /p/api\n  Trust this folder? Codex can read, edit, and run files here.\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit";
         let g = gate(&lines(trust)).unwrap();
         assert_eq!(g.opts, ["Trust and continue", "Quit"]);
@@ -347,7 +362,7 @@ mod tests {
         assert_eq!(g.title, "Folder access · /p/api · Trust this folder? Codex can read, edit, and run files here.");
         assert_eq!(gate_keys(&g, 1), ["Enter"]);
         assert_eq!(gate_keys(&g, 2), ["Down", "Enter"]);
-        // 高亮在第三个:往上走
+        // Highlight on the third: move up
         let review = "  Hooks need review\n  1. Review hooks\n  2. Trust all and continue\n› 3. Continue without trusting\n  enter confirm · esc skip";
         let g = gate(&lines(review)).unwrap();
         assert_eq!((g.at, gate_keys(&g, 1)), (2, vec!["Up", "Up", "Enter"]));
@@ -358,11 +373,11 @@ mod tests {
                 && said.contains("  2 Trust all and continue")
                 && said.contains("aca answer w1 <选项号>")
         );
-        // 编号不连着、只有一个、没有编号的:不认
+        // Numbers not consecutive, only one, no numbers: not recognized
         assert_eq!(gate(&lines("› 1. a\n  3. b")), None);
         assert_eq!(gate(&lines("› 1. only")), None);
         assert_eq!(gate(&lines("❯ No, exit\n  Yes, I trust this folder")), None);
-        // hook 报了是哪种的(选择题、权限框)照旧,不看屏幕
+        // When the hook reported the kind (multiple choice, permission prompt), it stands, without looking at the screen
         let q = Run { ask: "选?".into(), ask_kind: "choice".into(), ask_opts: vec!["A".into(), "B".into()], ..Default::default() };
         assert!(show(&s, &q, &lines(review)).contains("选?"));
     }

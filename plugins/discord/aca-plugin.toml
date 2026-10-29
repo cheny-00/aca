@@ -6,8 +6,8 @@ needs = ["curl", "jq"]
 description = "会话完成一轮、等待回应或出错时发送到 Discord 频道(webhook);有人正在查看该会话时不发送。只发送,不接收"
 description_en = "Posts to a Discord channel (webhook) when a session finishes, waits or fails; not while someone is watching it. Outgoing only."
 
-# 地址在 plugins.toml 里填:[plugins."aca.discord"] settings = { url = "https://discord.com/api/webhooks/…" }
-# 或者 aca plugin setting aca.discord url <地址>
+# The address goes in plugins.toml: [plugins."aca.discord"] settings = { url = "https://discord.com/api/webhooks/…" }
+# or aca plugin setting aca.discord url <url>
 
 [settings.url]
 default = ""
@@ -47,6 +47,6 @@ id = "test"
 title = "发送一条测试消息"
 title_en = "Post a test one"
 desc = "Post a test message to check the Discord webhook URL."
-# 诊断用的,不进 : 菜单(那里是对着高亮那一行做事的);aca plugin run aca.discord.test
+# For diagnosis, kept out of the : menu (that one acts on the highlighted row); aca plugin run aca.discord.test
 expose = ["cli"]
 command = ["sh", "post.sh", "test"]

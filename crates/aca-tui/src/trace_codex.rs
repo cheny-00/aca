@@ -1,24 +1,31 @@
-//! Codex 的 rollout → `trace` 的树。规则是 2026-09 在本机 2,429 份 rollout(0.107–0.159)上实测的:
-//! - 一轮:`task_started` … `task_complete` / `turn_aborted`,耗时用结束事件写的 duration_ms(0.120+,没有就拿时间戳相减)。
-//!   提问是 `user_message` 事件(≤ 0.147)或 `item_completed` 的 UserMessage(0.147+);跑着的时候插的话接在同一轮的提问后面
-//! - 一次调用:上一次用量之后出现的 reasoning / message / 工具调用都归它。用量是一个「新的」`token_count`
-//!   (累计数变了的,用它的 last_token_usage,和 `$` 的算法一样)。从前一个输入(工具输出 / 提问 / 开始)算起,
-//!   到最后一个模型输出项为止(0.153+ 是 `token_usage_record`,0.130 以前是 token_count 本身),都是估的
-//! - 工具:call_id 连调用和输出;命令跑了多久、退出码写在 `exec_command_end` 里,apply_patch 改了什么在 `patch_apply_end`
-//! - 0.144+ 的 `exec` 是一段 JS,在里面调 tools.exec_command / apply_patch …:它跑的命令、改的文件记成
-//!   `item_completed` 的 CommandExecution / FileChange(0.144–0.152 还有对不上 call_id 的 patch_apply_end),
-//!   按开始时刻挂到那时在跑的 exec 下(跑到后台、exec 回了才跑完的也挂得回去);记录里没有的,从 JS 里认出字面写的命令
-//! - 想的是加密的,只有少数老版本写了摘要
-//! - 压缩是 `compacted` 行(可能好几 MB,只看类型):画一行。回退是 `thread_rolled_back{num_turns}`:画一行,
-//!   前面那几轮还留在文件里,标成回退掉的(画灰、不编号;钱花出去了,照算)
-//! - 子线程(子代理):`spawn_agent` 起的另一份 rollout,线程 id 在它的输出里(`agent_id`,老版本)或者它还没回的时候来的
-//!   `sub_agent_activity` / `item_completed SubAgentActivity`(kind = started)里;按 id 在同一个 CODEX_HOME 里找记录
-//! - 子线程、分叉出来的线程开头整段抄了父线程的历史(时间戳改成新线程创建的时刻,累计 token 接着父线程的往上加),
-//!   不计,折成一块:有 history_base 的什么都没抄;有 subagent_history_start_ordinal 的,行上的 ordinal 比它小的是抄的;
-//!   别的抄到第一个父线程里没有的 turn_id 为止(本机 134 份父线程都在,认得准);父线程的记录找不到时,
-//!   到「前一轮还没结束又来了 task_started」为止
+//! Codex rollout → the `trace` tree. The rules were measured in 2026-09 on 2,429 rollouts on this machine (0.107–0.159):
+//! - A turn: `task_started` … `task_complete` / `turn_aborted`; its duration is the duration_ms the end event writes (0.120+,
+//!   otherwise the timestamp difference). The prompt is a `user_message` event (≤ 0.147) or an `item_completed` UserMessage
+//!   (0.147+); words put in while it's running are appended to the same turn's prompt
+//! - A call: the reasoning / message / tool calls after the previous usage all belong to it. Usage is a "new" `token_count`
+//!   (whose cumulative count changed; its last_token_usage is used, same algorithm as `$`). It runs from the previous input
+//!   (tool output / prompt / start) to the last model output item (0.153+ that's `token_usage_record`, before 0.130 the
+//!   token_count itself), all estimated
+//! - Tools: call_id links a call and its output; how long a command ran and its exit code are in `exec_command_end`, what
+//!   apply_patch changed is in `patch_apply_end`
+//! - 0.144+'s `exec` is a piece of JS that calls tools.exec_command / apply_patch …: the commands it runs and files it changes are
+//!   recorded as `item_completed` CommandExecution / FileChange (0.144–0.152 also has patch_apply_end without a matching call_id),
+//!   attached by start time to the exec running then (ones that went to the background and finished after exec returned are
+//!   attached back too); for what isn't recorded, literally written commands are recognized from the JS
+//! - Thinking is encrypted; only a few old versions wrote a summary
+//! - Compaction is a `compacted` line (possibly several MB, only its type is read): drawn as one line. Rollback is
+//!   `thread_rolled_back{num_turns}`: drawn as one line; the turns before it stay in the file and are marked rolled back (drawn
+//!   gray, unnumbered; the money was spent, so it still counts)
+//! - Child threads (subagents): another rollout started by `spawn_agent`; the thread id is in its output (`agent_id`, old
+//!   versions) or, while it hasn't returned yet, in `sub_agent_activity` / `item_completed SubAgentActivity` (kind = started);
+//!   the log is found by id in the same CODEX_HOME
+//! - Child threads and forked threads start with a full copy of the parent's history (timestamps changed to the new thread's
+//!   creation time, cumulative tokens continuing from the parent's), not counted, folded into one block: with history_base nothing
+//!   was copied; with subagent_history_start_ordinal, lines whose ordinal is below it are copied; otherwise copied up to the
+//!   first turn_id not in the parent (all 134 parents on this machine are present, so this is reliable); when the parent's log
+//!   can't be found, up to "a task_started arriving before the previous turn ended"
 //!
-//! 0.107 以前没有外层 type 的老格式不认。
+//! The old format before 0.107, without an outer type, isn't recognized.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -37,65 +44,67 @@ use crate::trace::{Asker, Change, Io, Kind, LABEL, Node, St, Trace, first_line, 
 
 type Src = (u64, u32);
 
-/// 解析到一半的状态(跨着读新增的那截)
+/// Half-parsed state (carried across reads of the appended part)
 #[derive(Default)]
 pub(crate) struct State {
-    /// 读过第一行了;第一行没有外层 type 的是老格式
+    /// First line read; a first line without an outer type is the old format
     seen: bool,
     pub(crate) old: bool,
-    /// 版本(0, 155)
+    /// Version (0, 155)
     pub(crate) ver: (u32, u32),
-    /// 现在用的模型、思考强度
+    /// Current model, reasoning effort
     model: String,
     effort: String,
-    /// 这一轮是 task_started 开的(提问先到的老版本:task_started 来了就接着用提问开的那轮)
+    /// This turn was opened by task_started (old versions where the prompt comes first: when task_started arrives, keep using the turn
+    /// the prompt opened)
     started: bool,
-    /// 上一句提问(user_message 和 UserMessage 都有时只算一次)
+    /// The previous prompt (counted once when both user_message and UserMessage exist)
     prompt: u64,
-    /// 还没等到用量的那次调用
+    /// The call still waiting for its usage
     call: Option<usize>,
-    /// 上一次的累计 token:额度刷新时重报的一样的数不算
+    /// The previous cumulative tokens: the same number re-reported on a quota refresh doesn't count
     total: Option<u64>,
-    /// 最后一个输入(工具输出 / 提问 / 开始)的时刻:下一次调用从它算起
+    /// Time of the last input (tool output / prompt / start): the next call starts from it
     last_in: i64,
-    /// exec:(开始时刻, 节点),按先后;还没回结果的那个
+    /// exec: (start time, node), in order; the one that hasn't returned yet
     execs: Vec<(i64, usize)>,
     open_exec: Option<usize>,
-    /// exec 里真跑了命令 / 改了文件(头一行换成它们)
+    /// Commands really run / files changed inside an exec (the first line is replaced with them)
     exec: HashMap<usize, Ran>,
-    /// 等着和下一个 web_search_call 配对的 web_search_end
+    /// web_search_end waiting to pair with the next web_search_call
     search: Option<Src>,
-    /// 这份记录里开过的轮(子线程开头抄的是哪段,按父线程的认)
+    /// Turns opened in this log (which part a child thread copied at its start is judged by the parent's)
     pub(crate) turn_ids: HashSet<String>,
-    /// 父线程开过的轮:打开子线程时给;单独打开分叉出来的线程时自己去读父线程的记录
+    /// Turns the parent opened: given when opening a child thread; a forked thread opened on its own reads the parent's log itself
     pub(crate) parent_turns: Option<HashSet<String>>,
-    /// 开头抄父线程历史的那段怎么认、现在是不是还在那段里
+    /// How to recognize the copied parent history at the start, and whether we're still inside it
     gate: Gate,
     pub(crate) copying: bool,
-    /// 还没认出起了哪个子线程的 spawn_agent
+    /// spawn_agent calls whose child thread isn't recognized yet
     spawns: Vec<usize>,
-    /// 这是个子线程:它的类型、名字(session_meta 里写的)
+    /// This is a child thread: its type and name (as session_meta writes them)
     pub(crate) role: String,
     pub(crate) nick: String,
-    /// 派给它的那件事的名字:`agent_path` 的最后一段(0.144+ 的 `/root/layout_review`;派活的正文是加密的,只有这个名字看得懂)
+    /// Name of the task given to it: the last segment of `agent_path` (0.144+'s `/root/layout_review`; the task text is encrypted, only
+    /// this name is readable)
     pub(crate) task: String,
 }
 
-/// 开头抄来的父线程历史到哪为止
+/// Where the parent history copied at the start ends
 #[derive(Default)]
 enum Gate {
-    /// 没抄(或者已经过了抄的那段)
+    /// Nothing copied (or already past the copied part)
     #[default]
     Own,
-    /// 行上的 ordinal 到这个数为止是抄的
+    /// Lines with ordinal up to this number are copied
     Ordinal(u64),
-    /// 到第一个父线程里没有的 turn_id
+    /// Up to the first turn_id not in the parent
     Turns,
-    /// 到前一轮还没结束又来的 task_started
+    /// Up to a task_started arriving before the previous turn ended
     Open,
 }
 
-/// 一个 exec 里真跑了的
+/// What really ran inside an exec
 #[derive(Default)]
 struct Ran {
     cmd: bool,
@@ -110,11 +119,11 @@ struct Line<'a> {
     kind: Option<&'a str>,
     #[serde(borrow)]
     payload: Option<&'a RawValue>,
-    /// 0.154+:行的序号(子线程开头抄的那段按它认)
+    /// 0.154+: the line's ordinal (the part a child thread copied at its start is recognized by it)
     ordinal: Option<u64>,
 }
 
-/// payload 里要用的字段(各种行的并起来;大的、形状不一的用 RawValue 等要时再解析)
+/// Fields needed from payload (all line kinds merged; big ones of varying shape are RawValue, parsed when needed)
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct P<'a> {
@@ -182,7 +191,7 @@ struct P<'a> {
     status: Option<String>,
 }
 
-/// item_completed 里的 item
+/// The item in item_completed
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Item<'a> {
@@ -190,7 +199,7 @@ struct Item<'a> {
     kind: Option<String>,
     status: Option<String>,
     exit_code: Option<f64>,
-    /// SubAgentActivity 的 started / interacted …(别的 item 的 kind 形状不一,先不解析)
+    /// SubAgentActivity's started / interacted … (other items' kind has varying shapes, not parsed for now)
     #[serde(rename = "kind", borrow)]
     kind_of: Option<&'a RawValue>,
     agent_thread_id: Option<String>,
@@ -216,7 +225,7 @@ fn string(r: Option<&RawValue>) -> Option<String> {
     r.and_then(|r| serde_json::from_str::<String>(r.get()).ok())
 }
 
-/// 行首那截里的时刻(压缩那行不解析)
+/// The time in the head of a line (the compaction line isn't parsed)
 fn stamp(head: &[u8]) -> i64 {
     let k = b"\"timestamp\":\"";
     let Some(at) = memmem::find(head, k) else { return 0 };
@@ -225,10 +234,10 @@ fn stamp(head: &[u8]) -> i64 {
     std::str::from_utf8(&rest[..end]).map_or(0, ts_ms)
 }
 
-/// 一行记录
+/// One log line
 pub(crate) fn line(t: &mut Trace, buf: &[u8], off: u64) {
     let head = &buf[..buf.len().min(120)];
-    // 压缩那行带着整段替换后的历史,可能好几 MB:只看类型
+    // The compaction line carries the whole replaced history, possibly several MB: only read its type
     if memmem::find(head, b"\"type\":\"compacted\"").is_some() {
         mark(t, t!("压缩", "compaction").into(), stamp(head));
         return;
@@ -270,9 +279,9 @@ pub(crate) fn line(t: &mut Trace, buf: &[u8], off: u64) {
         }
         Some("event_msg") => event(t, &p, ts, src),
         Some("response_item") => response(t, &p, ts, src),
-        // 字段顺序不是 timestamp、type 在前的(上面没认出来)
+        // Field order without timestamp and type first (not recognized above)
         Some("compacted") => mark(t, t!("压缩", "compaction").into(), ts),
-        // 这次回复写完了(0.153+)
+        // This reply is done (0.153+)
         Some("token_usage_record") => {
             if let Some(c) = t.cx.call {
                 let n = &mut t.nodes[c];
@@ -283,7 +292,7 @@ pub(crate) fn line(t: &mut Trace, buf: &[u8], off: u64) {
     }
 }
 
-/// 第一行:是不是子线程 / 分叉出来的(开头抄了父线程的历史),是的话怎么认抄的那段
+/// First line: whether it's a child / forked thread (its start copies the parent's history), and if so how to recognize the copy
 fn meta(t: &mut Trace, p: &P) {
     let src = value(p.source);
     let spawn = src.pointer("/subagent/thread_spawn");
@@ -307,12 +316,12 @@ fn meta(t: &mut Trace, p: &P) {
     };
 }
 
-/// 记录在哪个 CODEX_HOME 里(…/sessions/年/月/日/rollout-….jsonl)
+/// Which CODEX_HOME the log is in (…/sessions/year/month/day/rollout-….jsonl)
 fn home_of(path: &Path) -> Option<&Path> {
     path.ancestors().find(|a| a.file_name().is_some_and(|n| n == "sessions")).and_then(Path::parent)
 }
 
-/// 父线程的记录里开过的轮(只看 task_started 那几行)
+/// Turns opened in the parent's log (only the task_started lines are read)
 fn parent_turns(path: &Path, parent: &str) -> Option<HashSet<String>> {
     use std::io::BufRead;
     let f = crate::workdir::codex_log(home_of(path)?, parent)?;
@@ -331,13 +340,14 @@ fn parent_turns(path: &Path, parent: &str) -> Option<HashSet<String>> {
     Some(out)
 }
 
-/// 子线程的任务名(见 `State::task`);不是子线程、老版本没有 = 空
+/// The child thread's task name (see `State::task`); empty when not a child thread or an old version without it
 pub(crate) fn task_of(t: &Trace) -> &str {
     &t.cx.task
 }
 
-/// 起了的子线程的记录:在同一个 CODEX_HOME 里按线程 id 找,读成一棵树挂到起它的工具下。
-/// 起的时候记录可能还没写出来:下次读新增的时候再找,找 30 回(一分钟)还没有就算了。有新挂上的返回 true
+/// Logs of started child threads: found by thread id in the same CODEX_HOME, read into a tree attached under the tool that started it.
+/// The log may not be written yet at start: look again on the next read of appended lines, give up after 30 tries (a minute).
+/// Returns true if something new got attached
 pub(crate) fn find_subs(t: &mut Trace) -> bool {
     if t.want.is_empty() {
         return false;
@@ -360,7 +370,8 @@ pub(crate) fn find_subs(t: &mut Trace) -> bool {
     grew
 }
 
-/// 认出了一个子线程:挂到起它的工具下(同一个子线程老版本输出里、新版本的事件里各说一次,只算一回)
+/// A child thread was recognized: attach it under the tool that started it (the same child is announced once in old versions'
+/// output and once in new versions' events, counted once)
 fn spawned(t: &mut Trace, tool: usize, id: &str) {
     t.cx.spawns.retain(|&x| x != tool);
     if !id.is_empty() && !t.cx.copying && t.sub_ids.insert(id.to_string()) {
@@ -368,7 +379,8 @@ fn spawned(t: &mut Trace, tool: usize, id: &str) {
     }
 }
 
-/// 子线程起来了(新版本):挂到还没认出子线程的那个 spawn_agent 下,没有就挂在在跑的 exec 下
+/// A child thread started (new versions): attach it under the spawn_agent whose child isn't recognized yet, or else under the running
+/// exec
 fn started(t: &mut Trace, id: Option<&str>) {
     let Some(id) = id.filter(|_| !t.cx.copying) else { return };
     if t.sub_ids.contains(id) {
@@ -380,7 +392,7 @@ fn started(t: &mut Trace, id: Option<&str>) {
     }
 }
 
-/// 回退了 n 轮:最近的 n 轮(还没回退掉的)标上
+/// Rolled back n turns: mark the latest n turns (not yet rolled back)
 fn rollback(t: &mut Trace, n: usize) {
     let mut turns = vec![];
     for &r in t.roots.iter().rev() {
@@ -396,7 +408,7 @@ fn rollback(t: &mut Trace, n: usize) {
     }
 }
 
-/// 知道用的是哪个模型了。之前的调用还没模型(子线程常常先有用量、后有 thread_settings)的,就是它
+/// Now the model in use is known. Earlier calls without a model yet (child threads often have usage before thread_settings) used it
 fn learn(t: &mut Trace, m: &str) {
     if m.is_empty() || t.cx.model == m {
         return;
@@ -420,7 +432,7 @@ fn mark(t: &mut Trace, label: String, ts: i64) {
 fn event(t: &mut Trace, p: &P, ts: i64, src: Src) {
     match p.kind.as_deref() {
         Some("task_started") => {
-            // 抄来的那段到这里为止:父线程里没有的一轮 / 前一轮还没结束又开一轮
+            // The copied part ends here: a turn not in the parent / a new turn before the previous one ended
             let id = p.turn_id.clone().unwrap_or_default();
             let open = t.turn.is_some_and(|x| t.nodes[x].t1 == 0 && t.nodes[x].copied);
             let own = match t.cx.gate {
@@ -474,7 +486,7 @@ fn event(t: &mut Trace, p: &P, ts: i64, src: Src) {
     }
 }
 
-/// 开始一轮。提问先到了的(老版本):那一轮就是它
+/// Start a turn. When the prompt arrived first (old versions): that's the turn
 fn start(t: &mut Trace, ts: i64) {
     t.cx.call = None;
     t.cx.open_exec = None;
@@ -496,7 +508,7 @@ fn start(t: &mut Trace, ts: i64) {
     t.cx.prompt = 0;
 }
 
-/// 你说的:这一轮的提问,或者跑着的时候插的话(接在后面)
+/// What you said: this turn's prompt, or words put in while it's running (appended)
 fn prompt(t: &mut Trace, text: &str, ts: i64, src: Src) {
     let h = key(text.trim());
     if t.cx.prompt == h {
@@ -520,7 +532,7 @@ fn prompt(t: &mut Trace, text: &str, ts: i64, src: Src) {
     n.src.push(src);
 }
 
-/// 一轮结束:写明的耗时、被打断、出错
+/// A turn ends: the stated duration, interrupted, errored
 fn end(t: &mut Trace, p: &P, ts: i64, src: Src, stopped: bool) {
     t.cx.call = None;
     t.cx.open_exec = None;
@@ -551,7 +563,7 @@ fn end(t: &mut Trace, p: &P, ts: i64, src: Src, stopped: bool) {
     }
 }
 
-/// 现在这一轮;没有(记录从半截开始)就补一个
+/// The current turn; if none (the log starts midway), add one
 fn cur_turn(t: &mut Trace, ts: i64) -> usize {
     match t.turn {
         Some(x) if t.nodes[x].copied == t.cx.copying => x,
@@ -564,7 +576,8 @@ fn cur_turn(t: &mut Trace, ts: i64) -> usize {
     }
 }
 
-/// 模型的输出归哪次调用:上一次用量之后的都归同一次,没有就开一次(从上一个输入算起)
+/// Which call a model output belongs to: everything after the previous usage goes to the same call; if none, open one (from the
+/// previous input)
 fn call(t: &mut Trace, ts: i64) -> usize {
     if let Some(c) = t.cx.call {
         let n = &mut t.nodes[c];
@@ -584,14 +597,15 @@ fn call(t: &mut Trace, ts: i64) -> usize {
     n.effort.clone_from(&t.cx.effort);
     n.t1 = ts;
     t.cx.call = Some(c);
-    // 前面出过错、这次成了:这一轮不算出错
+    // An earlier error, success this time: this turn doesn't count as errored
     if t.nodes[turn].state == St::Err {
         t.nodes[turn].state = St::Ok;
     }
     c
 }
 
-/// 一个「新的」token_count 就是一次调用的用量(和 `$` 一样:累计数没变的不算,输入里去掉缓存读、缓存写)
+/// A "new" token_count is one call's usage (as in `$`: an unchanged cumulative count doesn't count, cache reads and cache writes are
+/// taken out of input)
 fn usage(t: &mut Trace, p: &P, ts: i64) {
     let Some(info) = p.info.and_then(|r| serde_json::from_str::<crate::usage::XInfo>(r.get()).ok()) else { return };
     let (Some(total), Some(last)) = (info.total_token_usage, info.last_token_usage) else { return };
@@ -606,7 +620,7 @@ fn usage(t: &mut Trace, p: &P, ts: i64) {
         return;
     }
     let old = t.cx.ver < (0, 130);
-    // 调用停在最后一个输出项,不拉长到这里(0.130 起 token_count 要等工具跑完才写)
+    // The call stops at its last output item and isn't stretched to here (from 0.130 token_count is written only after tools finish)
     let c = match t.cx.call {
         Some(c) => c,
         None => call(t, ts),
@@ -614,7 +628,7 @@ fn usage(t: &mut Trace, p: &P, ts: i64) {
     let n = &mut t.nodes[c];
     n.tok = tok;
     n.think = last.reasoning_output_tokens;
-    // 0.130 以前:token_count 紧跟着回复写;之后的要等工具跑完才写,不能当调用的结束
+    // Before 0.130 token_count is written right after the reply; later it waits for tools to finish, so it can't be the call's end
     if old {
         n.t1 = ts.max(n.t0);
     }
@@ -682,7 +696,7 @@ fn response(t: &mut Trace, p: &P, ts: i64, src: Src) {
     }
 }
 
-/// 模型调了一个工具:挂在这次调用下
+/// The model called a tool: attach it under this call
 fn tool(t: &mut Trace, name: &str, label: String, id: &str, ts: i64, src: Src) -> usize {
     let c = call(t, ts);
     let i = t.add(Kind::Tool, Some(c), ts, t.cx.copying);
@@ -697,7 +711,7 @@ fn tool(t: &mut Trace, name: &str, label: String, id: &str, ts: i64, src: Src) -
     i
 }
 
-/// 工具的输出回来了。输出头里写着退出码 / 脚本失败的,算出错
+/// A tool's output came back. If the output head shows an exit code / a failed script, it counts as an error
 fn output(t: &mut Trace, p: &P, ts: i64, src: Src) {
     t.cx.last_in = ts;
     let Some(&i) = p.call_id.as_ref().and_then(|id| t.tools.get(id)) else { return };
@@ -705,7 +719,7 @@ fn output(t: &mut Trace, p: &P, ts: i64, src: Src) {
         t.cx.open_exec = None;
     }
     let text = out_text(&value(p.output));
-    // 老版本 spawn_agent 的输出里写着子线程的 id
+    // Old versions' spawn_agent output contains the child thread's id
     if t.cx.spawns.contains(&i) {
         let id = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("agent_id").and_then(Value::as_str).map(String::from));
         match id {
@@ -724,8 +738,8 @@ fn output(t: &mut Trace, p: &P, ts: i64, src: Src) {
     }
 }
 
-/// exec_command_end / patch_apply_end / mcp_tool_call_end:对得上 call_id 的写上耗时、出错;
-/// 对不上的(0.144–0.152 在 exec 里跑的)挂在现在在跑的 exec 下
+/// exec_command_end / patch_apply_end / mcp_tool_call_end: ones matching a call_id get their duration and error written;
+/// unmatched ones (run inside exec in 0.144–0.152) are attached under the exec running now
 fn ended(t: &mut Trace, p: &P, src: Src) {
     let failed = p.exit_code.is_some_and(|x| x != 0.0) || p.success == Some(false) || p.status.as_deref() == Some("failed");
     match p.call_id.as_ref().and_then(|id| t.tools.get(id)).copied() {
@@ -764,8 +778,10 @@ fn item(t: &mut Trace, p: &P, ts: i64, src: Src) {
     }
 }
 
-/// exec 里跑的一条命令 / 改的文件:挂到开始时在跑的那个 exec 下(还没回结果的那个;它回了才跑完的,按开始时刻找)。
-/// 头一行换成真跑了的命令(没有命令的写改的文件);有一条命令失败了就算出错(同 Claude 的 Bash 退出码不是 0)
+/// A command run / file changed inside an exec: attach it under the exec running when it started (the one that hasn't returned; for
+/// ones that finished after it returned, found by start time).
+/// The first line becomes the command really run (the changed file if there's no command); one failed command means an error (like
+/// Claude's Bash with a non-zero exit code)
 fn inner(t: &mut Trace, start: Option<f64>, cmd: Option<String>, files: Vec<String>, failed: bool, src: Src) {
     let start = start.map(|x| x as i64).filter(|&x| x > 0);
     let e = match (t.cx.open_exec, start) {
@@ -799,14 +815,15 @@ fn inner(t: &mut Trace, start: Option<f64>, cmd: Option<String>, files: Vec<Stri
     }
 }
 
-// ---------- 摘要 ----------
+// ---------- Summaries ----------
 
-/// 加密过的一段(0.144+ 线程之间递的话:`gAAAAAB…` 一长串,没有空格):不能当摘要写出来
+/// An encrypted piece (0.144+ messages passed between threads: a long `gAAAAAB…` string without spaces): can't be written out as a
+/// summary
 fn sealed(x: &str) -> bool {
     x.len() > 40 && x.starts_with("gAAAA") && !x.contains(char::is_whitespace)
 }
 
-/// 函数工具在右边叫什么、头一行写什么
+/// What a function tool is called on the right and what its first line says
 fn fn_head(name: &str, ns: Option<&str>, args: &Value, cwd: &str) -> (String, String) {
     let s = |k: &str| args.get(k).and_then(Value::as_str).filter(|x| !sealed(x));
     let one = |x: &str| first_line(x, LABEL);
@@ -850,7 +867,7 @@ fn fn_head(name: &str, ns: Option<&str>, args: &Value, cwd: &str) -> (String, St
     (shown.to_string(), label)
 }
 
-/// 几个文件写成一句:第一个 · 另 N 个
+/// Several files as one phrase: the first · N more
 fn files_label(files: &[String], cwd: &str) -> String {
     match files {
         [] => String::new(),
@@ -859,7 +876,7 @@ fn files_label(files: &[String], cwd: &str) -> String {
     }
 }
 
-/// 命令:["/bin/zsh", "-lc", "…"] 取最后那段,别的用空格连起来
+/// Command: ["/bin/zsh", "-lc", "…"] takes the last part, others are joined with spaces
 fn cmd_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -878,7 +895,7 @@ static TOOLS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"tools\.([A-Za-z_][
 static CMD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"tools\.exec_command\(\s*\{[^}]*?\bcmd\s*:\s*"#).unwrap());
 static PATCH_FILE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\*\*\* (?:Update|Add|Delete) File: ([^\n\\`"']+)"#).unwrap());
 
-/// JS 的字符串字面量(s 从引号开始):内容;模板里的 ${…} 原样留着
+/// A JS string literal (s starts at the quote): its contents; ${…} in templates kept as is
 fn js_str(s: &str) -> Option<String> {
     let mut cs = s.chars();
     let q = cs.next().filter(|c| matches!(c, '"' | '\'' | '`'))?;
@@ -902,20 +919,21 @@ fn js_str(s: &str) -> Option<String> {
     None
 }
 
-/// exec 的 JS 里字面写的命令
+/// Commands written literally in an exec's JS
 fn lit_cmds(code: &str) -> Vec<String> {
     CMD.find_iter(code).filter_map(|m| js_str(&code[m.end()..])).filter(|c| !c.trim().is_empty()).collect()
 }
 
-/// exec 的 JS 里字面写的补丁(整段 *** Begin Patch … 所在的那个字符串)
+/// A patch written literally in an exec's JS (the string the whole *** Begin Patch … sits in)
 fn lit_patch(code: &str) -> Option<String> {
     let at = code.find("*** Begin Patch")?;
     let q = code[..at].rfind(['`', '"', '\''])?;
     js_str(&code[q..])
 }
 
-/// exec 在右边叫什么、头一行写什么:字面写了命令的是 Shell,写了补丁的是 Patch,
-/// 只调了一种别的工具的按那个工具叫;都认不出的叫 exec,写第一行代码(真跑了什么记录里有,再换)
+/// What an exec is called on the right and what its first line says: literal commands make it Shell, a patch makes it Patch,
+/// calling just one other kind of tool names it after that tool; if nothing is recognized it's exec with the first line of code
+/// (replaced once the log has what really ran)
 fn exec_head(code: &str, cwd: &str) -> (&'static str, String) {
     if let Some(c) = lit_cmds(code).first() {
         return ("Shell", first_line(c, LABEL));
@@ -938,7 +956,7 @@ fn exec_head(code: &str, cwd: &str) -> (&'static str, String) {
     (name, first)
 }
 
-/// apply_patch 补丁里改的文件
+/// Files changed in an apply_patch patch
 fn patch_files(patch: &str) -> Vec<String> {
     patch
         .lines()
@@ -949,7 +967,7 @@ fn patch_files(patch: &str) -> Vec<String> {
         .collect()
 }
 
-/// {secs, nanos} / 秒数 → 毫秒
+/// {secs, nanos} / seconds → milliseconds
 fn dur_ms(v: &Value) -> Option<i64> {
     match v {
         Value::Object(m) => Some(m.get("secs")?.as_i64()? * 1000 + m.get("nanos").and_then(Value::as_i64).unwrap_or(0) / 1_000_000),
@@ -958,13 +976,13 @@ fn dur_ms(v: &Value) -> Option<i64> {
     }
 }
 
-// ---------- 读回来的内容(排成字在 trace_page) ----------
+// ---------- Content read back (laid out as text in trace_page) ----------
 
 fn lines_of(t: &Trace, n: &Node) -> Vec<Value> {
     n.src.iter().filter_map(|&x| t.read_at(x)).collect()
 }
 
-/// 内容数组里某种块的字
+/// Text of blocks of one kind in a content array
 fn texts(v: &Value, kind: &str) -> Vec<String> {
     v.as_array()
         .into_iter()
@@ -975,7 +993,7 @@ fn texts(v: &Value, kind: &str) -> Vec<String> {
         .collect()
 }
 
-/// UserMessage 的内容:字,图片写成 [图片]
+/// UserMessage content: text, images written as 「[图片]」 ("[image]")
 fn user_text(v: &Value) -> String {
     let mut out = vec![];
     for b in v.as_array().into_iter().flatten() {
@@ -989,7 +1007,7 @@ fn user_text(v: &Value) -> String {
     out.join("\n")
 }
 
-/// 工具输出:字符串,或者块的数组(字、图片)
+/// Tool output: a string, or an array of blocks (text, images)
 fn out_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -1012,8 +1030,8 @@ fn out_text(v: &Value) -> String {
     }
 }
 
-/// 去掉输出头(Script completed / Exit code: 0 / Process exited with code 0 / Wall time / Output: …),
-/// 老的 apply_patch 输出是 JSON({"output", "metadata": {"exit_code"}})。返回:正文、退出码、脚本失败了没有
+/// Strip the output head (Script completed / Exit code: 0 / Process exited with code 0 / Wall time / Output: …);
+/// old apply_patch output is JSON ({"output", "metadata": {"exit_code"}}). Returns: body, exit code, whether the script failed
 fn strip_head(text: &str) -> (String, Option<i64>, bool) {
     if text.starts_with('{')
         && let Ok(v) = serde_json::from_str::<Value>(text)
@@ -1057,7 +1075,7 @@ fn strip_head(text: &str) -> (String, Option<i64>, bool) {
     (rest.to_string(), code, failed)
 }
 
-/// 一次调用想的、说的
+/// What one call thought and said
 pub(crate) fn said(t: &Trace, n: &Node) -> (Vec<String>, Vec<String>) {
     let (mut thought, mut text) = (vec![], vec![]);
     for v in lines_of(t, n) {
@@ -1075,7 +1093,7 @@ pub(crate) fn said(t: &Trace, n: &Node) -> (Vec<String>, Vec<String>) {
     (keep(thought), keep(text))
 }
 
-/// 你问了什么(插的话接在后面);记录从一轮中间开始、没有提问的谁也不是
+/// What you asked (words put in appended); a log starting mid-turn with no prompt is from nobody
 pub(crate) fn asked(t: &Trace, n: &Node) -> (Asker, String) {
     let mut parts = vec![];
     for v in lines_of(t, n) {
@@ -1106,7 +1124,7 @@ pub(crate) fn asked(t: &Trace, n: &Node) -> (Asker, String) {
     (Asker::You, parts.join("\n\n").trim().to_string())
 }
 
-/// task_complete.error:字符串,或者带 message 的对象
+/// task_complete.error: a string, or an object with message
 fn error_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -1126,7 +1144,7 @@ pub(crate) fn fail_text(t: &Trace, n: &Node) -> String {
     }
 }
 
-/// 改了哪些文件:{路径: {type: update, unified_diff} / {type: add | delete, content}}
+/// Which files changed: {path: {type: update, unified_diff} / {type: add | delete, content}}
 fn file_changes(v: &Value) -> Vec<(String, Vec<Change>)> {
     let Some(m) = v.as_object() else { return vec![] };
     m.iter()
@@ -1142,7 +1160,7 @@ fn file_changes(v: &Value) -> Vec<(String, Vec<Change>)> {
         .collect()
 }
 
-/// 统一 diff(@@ -7,3 +7,4 @@ 起头的几处)→ 带行号的改动
+/// Unified diff (hunks starting with @@ -7,3 +7,4 @@) → changes with line numbers
 fn unified(diff: &str) -> Vec<Change> {
     static AT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@").unwrap());
     let mut out = vec![];
@@ -1167,7 +1185,7 @@ fn unified(diff: &str) -> Vec<Change> {
     out
 }
 
-/// apply_patch 的补丁 → 每个文件的改动(补丁里没有行号;新建的从第 1 行起)
+/// An apply_patch patch → each file's changes (the patch has no line numbers; new files start at line 1)
 fn patch_edits(patch: &str) -> Vec<(String, Vec<Change>)> {
     let mut out: Vec<(String, Vec<Change>)> = vec![];
     let mut add = false;
@@ -1201,7 +1219,7 @@ fn patch_edits(patch: &str) -> Vec<(String, Vec<Change>)> {
     out
 }
 
-/// update_plan 的计划:✓ 做完的、▸ 在做的、· 还没做的
+/// update_plan's plan: ✓ done, ▸ in progress, · not yet
 fn plan_text(args: &Value) -> String {
     let mut out = vec![];
     if let Some(e) = args.get("explanation").and_then(Value::as_str).filter(|e| !e.trim().is_empty()) {
@@ -1218,7 +1236,8 @@ fn plan_text(args: &Value) -> String {
     out.join("\n")
 }
 
-/// 一个工具的内容。exec 的命令、改动取记录里真跑了的,没有才从 JS 里认;都认不出的露 JS 本身
+/// One tool's content. An exec's commands and changes come from what the log says really ran, recognized from the JS only if absent;
+/// if nothing is recognized, show the JS itself
 pub(crate) fn io(t: &Trace, n: &Node) -> Io {
     let mut io = Io::default();
     let (mut code, mut patch, mut plan) = (None, None, false);
@@ -1296,7 +1315,7 @@ pub(crate) fn io(t: &Trace, n: &Node) -> Io {
         if io.cmds.is_empty() && edits.is_empty() {
             io.input = Some(("js", code));
         }
-        // 脚本自己没打印什么:只跑了一条命令的,拿那条命令的输出
+        // The script printed nothing itself: if it ran just one command, use that command's output
         if io.out.as_deref().is_none_or(|o| o.trim().is_empty()) && ran_out.len() == 1 {
             io.out = ran_out.pop();
         }
@@ -1305,10 +1324,10 @@ pub(crate) fn io(t: &Trace, n: &Node) -> Io {
             edits = patch_edits(&p);
         }
     } else if let Some(o) = ran_out.pop().filter(|_| !io.cmds.is_empty()) {
-        // exec_command:exec_command_end 里是完整的输出(给模型的那份可能截过)
+        // exec_command: exec_command_end has the full output (the copy given to the model may be truncated)
         io.out = Some(o);
     }
-    // 退出码:有失败的写第一个失败的
+    // Exit code: if any failed, the first failure
     if let Some(&x) = exits.iter().find(|&&x| x != 0).or(exits.last()) {
         io.exit = Some(x);
     }
@@ -1352,7 +1371,7 @@ pub(crate) mod tests {
         )
     }
 
-    /// 一个新的累计数:total 每次都不一样
+    /// A new cumulative count: total differs every time
     fn tokens(ms: u32, total: u64, input: u64, cached: u64, out: u64) -> Value {
         ev(
             ms,
@@ -1374,7 +1393,7 @@ pub(crate) mod tests {
         let p = d.join("rollout-2026-09-30T01-00-00-th.jsonl");
         let mut f = std::fs::File::create(&p).unwrap();
         for l in lines {
-            // 照 Codex 写的顺序:timestamp、type 在前,payload 在后
+            // In the order Codex writes: timestamp, type first, payload after
             match (l.get("timestamp"), l.get("type"), l.get("payload")) {
                 (Some(ts), Some(k), Some(p)) => writeln!(f, r#"{{"timestamp":{ts},"type":{k},"payload":{p}}}"#).unwrap(),
                 _ => writeln!(f, "{l}").unwrap(),
@@ -1391,7 +1410,8 @@ pub(crate) mod tests {
         t.nodes[i].kids.iter().map(|&k| t.nodes[k].kind).collect()
     }
 
-    /// 0.155 的一轮:exec 里跑两条命令(一条跑到后台,exec 回了才完),下一次调用改文件,最后回复
+    /// A 0.155 turn: the exec runs two commands (one goes to the background and finishes after exec returns), the next call changes a
+    /// file, then the reply
     pub(crate) fn fixture(name: &str) -> (Trace, PathBuf) {
         let p = file(name, &fixture_lines());
         (Trace::open_born(p.clone(), Agent::Codex, 0).unwrap(), p)
@@ -1439,7 +1459,7 @@ pub(crate) mod tests {
                 json!({"type": "custom_tool_call", "name": "exec", "call_id": "c2",
                              "input": "const patch = `*** Begin Patch\n*** Update File: src/b.rs\n@@\n-    assert_eq!(x, 1);\n+    assert_eq!(x, 2);\n*** End Patch`;\nawait tools.apply_patch(patch);"}),
             ),
-            // 上一次的 sleep 60 这时才跑完:按开始时刻挂回第一个 exec
+            // The previous sleep 60 only finishes now: attached back to the first exec by start time
             ev(
                 13_050,
                 json!({"type": "item_completed", "started_at_ms": ts_ms(&at(9100)), "completed_at_ms": ts_ms(&at(13_050)),
@@ -1456,7 +1476,7 @@ pub(crate) mod tests {
                 json!({"type": "custom_tool_call_output", "call_id": "c2", "output": [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"}]}),
             ),
             tokens(13_210, 2000, 1000, 900, 80),
-            // 额度刷新时重报一样的累计数:不是新的调用
+            // The same cumulative count re-reported on a quota refresh: not a new call
             tokens(13_220, 2000, 1000, 900, 80),
             say(20_000, "改好了:**b** 的断言写错了。\n\n- 测试全过", "final_answer"),
             tokens(20_100, 3000, 1100, 1000, 40),
@@ -1503,18 +1523,18 @@ pub(crate) mod tests {
         let turn = t.roots[0];
         let n = &t.nodes[turn];
         assert_eq!((n.label.as_str(), n.exact, t.dur(turn, false, 0), n.state), ("跑一下测试", true, 19_000, St::Ok));
-        // 三次调用:重报的累计数不算
+        // Three calls: re-reported cumulative counts don't count
         assert_eq!(kinds(&t, turn), [Kind::Call, Kind::Call, Kind::Call]);
         let c1 = &t.nodes[n.kids[0]];
-        // 从提问算起,到 token_usage_record;输入去掉缓存读
+        // From the prompt to token_usage_record; cache reads taken out of input
         assert_eq!((c1.t1 - c1.t0, c1.tok, c1.think, c1.label.as_str()), (8100 - 1030, [100, 0, 0, 800, 50], 3, "先跑测试"));
         assert_eq!((t.models[c1.model].as_str(), c1.effort.as_str()), ("gpt-5.5", "high"));
         let c2 = &t.nodes[n.kids[1]];
-        // 第二次调用从上一个工具输出算起;想的有摘要就写第一句
+        // The second call starts at the previous tool output; when thinking has a summary, write its first sentence
         assert_eq!((c2.t0, c2.thought.as_str()), (ts_ms(&at(9500)), "**修 b**"));
         assert_eq!(t.nodes[n.kids[2]].label, "改好了:b 的断言写错了。");
         assert_eq!(t.nodes[t.roots[1]].label, "压缩");
-        // 钱:和 $ 面板读同一份记录算的一样
+        // Money: same as the $ panel computes from the same log
         let s = t.total(false, 0).2;
         let mut seen = crate::usage::tests::codex_seen(&p);
         let bill: f64 = seen.drain(..).map(|(m, tok)| crate::usage::call_cost(&m, tok, false, false, 0).unwrap()).sum();
@@ -1528,13 +1548,13 @@ pub(crate) mod tests {
         let c1 = t.nodes[t.roots[0]].kids[0];
         let e1 = t.nodes[c1].kids[0];
         let n = &t.nodes[e1];
-        // 头一行写真跑了的第一条命令;测试失败了算出错,退出码写失败的那条
+        // The first line shows the first command really run; failed tests mean an error, the exit code is the failed one's
         assert_eq!((n.name.as_str(), n.label.as_str(), n.t1 - n.t0, n.state), ("Shell", "cargo test --release", 1500, St::Err));
         let io = io(&t, n);
         assert_eq!(io.cmds, ["cargo test --release", "sleep 60"]);
         assert_eq!(io.out.as_deref(), Some("running 3 tests\ntest a ... ok\ntest b ... FAILED"));
         assert_eq!(io.exit, Some(101));
-        // 第二个 exec:改文件,带行号(统一 diff 里的),e 停在改的那行
+        // The second exec: changes a file, with line numbers (from the unified diff), e stops at the changed line
         let e2 = t.nodes[t.nodes[t.roots[0]].kids[1]].kids[0];
         assert_eq!((t.nodes[e2].name.as_str(), t.nodes[e2].label.as_str()), ("Patch", "src/b.rs"));
         let io = crate::trace::io(&t, e2);
@@ -1552,10 +1572,10 @@ pub(crate) mod tests {
         let call = t.nodes[turn].kids[0];
         let (build, patch) = (t.nodes[call].kids[0], t.nodes[call].kids[1]);
         let b = &t.nodes[build];
-        // 耗时用 exec_command_end 写明的,输出去掉头
+        // Duration is what exec_command_end states, output with the head stripped
         assert_eq!((b.name.as_str(), b.label.as_str(), b.t1 - b.t0, b.exact, b.state), ("Shell", "cargo build", 3500, true, St::Ok));
         assert_eq!(io(&t, b).out.as_deref(), Some("Finished\n"));
-        // apply_patch 校验没过:出错;两个文件,新建的从第 1 行起
+        // apply_patch verification failed: an error; two files, the new one starts at line 1
         let p = &t.nodes[patch];
         assert_eq!((p.name.as_str(), p.label.as_str(), p.state), ("Patch", "docs/n.md 等 2 个文件", St::Err));
         let io = io(&t, p);
@@ -1574,17 +1594,18 @@ pub(crate) mod tests {
         let c = crate::trace::chat(&t, turn, false, 0);
         assert_eq!(plain(&c.asked, 60), ["你  跑一下测试", "    顺便修掉", "    [图片]"]);
         assert_eq!(plain(&c.reply, 60)[0], "Codex  改好了:b 的断言写错了。");
-        // 右边:exec 收着露输出开头,靠右写几条命令;改文件的露改动行
+        // Right side: a folded exec shows the start of its output and the command count at the right; changing files shows
+        // the changed lines
         let steps: Vec<String> = crate::trace::steps(&t, turn, false, 0, &|_| false).iter().flat_map(|s| plain(&s.paras, 70)).collect();
         assert!(steps.iter().any(|l| l.starts_with("▸ Shell cargo test --release") && l.ends_with("2 条命令 · 1.5s")), "{steps:#?}");
         assert!(steps.iter().any(|l| l == "  running 3 tests"), "{steps:#?}");
         assert!(steps.iter().any(|l| l.starts_with("▸ Patch src/b.rs") && l.ends_with("+1 -1")), "{steps:#?}");
         assert!(steps.iter().any(|l| l == "  8 +     assert_eq!(x, 2);"), "{steps:#?}");
         assert!(steps.iter().any(|l| l == "思考 修 b · 改断言"), "{steps:#?}");
-        // 展开:两条命令都写出来
+        // Unfolded: both commands written out
         let open: Vec<String> = crate::trace::steps(&t, turn, false, 0, &|_| true).iter().flat_map(|s| plain(&s.paras, 70)).collect();
         assert!(open.windows(2).any(|w| w[0] == "  $ cargo test --release" && w[1] == "  $ sleep 60"), "{open:#?}");
-        // 详情:命令、退出码;e 写成 Markdown
+        // Details: commands, exit code; e writes Markdown
         let e1 = t.nodes[t.nodes[turn].kids[0]].kids[0];
         let d = plain(&crate::trace::detail(&t, e1, false, 0), 80);
         assert!(d.iter().any(|l| l == "cargo test --release") && d.iter().any(|l| l == "sleep 60"), "{d:#?}");
@@ -1601,7 +1622,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_block_whose_signature_stays_the_same_looks_the_same_after_the_record_grows() {
-        // 在跑的会话:记录读到第一轮一半,再接着读下去。签名没变的块照旧用(界面不重排),必须和重排的一模一样
+        // A running session: the log read up to half of the first turn, then read on. Blocks whose signature didn't change are reused (the
+        // UI doesn't re-lay out) and must be identical to re-laid-out ones
         let all = fixture_lines();
         let p = file("grow", &all[..13]);
         let mut t = Trace::open_born(p.clone(), Agent::Codex, 0).unwrap();
@@ -1637,11 +1659,12 @@ pub(crate) mod tests {
                     kept += 1;
                 }
             }
-            // 头(整轮的合计)、后台命令跑完了的 exec、不再是最后的那次调用要重排;第一次调用还是老样子
+            // The head (whole-turn total), the exec whose background command finished, and the call that's no longer the last
+            // get re-laid out; the first call stays as it was
             let c1 = t.nodes[turn].kids[0];
             assert!(before.iter().chain(&after).filter(|b| b.0 == c1).map(|b| b.1).collect::<std::collections::HashSet<_>>().len() == 1);
             assert!(kept >= 1 && kept < after.len(), "kept={kept} of {}", after.len());
-            // 重新来一遍(下一轮 open 从同一个起点长)
+            // Once more (the next round of open grows from the same starting point)
             before.clear();
             let _ = std::fs::write(
                 &p,
@@ -1676,7 +1699,7 @@ pub(crate) mod tests {
         assert_eq!(cmd_text(&json!(["git", "status"])), "git status");
     }
 
-    /// 一个 CODEX_HOME:sessions/2026/09/30/rollout-…-<id>.jsonl(行上有 ordinal 的照 Codex 写在 payload 前面)
+    /// A CODEX_HOME: sessions/2026/09/30/rollout-…-<id>.jsonl (lines with an ordinal have it before payload, as Codex writes)
     fn home_file(home: &std::path::Path, id: &str, lines: &[Value]) -> PathBuf {
         let d = home.join("sessions/2026/09/30");
         std::fs::create_dir_all(&d).unwrap();
@@ -1705,7 +1728,8 @@ pub(crate) mod tests {
         row(2150, "session_meta", p)
     }
 
-    /// 父线程一轮里起两个子线程:一个新版本(起来时来 sub_agent_activity),一个老版本(id 在 spawn_agent 的输出里)
+    /// The parent starts two child threads in one turn: one new version (sub_agent_activity arrives when it starts), one old (id in
+    /// spawn_agent's output)
     pub(crate) fn family(name: &str, kid1_done: bool) -> (PathBuf, PathBuf) {
         let h = home(name);
         let spawn = |ms, id: &str, args: Value| {
@@ -1739,7 +1763,7 @@ pub(crate) mod tests {
                 ev(9200, json!({"type": "task_complete", "turn_id": "t1", "duration_ms": 8200})),
             ],
         );
-        // kid1:开头抄了父线程的第一轮(连那次的用量),到父线程里没有的 turn_id 为止
+        // kid1: its start copies the parent's first turn (including that call's usage), up to a turn_id not in the parent
         let mut kid1 = vec![
             child_meta("kid1", json!({})),
             row(2150, "session_meta", json!({"id": "th", "cwd": "/p/app", "cli_version": "0.155.0", "source": "cli"})),
@@ -1770,7 +1794,7 @@ pub(crate) mod tests {
             ]);
         }
         home_file(&h, "kid1", &kid1);
-        // kid2(0.154+):行上有 ordinal,比 subagent_history_start_ordinal 小的是抄的
+        // kid2 (0.154+): lines have an ordinal; those below subagent_history_start_ordinal are copied
         let o = |mut v: Value, n: u64| {
             v["ordinal"] = json!(n);
             v
@@ -1806,14 +1830,14 @@ pub(crate) mod tests {
         let k1 = t.sub_of(sp1).expect("kid1 按 sub_agent_activity 挂上");
         let k2 = t.sub_of(sp2).expect("kid2 按输出里的 agent_id 挂上");
         assert_eq!((k1.kind.as_str(), k1.desc.as_str(), k2.desc.as_str()), ("explorer", "Euclid", "Noether"));
-        // 开头抄的父线程那一轮折成一块、不计;自己的那轮是第 1 轮,收到的是任务
+        // The parent turn copied at the start is folded into one block, not counted; its own turn is turn 1, receiving the task
         for k in [k1, k2] {
             let roots: Vec<Kind> = k.t.roots.iter().map(|&r| k.t.nodes[r].kind).collect();
             assert_eq!(roots, [Kind::Copied, Kind::Turn], "{}", k.id);
             assert_eq!(k.t.turn_no(k.t.roots[1]), Some(1));
         }
         assert_eq!(crate::trace::asked(&k1.t, k1.t.roots[1]), ("任务", "看看 b.rs 里的断言".to_string()));
-        // 钱:子线程只算自己的用量(抄来的那次不算),算进起它的那一轮
+        // Money: a child thread counts only its own usage (not the copied call), added to the turn that started it
         let cost = |m: &str, tok: [u64; 5]| crate::usage::call_cost(m, tok, false, false, 0).unwrap();
         let own = cost("gpt-5.5", [100, 0, 0, 300, 70]) + cost("gpt-5.5", [100, 0, 0, 200, 60]);
         assert!((k1.t.total(false, 0).2.cost - own).abs() < 1e-12);
@@ -1822,7 +1846,7 @@ pub(crate) mod tests {
         let s = t.sum(t.roots[0]);
         assert_eq!((s.calls, s.subs), (2, 2));
         assert!((s.sub_cost - own - kid2).abs() < 1e-12);
-        // 都干完了;右边写子线程的数字,露它最后说的
+        // All done; the right side shows the child thread's numbers and what it said last
         assert!(!t.sub_live(sp1, true, ts_ms(&at(9000))));
         let plain = |ps: &[crate::trace::Para]| {
             crate::trace::wrap(ps, 80).iter().map(|l| crate::ansi::plain(l).trim_end().to_string()).collect::<Vec<_>>()
@@ -1843,7 +1867,7 @@ pub(crate) mod tests {
         let call = t.nodes[t.roots[0]].kids[0];
         let (sp1, sp2) = (t.nodes[call].kids[0], t.nodes[call].kids[1]);
         assert!(t.sub_live(sp1, true, ts_ms(&at(9000))) && t.sub_of(sp2).is_none() && t.want.len() == 1);
-        // 半小时没动静:会话被关掉时没干完的,不算在跑
+        // Quiet for half an hour: unfinished when the session was closed, not counted as running
         assert!(!t.sub_live(sp1, true, ts_ms(&at(5000)) + 31 * 60_000));
         std::fs::write(&kid2, body).unwrap();
         assert!(t.tail().unwrap());
@@ -1852,7 +1876,7 @@ pub(crate) mod tests {
 
     #[test]
     fn without_the_parent_record_the_copy_ends_where_a_turn_starts_before_the_last_one_ended() {
-        // 分叉出来的(父线程的记录不在本机):抄来的最后一轮还没结束就又来了 task_started,那是它自己的
+        // Forked (the parent's log isn't on this machine): a task_started arrives before the last copied turn ended; that one is its own
         let t = open(
             "fork",
             &[
@@ -1877,7 +1901,7 @@ pub(crate) mod tests {
         assert_eq!(roots, [Kind::Copied, Kind::Turn]);
         assert_eq!(t.nodes[t.roots[0]].kids.len(), 2);
         assert_eq!(t.total(false, 0).2.calls, 1);
-        // history_base:什么都没抄
+        // history_base: nothing copied
         let t = open(
             "paged",
             &[

@@ -1,21 +1,26 @@
-//! 跟随(`aca ui --client … --follow`):界面开在 tmux 弹窗里、只占屏幕一边时,高亮挪到哪,
-//! 这台客户端就切到哪个会话。弹窗是挂在客户端上的,切了会话它还在,旁边露出来的就是高亮的那个。
+//! Follow (`aca ui --client … --follow`): when the interface is open in a tmux popup taking only one side of the screen,
+//! wherever the highlight moves, this client switches to that session. The popup is attached to the client, so it stays when
+//! the session switches, and what shows beside it is the highlighted one.
 //!
-//! - ⏎ 留在那个会话(和不跟随时一样:切过去、弹窗关、算看过)
-//! - Esc 回到打开时停着的那一格
-//! - Ctrl+\(开弹窗的那个键)/ qq 关掉,人留在旁边现在露出来的那个,它算看过
+//! - ⏎ stays in that session (as without follow: switch there, the popup closes, counted as seen)
+//! - Esc goes back to the pane it was on when opened
+//! - Ctrl+\ (the key that opens the popup) / qq closes it; you stay in the one now showing beside it, which counts as seen
 //!
-//! 高亮停稳了才切:滑动途中、正在打过滤词时不切;停在分组上、没在跑的会话上,旁边不动。
-//! 路过不算看过:切过去 tmux 就记它「连进去过」,核心那边的「跑完没看」跟着没了,所以路过的记成未读(见 reads.rs)。
-//! 预览默认不画(旁边就是真的),`v` 换的只管这一次,不动手机 / 桌面各自记着的布局。
+//! Switches only once the highlight settles: not while swiping or typing a filter; on a group or a session that isn't running,
+//! the side stays as it is.
+//! Passing by doesn't count as seen: switching there makes tmux record it as "attached", which clears core's "finished, not
+//! looked at", so the ones passed by are marked unread (see reads.rs).
+//! The preview isn't drawn by default (the real thing is right beside it); `v` changes it for this time only, leaving the
+//! layouts the phone / desktop each remember alone.
 //!
-//! 这里只管「该不该切、切到哪」;发 tmux 命令的是 `data::show`,接进界面的几处在 ui.rs(`follow_step` / `follow_done`)。
+//! This only decides "whether to switch, and where"; `data::show` sends the tmux commands, and the places it's wired into the
+//! interface are in ui.rs (`follow_step` / `follow_done`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ui::Preview;
 
-/// 启动时带了 `--follow`(^L 重启时原样带上)
+/// Started with `--follow` (passed on as is when ^L restarts)
 static ASKED: AtomicBool = AtomicBool::new(false);
 
 pub fn ask() {
@@ -26,14 +31,14 @@ pub fn asked() -> bool {
     ASKED.load(Ordering::Relaxed)
 }
 
-/// 客户端停着 / 要去的地方
+/// Where the client is / is going
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Place {
-    /// 列表里那一行的键(`Session::name`);打开时高亮没落在哪一行上就是空的
+    /// The key of that row in the list (`Session::name`); empty if the highlight wasn't on any row when opened
     pub row: String,
-    /// tmux 的会话号(`$3`)
+    /// tmux's session id (`$3`)
     pub session: String,
-    /// 落在哪一格(`%12`);空 = 那个会话现在的那一格
+    /// Which pane it lands in (`%12`); empty = that session's current pane
     pub pane: String,
 }
 
@@ -44,13 +49,14 @@ impl Place {
 }
 
 pub struct Follow {
-    /// 打开时:高亮的那一行,和客户端真正停着的会话、窗格(那一行自己的窗格可能是另一格,回来时落回原来这格)
+    /// When opened: the highlighted row, plus the session and pane the client was really on (that row's own pane may be a
+    /// different one; coming back lands on this original pane)
     home: Place,
-    /// 客户端现在被带到了哪
+    /// Where the client has been taken now
     at: Place,
-    /// 按了 Esc:下一步回 home
+    /// Esc was pressed: the next step goes back home
     back: bool,
-    /// 这一次用的布局
+    /// The layout used this time
     pub layout: Preview,
 }
 
@@ -59,11 +65,12 @@ impl Follow {
         Follow { at: home.clone(), home, back: false, layout: Preview::Off }
     }
 
-    /// 高亮停稳在 want 上(None = 还没停稳,或者停在切不过去的行上)。要切就给出切到哪,已经在那就不给
+    /// The highlight settled on want (None = not settled yet, or on a row that can't be switched to). Returns where to switch to if
+    /// needed; nothing if already there
     pub fn step(&mut self, want: Option<Place>) -> Option<Place> {
         let to = match want {
             _ if self.back => self.home.clone(),
-            // 挪回打开时那一行:落回原来那一格,不是那一行自己的窗格
+            // Back to the row it opened on: land on the original pane, not that row's own pane
             Some(w) if w.row == self.home.row => self.home.clone(),
             Some(w) => w,
             None => return None,
@@ -75,17 +82,17 @@ impl Follow {
         Some(to)
     }
 
-    /// Esc:回到打开时停着的地方
+    /// Esc: go back to where it was when opened
     pub fn back(&mut self) {
         self.back = true;
     }
 
-    /// 是不是打开时停着的那个会话
+    /// Whether this is the session it was on when opened
     pub fn is_home(&self, session: &str) -> bool {
         self.home.session == session
     }
 
-    /// 关掉时人留在了别的会话:它的会话号
+    /// You stayed in another session on close: its session id
     pub fn stayed(&self) -> Option<&str> {
         (!self.is_home(&self.at.session)).then_some(self.at.session.as_str())
     }
@@ -101,15 +108,15 @@ mod tests {
 
     #[test]
     fn opening_moves_nothing_and_each_row_is_switched_to_once() {
-        // 打开时停在会话 a 的一个 shell 格(%7)上,高亮落在 a 那一行(它自己的窗格是 agent 的 %1)
+        // Opened on a shell pane (%7) of session a, with the highlight on a's row (its own pane is the agent's %1)
         let mut f = Follow::new(spot("a", "$1", "%7"));
         assert_eq!(f.step(Some(spot("a", "$1", "%1"))), None, "刚打开:不动");
         assert_eq!(f.step(None), None, "滑动途中 / 停在分组上:不动");
         assert_eq!(f.step(Some(spot("b", "$2", "%3"))), Some(spot("b", "$2", "%3")));
         assert_eq!(f.step(Some(spot("b", "$2", "%3"))), None, "已经在那:不再发命令");
-        // 同一个会话里另一格也要切
+        // Another pane in the same session switches too
         assert_eq!(f.step(Some(spot("b\u{1}%4", "$2", "%4"))), Some(spot("b\u{1}%4", "$2", "%4")));
-        // 挪回打开时那一行:落回原来那格(%7),不是 agent 的 %1
+        // Back to the row it opened on: lands on the original pane (%7), not the agent's %1
         assert_eq!(f.step(Some(spot("a", "$1", "%1"))), Some(spot("a", "$1", "%7")));
         assert_eq!(f.stayed(), None);
     }
@@ -120,10 +127,10 @@ mod tests {
         f.step(Some(spot("b", "$2", "%3")));
         assert_eq!(f.stayed(), Some("$2"));
         f.back();
-        // 高亮还在 b 上、甚至还在滑:照样回去
+        // The highlight still on b, even still swiping: goes back anyway
         assert_eq!(f.step(Some(spot("b", "$2", "%3"))), Some(spot("a", "$1", "%7")));
         assert_eq!((f.step(None), f.stayed()), (None, None));
-        // 没挪过就按 Esc:本来就在,不发命令
+        // Esc without having moved: already there, no command sent
         let mut f = Follow::new(spot("a", "$1", "%7"));
         f.back();
         assert_eq!(f.step(None), None);

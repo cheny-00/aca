@@ -1,30 +1,38 @@
-//! 清单 `aca-plugin.toml`:插件里有什么。读进来、查一遍,链接、调用时都从这里拿。
+//! The manifest `aca-plugin.toml`: what's in a plugin. Read in and checked here; linking and calling take everything from it.
 //!
-//! 一个插件能带的几样(都可以不写):
-//! - **能力** `[[commands]]`(老写法 `[[actions]]` 照认):一条命令,带参数说明;`expose` 说露给谁 ——
-//!   `menu` 界面(菜单、键)、`cli` 命令行(`aca plugin run`)、`agent` 给 agent 当工具用、
-//!   `agent?` 能给 agent 但默认不给(你在 plugins.toml 的 `tools` 里点了名才给,见 [`super::yours`])
-//! - 能力、窗格、视图都能写 `input`(把会话的最后一条回复 / 屏幕 / 回滚交给它:命令从标准输入读,
-//!   窗格读 `ACA_INPUT_FILE`)和 `cwd = "session"`(在会话的目录里跑,不在插件目录里)
-//! - **事件钩子** `[[events]]`:某件事发生时跑一条命令;`if` 写过滤条件,不匹配不起进程
-//! - **窗格** `[[panes]]`:一个终端程序,开在弹窗 / 分屏 / 新窗口里
-//! - **视图** `[[views]]`:一条命令的输出,放进 aca 自己的阅读页(翻页、搜索、复制;手机上好用)。
-//!   `rows = true` 的是列表:命令输出一份 JSON(一行一条,见 [`super::ViewRows`]),`[[views.keys]]` 说每行能按哪些键
-//!   (复制一个字段、带着这一行跑这个插件的某个能力),按完列表重读
-//! - **键** `[[keys]]`:界面 `:` 菜单里按一个键直接跑某个能力 / 窗格 / 视图
-//! - **定时** `[[timers]]`:每隔一阵跑这个插件的一个能力;`manual` 的平时关着,插件自己开关(见 [`super::timer`])
-//! - **热键** `[[hotkeys]]`:在会话里面(不在界面里)不按前缀直接按的键,开这个插件的一个窗格。aca 把它绑在 tmux 上,
-//!   和 Ctrl+Q 一个办法(见 [`crate::tmux::bind_hotkeys`]):只在 aca 的会话里拦,别的会话里键照样给里面的程序
-//! - **依赖** `requires`:只能是第一方插件(`aca.core` 这种),装它时一起装上
-//! - **要用的程序** `needs`:外面的命令(`jq`、`tailscale`;`a|b` = 有一个就行)。aca 不替它装,只在装的时候、
-//!   `aca plugin check`、插件页里说这台机器上缺了哪个
-//! - **设置** `[settings.<名字>]`:默认值和说明;值写在 `plugins.toml`,交给命令时在环境里
-//! - **给 agent 的** `[agent]`:一个 Claude 格式的插件目录(skills/、commands/),两家共用;`[agent.mcp]` 一个 MCP 服务;
-//!   `auto` 指一个开关设置,开着时命令头上的 `disable-model-invocation` 不作数(见 [`super::mount`])
-//!   (老写法 `[agents.claude] plugin_dir` 照认,只给 Claude)
+//! What a plugin can bring (all optional):
+//! - **Commands** `[[commands]]` (the old `[[actions]]` still works): a command with its arguments described; `expose` says
+//!   who it's exposed to — `menu` the interface (menu, keys), `cli` the command line (`aca plugin run`), `agent` as a tool
+//!   for agents, `agent?` can go to agents but doesn't by default (only when you name it in `tools` in plugins.toml, see
+//!   [`super::yours`])
+//! - Commands, panes and views can all have `input` (hands them the session's last reply / screen / scrollback: commands
+//!   read it from stdin, panes read `ACA_INPUT_FILE`) and `cwd = "session"` (run in the session's directory, not the
+//!   plugin directory)
+//! - **Event hooks** `[[events]]`: run a command when something happens; `if` filters, and no process starts when it
+//!   doesn't match
+//! - **Panes** `[[panes]]`: a terminal program, opened in a popup / split / new window
+//! - **Views** `[[views]]`: a command's output in aca's own reader (paging, search, copying; handy on a phone).
+//!   `rows = true` makes it a list: the command prints JSON (one row per item, see [`super::ViewRows`]), and
+//!   `[[views.keys]]` says which keys each row takes (copy a field, run one of this plugin's commands with the row); the
+//!   list is re-read after a key
+//! - **Keys** `[[keys]]`: a key in the interface's `:` menu that runs a command / pane / view directly
+//! - **Timers** `[[timers]]`: run one of this plugin's commands every so often; `manual` ones are normally off and the
+//!   plugin switches them itself (see [`super::timer`])
+//! - **Hotkeys** `[[hotkeys]]`: keys pressed inside a session (not in the interface), with no prefix, that open one of
+//!   this plugin's panes. aca binds them in tmux, the same way as Ctrl+Q (see [`crate::tmux::bind_hotkeys`]): caught only
+//!   in aca's sessions; in other sessions the key still goes to the program inside
+//! - **Dependencies** `requires`: first-party plugins only (like `aca.core`), installed along with it
+//! - **Programs it needs** `needs`: outside commands (`jq`, `tailscale`; `a|b` = either one). aca doesn't install them
+//!   for it, it only says which are missing on this machine when installing, in `aca plugin check` and on the plugins page
+//! - **Settings** `[settings.<name>]`: a default and a description; values live in `plugins.toml` and reach commands
+//!   through the environment
+//! - **For agents** `[agent]`: a plugin directory in Claude's format (skills/, commands/), shared by both agents;
+//!   `[agent.mcp]` an MCP server; `auto` names an on/off setting, and while it's on, `disable-model-invocation` in command
+//!   headers doesn't count (see [`super::mount`]) (the old `[agents.claude] plugin_dir` still works, Claude only)
 //!
-//! `api` 是插件照着写的那一版插件接口(不写 = 1,见 [`API`]);写得比这个 aca 新的读不进来。
-//! 不认识的字段不拦着,提醒一声(多半是拼错了,或者写到了别的表底下)
+//! `api` is the plugin API version the plugin was written for (default 1, see [`API`]); one newer than this aca won't
+//! read. Unknown fields don't block anything, they get a warning (usually a typo, or a field that ended up under another
+//! table)
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -36,26 +44,28 @@ use crate::{t, tr};
 
 pub const MANIFEST: &str = "aca-plugin.toml";
 
-/// 这个 aca 认的插件接口版本(清单的 `api`)。同一版里只加不改:新的可选字段、新的环境变量、新的事件和字段;
-/// 要删要改名就是下一版。约定写在 docs/plugins.md「接口约定」
+/// The plugin API version this aca understands (the manifest's `api`). Within a version things are only added, never
+/// changed: new optional fields, new environment variables, new events and fields; removing or renaming something means
+/// the next version. The contract is in docs/plugins.md, "The contract"
 pub const API: u32 = 1;
 
-/// 参数认的类型;后面带 `?` 的可以不给
+/// Argument types accepted; a trailing `?` makes one optional
 pub const ARG_TYPES: &[&str] = &["string", "path", "int", "bool"];
-/// 能力能露给的几处(`agent?`:能给 agent,默认不给)
+/// Where a command can be exposed (`agent?`: can go to agents, not by default)
 pub const EXPOSE: &[&str] = &["menu", "cli", "agent", "agent?"];
-/// `input` 认的几样:最后一条回复、屏幕上现在的字、连回滚一起
+/// What `input` accepts: the last reply, the text on screen now, the screen plus scrollback
 pub const INPUTS: &[&str] = &["reply", "screen", "scrollback"];
-/// `:` 菜单里键留给界面自己的:`/` 筛
+/// Keys in the `:` menu kept for the interface itself: `/` filters
 pub const MENU_KEYS_TAKEN: &[&str] = &["/"];
-/// 热键不给的:Ctrl+Q 是 aca 自己的(回来);剩下几个终端里另有意思(中断、文件尾、挂起、回车、Tab、换行、退格)。
-/// 再加上 Alt 的(`C-M-c`)也不给:绑定还没补上的时候(tmux 刚重启),这个键发给 agent 的是 Esc 加 Ctrl+C
+/// Not allowed as hotkeys: Ctrl+Q is aca's own (going back); the rest mean something else in a terminal (interrupt, end
+/// of file, suspend, Enter, Tab, newline, backspace). Not with Alt added either (`C-M-c`): before the binding is back in
+/// place (tmux just restarted), that key reaches the agent as Esc plus Ctrl+C
 pub const HOTKEYS_TAKEN: &[&str] = &["C-q", "C-c", "C-d", "C-z", "C-m", "C-i", "C-j", "C-h"];
-/// `[agent] for` 认的几家
+/// The agents `[agent] for` accepts
 pub const AGENTS: &[&str] = &["claude", "codex"];
-/// 起的时候带得进插件 MCP 服务的几家(插件目录只有 [`AGENTS`] 那几家认)
+/// The agents that can take plugin MCP servers at launch (only the [`AGENTS`] ones accept plugin directories)
 pub const MCP_AGENTS: &[&str] = &["claude", "codex", "pi", "opencode"];
-/// `contexts` 认的几处:在会话上、在分组上、哪儿都行
+/// What `contexts` accepts: on a session, on a group, anywhere
 pub const CONTEXTS: &[&str] = &["session", "group", "global"];
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -63,18 +73,20 @@ pub const CONTEXTS: &[&str] = &["session", "group", "global"];
 pub struct Action {
     pub id: String,
     pub title: String,
-    /// 给 agent 看的那段说明(它决定什么时候调);不写用 title
+    /// The description agents see (it decides when to call); defaults to title
     pub desc: String,
-    /// 在什么上面才有意义:session / group / global;不写 = 哪儿都行(界面 `:` 菜单按高亮的那行挑)
+    /// Where it makes sense: session / group / global; not written = anywhere (the interface's `:` menu picks by the
+    /// highlighted row)
     pub contexts: Vec<String>,
-    /// 参数:名字 → 类型(`string` / `path` / `int` / `bool`,后面带 `?` = 可以不给)。
-    /// 界面拿它生成表单,MCP 拿它生成参数说明;调的时候以 JSON 放在 `ACA_PLUGIN_ARGS_JSON` 里
+    /// Arguments: name → type (`string` / `path` / `int` / `bool`, a trailing `?` = optional). The interface builds a form
+    /// from it, MCP builds the argument schema; on a call they're passed as JSON in `ACA_PLUGIN_ARGS_JSON`
     pub args: BTreeMap<String, String>,
-    /// 露给谁:menu / cli / agent / agent?。不写 = menu + cli(不写 agent 就不给 agent 用)
+    /// Exposed to whom: menu / cli / agent / agent?. Not written = menu + cli (without agent it's not for agents)
     pub expose: Vec<String>,
-    /// 交给它会话的什么:reply / screen / scrollback(空 = 什么都不给)
+    /// What of the session it gets: reply / screen / scrollback (empty = nothing)
     pub input: String,
-    /// 在哪跑:空 / plugin = 插件目录,session = 会话的目录(没有会话还是插件目录)
+    /// Where it runs: empty / plugin = the plugin directory, session = the session's directory (still the plugin directory
+    /// when there's no session)
     pub cwd: String,
     pub command: Vec<String>,
 }
@@ -84,12 +96,12 @@ impl Action {
         self.expose.iter().any(|e| e == to)
     }
 
-    /// `agent?`:能给 agent,但要你点名(plugins.toml 的 `tools`)
+    /// `agent?`: can go to agents, but only when you name it (`tools` in plugins.toml)
     pub fn agent_opt_in(&self) -> bool {
         self.exposed("agent?")
     }
 
-    /// 参数的类型,和它能不能不给
+    /// An argument's type, and whether it's optional
     pub fn arg(&self, name: &str) -> Option<(&str, bool)> {
         self.args.get(name).map(|t| match t.strip_suffix('?') {
             Some(base) => (base, true),
@@ -102,8 +114,9 @@ impl Action {
 #[serde(default)]
 pub struct Hook {
     pub on: String,
-    /// 过滤条件:键是事件里的字段(`kind`、`data.x` 这种点号写法),加上会话的几样(`parent` 有没有派它的、
-    /// `tool`、`account`、`group`);值相等才跑。值写数组 = 其中一个就行;`true` / `false` = 有没有(非空)
+    /// Filter: keys are fields of the event (`kind`, dotted like `data.x`), plus a few about the session (`parent`: whether
+    /// something dispatched it, `tool`, `account`, `group`); runs only when the values are equal. An array = any one of them;
+    /// `true` / `false` = present (non-empty) or not
     #[serde(rename = "if")]
     pub cond: BTreeMap<String, toml::Value>,
     pub command: Vec<String>,
@@ -116,17 +129,18 @@ pub struct PaneDef {
     pub title: String,
     pub contexts: Vec<String>,
     pub placement: String,
-    /// 格数(`20`)或者占终端的百分比(`"80%"`)
+    /// Cells (`20`) or a percentage of the terminal (`"80%"`)
     pub width: Option<toml::Value>,
     pub height: Option<toml::Value>,
-    /// 交给它会话的什么(写进一个文件,路径在 `ACA_INPUT_FILE`):reply / screen / scrollback
+    /// What of the session it gets (written to a file whose path is in `ACA_INPUT_FILE`): reply / screen / scrollback
     pub input: String,
-    /// 空 / plugin = 插件目录,session = 会话的目录
+    /// Empty / plugin = the plugin directory, session = the session's directory
     pub cwd: String,
     pub command: Vec<String>,
 }
 
-/// 一条命令的输出,放进阅读页;`r` 重跑。`rows = true`:输出是一份列表(JSON),每行能按 `keys` 里的键
+/// A command's output in the reader; `r` reruns it. `rows = true`: the output is a list (JSON), and each row takes the
+/// keys in `keys`
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct View {
@@ -136,29 +150,30 @@ pub struct View {
     pub command: Vec<String>,
     pub rows: bool,
     pub keys: Vec<RowKey>,
-    /// 交给它会话的什么(标准输入):reply / screen / scrollback
+    /// What of the session it gets (on stdin): reply / screen / scrollback
     pub input: String,
-    /// 空 / plugin = 插件目录,session = 会话的目录
+    /// Empty / plugin = the plugin directory, session = the session's directory
     pub cwd: String,
 }
 
-/// 列表视图里的一个键:复制(`copy`)或者跑这个插件的一个能力(`run`,参数从这一行填)
+/// A key in a list view: copy (`copy`) or run one of this plugin's commands (`run`, arguments filled from the row)
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RowKey {
-    /// 一个字符,或者 `enter`
+    /// One character, or `enter`
     pub key: String,
-    /// 键旁边写的
+    /// What's written next to the key
     pub title: String,
-    /// 跑这个插件里的哪个能力(露没露给菜单都行)
+    /// Which of this plugin's commands to run (whether or not it's in the menu)
     pub run: String,
-    /// 能力的参数:名字 → 模板(`{id}`、`{url}`:这一行的字段);能力要的别的参数先弹表单问
+    /// The command's arguments: name → template (`{id}`, `{url}`: fields of the row); any other arguments the command needs
+    /// are asked for in a form first
     pub args: BTreeMap<String, String>,
-    /// 复制这段(模板)
+    /// Copy this (a template)
     pub copy: String,
-    /// 按两次才算(撤掉、删除这种)
+    /// Needs a second press (withdrawing, deleting and the like)
     pub confirm: bool,
-    /// 要停在某一行上才有意义;false = 列表空着也能按(新加一条、现在去取)
+    /// Only makes sense on a row; false = works on an empty list too (add a new one, fetch now)
     pub row: bool,
 }
 
@@ -176,51 +191,53 @@ impl Default for RowKey {
     }
 }
 
-/// 列表视图里键留给界面自己的:上下、关掉
+/// Keys in a list view kept for the interface itself: up, down, close
 pub const ROW_KEYS_TAKEN: &[&str] = &["j", "k", "q"];
 
-/// 定时:每隔 `every` 跑这个插件的一个能力(`run`)
+/// A timer: runs one of this plugin's commands (`run`) every `every`
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Timer {
-    /// 能力的 id:不能有必填的参数,到点跑的时候没有会话
+    /// The command id: no required arguments, there's no session when it fires
     pub run: String,
-    /// 30s / 10m / 2h / 1d,最短 1m
+    /// 30s / 10m / 2h / 1d, at least 1m
     pub every: String,
-    /// 平时关着,插件自己 `aca plugin timer on / off`(有活才开);不写 = 插件开着就开着
+    /// Normally off; the plugin itself runs `aca plugin timer on / off` (on only while there's work); not written = on
+    /// whenever the plugin is
     pub manual: bool,
 }
 
 impl Timer {
-    /// 隔几秒(读清单时查过,读不懂的进不来)
+    /// Seconds between runs (checked when the manifest is read; an unreadable one never gets in)
     pub fn secs(&self) -> u64 {
         super::timer::parse_every(&self.every).unwrap_or(0)
     }
 }
 
-/// `:` 菜单里的一个键
+/// A key in the `:` menu
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Key {
-    /// 一个字符
+    /// One character
     pub key: String,
-    /// 同一个插件里的能力 / 窗格 / 视图的 id
+    /// The id of a command / pane / view in the same plugin
     pub run: String,
 }
 
-/// 会话里面的一个热键
+/// A hotkey inside sessions
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Hotkey {
-    /// tmux 的键名,要带 Ctrl / Alt:`C-]`、`M-y`、`C-M-y`;或者 `F1`–`F12`
+    /// A tmux key name with Ctrl / Alt: `C-]`, `M-y`, `C-M-y`; or `F1`–`F12`
     pub key: String,
-    /// 同一个插件里的窗格的 id
+    /// The id of a pane in the same plugin
     pub run: String,
 }
 
-/// 能当热键的键(tmux 的键名)。光一个字符的不行:它会把你在会话里打的字截走。
-/// 后面那个字符只认小写字母、数字和 `, . / = -`(光 Ctrl 的还有 `]` `^`):别的在 tmux 的键表里要转义,
-/// Alt 加大写字母、`[` `]` 发出来的又是终端里别的序列的开头(ESC O、ESC [、ESC ])
+/// Keys that can be hotkeys (tmux key names). A bare character isn't allowed: it would swallow what you type in the
+/// session. The final character can only be a lowercase letter, a digit or one of `, . / = -` (plus `]` `^` with Ctrl
+/// alone): others need escaping in tmux's key table, and Alt with an uppercase letter, `[` or `]` sends what's the start
+/// of another terminal sequence (ESC O, ESC [, ESC ])
 pub fn hotkey_ok(k: &str) -> Res<()> {
     let f = k
         .strip_prefix('F')
@@ -251,31 +268,34 @@ pub fn hotkey_ok(k: &str) -> Res<()> {
 pub struct Setting {
     pub default: Option<toml::Value>,
     pub desc: String,
-    /// 不给人看全(webhook 地址、key 这种):界面、`aca plugin setting` 列的时候打码
+    /// Not shown in full (webhook URLs, keys and the like): masked where the interface and `aca plugin setting` list it
     pub secret: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct McpSpec {
-    /// 起这个 MCP 服务的命令(stdio),相对插件目录
+    /// The command that starts this MCP server (stdio), relative to the plugin directory
     pub command: Vec<String>,
-    /// 怎么挂:auto(默认:gateway 开着就登记到 gateway,不然直接挂到 agent 上)/ direct / gateway
+    /// How it's mounted: auto (default: registered with the gateway when it's on, otherwise attached to the agent directly)
+    /// / direct / gateway
     pub via: String,
-    /// 在 gateway 里:shared(默认,大家共用一份)/ session(每个会话一份,有状态的用这个)
+    /// In the gateway: shared (default, one copy for everyone) / session (one per session, for servers that keep state)
     pub scope: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AgentSpec {
-    /// 给哪几家:claude / codex。不写 = 两家都给
+    /// Which agents: claude / codex. Not written = both
     #[serde(rename = "for")]
     pub targets: Vec<String>,
-    /// Claude 格式的插件目录(`.claude-plugin/plugin.json`、`skills/`、`commands/`),相对插件目录
+    /// A plugin directory in Claude's format (`.claude-plugin/plugin.json`, `skills/`, `commands/`), relative to the plugin
+    /// directory
     pub dir: String,
-    /// 一个开关设置的名字:它开着时,`dir` 里命令、skill 头上的 `disable-model-invocation` 不作数(agent 自己能用);
-    /// 关着照文件写的来。不写 = 一直照文件写的来。只管 Claude:Codex 的 skill 本来就都在它的列表里
+    /// The name of an on/off setting: while it's on, `disable-model-invocation` in the headers of commands and skills in
+    /// `dir` doesn't count (the agent can use them on its own); while off, as the files say. Not written = always as the files
+    /// say. Only affects Claude: Codex's skills are all in its list anyway
     pub auto: String,
     pub mcp: Option<McpSpec>,
 }
@@ -283,7 +303,7 @@ pub struct AgentSpec {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AgentPart {
-    /// 这一家自己的插件目录(相对插件目录):起它时带上(Claude:`--plugin-dir`)
+    /// This agent's own plugin directory (relative to the plugin directory): passed when it starts (Claude: `--plugin-dir`)
     pub plugin_dir: String,
 }
 
@@ -293,11 +313,11 @@ pub struct Manifest {
     pub id: String,
     pub name: String,
     pub version: String,
-    /// 照着哪一版插件接口写的;不写 = 1
+    /// Which plugin API version it's written for; not written = 1
     pub api: Option<u32>,
     pub min_aca_version: String,
     pub description: String,
-    /// `[[actions]]` 和 `[[commands]]` 合在一起(读的时候合)
+    /// `[[actions]]` and `[[commands]]` combined (merged when read)
     pub actions: Vec<Action>,
     commands: Vec<Action>,
     pub events: Vec<Hook>,
@@ -306,18 +326,19 @@ pub struct Manifest {
     pub keys: Vec<Key>,
     pub timers: Vec<Timer>,
     pub hotkeys: Vec<Hotkey>,
-    /// 要先有的第一方插件
+    /// First-party plugins it needs first
     pub requires: Vec<String>,
-    /// 要用到的外面的程序(PATH 里找;写了 / 的看那个文件;`a|b` = 有一个就行)
+    /// Outside programs it uses (looked up in PATH; one with a / is checked as that file; `a|b` = either one)
     pub needs: Vec<String>,
     pub settings: BTreeMap<String, Setting>,
     pub agent: AgentSpec,
-    /// 老写法:给哪家 agent 带什么(`[agents.claude]`)
+    /// Old form: what to bring to which agent (`[agents.claude]`)
     pub agents: BTreeMap<String, AgentPart>,
 }
 
 impl Manifest {
-    /// 给这一家带东西的那个目录(相对插件目录):`[agent] dir`,或者老写法 `[agents.<它>] plugin_dir`
+    /// The directory with what this agent gets (relative to the plugin directory): `[agent] dir`, or the old
+    /// `[agents.<it>] plugin_dir`
     pub fn agent_dir(&self, agent: &str) -> Option<&str> {
         if !self.agent.dir.is_empty() && self.gives(agent) {
             return Some(&self.agent.dir);
@@ -325,22 +346,23 @@ impl Manifest {
         self.agents.get(agent).map(|p| p.plugin_dir.as_str()).filter(|d| !d.is_empty())
     }
 
-    /// `[agent]` 给不给这一家(没写 for = 都给)
+    /// Whether `[agent]` gives to this agent (no for = all)
     pub fn gives(&self, agent: &str) -> bool {
         self.agent.targets.is_empty() || self.agent.targets.iter().any(|t| t == agent)
     }
 
-    /// `needs` 里这台机器上找不到的
+    /// The ones in `needs` not found on this machine
     pub fn missing(&self) -> Vec<String> {
         self.needs.iter().filter(|n| !n.split('|').any(|p| found(p.trim()))).cloned().collect()
     }
 
-    /// 设置的默认值(没写默认值的不在里面)
+    /// The settings' defaults (settings without a default aren't included)
     pub fn defaults(&self) -> toml::Table {
         self.settings.iter().filter_map(|(k, s)| Some((k.clone(), s.default.clone()?))).collect()
     }
 
-    /// 它带了什么,一样一行(装的时候、插件页给人看):给 agent 的、给人的、订的事件、设置
+    /// What it brings, one line each (shown when installing and on the plugins page): for agents, for people, subscribed
+    /// events, settings
     pub fn brings(&self) -> Vec<String> {
         let mut out = vec![];
         let mut agent = vec![];
@@ -423,7 +445,7 @@ impl Manifest {
     }
 }
 
-/// 这个程序在不在:写了 / 的看那个文件,不然在 PATH 里找
+/// Whether this program exists: one with a / is checked as that file, otherwise looked up in PATH
 fn found(prog: &str) -> bool {
     if prog.is_empty() {
         return false;
@@ -435,7 +457,7 @@ fn found(prog: &str) -> bool {
     std::env::split_paths(&path).any(|d| d.join(prog).is_file())
 }
 
-/// 缺了的程序,一句话(装的时候、插件页、`aca plugin check` 说)
+/// The missing programs, in one sentence (said when installing, on the plugins page, by `aca plugin check`)
 pub fn missing_note(missing: &[String]) -> String {
     tr!(
         "需要 {},但本机未安装(PATH 中找不到):安装后才能使用",
@@ -448,7 +470,7 @@ pub(crate) fn id_ok(id: &str, dots: bool) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-') || (dots && c == '.'))
 }
 
-/// 读清单并检查;第二个是提醒(不拦着链接的小问题)
+/// Reads and checks a manifest; the second value is warnings (small problems that don't block linking)
 pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     let unreadable = |e: toml::de::Error| tr!("无法解析清单:{}", "can't parse the manifest: {}", e.message());
     let mut t: toml::Table = text.parse().map_err(unreadable)?;
@@ -499,7 +521,7 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
                 "{what} id “{id}” is invalid (letters, digits, : _ -, no dots)"
             ));
         }
-        // 能力、窗格、视图共用一套 id:键、命令行都只拿 id 找
+        // Commands, panes and views share one set of ids: keys and the command line find them by id alone
         if let Some(first) = seen.insert(id.clone(), what) {
             return Err(if first == what {
                 tr!("{what} {id} 重复", "{what} {id} is defined twice")
@@ -797,12 +819,14 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     Ok((m, warn))
 }
 
-/// 名字 → 交给命令的环境变量名:大写,`-` `:` 换成 `_`(`max-lines` → `ACA_SETTING_MAX_LINES`)
+/// Name → the environment variable name handed to commands: uppercase, `-` `:` turned into `_`
+/// (`max-lines` → `ACA_SETTING_MAX_LINES`)
 pub(crate) fn var(prefix: &str, name: &str) -> String {
     format!("{prefix}{}", name.to_ascii_uppercase().replace(['-', ':'], "_"))
 }
 
-// 每张表认的字段。加了字段这里也要加(docs/plugins.md 里那份全的清单读出来不能有提醒,测试里查)
+// Fields each table accepts. Add new fields here too (the full manifest in docs/plugins.md must read without a single
+// warning; a test checks it)
 const TOP_KEYS: &[&str] = &[
     "id",
     "name",
@@ -836,10 +860,12 @@ const AGENT_KEYS: &[&str] = &["for", "dir", "auto", "mcp"];
 const MCP_KEYS: &[&str] = &["command", "via", "scope"];
 const AGENT_PART_KEYS: &[&str] = &["plugin_dir"];
 
-/// 清单里不认识的字段,写成 `keys[1].requires` 这样(第几条从 1 数)。`args`、`if`、设置名这些自己起名的不算
+/// Unknown fields in a manifest, written like `keys[1].requires` (counted from 1). Names you choose yourself, like
+/// `args`, `if` and setting names, don't count
 fn unknown_keys(t: &toml::Table) -> Vec<String> {
     fn check(t: &toml::Table, at: &str, known: &[&str], out: &mut Vec<String>) {
-        // 给人看的字另写一种话的那份(`desc_en`):这张表认 desc,就认它(见 [`localize`])
+        // The copy of human-facing text in the other language (`desc_en`): accepted wherever this table accepts desc (see
+        // [`localize`])
         let other_lang =
             |k: &str| ["_en", "_zh"].iter().any(|s| k.strip_suffix(s).is_some_and(|base| TEXTS.contains(&base) && known.contains(&base)));
         out.extend(
@@ -891,7 +917,7 @@ fn unknown_keys(t: &toml::Table) -> Vec<String> {
     out
 }
 
-/// `if` 里能写的值:字、数、布尔,或者它们的数组
+/// Values allowed in `if`: strings, numbers, booleans, or arrays of them
 fn plain(v: &toml::Value) -> bool {
     match v {
         toml::Value::String(_) | toml::Value::Integer(_) | toml::Value::Boolean(_) => true,
@@ -900,7 +926,7 @@ fn plain(v: &toml::Value) -> bool {
     }
 }
 
-/// a 比 b 新(按点分开的数字比)
+/// a is newer than b (compared as dot-separated numbers)
 pub(crate) fn newer(a: &str, b: &str) -> bool {
     let n = |s: &str| s.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
     n(a) > n(b)
@@ -912,12 +938,14 @@ pub fn read_manifest(dir: &Path) -> Res<(Manifest, Vec<String>)> {
     if super::user::is_dir(dir) { parse_user(&text) } else { parse(&text) }
 }
 
-/// 给人看的几样字(名字、说明、标题)可以按语言另写一份:`description_en`、`title_zh` 这样带后缀的,
-/// 界面是那种话时顶替不带后缀的那份;不带后缀的照旧是默认的、两种话都没另写时用的。
-/// 旧的 aca 不认后缀,照旧用不带后缀的 —— 只加不改(见 [`API`])
+/// Human-facing text (name, description, title) can have a copy per language: suffixed ones like `description_en`,
+/// `title_zh` replace the unsuffixed one when the interface is in that language; the unsuffixed one is still the default,
+/// used when neither language has its own copy. An older aca doesn't know the suffixes and keeps using the unsuffixed one
+/// — only added, never changed (see [`API`])
 const TEXTS: [&str; 4] = ["name", "description", "title", "desc"];
 
-/// 照现在的语言把带后缀的那份换上来,带后缀的都拿掉。每一层的表、表数组里的每一张都看
+/// Puts the copy for the current language in place and drops all suffixed ones. Every level of table and every table in
+/// an array of tables is looked at
 fn localize(t: &mut toml::Table) {
     let mine = match crate::i18n::lang() {
         crate::i18n::Lang::Zh => "zh",
@@ -942,7 +970,7 @@ fn localize(t: &mut toml::Table) {
     }
 }
 
-/// 你自己的那份(`~/.config/aca/user/`,见 [`super::user`]):id 总是 `user`,name、version 可以不写
+/// Your own one (`~/.config/aca/user/`, see [`super::user`]): the id is always `user`, name and version can be left out
 pub fn parse_user(text: &str) -> Res<(Manifest, Vec<String>)> {
     let mut t: toml::Table =
         text.parse().map_err(|e: toml::de::Error| tr!("无法解析清单:{}", "can't parse the manifest: {}", e.message()))?;
@@ -959,7 +987,8 @@ pub fn parse_user(text: &str) -> Res<(Manifest, Vec<String>)> {
     Ok((m, warn))
 }
 
-/// 事件钩子的 `if` 对不对得上:`facts` 是事件那一行加上会话的几样(见 [`Hook::cond`])
+/// Whether an event hook's `if` matches: `facts` is the event's line plus a few things about the session (see
+/// [`Hook::cond`])
 pub fn cond_matches(cond: &BTreeMap<String, toml::Value>, facts: &serde_json::Value) -> bool {
     cond.iter().all(|(k, want)| {
         let got = facts.pointer(&format!("/{}", k.replace('.', "/")));
@@ -1054,7 +1083,7 @@ scope = "session"
         assert!(bad("[[commands]]\nid = \"c\"\nargs = { n = \"float\" }\ncommand = [\"true\"]").contains("float"));
         assert!(bad("[agent]\nfor = [\"gemini\"]").contains("gemini"));
         assert!(bad("[agent.mcp]\ncommand = []").contains("command"));
-        // auto 得指一个开关设置,还得有 dir
+        // auto must name an on/off setting, and dir is required
         assert!(bad("[agent]\ndir = \"a\"\nauto = \"nope\"").contains("nope"));
         assert!(bad("[settings.n]\ndefault = 1\n[agent]\ndir = \"a\"\nauto = \"n\"").contains("true / false"));
         assert!(bad("[settings.on]\ndefault = true\n[agent]\nauto = \"on\"").contains("dir"));
@@ -1063,7 +1092,7 @@ scope = "session"
         assert!(m.agent.auto == "on" && warn.is_empty(), "{warn:?}");
         assert!(bad("[agent.mcp]\ncommand = [\"x\"]\nvia = \"socket\"").contains("socket"));
         assert!(bad("[[events]]\non = \"turn.done\"\nif = { x = { y = 1 } }\ncommand = [\"true\"]").contains("if"));
-        // 列表视图的键
+        // Keys of a list view
         let view = |keys: &str| {
             bad(&format!(
                 "[[commands]]\nid = \"rm\"\nargs = {{ id = \"string\" }}\ncommand = [\"true\"]\n[[views]]\nid = \"v\"\nrows = true\ncommand = [\"true\"]\n{keys}"
@@ -1081,7 +1110,7 @@ scope = "session"
             parse("id = \"a\"\nname = \"x\"\nversion = \"1\"\n[[commands]]\nid = \"c\"\nexpose = [\"agent\"]\ncommand = [\"true\"]")
                 .unwrap();
         assert_eq!(warn.len(), 1, "{warn:?}");
-        // input、cwd、agent?、: 菜单留给自己的键
+        // input, cwd, agent?, keys the : menu keeps for itself
         assert!(bad("[[commands]]\nid = \"c\"\ninput = \"clipboard\"\ncommand = [\"true\"]").contains("clipboard"));
         assert!(bad("[[panes]]\nid = \"p\"\ncwd = \"home\"\ncommand = [\"true\"]").contains("home"));
         assert!(bad("[[commands]]\nid = \"c\"\nexpose = [\"agent\", \"agent?\"]\ncommand = [\"true\"]").contains("agent?"));
@@ -1125,7 +1154,7 @@ scope = "session"
         };
         assert_eq!(texts(crate::i18n::Lang::En), ["In English", "A", "只有一种", "Go", "Pad"]);
         assert_eq!(texts(crate::i18n::Lang::Zh), ["中文说明", "甲", "只有一种", "走", "便签"]);
-        // 带后缀的那几样不算不认识;别的后缀、这张表本来就没有的字段带后缀,照样点名
+        // The suffixed ones aren't unknown; other suffixes, or a suffix on a field this table doesn't have, are still named
         let (_, warn) = crate::i18n::with(crate::i18n::Lang::Zh, || parse(&m).unwrap());
         assert!(warn.is_empty(), "{warn:?}");
         let odd = format!("{BASE}description_fr = \"x\"\n[settings.a]\ntitle_en = \"x\"\n");
@@ -1143,14 +1172,15 @@ scope = "session"
         for ok in ["M-y", "C-M-y", "F5", "F12", "C-/", "M-9", "C-^"] {
             assert!(with(ok, "pick").is_ok(), "{ok}");
         }
-        // 光一个字符会把打的字截走;要转义的、tmux 不认的、发出来是别的序列开头的都不行
+        // A bare character would swallow what you type; ones that need escaping, that tmux doesn't know, or that send the start
+        // of another sequence are all rejected
         for no in ["y", "", "C-", "C-yy", "M-[", "M-]", "M-O", "C-M-]", "C-\\\\", "M-;", "F13", "F0", "F05", "S-y", "c-y"] {
             assert!(with(no, "pick").unwrap_err().contains("tmux"), "{no}");
         }
         assert!(with("C-q", "pick").unwrap_err().contains("C-q"));
         assert!(with("C-c", "pick").unwrap_err().contains("C-c"));
         assert!(with("C-M-c", "pick").unwrap_err().contains("C-M-c"));
-        // 只开窗格;一个键、一个窗格都只能写一遍
+        // Only panes can be opened; each key and each pane can be written only once
         let cmd = format!("{BASE}[[commands]]\nid = \"go\"\ncommand = [\"true\"]\n[[hotkeys]]\nkey = \"C-]\"\nrun = \"go\"\n");
         assert!(parse(&cmd).unwrap_err().contains("只能打开窗格"));
         let twice = |a: &str, b: &str| {
@@ -1183,7 +1213,7 @@ scope = "session"
             ["descripton", "commands[1].titel", "keys[1].requires", "views[1].keys[1].confrim", "settings.n.secrt", "agent.mcp.vai"],
             "{warn:?}"
         );
-        // 老写法、自己起名的(参数、if、设置名)不算
+        // The old form and names you choose yourself (arguments, if, setting names) don't count
         assert!(parse(V2).unwrap().1.is_empty());
     }
 
@@ -1195,13 +1225,14 @@ scope = "session"
         assert!(parse(&settings).unwrap_err().contains("ACA_SETTING_MAX_LINES"));
         let tool = format!("{BASE}[[commands]]\nid = \"a__b\"\ntitle = \"t\"\nexpose = [\"agent\"]\ncommand = [\"true\"]\n");
         assert!(parse(&tool).unwrap_err().contains("MCP"));
-        // 不给 agent 的照样能用 :
+        // One not exposed to agents can still have : in its id
         assert!(parse(&format!("{BASE}[[commands]]\nid = \"a:b\"\ncommand = [\"true\"]\n")).is_ok());
         let shared = format!("{BASE}[[commands]]\nid = \"go\"\ncommand = [\"true\"]\n[[views]]\nid = \"go\"\ncommand = [\"true\"]\n");
         assert!(parse(&shared).unwrap_err().contains("id 不能重"), "{:?}", parse(&shared));
     }
 
-    /// 定时跑这个插件的一个能力:到点时没有会话、没人给参数,所以能力不能要这些;every 要读得懂、不短于 1m
+    /// A timer runs one of this plugin's commands: when it fires there's no session and nobody to give arguments, so the
+    /// command can't need either; every must read and be at least 1m
     #[test]
     fn a_timer_runs_a_command_that_needs_no_session_or_arguments_at_least_a_minute_apart() {
         let with = |cmd: &str, timer: &str| {
@@ -1223,12 +1254,13 @@ scope = "session"
             assert!(err("", "every = \"5m\"\n[[timers]]\nrun = \"go\"\nevery = \"1h\"\n").contains("重复"));
             let nothing = format!("{BASE}[[timers]]\nrun = \"gone\"\nevery = \"5m\"\n");
             assert!(parse(&nothing).unwrap_err().contains("不是此插件的能力"));
-            // 写错的字段照样点名
+            // A misspelled field is still named
             assert!(parse(&with("", "every = \"5m\"\nevry = 1\n")).unwrap().1.iter().any(|w| w.contains("timers[1].evry")));
         });
     }
 
-    /// docs/plugins.md(英文)和 plugins.zh-CN.md「清单」那份写全了的例子:读得进来,一条提醒都没有(字段表和文档对得上)
+    /// The fully written example in docs/plugins.md (English) and plugins.zh-CN.md ("The manifest"): reads in without a
+    /// single warning (the field tables match the docs)
     #[test]
     fn the_full_example_in_the_docs_reads_without_a_single_note() {
         for (docs, head) in [

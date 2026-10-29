@@ -1,26 +1,31 @@
-//! `aca tmux install | uninstall`:aca 在 tmux 里要的几样 —— 会话切换器的两个键、状态栏上谁在等你 —— 写在 aca 自己的一份
-//! 配置里(`~/.config/aca/tmux.conf`),你的 tmux.conf 里只多两行:一行注释、一行 `source-file -q`。
+//! `aca tmux install | uninstall`: the few things aca needs in tmux (the session switcher's two keys, which sessions need you
+//! in the status bar) are written in aca's own config file (`~/.config/aca/tmux.conf`); your tmux.conf gains only two lines:
+//! a comment and a `source-file -q`.
 //!
-//! - aca 那份归 aca:每次 install 照新的重写(install.sh 升级时也重写一遍;没跑 install.sh 的升级,打开界面时重写,见 `refresh`),别在里面改。要换键,在你的 tmux.conf 里
-//!   source 它的那一行后面自己 unbind / bind
-//! - 你的 tmux.conf 只加、只删那两行,别的一个字节不动;放在 TPM 那一段前面(它照规矩在最后),没有 TPM 就接在最后 ——
-//!   状态栏那一段是接在你的 status-right 后面的,要排在你设 status-right 的那几行后面
-//! - 是链接(dotfiles 管的)就写到它指着的那个文件,不把链接换成普通文件
-//! - `-q`:aca 那份不在了(删了 aca)也不报错
-//! - 开着的 tmux 马上变:install 时 source 一遍 aca 那份(状态栏那段已经接过的不再接);uninstall 时撤掉 aca 绑的键和那一段
-//! - 设了 `ACA_HOME`(测试)时「你的 tmux.conf」是 `$ACA_HOME/tmux.conf`,碰不到真的
+//! - aca's file belongs to aca: every install rewrites it from scratch (install.sh rewrites it on upgrade too; for an upgrade
+//!   that doesn't run install.sh, it's rewritten when the interface opens, see `refresh`); don't edit it. To change a key,
+//!   unbind / bind it yourself in your tmux.conf after the line that sources it
+//! - in your tmux.conf only those two lines are added or removed, no other byte is touched; they go before the TPM section
+//!   (which by convention comes last), or at the end without TPM: the status bar segment is appended to your status-right,
+//!   so it must come after the lines where you set status-right
+//! - a symlink (managed by dotfiles) is written through to the file it points at; the link isn't replaced with a regular file
+//! - `-q`: no error once aca's file is gone (aca removed)
+//! - a running tmux changes right away: install sources aca's file once (a status bar segment already appended isn't
+//!   appended again); uninstall removes the keys aca bound and that segment
+//! - with `ACA_HOME` set (tests), "your tmux.conf" is `$ACA_HOME/tmux.conf`, so the real one is never touched
 //!
-//! `aca tmux key`:aca 自己绑在 tmux 上、你能换的键 —— 现在就一个,进下一个在等你的(`aca next`)。它不在上面那份配置里:
-//! 和 Ctrl+Q、插件的热键一个办法,aca 直接绑在 tmux 服务上(`plugin::bind_hotkeys`),哪个键记在 config.toml 的 `[keys] next`
+//! `aca tmux key`: the keys aca binds on tmux itself that you can change: just one for now, go to the next session that
+//! needs you (`aca next`). It isn't in the file above: like Ctrl+Q and plugin hotkeys, aca binds it directly on the tmux
+//! server (`plugin::bind_hotkeys`); which key is kept in config.toml's `[keys] next`
 
 use std::path::{Path, PathBuf};
 
 use aca_core::paths;
 use aca_core::{t, tr};
 
-/// 加在你的 tmux.conf 里那行注释的开头(卸的时候认它)
+/// How the comment line added to your tmux.conf starts (uninstall recognizes it by this)
 const MARK: &str = "# aca:";
-/// aca 那份绑的命令都带着它(你自己手写的不带):uninstall 只撤带它的
+/// Every command aca's file binds carries it (ones you wrote yourself don't): uninstall only removes the ones carrying it
 const OURS_TAG: &str = "#{socket_path}";
 
 pub fn run(args: &[String]) -> i32 {
@@ -45,12 +50,12 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// aca 自己那份
+/// aca's own file
 fn ours() -> PathBuf {
     paths::config_dir().join("tmux.conf")
 }
 
-/// 你的 tmux.conf:`~/.tmux.conf`;没有它、有 `~/.config/tmux/tmux.conf`(XDG)就是那个
+/// Your tmux.conf: `~/.tmux.conf`; if it doesn't exist and `~/.config/tmux/tmux.conf` (XDG) does, that one
 fn theirs() -> PathBuf {
     if let Some(h) = std::env::var_os("ACA_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(h).join("tmux.conf");
@@ -64,7 +69,7 @@ fn theirs() -> PathBuf {
     if !dot.exists() && xdg.exists() { xdg } else { dot }
 }
 
-/// 给人看、写进 source-file 的路径:家目录下的写成 ~/…(tmux 自己会展开)
+/// The path shown to people and written into source-file: under the home directory it's written ~/… (tmux expands it itself)
 fn shown(p: &Path) -> String {
     let home = paths::home();
     match p.strip_prefix(&home) {
@@ -73,10 +78,10 @@ fn shown(p: &Path) -> String {
     }
 }
 
-/// 你的 tmux.conf 里加的那一行
+/// The line added to your tmux.conf
 fn source_line(p: &Path) -> String {
     let s = shown(p);
-    // 带空格的:引起来,不用 ~(引号里不展开)
+    // With spaces: quote it and don't use ~ (not expanded inside quotes)
     if s.contains(char::is_whitespace) { format!("source-file -q \"{}\"", p.display()) } else { format!("source-file -q {s}") }
 }
 
@@ -85,12 +90,12 @@ fn is_ours(line: &str, p: &Path) -> bool {
     l.starts_with("source-file") && (l.contains(&shown(p)) || l.contains(&p.display().to_string()))
 }
 
-/// 状态栏上接的那一段(uninstall 照原样从 status-right 里摘掉)
+/// The segment appended to the status bar (uninstall takes it out of status-right exactly as written)
 fn segment(aca: &str) -> String {
     format!(" #({aca} tmux-status #{{@aca_id}})")
 }
 
-/// aca 那份的全文。`aca` = 这个 aca 的完整路径
+/// The full text of aca's file. `aca` = this aca's full path
 fn content(aca: &str) -> String {
     let popup = |args: &str, follow: &str| {
         format!(
@@ -136,8 +141,9 @@ fn content(aca: &str) -> String {
     )
 }
 
-/// 开着的 tmux 里那一段接了不止一遍的(早先那份的判断在自己设了 status-right 的会话里看不到全局的,每装一次多接一遍):
-/// 只留头一处。原来有几遍;没接重 = None
+/// The running tmux has that segment more than once (an earlier file's check couldn't see the global value in a session with
+/// its own status-right, so every install appended one more): keep only the first. Returns how many there were; no
+/// duplicate = None
 fn dedupe(aca: &str) -> Option<usize> {
     use aca_core::tmux::run;
     let right = run(&["show-options", "-gv", "status-right"]).unwrap_or_default();
@@ -147,7 +153,7 @@ fn dedupe(aca: &str) -> Option<usize> {
     (n > 1 && run(&["set-option", "-g", "status-right", &format!("{head}{}", rest.replace(&seg, ""))]).is_ok()).then_some(n)
 }
 
-/// 加上那两行,返回新的全文和 source-file 那一行是第几行。已经有了 = None
+/// Add the two lines; returns the new full text and the line number of the source-file line. Already there = None
 fn add(text: &str, p: &Path) -> Option<(String, usize)> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.iter().any(|l| is_ours(l, p)) {
@@ -161,7 +167,7 @@ fn add(text: &str, p: &Path) -> Option<(String, usize)> {
         )
     );
     let block = [note, source_line(p)];
-    // TPM 那一行(run '~/.tmux/plugins/tpm/tpm')连同它上面紧挨着的注释
+    // The TPM line (run '~/.tmux/plugins/tpm/tpm') together with the comments right above it
     let at = lines.iter().rposition(|l| l.trim_start().starts_with("run") && l.contains("tpm/tpm")).map(|mut j| {
         while j > 0 && lines[j - 1].trim_start().starts_with('#') {
             j -= 1;
@@ -194,20 +200,20 @@ fn add(text: &str, p: &Path) -> Option<(String, usize)> {
     Some((out.join("\n") + "\n", line_no))
 }
 
-/// 拿掉那两行(和加的时候垫的空行)。没有 = None
+/// Remove the two lines (and the blank line padded in when adding them). Not there = None
 fn remove(text: &str, p: &Path) -> Option<String> {
     let mut lines: Vec<&str> = text.lines().collect();
     let i = lines.iter().position(|l| is_ours(l, p))?;
     let start = if i > 0 && lines[i - 1].trim_start().starts_with(MARK) { i - 1 } else { i };
     lines.drain(start..=i);
-    // 两边都是空行(或者到了末尾)就收掉一个,别留下两个空行
+    // A blank line (or the end) on both sides: drop one, so no two blank lines are left
     if start > 0 && lines[start - 1].trim().is_empty() && lines.get(start).is_none_or(|l| l.trim().is_empty()) {
         lines.remove(start - 1);
     }
     Some(if lines.is_empty() { String::new() } else { lines.join("\n") + "\n" })
 }
 
-/// 你自己手写的 aca 那几样(没注释掉的):第几行
+/// The aca lines you wrote yourself (not commented out): their line numbers
 fn handwritten(text: &str, p: &Path) -> Vec<usize> {
     text.lines()
         .enumerate()
@@ -219,7 +225,7 @@ fn handwritten(text: &str, p: &Path) -> Vec<usize> {
         .collect()
 }
 
-/// 写你的 tmux.conf:是链接就写它指着的那个
+/// Write your tmux.conf: if it's a symlink, write the file it points at
 fn write_theirs(path: &Path, text: &str) -> Res<()> {
     let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     paths::write_atomic(&real, text).map_err(|e| tr!("无法写入 {}:{e}", "can't write {}: {e}", shown(path)))
@@ -227,7 +233,7 @@ fn write_theirs(path: &Path, text: &str) -> Res<()> {
 
 type Res<T> = Result<T, String>;
 
-/// tmux 服务在不在跑(不在就不用管开着的那份)
+/// Whether the tmux server is running (if not, there's no running config to care about)
 fn live() -> bool {
     aca_core::tmux::run(&["list-sessions"]).is_ok()
 }
@@ -273,9 +279,11 @@ fn install() -> Res<String> {
     Ok(say.join("\n"))
 }
 
-/// 界面打开时(^L 重启成新版也是):aca 那份装过、写的就是这个程序,内容却和这一版要写的不一样(升级了、换了界面语言)
-/// → 照这一版重写,开着的 tmux 也 source 一遍。brew 之类的升级不跑 install.sh,靠它跟上。
-/// 写的是别的 aca(工作树里编的、另一种装法装的)就不动:免得开一下临时编的程序,tmux 的键就指到它上面
+/// When the interface opens (also after ^L restarts into a new version): aca's file is installed and names this very program,
+/// but differs from what this version would write (upgraded, interface language changed)
+/// → rewrite it per this version, and source it in the running tmux too. Upgrades like brew don't run install.sh; this keeps up.
+/// If it names another aca (built in a worktree, installed another way), leave it: otherwise just running a throwaway build
+/// once would point tmux's keys at it
 pub fn refresh() {
     let (aca, file) = (aca_core::agent::self_exe(), ours());
     let Ok(old) = std::fs::read_to_string(&file) else { return };
@@ -285,7 +293,8 @@ pub fn refresh() {
     }
 }
 
-/// aca 那份里用的就是这个程序(`"<aca> ui --client`、`#(<aca> tmux-status`):前面带着引号、括号,别的路径以它结尾的不算
+/// aca's file uses this very program (`"<aca> ui --client`, `#(<aca> tmux-status`): with the quote / parenthesis before it, so
+/// another path that merely ends with it doesn't count
 fn stale(old: &str, aca: &str) -> bool {
     old.contains(&format!("\"{aca} ")) || old.contains(&format!("#({aca} "))
 }
@@ -317,7 +326,8 @@ fn uninstall() -> Res<String> {
     Ok(say.join("\n"))
 }
 
-/// 开着的 tmux 里撤掉 aca 那份绑的键(只撤带 OURS_TAG 的,你自己绑的不动)和状态栏上接的那一段。撤了什么 = true
+/// In the running tmux, remove the keys aca's file bound (only those with OURS_TAG; ones you bound yourself stay) and the
+/// segment appended to the status bar. Removed anything = true
 fn unapply(aca: &str) -> bool {
     use aca_core::tmux::run;
     let mut any = false;
@@ -374,7 +384,8 @@ fn status() -> Res<String> {
     Ok(say.join("\n"))
 }
 
-/// `aca tmux key [next [<键> | --none]]`:看 / 换进下一个在等你的那个键。换了马上绑上
+/// `aca tmux key [next [<key> | --none]]`: show / change the key that goes to the next session that needs you. A new key is
+/// bound right away
 fn key(args: &[String]) -> Res<String> {
     match args {
         [] => {}
@@ -392,7 +403,8 @@ fn key(args: &[String]) -> Res<String> {
     Ok(next_key().join("\n"))
 }
 
-/// 进下一个在等你的那个键现在是哪个、绑上没有。顺手让 tmux 上绑的跟配置一致(同 `aca plugin hotkey`)
+/// Which key goes to the next session that needs you, and whether it's bound. Also brings tmux's bindings in line with the
+/// config (like `aca plugin hotkey`)
 fn next_key() -> Vec<String> {
     let notes = aca_core::plugin::bind_hotkeys();
     let mut say = vec![match aca_core::config::load().keys.next_key() {
@@ -411,7 +423,7 @@ fn next_key() -> Vec<String> {
     say
 }
 
-/// tmux 的键名写成键盘上的样子:`C-M-n` → `Ctrl+Alt+N(C-M-n)`;认不出的原样
+/// Write a tmux key name the way it looks on the keyboard: `C-M-n` → `Ctrl+Alt+N(C-M-n)`; unrecognized ones as they are
 fn human(k: &str) -> String {
     let (mods, last) = match k {
         _ if k.starts_with("C-M-") => ("Ctrl+Alt+", &k[4..]),
@@ -446,7 +458,7 @@ mod tests {
         assert_eq!(add(&with, &p()), None);
         assert_eq!(remove(&with, &p()).as_deref(), Some(before));
         assert_eq!(remove(before, &p()), None);
-        // 没有 TPM:接在最后;没有文件:就这两行
+        // No TPM: appended at the end; no file: just these two lines
         let plain = "set -g mouse on\n";
         let (with, _) = add(plain, &p()).unwrap();
         assert!(with.starts_with("set -g mouse on\n\n# aca:") && with.ends_with("tmux.conf\"\n"), "{with}");
@@ -467,7 +479,7 @@ mod tests {
     fn only_the_program_that_wrote_aca_s_file_rewrites_it() {
         let old = content("/opt/homebrew/bin/aca");
         assert!(stale(&old, "/opt/homebrew/bin/aca"));
-        // 工作树里编的、路径是它结尾的别的程序:不动
+        // One built in a worktree, another program whose path ends with it: left alone
         assert!(!stale(&old, "/x/target/debug/aca") && !stale(&old, "/homebrew/bin/aca") && !stale(&old, "aca"));
     }
 

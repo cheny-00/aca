@@ -6,8 +6,9 @@ description = "把耗时长的任务派到其他机器上后台运行(ssh),结�
 description_en = "Runs long tasks in the background on another machine (ssh); the result comes back to the session that sent it."
 needs = ["jq", "curl", "ssh"]
 
-# 整个功能就是 remote.sh(sh + jq + curl + ssh),aca 里没有远端任务的代码,用的只是插件接口。
-# 回调先落在一台一直在线的 server 上(jobhook,装法见 https://github.com/cheny-00/jobhook),地址和口令是下面两个设置。
+# The whole feature is remote.sh (sh + jq + curl + ssh); aca has no code for remote tasks, it only uses the plugin interface.
+# Callbacks land first on a server that is always online (jobhook; for how to install it see https://github.com/cheny-00/jobhook);
+# its address and token are the two settings below.
 
 [settings.url]
 default = ""
@@ -66,17 +67,19 @@ command = ["sh", "remote.sh", "collect"]
 id = "check"
 title = "测试 server(能否连接、口令是否正确)"
 title_en = "Test the server (reachable, token right)"
-# 诊断用的,不进 : 菜单(那里是对着高亮那一行做事的);aca plugin run aca.remote.check
+# For diagnosis, kept out of the : menu (that one acts on the highlighted row); aca plugin run aca.remote.check
 expose = ["cli"]
 command = ["sh", "remote.sh", "check"]
 
-# 每 5 分钟去取一次:派任务时开上,都了结了 collect 自己关掉 —— 没派任务的日子里什么都不跑
+# Fetches every 5 minutes: turned on when a task is sent, and collect turns it off itself once all are settled — on days with
+# no tasks sent, nothing runs
 [[timers]]
 run = "collect"
 every = "5m"
 manual = true
 
-# 一行一个:在等(● 已经多久)、失联(? 过了时限没回调)、结束(✓ / ✕ 退出码,发给会话了没有);下面是高亮那个的会话和结果最后几行
+# One row each: waiting (● for how long), lost (? no callback by the deadline), finished (✓ / ✕ exit code, sent to the session
+# or not); below, the session of the highlighted one and the last lines of its result
 [[views]]
 id = "tasks"
 title = "远端任务"

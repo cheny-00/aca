@@ -1,10 +1,11 @@
-//! tmux 这一层:会话是 tmux 持有的,aca 只在上面记账。
+//! The tmux layer: tmux holds the sessions, and aca only keeps records on top.
 //!
-//! 认会话不靠名字:建的时候在 tmux 会话上记 `@aca_id`,agent 那一格记 `@aca_agent`。
-//! 所以**会话名可以就是标题**,随便改(Moshi 这类客户端的列表里看到的就是它),
-//! 发命令时一律用 tmux 自己的 `$会话号` / `%窗格号`,名字里有什么字符都不怕。
+//! Sessions aren't recognized by name: on creation the tmux session gets `@aca_id`, and the agent's pane gets `@aca_agent`.
+//! So **the session name can simply be the title** and change freely (it's what clients like Moshi show in their list),
+//! and commands always use tmux's own `$<session>` / `%<pane>` ids, so no character in a name can cause trouble.
 //!
-//! `ACA_TMUX_SOCKET` 换一个 tmux 服务(`tmux -L`):测试只连假会话的那个,动不到真的。
+//! `ACA_TMUX_SOCKET` switches to another tmux server (`tmux -L`): tests only connect to the one with fake sessions and
+//! can't touch the real ones.
 
 use std::process::{Command, Stdio};
 
@@ -20,7 +21,7 @@ pub fn cmd() -> Command {
     c
 }
 
-/// 跑一条,成了给标准输出,不成给 tmux 说的那句
+/// Runs one command: stdout on success, tmux's message on failure
 pub fn run<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Res<String> {
     let o = cmd().args(args).output().map_err(|e| tr!("无法启动 tmux:{e}", "can't run tmux: {e}"))?;
     if o.status.success() {
@@ -30,7 +31,7 @@ pub fn run<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Res<String> {
     }
 }
 
-/// tmux 把单独的 `;` 和词尾的 `;` 当成命令分隔;交给它的参数里有的话转义掉
+/// tmux treats a lone `;` and a trailing `;` as command separators; escape them in arguments passed to it
 pub fn arg(a: &str) -> String {
     match a.strip_suffix(';') {
         Some(head) => format!("{head}\\;"),
@@ -38,14 +39,14 @@ pub fn arg(a: &str) -> String {
     }
 }
 
-/// 一个窗格,连它所在会话的几样
+/// A pane, plus a few things about its session
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Pane {
-    /// `@aca_id`:空 = 不是 aca 建的
+    /// `@aca_id`: empty = not created by aca
     pub id: String,
-    /// `@aca_agent`:agent 在的那一格
+    /// `@aca_agent`: the pane the agent is in
     pub agent: bool,
-    /// tmux 的会话号(`$3`),发命令用
+    /// tmux's session id (`$3`), for commands
     pub sid: String,
     pub session: String,
     pub pane: String,
@@ -53,18 +54,18 @@ pub struct Pane {
     pub cmd: String,
     pub dead: bool,
     pub attached: u32,
-    /// 最后连进去、最后有人动的时刻(只是路过的那一下不算,见 [`attach_via`])
+    /// When it was last attached and last touched (just passing through doesn't count, see [`attach_via`])
     pub last_attached: u64,
     pub activity: u64,
     pub window: u32,
     pub index: u32,
     pub path: String,
-    /// 这个窗口最后有输出的时刻(会话的 `activity` 是最后有人动的时刻,不跟输出走)
+    /// When this window last had output (the session's `activity` is when someone last touched it, not output)
     pub win_activity: u64,
-    /// 这个窗口里有几格(>1 = 分了屏)和窗口名
+    /// How many panes this window has (>1 = split) and the window name
     pub win_panes: u32,
     pub win_name: String,
-    /// 程序自己写的窗格标题(Claude 干活时前面带一个转圈的字符)
+    /// The pane title the program writes itself (Claude puts a spinner at the front while working)
     pub title: String,
 }
 
@@ -101,10 +102,12 @@ pub fn parse_panes(out: &str) -> Vec<Pane> {
         .collect()
 }
 
-/// 从外面连进 `to`,先路过 `via`(这个终端刚离开的那个):tmux 这样才记得 `via` 是这台客户端的上一个会话,
-/// 进去之后 `switch-client -l`(你绑的 ^`)回得去。可 tmux 把路过也记成连进去过、有人动过,
-/// 「跑完没看」(◐)就没了,自动停的钟也重新走。所以同一条命令里把路过之前的两个时刻和路过那一刻记在 `via` 的
-/// `@aca_pass` 上(`连进去/有人动/路过`),读窗格时最后一次连进去就是这次路过的,照路过之前的算(见 [`unpass`])
+/// Attach to `to` from outside, passing through `via` first (the one this terminal just left): that's how tmux remembers
+/// `via` as this client's previous session, so `switch-client -l` (your ^` binding) gets back to it after going in. But
+/// tmux records passing through as attached and touched too, so "unread" (◐) would be lost and the auto-stop clock would
+/// restart. So the same command records on `via`'s `@aca_pass` the two times from before passing through plus the moment
+/// of passing (`attached/touched/passed`); when panes are read, if the last attach is this pass, the times from before it
+/// are used (see [`unpass`])
 pub fn attach_via(via: &str, to: &str) -> Vec<String> {
     let before = ["set-option", "-F", "-t", via, "@aca_pass", "#{session_last_attached}/#{session_activity}"];
     let after = ["set-option", "-aF", "-t", via, "@aca_pass", "/#{session_last_attached}"];
@@ -115,8 +118,9 @@ pub fn attach_via(via: &str, to: &str) -> Vec<String> {
         .collect()
 }
 
-/// 会话上记着路过(`@aca_pass`),之后再没人连进去过:连进去、有人动的时刻换回路过之前的。
-/// 只记了前半截的(连 `via` 没成)、之后又有人连进去的,照 tmux 说的
+/// The session has a pass recorded (`@aca_pass`) and nobody attached since: swap the attached and touched times back to
+/// those from before the pass. If only the first half was recorded (attaching to `via` failed), or someone attached since,
+/// go by what tmux says
 fn unpass(last_attached: u64, activity: u64, pass: &str) -> (u64, u64) {
     let f: Vec<u64> = pass.split('/').map(|x| x.parse().unwrap_or(0)).collect();
     match f[..] {
@@ -125,12 +129,13 @@ fn unpass(last_attached: u64, activity: u64, pass: &str) -> (u64, u64) {
     }
 }
 
-/// 全部窗格;tmux 服务没起来 = 空
+/// All panes; tmux server not running = empty
 pub fn panes() -> Vec<Pane> {
     run(&["list-panes", "-a", "-F", FMT]).map(|o| parse_panes(&o)).unwrap_or_default()
 }
 
-/// 一个会话里 agent 的那一格:记了 `@aca_agent` 的;没有(老会话、被人关了)就取编号最小的
+/// A session's agent pane: the one marked `@aca_agent`; if there is none (old session, someone closed it), the one with
+/// the lowest index
 pub fn agent_pane<'a>(panes: &'a [Pane], id: &str) -> Option<&'a Pane> {
     let mine = || panes.iter().filter(|p| p.id == id);
     mine().find(|p| p.agent).or_else(|| mine().min_by_key(|p| (p.window, p.index)))
@@ -140,12 +145,13 @@ pub fn find(id: &str) -> Option<Pane> {
     agent_pane(&panes(), id).cloned()
 }
 
-/// 这一格在哪个 aca 会话里(它那儿看得到的 `@aca_id`);不是 aca 的会话、问不到 = None
+/// Which aca session this pane is in (the `@aca_id` visible from it); not an aca session, or can't ask = None
 pub fn session_of(pane: &str) -> Option<String> {
     run(&["display-message", "-p", "-t", pane, "#{@aca_id}"]).ok().map(|o| o.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// 标题 → tmux 会话名:`.` 和 `:` 在 tmux 的目标写法里有意思(`会话:窗口.窗格`),换掉;空白收成一个;太长截断
+/// Title → tmux session name: `.` and `:` mean something in tmux targets (`session:window.pane`), so replace them;
+/// collapse whitespace into one; truncate if too long
 pub fn safe_name(title: &str) -> String {
     let t: String = title
         .chars()
@@ -160,7 +166,7 @@ pub fn safe_name(title: &str) -> String {
     if t.is_empty() { "aca".into() } else { t }
 }
 
-/// 重名的加 ` (2)`、` (3)` …
+/// Duplicates get ` (2)`, ` (3)` …
 pub fn unique_name(want: &str, taken: &[String]) -> String {
     let mut name = want.to_string();
     let mut n = 2;
@@ -171,7 +177,8 @@ pub fn unique_name(want: &str, taken: &[String]) -> String {
     name
 }
 
-/// 让会话名跟着标题走(agent 那个窗口的名字也是):Moshi 第一层列的是会话名,第二层是窗口名
+/// Makes the session name follow the title (the agent window's name too): Moshi lists session names at the first level
+/// and window names at the second
 pub fn sync_name(id: &str, title: &str) -> Option<String> {
     let all = panes();
     let p = agent_pane(&all, id)?;
@@ -185,12 +192,12 @@ pub fn sync_name(id: &str, title: &str) -> Option<String> {
     Some(name)
 }
 
-/// 屏幕上现在的字(不带颜色):判断状态用
+/// The text on screen now (no colors): for telling the state
 pub fn capture(pane: &str) -> Vec<String> {
     plain_lines(&run(&["capture-pane", "-p", "-t", pane]).unwrap_or_default())
 }
 
-/// `capture-pane -p` 打出来的 → 一行一行的字:行尾的空白、末尾的空行不要
+/// `capture-pane -p` output → lines of text: no trailing whitespace on lines, no trailing empty lines
 pub fn plain_lines(out: &str) -> Vec<String> {
     let mut lines: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
     while lines.last().is_some_and(|l| l.is_empty()) {
@@ -199,21 +206,23 @@ pub fn plain_lines(out: &str) -> Vec<String> {
     lines
 }
 
-/// 好几格的屏幕一条 tmux 命令抓回来(`ansi` = 带颜色,`capture-pane -e`):顺序同 `panes`,一格一段,
-/// 就是单独抓它时打出来的那些字;抓不到的那格是空的。
-/// 一格起一个 tmux 的话,列表每刷新一次就是三十几个进程(2026-10-14 实测 37 格 143 毫秒 CPU,合成一条 3.6 毫秒)
+/// Captures several panes' screens with one tmux command (`ansi` = with colors, `capture-pane -e`): same order as
+/// `panes`, one chunk per pane, exactly the text capturing it alone would print; a pane that can't be captured is empty.
+/// One tmux per pane would be thirty-odd processes per list refresh (measured 2026-10-14: 37 panes, 143 ms CPU; merged
+/// into one, 3.6 ms)
 pub fn capture_many(panes: &[&str], ansi: bool) -> Vec<String> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
-    // 记号每次现编:屏幕上碰巧有一样的一行(正开着这份源码)也分不错
+    // The mark is made up fresh every time: even if a line on the screen happens to match (this source file open), the split
+    // stays right
     let mark = format!("aca-cut-{:x}-{:x}-{:x}", std::process::id(), nanos, N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     capture_with(panes, ansi, &mark, |args| {
         cmd().args(args).stderr(Stdio::null()).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
     })
 }
 
-/// 每格抓完跟一条 `display-message -p` 打一行记号,回来靠它分段。
-/// 记号里不能有 `#`、`%`(display-message 会当格式展开)和词尾的 `;`
+/// After each pane's capture, a `display-message -p` prints a mark line, used to split the output back up. The mark can't
+/// contain `#` or `%` (display-message expands them as formats) or a trailing `;`
 fn capture_args(panes: &[&str], ansi: bool, mark: &str) -> Vec<String> {
     let mut args: Vec<String> = vec![];
     for p in panes {
@@ -229,7 +238,7 @@ fn capture_args(panes: &[&str], ansi: bool, mark: &str) -> Vec<String> {
     args
 }
 
-/// 打出来的那一长串按记号行切开;最后没等到记号的半段不算
+/// Splits the long output at the mark lines; a last half-chunk that never got its mark doesn't count
 fn split_marked(out: &str, mark: &str) -> Vec<String> {
     let (mut segs, mut cur) = (vec![], String::new());
     for l in out.split_inclusive('\n') {
@@ -242,8 +251,9 @@ fn split_marked(out: &str, mark: &str) -> Vec<String> {
     segs
 }
 
-/// 有一格抓不到(刚关掉的)tmux 就停在那儿,后面的命令不跑了:那格记成空的,从下一格接着抓。
-/// 每一轮至少往前一格,全都抓不到也就是一格一个进程(和原来一样)
+/// If one pane can't be captured (just closed), tmux stops there and doesn't run the rest: record that pane as empty and
+/// carry on from the next. Each round moves at least one pane forward, so even if none can be captured it's one process
+/// per pane (same as before)
 fn capture_with(panes: &[&str], ansi: bool, mark: &str, mut run: impl FnMut(&[String]) -> String) -> Vec<String> {
     let mut got: Vec<String> = Vec::with_capacity(panes.len());
     while got.len() < panes.len() {
@@ -258,7 +268,8 @@ fn capture_with(panes: &[&str], ansi: bool, mark: &str, mut run: impl FnMut(&[St
     got
 }
 
-/// 交给插件的字(`input = "screen" / "scrollback"`):折了行的接回一行(网址不断开),`back` = 连回滚一起(最多这么多行)
+/// Text for plugins (`input = "screen" / "scrollback"`): wrapped lines joined back into one (URLs don't break), `back` =
+/// including scrollback (at most this many lines)
 pub fn text(pane: &str, back: bool) -> String {
     let mut args = vec!["capture-pane", "-p", "-J", "-t", pane];
     if back {
@@ -270,13 +281,15 @@ pub fn text(pane: &str, back: bool) -> String {
     lines[..end].iter().map(|l| format!("{l}\n")).collect()
 }
 
-/// 带颜色的屏幕(`capture-pane -e`):输入框里哪些字是灰的(提示)、哪些是人打的,要看颜色
+/// The screen with colors (`capture-pane -e`): telling which text in the input box is gray (a hint) and which a person
+/// typed takes the colors
 pub fn capture_ansi(pane: &str) -> Vec<String> {
     run(&["capture-pane", "-p", "-e", "-t", pane]).unwrap_or_default().lines().map(String::from).collect()
 }
 
-/// 你是不是正在这一格里打字:有终端正看着它,而且那个终端最后一次按键在 `secs` 秒以内。
-/// tmux 记的「最后一次按键」只随终端里真的按键变,aca 自己 send-keys、粘贴都不改它(2026-10-08 实测)
+/// Whether you're typing in this pane right now: a terminal is looking at it, and that terminal's last key press was within
+/// `secs` seconds. tmux's "last key press" only changes with real key presses in the terminal; aca's own send-keys and
+/// pastes don't change it (tested 2026-10-08)
 pub fn typing(pane: &str, secs: u64) -> bool {
     let now = crate::paths::now();
     run(&["list-clients", "-F", "#{client_activity}\t#{pane_id}"]).unwrap_or_default().lines().any(|l| {
@@ -285,15 +298,15 @@ pub fn typing(pane: &str, secs: u64) -> bool {
     })
 }
 
-/// 往窗格按几个键(tmux 的键名:`2`、`Escape`、`Enter`)
+/// Presses a few keys in a pane (tmux key names: `2`, `Escape`, `Enter`)
 pub fn keys(pane: &str, keys: &[&str]) -> Res<()> {
     let mut a = vec!["send-keys", "-t", pane];
     a.extend_from_slice(keys);
     run(&a).map(|_| ())
 }
 
-/// 把文字粘进窗格的输入框(括号粘贴,多行不会被当成发送),不按回车。
-/// 窗格停在 copy-mode 里时先退出来:那时候粘进去的字是一个个敲给 tmux 的
+/// Pastes text into the pane's input box (bracketed paste, so multiple lines aren't taken as sending), without pressing
+/// Enter. If the pane is in copy-mode, leave it first: text pasted then would be typed key by key to tmux
 pub fn paste(pane: &str, text: &str) -> Res<()> {
     let in_mode = || run(&["display-message", "-p", "-t", pane, "#{pane_in_mode}"]).is_ok_and(|o| o.trim() == "1");
     if in_mode() {
@@ -308,32 +321,36 @@ pub fn paste(pane: &str, text: &str) -> Res<()> {
 }
 
 const DETACH_KEY: &str = "C-q";
-/// 在哪些会话里按它是回来:记了 `@aca_id` 的,和 agent-deck 起名的
+/// Sessions where pressing it gets you back: those marked `@aca_id`, and those named by agent-deck
 const DETACH_IN: &str = "#{||:#{m:agentdeck_*,#{session_name}},#{?@aca_id,1,0}}";
-/// `after-bind-key` 是个数组,aca 只占这一格:你自己挂的、agent-deck 挂的在别的格里,不碰
+/// `after-bind-key` is an array, and aca takes only this slot: what you or agent-deck hook in sit in other slots and
+/// aren't touched
 const DETACH_HOOK: &str = "after-bind-key[222]";
-/// 钩子里:刚绑的是这个键,而且是 agent-deck 那一版(认它起的会话名、不认 `@aca_id`)。你自己绑别的不算
+/// In the hook: the key just bound is this one, and it's agent-deck's version (recognizes its own session names, not
+/// `@aca_id`). Your own bindings to something else don't count
 const DECK_BOUND: &str =
     "#{&&:#{==:#{hook_argument_0},C-q},#{&&:#{m:*agentdeck_*,#{hook_arguments}},#{==:#{m:*@aca_id*,#{hook_arguments}},0}}}";
 
-/// 进去之后按 Ctrl+Q 回来。键绑在 tmux 服务上(不用前缀):aca 的会话里是 detach,别的会话里照样把键送给里面的程序。
-/// agent-deck 也绑这个键,只认它自己起名的会话(`agentdeck_*`),别的会话里把键吞掉 —— 接管过来的会话改了名,它就不管了。
-/// 所以它绑的换成两边都认的;你自己绑了别的不动。
-/// 绑定不在 tmux.conf 里:服务重启、agent-deck 再起一个会话都会把它冲掉,所以建会话后、进会话前都来一遍。
-/// 你人已经在会话里时 agent-deck 起会话(它每起一个就绑一次),这几处都轮不到:挂一个钩子,它一绑 tmux 当场换回来。
-/// 进会话前要等它做完:一次 list-keys 看现状,要改的一次 tmux 调用做完
+/// Ctrl+Q gets you back after going in. The key is bound on the tmux server (no prefix): detach in aca's sessions, and in
+/// other sessions the key goes through to the program inside. agent-deck binds this key too, recognizing only sessions it
+/// named (`agentdeck_*`) and swallowing the key in others — once an adopted session is renamed, it stops working there.
+/// So its binding is replaced with one that recognizes both; a different binding of your own is left alone. The binding
+/// isn't in tmux.conf: a server restart or agent-deck starting another session wipes it, so it's redone after creating a
+/// session and before going into one. When agent-deck starts a session while you're already inside one (it binds once per
+/// session it starts), none of those points come up: a hook is set so tmux switches it back the moment it binds. Going in
+/// waits for this to finish: one list-keys to see the current state, and one tmux call for all the changes
 pub fn bind_detach() {
     let Ok(keys) = run(&["list-keys"]) else { return };
     let mut cmds = detach_changes(&keys);
-    // 插件要的热键一样不在 tmux.conf 里:跟着一起补
+    // The hotkeys plugins want aren't in tmux.conf either: fill them in along with it
     if let Some(want) = crate::plugin::hotkey_binds() {
         cmds.extend(hotkey_changes(&keys, &want).0);
     }
     let _ = run(&cmds.join(&";".to_string()));
 }
 
-/// Ctrl+Q 要跑的命令。钩子每次都挂(看一眼它在不在和挂一次一样贵),键上不是这一版的才绑。
-/// 钩子在最前:一串命令里有一条出错,tmux 就不跑后面的了
+/// The commands Ctrl+Q needs. The hook is set every time (checking whether it's there costs as much as setting it); the
+/// key is bound only if it isn't this version. The hook goes first: when one command in a chain fails, tmux skips the rest
 fn detach_changes(keys: &str) -> Vec<Vec<String>> {
     let s = |x: &str| x.to_string();
     let again = format!("bind-key -n {DETACH_KEY} if-shell -F '{DETACH_IN}' detach-client 'send-keys {DETACH_KEY}'");
@@ -345,28 +362,31 @@ fn detach_changes(keys: &str) -> Vec<Vec<String>> {
     cmds
 }
 
-/// 热键绑的命令里都带着它:「这是 aca 绑的」靠它认。你自己在 tmux.conf 里绑的 `aca plugin pane …` 没有它,不会被当成 aca 的解掉
+/// Every hotkey command carries it: "aca bound this" is recognized by it. An `aca plugin pane …` you bound in your own
+/// tmux.conf doesn't have it, so it won't be taken for aca's and unbound
 pub const HOTKEY_MARK: &str = "--hotkey";
-/// 热键只在 aca 的会话里拦
+/// Hotkeys are only intercepted in aca's sessions
 const HOTKEY_IN: &str = "#{?@aca_id,1,0}";
-/// 在这几张键表里绑:平常(root),和往上翻着看的时候(copy-mode;vi 键位是 copy-mode-vi)
+/// Bound in these key tables: normally (root), and while scrolling back (copy-mode; with vi keys, copy-mode-vi)
 const HOTKEY_TABLES: [&str; 3] = ["root", "copy-mode", "copy-mode-vi"];
 
-/// 插件的热键(清单的 `[[hotkeys]]`),和 Ctrl+Q 一个办法:绑在 tmux 服务上、不用前缀;aca 的会话里跑那条命令,
-/// 别的会话里键照样送给里面的程序。`want`:(键, 按了跑的 shell 命令 —— 带着 [`HOTKEY_MARK`],里面的 `#{…}` tmux 会展开)。
-/// aca 以前绑的、现在没人要的解掉;键上有别人绑的(你的 tmux.conf、tmux 自带的)不动。返回平常那张键表里没绑上的键。
-/// tmux 没在跑:什么都不做
+/// Plugin hotkeys (the manifest's `[[hotkeys]]`), done the same way as Ctrl+Q: bound on the tmux server, no prefix; in
+/// aca's sessions the command runs, in other sessions the key goes through to the program inside. `want`: (key, shell
+/// command to run on press — carrying [`HOTKEY_MARK`], with `#{…}` inside expanded by tmux). Keys aca bound before that
+/// nobody wants now are unbound; keys someone else bound (your tmux.conf, tmux's defaults) are left alone. Returns the
+/// keys that couldn't be bound in the normal key table. tmux not running: does nothing
 pub fn bind_hotkeys(want: &[(String, String)]) -> Vec<String> {
     let Ok(keys) = run(&["list-keys"]) else { return vec![] };
     let (cmds, held) = hotkey_changes(&keys, want);
     if !cmds.is_empty() {
-        // 一次调用全做完:命令之间放一个单独的 `;`
+        // All in one call: a lone `;` between commands
         let _ = run(&cmds.join(&";".to_string()));
     }
     held
 }
 
-/// 现在的键表(`list-keys` 的输出)要变成 `want`,得跑哪些 tmux 命令;和平常那张键表里被别人占着的键
+/// Which tmux commands turn the current key tables (`list-keys` output) into `want`; plus the keys in the normal key table
+/// someone else holds
 fn hotkey_changes(keys: &str, want: &[(String, String)]) -> (Vec<Vec<String>>, Vec<String>) {
     let s = |x: &str| x.to_string();
     let (mut cmds, mut held) = (vec![], vec![]);
@@ -386,7 +406,7 @@ fn hotkey_changes(keys: &str, want: &[(String, String)]) -> (Vec<Vec<String>>, V
                 _ => {
                     let go = format!("run-shell -b {}", quote(sh));
                     let mut c = vec![s("bind-key"), s("-T"), s(table), k.clone(), s("if-shell"), s("-F"), s(HOTKEY_IN), go];
-                    // 平常:不是 aca 的会话,键原样送进去。翻着看的时候没有「送进去」这回事
+                    // Normally: not an aca session, so the key goes through as is. While scrolling back there's no "going through"
                     if table == "root" {
                         c.push(format!("send-keys {k}"));
                     }
@@ -398,7 +418,7 @@ fn hotkey_changes(keys: &str, want: &[(String, String)]) -> (Vec<Vec<String>>, V
     (cmds, held)
 }
 
-/// `list-keys` 里一张键表的每一条:(键, 命令那一段)
+/// Each binding in one key table from `list-keys`: (key, the command part)
 fn bindings<'a>(keys: &'a str, table: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
     keys.lines().filter_map(move |l| {
         let (t, rest) = l.split_once("-T")?.1.trim_start().split_once(char::is_whitespace)?;
@@ -407,13 +427,14 @@ fn bindings<'a>(keys: &'a str, table: &'a str) -> impl Iterator<Item = (&'a str,
     })
 }
 
-/// 是不是同一个键:修饰键的先后不算。Debian 12 的 tmux 3.3a、Ubuntu 24.04 的 3.4 在 `list-keys` 里把
-/// `C-M-y` 打成 `M-C-y`(Mac 上新的 tmux 照写的打),按字面比就认不出 aca 自己绑过的,也认不出你绑的
+/// Whether two keys are the same: the order of modifiers doesn't matter. Debian 12's tmux 3.3a and Ubuntu 24.04's 3.4
+/// print `C-M-y` as `M-C-y` in `list-keys` (newer tmux on the Mac prints it as written), so comparing literally would
+/// recognize neither aca's own bindings nor yours
 fn same_key(a: &str, b: &str) -> bool {
     key_parts(a) == key_parts(b)
 }
 
-/// (按着哪几个修饰键 C / M / S, 剩下的那个键)。`M--` 是 Alt 加减号:最后剩的一段不再拆
+/// (which modifiers C / M / S are held, the remaining key). `M--` is Alt plus minus: the last piece isn't split further
 fn key_parts(k: &str) -> ([bool; 3], &str) {
     let mut mods = [false; 3];
     let mut rest = k;
@@ -430,7 +451,7 @@ fn key_parts(k: &str) -> ([bool; 3], &str) {
     (mods, rest)
 }
 
-/// 一段字写成 tmux 命令里的一个参数(双引号里 `\` `"` `$` 要转义)
+/// Writes text as one argument of a tmux command (inside double quotes, `\` `"` `$` are escaped)
 fn quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
@@ -442,17 +463,20 @@ fn quote(s: &str) -> String {
     out + "\""
 }
 
-/// 去掉引号和转义:`list-keys` 打出来的命令引号加得和绑的时候不一样,比的时候不看它们
+/// Strips quotes and escapes: `list-keys` prints commands quoted differently from how they were bound, so comparisons
+/// ignore them
 fn plain(s: &str) -> String {
     s.chars().filter(|c| !matches!(c, '\\' | '"' | '\'')).collect()
 }
 
-/// `list-keys` 里这个键在平常那张键表上绑的命令(`bind-key [-r] -T root C-q 命令 …` 的命令那一段)
+/// The command this key is bound to in the normal key table, from `list-keys` (the command part of
+/// `bind-key [-r] -T root C-q <command> …`)
 fn bound<'a>(keys: &'a str, key: &str) -> Option<&'a str> {
     bindings(keys, "root").find(|(k, _)| same_key(k, key)).map(|(_, cmd)| cmd)
 }
 
-/// 没绑、agent-deck 绑的、aca 以前绑的(条件改过)→ 绑;已经是这一版、别人绑的 → 不动
+/// Not bound, bound by agent-deck, bound by an older aca (condition changed) → bind; already this version, or bound by
+/// someone else → leave alone
 fn rebind(now: Option<&str>) -> bool {
     match now {
         None => true,
@@ -482,14 +506,15 @@ mod tests {
             format!("'/bin/aca' plugin pane aca.copy {pane} {HOTKEY_MARK} {key} --session '#{{@aca_id}}' --client '#{{client_name}}'")
         };
         let want = vec![("C-]".to_string(), sh("pick", "C-]"))];
-        // 什么都没绑:三张键表各绑一条;平常那张不是 aca 的会话把键送进去
+        // Nothing bound: one binding in each of the three key tables; in the normal one, non-aca sessions get the key passed
+        // through
         let (cmds, held) = hotkey_changes("bind-key    -T root         M-.   next-window\n", &want);
         assert!(held.is_empty());
         assert_eq!(cmds.len(), 3);
         assert_eq!(cmds[0][..7], ["bind-key", "-T", "root", "C-]", "if-shell", "-F", HOTKEY_IN]);
         assert_eq!(cmds[0][7], format!("run-shell -b \"{}\"", sh("pick", "C-]")));
         assert_eq!((cmds[0][8].as_str(), cmds[1].len(), cmds[2][2].as_str()), ("send-keys C-]", 8, "copy-mode-vi"));
-        // tmux 打出来的是这个样子(引号换了一种):已经是这一条,不用再绑
+        // This is what tmux prints (quoted differently): already this binding, no need to bind again
         let line = |table: &str, key: &str, pane: &str| {
             format!(
                 "bind-key    -T {table} {key}  if-shell -F \"#{{?@aca_id,1,0}}\" \"run-shell -b \\\"'/bin/aca' plugin pane aca.copy {pane} --hotkey {key} --session '#{{@aca_id}}' --client '#{{client_name}}'\\\"\" \"send-keys {key}\"\n"
@@ -497,14 +522,14 @@ mod tests {
         };
         let all = |key: &str, pane: &str| HOTKEY_TABLES.map(|t| line(t, key, pane)).concat();
         assert_eq!(hotkey_changes(&all("C-]", "pick"), &want), (vec![], vec![]));
-        // 换了要开的窗格:重绑。换了键:旧的解掉、新的绑上。没人要了:全解掉
+        // Pane to open changed: rebind. Key changed: unbind the old, bind the new. Nobody wants it any more: unbind all
         assert_eq!(hotkey_changes(&all("C-]", "old"), &want).0.len(), 3);
         let (cmds, _) = hotkey_changes(&all("M-y", "pick"), &want);
         assert_eq!(cmds.iter().filter(|c| c[0] == "unbind-key" && c[3] == "M-y").count(), 3);
         assert_eq!(cmds.iter().filter(|c| c[0] == "bind-key" && c[3] == "C-]").count(), 3);
         let (cmds, _) = hotkey_changes(&all("C-]", "pick"), &[]);
         assert_eq!(cmds, HOTKEY_TABLES.map(|t| vec!["unbind-key".to_string(), "-T".into(), t.into(), "C-]".into()]));
-        // 你自己绑的(哪怕也是开 aca 的窗格):不动,平常那张键表里的报出来
+        // Your own binding (even one opening an aca pane): left alone, and the one in the normal key table is reported
         let yours =
             "bind-key -T root C-] run-shell -b \"aca plugin pane aca.note pad\"\nbind-key -T copy-mode-vi C-] send-keys -X cancel\n";
         let (cmds, held) = hotkey_changes(yours, &want);
@@ -521,12 +546,12 @@ mod tests {
         assert!(!same_key("C-y", "M-y") && !same_key("C-M-y", "C-y") && !same_key("M--", "M-"));
         let sh = format!("'/bin/aca' next {HOTKEY_MARK} C-M-n --session '#{{@aca_id}}' --client '#{{client_name}}'");
         let want = vec![("C-M-n".to_string(), sh.clone())];
-        // tmux 3.4 把 aca 绑的 C-M-n 打成 M-C-n:认得是它,不解也不重绑
+        // tmux 3.4 prints aca's C-M-n as M-C-n: recognized as aca's, neither unbound nor rebound
         let ours = HOTKEY_TABLES
             .map(|t| format!("bind-key -T {t} M-C-n if-shell -F \"#{{?@aca_id,1,0}}\" \"run-shell -b \\\"{sh}\\\"\" \"send-keys C-M-n\"\n"))
             .concat();
         assert_eq!(hotkey_changes(&ours, &want), (vec![], vec![]));
-        // 你绑在 C-M-n 上的,一样打成 M-C-n:不动它,报出来;翻着看的两张表空着,照绑
+        // Yours on C-M-n is also printed as M-C-n: left alone and reported; the two scroll-back tables are free, so bind there
         let (cmds, held) = hotkey_changes("bind-key -T root M-C-n display-message mine\n", &want);
         assert_eq!(held, ["C-M-n"]);
         assert_eq!(cmds.iter().map(|c| c[2].as_str()).collect::<Vec<_>>(), ["copy-mode", "copy-mode-vi"]);
@@ -540,19 +565,19 @@ mod tests {
         assert_eq!(bound(&line("detach-client"), "C-q"), Some("detach-client"));
         assert_eq!(bound("bind-key  -T root M-. next-window\n", "C-q"), None);
         assert!(rebind(None));
-        // agent-deck 绑的:只认它起名的会话
+        // agent-deck's binding: only recognizes sessions it named
         let deck = line("if-shell -F \"#{m:agentdeck_*,#{session_name}}\" detach-client ''");
         assert!(rebind(bound(&deck, "C-q")));
-        // 已经是这一版的:不用再绑
+        // Already this version: no need to bind again
         let ours = line(&format!("if-shell -F \"{DETACH_IN}\" detach-client \"send-keys C-q\""));
         assert!(!rebind(bound(&ours, "C-q")));
-        // 条件改过之前的那一版:换掉
+        // The version from before the condition changed: replace it
         assert!(rebind(bound(&line("if-shell -F \"#{@aca_id}\" detach-client"), "C-q")));
-        // 你自己绑的
+        // Your own binding
         assert!(!rebind(bound(&line("display-popup -E htop"), "C-q")));
-        // 读的是全部键表:别的表上的 C-q 不算
+        // All key tables are read: C-q in other tables doesn't count
         assert_eq!(bound("bind-key -T copy-mode C-q send-keys -X cancel\n", "C-q"), None);
-        // 钩子每次都挂、挂在最前;键已经是这一版的就不再绑
+        // The hook is set every time, first; if the key is already this version it isn't bound again
         let first = |cmds: &[Vec<String>]| cmds.iter().map(|c| c[0].clone()).collect::<Vec<_>>();
         assert_eq!(first(&detach_changes(&ours)), ["set-hook"]);
         assert_eq!(first(&detach_changes(&deck)), ["set-hook", "bind-key"]);
@@ -569,7 +594,7 @@ mod tests {
         let a = agent_pane(&v, "ab12").unwrap();
         assert_eq!((a.pane.as_str(), a.title.as_str(), a.attached, a.last_attached), ("%2", "✳ 带\t制表符", 1, 7));
         assert!(v[2].dead && v[2].id.is_empty());
-        // 没有记 @aca_agent 的:编号最小的那格
+        // None marked @aca_agent: the pane with the lowest index
         let mut w = v.clone();
         w[1].agent = false;
         assert_eq!(agent_pane(&w, "ab12").unwrap().pane, "%2");
@@ -582,16 +607,16 @@ mod tests {
             let v = parse_panes(&format!("ab12\t1\t$1\t标题\t%2\t99\tnode\t0\t0\t{last}\t{active}\t0\t0\t/p\t6\t1\tzsh\t{pass}\t✳ 标题\n"));
             (v[0].last_attached, v[0].activity)
         };
-        // 路过之前 40 连进去过、45 有人动过;50 路过,之后没人来过:还是 40、45
+        // Before the pass: attached at 40, touched at 45; passed at 50 and nobody came since: still 40, 45
         assert_eq!(row(50, 50, "40/45/50"), (40, 45));
-        // 从没连进去过的(tmux 给的是空)
+        // Never attached (tmux gives empty)
         assert_eq!(row(50, 50, "/45/50"), (0, 45));
-        // 路过之后又连进去了(60):照 tmux 说的
+        // Attached again after the pass (60): go by what tmux says
         assert_eq!(row(60, 61, "40/45/50"), (60, 61));
-        // 连 via 没成,只记了前半截;没记过的
+        // Attaching to via failed, only the first half recorded; nothing recorded
         assert_eq!(row(50, 50, "40/45"), (50, 50));
         assert_eq!(row(50, 50, ""), (50, 50));
-        // 先路过、后要进的那个,同一条命令
+        // Pass through one, then the one to go into, in the same command
         let a = attach_via("$3", "$7").join(" ");
         assert!(a.contains("attach-session -t $3 ;") && a.ends_with("switch-client -t $7"), "{a}");
     }
@@ -611,11 +636,12 @@ mod tests {
             "capture-pane -p -e -t %1 ; display-message -p -t %1 CUT ; capture-pane -p -e -t %2 ; display-message -p -t %2 CUT"
         );
         assert_eq!(words(&capture_args(&["%1"], false, "CUT")), "capture-pane -p -t %1 ; display-message -p -t %1 CUT");
-        // 一段就是单独抓那格时打出来的字;空屏也是一段;最后没等到记号的半段不算;别的记号只是屏幕上的一行字
+        // A chunk is exactly what capturing that pane alone prints; an empty screen is a chunk too; a last half-chunk that never
+        // got its mark doesn't count; other marks are just a line of text on the screen
         assert_eq!(split_marked("a\n  b  \n\nCUT\n\nCUT\nCUT-old\nCUT\n半段\n", "CUT"), ["a\n  b  \n\n", "\n", "CUT-old\n"]);
         assert_eq!(plain_lines("a  \n\n b\n\n\n"), ["a", "", " b"]);
 
-        // 假的 tmux:命令一条一条跑,碰到抓不到的那格就停,后面的不跑
+        // A fake tmux: runs commands one by one and stops at a pane it can't capture, skipping the rest
         let screen = |p: &str| match p {
             "%1" => Some("一\n"),
             "%3" => Some("\n"),
@@ -638,12 +664,12 @@ mod tests {
         };
         let mut calls = vec![];
         assert_eq!(capture_with(&["%1", "%2", "%3", "%4"], false, "CUT", |a| fake(&mut calls, a)), ["一\n", "", "\n", "四\n"]);
-        // 都在的话就一个进程;%2 没了:它前面的那次白跑了后半截,从 %3 接着再来一次
+        // All there: one process; %2 gone: the second half of the call before it was wasted, so go again from %3
         assert_eq!(calls, [4, 2]);
         let mut calls = vec![];
         assert_eq!(capture_with(&["%1", "%3", "%4"], false, "CUT", |a| fake(&mut calls, a)).len(), 3);
         assert_eq!(calls, [3]);
-        // 一格都抓不到(tmux 没了):一格一次,不会转不出来;没有格就不起 tmux
+        // No pane can be captured (tmux gone): one call per pane, so it can't loop forever; no panes, no tmux
         let mut calls = vec![];
         assert_eq!(capture_with(&["%8", "%9"], false, "CUT", |a| fake(&mut calls, a)), ["", ""]);
         assert_eq!(calls, [2, 1]);

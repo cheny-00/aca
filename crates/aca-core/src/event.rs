@@ -1,9 +1,11 @@
-//! 事件:会话上发生的每件事记一行到 `events.jsonl`,同时交给订了它的插件。
+//! Events: everything that happens to a session is written as one line to `events.jsonl` and handed to the plugins
+//! subscribed to it.
 //!
-//! 这是界面和插件共用的一条线:界面盯着这个文件(变了就刷新,不用干等下一次轮询),
-//! 插件在清单里写 `[[events]] on = "turn.done"` 订,或者自己 `aca events -f` 一直读。
+//! This is the one channel the interface and plugins share: the interface watches this file (refreshing when it changes
+//! instead of waiting for the next poll), and plugins subscribe in their manifest with `[[events]] on = "turn.done"`, or
+//! read it themselves with `aca events -f`.
 //!
-//! 一行一个 JSON:`{"ts": 毫秒, "event": 名字, "session": 会话 id, …这件事自己的字段}`。
+//! One JSON object per line: `{"ts": milliseconds, "event": name, "session": session id, …the event's own fields}`.
 
 use std::io::Write;
 
@@ -11,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::paths;
 
-/// 会发出来的事件(插件清单里写了别的名字,链接时提醒一声)
+/// Events that get emitted (a plugin manifest naming anything else gets a warning when it's linked)
 pub const KNOWN: &[&str] = &[
     "session.created",
     "session.started",
@@ -36,8 +38,10 @@ pub const KNOWN: &[&str] = &[
     "limits.changed",
 ];
 
-/// 每个事件自己带的字段(公共的 `ts` `event` `session` 不算)。这是插件接口的一部分(docs/plugins.md「事件」那张表照它写,
-/// 测试里对):同一版接口里只加不删。发出去的事件带了这里没写的字段,调试版直接崩 —— 先来这里登记、写进文档
+/// Each event's own fields (not counting the common `ts` `event` `session`). This is part of the plugin interface (the
+/// "Events" table in docs/plugins.md follows it, and a test checks): within one interface version fields are only added,
+/// never removed. An emitted event carrying a field not listed here crashes a debug build — register it here and in the
+/// docs first
 pub const FIELDS: &[(&str, &[&str])] = &[
     ("session.created", &["title", "tool", "account", "dir", "group", "parent", "fork", "fork_of", "adopted", "tmux"]),
     ("session.started", &["how"]),
@@ -55,19 +59,19 @@ pub const FIELDS: &[(&str, &[&str])] = &[
     ("agent.waiting", &["ask", "kind", "options"]),
     ("agent.exited", &["reason"]),
     ("conversation.changed", &["conv", "from"]),
-    ("message.sent", &["id", "from", "kind", "what", "wake", "text"]),
+    ("message.sent", &["id", "from", "kind", "what", "wake", "text", "at"]),
     ("message.delivered", &["id", "how"]),
     ("message.throttled", &["from", "count", "secs"]),
     ("ask.answered", &["by", "answer", "ask", "kind"]),
     ("limits.changed", &["tool", "name", "dir", "wins"]),
 ];
 
-/// 这个事件自己的字段(没有这个事件 = 空)
+/// This event's own fields (no such event = empty)
 pub fn fields(name: &str) -> &'static [&'static str] {
     FIELDS.iter().find(|(n, _)| *n == name).map_or(&[], |(_, f)| f)
 }
 
-/// 文件到这么大就换一个新的(旧的留一份 .1)
+/// When the file reaches this size, start a new one (the old one is kept as .1)
 const ROTATE: u64 = 4 * 1024 * 1024;
 
 pub fn line(name: &str, session: &str, data: Value) -> String {
@@ -91,14 +95,14 @@ pub fn emit(name: &str, session: &str, data: Value) {
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > ROTATE) {
         let _ = std::fs::rename(&path, path.with_extension("jsonl.1"));
     }
-    // 一行一次 write、追加打开:几个进程同时写也不会串行
+    // One write per line, opened for append: several processes writing at once don't interleave
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(format!("{line}\n").as_bytes());
     }
     crate::plugin::dispatch(name, session, &line);
 }
 
-/// 清单里的 `on` 对不对得上这个事件:原样、`turn.*` 这样的前缀、或者 `*`
+/// Whether a manifest's `on` matches this event: exactly, a prefix like `turn.*`, or `*`
 pub fn matches(on: &str, name: &str) -> bool {
     match on.strip_suffix('*') {
         Some(prefix) => name.starts_with(prefix),
@@ -110,7 +114,8 @@ pub fn matches(on: &str, name: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// 每个事件都登记了字段,docs/plugins.md(英文)和 plugins.zh-CN.md 的事件表里每一行把它的字段都写了
+    /// Every event registers its fields, and each row of the event tables in docs/plugins.md (English) and plugins.zh-CN.md
+    /// lists all of them
     #[test]
     fn every_event_declares_its_fields_and_the_docs_list_them() {
         let names: Vec<&str> = FIELDS.iter().map(|(n, _)| *n).collect();

@@ -1,11 +1,15 @@
-//! `aca plugin tools`:把开着的插件露给 agent 的能力(`expose = ["agent"]`)包成 MCP 工具。挂载时这个服务叫 `aca`(见 [`super::mount`])。
+//! `aca plugin tools`: wraps the commands enabled plugins expose to agents (`expose = ["agent"]`) as MCP tools. When
+//! mounted, this server is called `aca` (see [`super::mount`]).
 //!
-//! stdio,一行一个 JSON-RPC。agent 起它,环境里的 `ACA_SESSION_ID` 就是在调的那个会话:列出来的只有够得着这个会话的插件
-//! (plugins.toml 的 agents),调的时候插件命令拿到的会话也是它。
+//! stdio, one JSON-RPC message per line. An agent starts it, and `ACA_SESSION_ID` in its environment is the calling
+//! session: only plugins that reach this session (`agents` in plugins.toml) are listed, and a call hands the plugin
+//! command that same session.
 //!
-//! 只做工具这一样:initialize / tools/list / tools/call / ping。按 2025-11-25 那一版(握手一次);
-//! 新版(2026-07-28)的客户端先问 `server/discover` 的,这里回「没有这个方法」,它们退回旧版握手 —— 两家现在两版都认。
-//! 一次调用最多跑 [`TIMEOUT`],Codex 默认 300 秒不等;要等更久的(等一个 worker 跑完)让命令先回「还在跑」,下次再问。
+//! Tools only: initialize / tools/list / tools/call / ping. Follows the 2025-11-25 version (one handshake); clients of
+//! the new version (2026-07-28) that ask `server/discover` first get "method not found" here and fall back to the old
+//! handshake — both agents accept both versions for now. A call runs for at most [`TIMEOUT`] (Codex stops waiting after
+//! 300 seconds by default); for longer waits (until a worker finishes) have the command answer "still running" first and
+//! ask again later.
 
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
@@ -42,7 +46,7 @@ pub fn serve() -> Res<i32> {
     Ok(0)
 }
 
-/// 一条消息 → 回什么(通知不回)
+/// One message → the reply (notifications get none)
 pub(crate) fn handle(msg: &Value) -> Option<Value> {
     let id = msg.get("id")?.clone();
     let method = msg["method"].as_str().unwrap_or("");
@@ -67,7 +71,7 @@ pub(crate) fn handle(msg: &Value) -> Option<Value> {
     })
 }
 
-/// 一个露给 agent 的能力
+/// A command exposed to agents
 struct Offered {
     entry: Entry,
     manifest: Manifest,
@@ -75,7 +79,7 @@ struct Offered {
 }
 
 impl Offered {
-    /// 工具名:`<插件>__<能力>`(只有字母数字 _ -,Claude 再在前面加 mcp__aca__)
+    /// Tool name: `<plugin>__<command>` (only letters, digits, _ -; Claude adds mcp__aca__ in front)
     fn name(&self) -> String {
         format!("{}__{}", mount::safe(&self.entry.id), self.action.id)
     }
@@ -106,7 +110,8 @@ impl Offered {
     }
 }
 
-/// 在调的是哪个会话:gateway 转来的请求在 `_meta` 里写着(`dev.aca/session`),直接挂的看环境里的 `ACA_SESSION_ID`
+/// Which session is calling: requests forwarded by the gateway say so in `_meta` (`dev.aca/session`); a directly attached
+/// server looks at `ACA_SESSION_ID` in its environment
 pub(crate) fn caller(params: &Value) -> super::Context {
     match params.pointer("/_meta/dev.aca~1session").and_then(Value::as_str) {
         Some(s) => super::agent_context_for(s),
@@ -114,8 +119,8 @@ pub(crate) fn caller(params: &Value) -> super::Context {
     }
 }
 
-/// 这个会话(环境里的 `ACA_SESSION_ID`)能用的:开着的、够得着它的插件里露给 agent 的能力。
-/// 共用的那一份(gateway 下面、没有会话)列全部,由 gateway 按会话挑
+/// What this session (`ACA_SESSION_ID` in the environment) can use: the commands exposed to agents by enabled plugins
+/// that reach it. The shared copy (under the gateway, no session) lists all of them and the gateway picks per session
 fn offered() -> Vec<Offered> {
     offered_for(&super::agent_context())
 }
@@ -128,7 +133,7 @@ fn offered_for(ctx: &super::Context) -> Vec<Offered> {
     let wants = decl::wants().unwrap_or_default();
     let mut out = vec![];
     for e in registry().into_iter().filter(|e| e.enabled) {
-        // 给哪些:你在 plugins.toml 里定的(没写 = 清单里写 agent 的),见 yours
+        // Which ones: what you set in plugins.toml (not written = those marked agent in the manifest), see yours
         let allowed = super::yours::agent_tools(&e, wants.get(&e.id));
         if allowed.is_empty() || (s.is_some() && !wants.get(&e.id).is_none_or(|w| w.reaches(&tool, &kind, &account))) {
             continue;
@@ -145,15 +150,16 @@ fn text(t: String, error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": t }], "isError": error })
 }
 
-/// 调一个工具:参数照清单的类型查一遍,跑那条命令(参数在 `ACA_PLUGIN_ARGS_JSON`),输出原样交回去。
-/// 出错(参数不对、命令退出码不是 0、超时)也是正常的回答,`isError` 标出来,agent 看得到原因
+/// Calls a tool: checks the arguments against the manifest's types, runs the command (arguments in
+/// `ACA_PLUGIN_ARGS_JSON`), and hands the output back as it is. Errors (wrong arguments, non-zero exit code, timeout)
+/// are normal answers too, marked with `isError`, so the agent sees why
 fn call(params: &Value) -> Value {
     let name = params["name"].as_str().unwrap_or("");
     let ctx = caller(params);
     let Some(mut o) = offered_for(&ctx).into_iter().find(|o| o.name() == name) else {
         return text(tr!("没有工具 {name}(插件已关闭,或未提供给此会话)", "no tool {name} (plugin off, or not for this session)"), true);
     };
-    // 自带的:刚升级了 aca 就先换成新写出来的那份
+    // Built-in: right after an aca upgrade, switch to the freshly written copy first
     if o.entry.source == super::first_party::SOURCE
         && super::first_party::refresh_one(&o.entry.id)
         && let Some(now) = offered_for(&ctx).into_iter().find(|o| o.name() == name)
@@ -173,7 +179,8 @@ fn call(params: &Value) -> Value {
     }
 }
 
-/// MCP 给的参数(已经是 JSON)照清单的类型查:少了必须给的、多了没声明的、类型不对的都说。返回交给命令的那段 JSON
+/// Checks the arguments MCP gave (already JSON) against the manifest's types: missing required ones, undeclared extras
+/// and wrong types are all reported. Returns the JSON handed to the command
 pub(crate) fn check(a: &Action, given: &Value) -> Res<String> {
     let empty = serde_json::Map::new();
     let given = given.as_object().unwrap_or(&empty);
@@ -202,20 +209,20 @@ pub(crate) fn check(a: &Action, given: &Value) -> Res<String> {
     Ok(Value::Object(v).to_string())
 }
 
-/// 跑完一条插件命令收下的
+/// What a finished plugin command produced
 #[derive(Debug, PartialEq)]
 pub struct Fed {
     pub ok: bool,
-    /// 退出码;被信号打断的、停掉了的是 None
+    /// Exit code; None when killed by a signal or stopped
     pub code: Option<i32>,
     pub out: String,
     pub err: String,
-    /// 过了这么多秒还没完,停掉了
+    /// Still not done after this many seconds, so it was stopped
     pub late: Option<u64>,
 }
 
 impl Fed {
-    /// 给人看、给 agent 看的:标准输出,后面接标准错误;停掉了的说一句
+    /// For people and agents to read: stdout followed by stderr; a stopped one says so
     pub fn text(&self) -> String {
         let mut text = self.out.clone();
         if !self.err.trim().is_empty() {
@@ -231,11 +238,12 @@ impl Fed {
     }
 }
 
-/// 发了 TERM 再等这么久,还不退就 KILL;它自己退出(或被杀)之后,输出最多再等这么久(后台进程占着管道不放时不跟着等)
+/// After TERM, wait this long, then KILL if it hasn't exited; after it exits (or is killed), wait at most this long more
+/// for output (don't keep waiting when a background process holds on to the pipe)
 const GRACE: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(3) };
 
-/// 跑完(最多等 `limit`)。到时间了先 TERM 它那一组,不退再 KILL。
-/// `input` 给了就写进它的标准输入(插件的 `input`)
+/// Runs it to the end (waiting at most `limit`). When time's up, TERM its process group first, then KILL if it doesn't
+/// exit. `input`, if given, is written to its stdin (the plugin's `input`)
 pub(crate) fn run_fed(mut c: std::process::Command, limit: Duration, input: Option<String>) -> Res<Fed> {
     use std::os::unix::process::CommandExt;
     if input.is_some() {
@@ -243,13 +251,15 @@ pub(crate) fn run_fed(mut c: std::process::Command, limit: Duration, input: Opti
     }
     let mut child = c.process_group(0).spawn().map_err(|e| tr!("无法启动:{e}", "can't start: {e}"))?;
     if let (Some(text), Some(mut w)) = (input, child.stdin.take()) {
-        // 另起一个线程写:它不读完也不会卡住这边(管道满了只卡那个线程)
+        // Written from another thread: if it doesn't read everything this side doesn't get stuck (a full pipe only blocks that
+        // thread)
         std::thread::spawn(move || {
             use std::io::Write;
             let _ = w.write_all(text.as_bytes());
         });
     }
-    // 读到一点放一点:它留在后台的进程占着输出不放时,这边拿走已经读到的就走,不跟着一直等
+    // Keep what's read as it comes: when a process it left in the background holds on to the output, this side takes what
+    // it has and goes, instead of waiting along
     type Got = (std::sync::Arc<std::sync::Mutex<Vec<u8>>>, std::sync::mpsc::Receiver<()>);
     let read = |r: Option<Box<dyn Read + Send>>| -> Got {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
@@ -273,7 +283,8 @@ pub(crate) fn run_fed(mut c: std::process::Command, limit: Duration, input: Opti
     };
     let out = read(child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
     let err = read(child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
-    // 另一个线程等它退出,这边最多等 limit:它一退出马上知道(不隔一阵看一眼 —— 那样每条命令平白多等几十毫秒)
+    // Another thread waits for it to exit, this side waits at most limit: an exit is known at once (no checking every so
+    // often — that would add tens of milliseconds to every command for nothing)
     let pid = child.id() as i32;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -283,7 +294,7 @@ pub(crate) fn run_fed(mut c: std::process::Command, limit: Duration, input: Opti
         Ok(st) => Some(st.map_err(|e| e.to_string())?),
         Err(_) => {
             unsafe { libc::killpg(pid, libc::SIGTERM) };
-            // 把 TERM 忽略掉的:过一会儿 KILL(KILL 收不到也躲不掉)
+            // For one that ignores TERM: KILL after a while (KILL can't be ignored or dodged)
             if rx.recv_timeout(GRACE).is_err() {
                 unsafe { libc::killpg(pid, libc::SIGKILL) };
                 let _ = rx.recv();
@@ -323,7 +334,7 @@ mod tests {
         let r =
             handle(&json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize", "params": { "protocolVersion": "2099-01-01" } })).unwrap();
         assert_eq!(r["result"]["protocolVersion"], PROTOCOL);
-        // 新版客户端先探的那个:没有这个方法,它退回旧版握手
+        // What new-version clients probe first: the method doesn't exist, so they fall back to the old handshake
         let r = handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "server/discover" })).unwrap();
         assert_eq!(r["error"]["code"], -32601);
         assert!(handle(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).is_none());
@@ -368,7 +379,7 @@ mod tests {
         let f = run_fed(sh("trap '' TERM; echo stubborn; sleep 30"), Duration::from_millis(200), None).unwrap();
         assert!(!f.ok && f.out == "stubborn\n" && f.late.is_some(), "{f:?}");
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
-        // 退出了,后台还有个进程拿着它的标准输出:收下已有的就回来
+        // It exited, but a background process still holds its stdout: take what's there and return
         let t = std::time::Instant::now();
         let f = run_fed(sh("sleep 3 & echo done"), TIMEOUT, None).unwrap();
         assert!(f.ok && f.out == "done\n", "{f:?}");

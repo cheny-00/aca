@@ -1,13 +1,20 @@
-//! 插件详情:插件页右边那一栏(窄屏是下半截)。高亮的插件能改的分三段,都写进 plugins.toml;最后是它带了什么:
+//! Plugin details: the right-hand pane of the plugins page (the lower half on a narrow screen). What can be changed for the
+//! highlighted plugin comes in three sections, all written to plugins.toml; last comes what it brings:
 //!
-//! - **设置**:一行一个,名字、现在的值(改过的标出来);高亮的那个,说明由插件页折行写全在详情下面(见 [`Detail::hint`])。
-//!   ⏎ 改(开关类空格开 / 关),`-` 回到默认;清单里标了 `secret` 的(webhook 地址、key)打码显示,改的时候从空的开始填
-//! - **给 agent 的工具**:✓ 给了 ○ 没给;清单写 `agent?` 的(会动你机器上东西的)标「要你点名」。空格切换
-//! - **插件菜单**(会话列表上按 `:` 出来的那个):它在菜单里的几项和键。⏎ 再按一个键换成它,⌫ 不要键,
-//!   `-` 回到清单的;没拿到的(别的插件先拿了)写在下面
+//! - **Settings**: one per row, name and current value (changed ones marked); for the highlighted one, the plugins page
+//!   wraps the full description under the details (see [`Detail::hint`]).
+//!   ⏎ edits (space turns switches on / off), `-` goes back to the default; ones the manifest marks `secret` (webhook URLs,
+//!   keys) are masked, and editing starts from empty
+//! - **Tools for agents**: ✓ given ○ not given; ones the manifest writes as `agent?` (they touch things on your machine)
+//!   are marked "only if allowed". Space toggles
+//! - **Plugin menu** (the one `:` opens on the session list): its items in the menu and their keys. ⏎ then a key switches
+//!   to that key, ⌫ removes the key, `-` goes back to the manifest's; keys it didn't get (another plugin took them first)
+//!   are listed below
 //!
-//! 改了要重启开着的会话才带上的(给 agent 的工具),这里不讲:插件页底下点名哪些会话要重启。
-//! 插件页上 ⏎ 进到这一栏(高亮落到这里),Esc 回列表。改动放到后台跑(`Job::Plugins`),做完和插件页一起重读。
+//! What only reaches open sessions after a restart (tools for agents) isn't covered here: the bottom of the plugins page
+//! names the sessions that need one.
+//! ⏎ on the plugins page enters this pane (the highlight moves here), Esc goes back to the list. Changes run in the background
+//! (`Job::Plugins`) and are reloaded together with the plugins page when done.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
@@ -22,44 +29,44 @@ use crate::overlay::{Fx, kit};
 use crate::plugins::Act;
 use crate::theme;
 
-/// 一个值最多输这么长
+/// The longest input for one value
 const INPUT_MAX: usize = 2000;
 
-/// 一个设置
+/// One setting
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Set {
     pub name: String,
-    /// 给人看的值(secret 的打码了)
+    /// The value shown to people (masked if secret)
     pub shown: String,
-    /// 改的时候先填上的(secret 的是空的)
+    /// Pre-filled when editing (empty if secret)
     pub raw: String,
     pub changed: bool,
     pub desc: String,
-    /// 开关:Some(现在开没开)
+    /// A switch: Some(whether it's on now)
     pub switch: Option<bool>,
     pub secret: bool,
 }
 
-/// 一个能给 agent 的能力
+/// One command that can be given to agents
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Tool {
     pub id: String,
     pub title: String,
     pub on: bool,
-    /// 清单写的 `agent?`:要你点名才给
+    /// The manifest's `agent?`: given only when you explicitly allow it
     pub ask: bool,
 }
 
-/// `:` 菜单里的一个
+/// One item in the `:` menu
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Bind {
     pub id: String,
     pub title: String,
-    /// 现在的键
+    /// The current key
     pub key: Option<char>,
-    /// 清单写的键
+    /// The key in the manifest
     pub default: Option<char>,
-    /// plugins.toml 里你写的(Some("") = 不要键)
+    /// What you wrote in plugins.toml (Some("") = no key)
     pub mine: Option<String>,
 }
 
@@ -73,17 +80,17 @@ pub struct Tune {
     pub settings: Vec<Set>,
     pub tools: Vec<Tool>,
     pub binds: Vec<Bind>,
-    /// 它给 agent 带了什么:(标签, 值)
+    /// What it brings agents: (label, value)
     pub info: Vec<(String, String)>,
-    /// 这个插件没拿到的键、写得不对的
+    /// Keys this plugin didn't get, things written wrong
     pub notes: Vec<String>,
-    /// 订了事件(有日志可看)
+    /// Subscribed to events (has a log to look at)
     pub log: bool,
-    /// 你自己的那份:它的清单(e 打开它,不打开 plugins.toml)
+    /// Your own plugin: its manifest (e opens that, not plugins.toml)
     pub mine: Option<String>,
 }
 
-/// 读一个插件:清单、你在 plugins.toml 里定的、它带了什么
+/// Read one plugin: the manifest, what you set in plugins.toml, what it brings
 pub fn load(id: &str) -> Tune {
     let Some(e) = plugin::registry().into_iter().find(|e| e.id == id) else { return Tune { id: id.into(), ..Default::default() } };
     let mine = (e.source == plugin::user::SOURCE).then(|| format!("{}/{}", e.path, plugin::MANIFEST));
@@ -165,7 +172,7 @@ pub fn load(id: &str) -> Tune {
     }
 }
 
-/// 高亮停在哪一段的第几个
+/// Which item of which section the highlight is on
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum At {
     Set(usize),
@@ -173,24 +180,24 @@ enum At {
     Bind(usize),
 }
 
-/// 这一栏按完一个键:留在这里,还是回列表
+/// After a key in this pane: stay here, or go back to the list
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Back {
     Stay,
     Leave,
 }
 
-/// 一个插件的详情:插件页右边那一栏
+/// One plugin's details: the right-hand pane of the plugins page
 pub struct Detail {
     pub data: Tune,
     sel: usize,
-    /// 正在改一个设置的值
+    /// Editing a setting's value
     input: Option<String>,
-    /// ⏎ 了插件菜单里的一项:等你按它的新键
+    /// ⏎ on a plugin menu item: waiting for you to press its new key
     waiting: bool,
 }
 
-/// 一段的标题:粗体,后面跟一句淡的说明,再拿细线补满一行
+/// A section heading: bold, followed by a dim note, then a thin rule filling the rest of the line
 fn heading(text: &str, note: &str, w: usize) -> Line<'static> {
     let mut spans = vec![Span::styled(text.to_string(), Style::new().add_modifier(Modifier::BOLD))];
     let mut used = text.width();
@@ -206,7 +213,7 @@ fn heading(text: &str, note: &str, w: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// 能挑的一行:高亮时行首一道强调色的竖条、铺上选中的底色
+/// A selectable row: when highlighted, an accent-colored bar at its start and the selected background
 fn pick(mut spans: Vec<Span<'static>>, w: usize, on: bool) -> Line<'static> {
     if on {
         spans[0] = Span::styled("▌ ", theme::accent());
@@ -219,13 +226,13 @@ impl Detail {
         Detail { data, sel: 0, input: None, waiting: false }
     }
 
-    /// 同一个插件重读了:换上新的,高亮留在原来那行
+    /// The same plugin was reloaded: swap in the new data, the highlight stays on the same row
     pub fn swap(&mut self, data: Tune) {
         self.data = data;
         self.sel = self.sel.min(self.rows().saturating_sub(1));
     }
 
-    /// 能挑的有几行(设置 + 工具 + 菜单项)
+    /// How many selectable rows (settings + tools + menu items)
     pub fn rows(&self) -> usize {
         self.data.settings.len() + self.data.tools.len() + self.data.binds.len()
     }
@@ -240,12 +247,12 @@ impl Detail {
         }
     }
 
-    /// 正在打字 / 等你按一个键
+    /// Typing / waiting for you to press a key
     pub fn typing(&self) -> bool {
         self.waiting || self.input.is_some()
     }
 
-    /// 一个设置显示成什么:开关写开 / 关,空的(空列表也算)写「没填」
+    /// How a setting is shown: a switch says on / off, an empty one (an empty list too) says "empty"
     fn value(s: &Set) -> String {
         match s.switch {
             Some(true) => t!("开", "on").to_string(),
@@ -259,7 +266,8 @@ impl Detail {
         s.switch.is_none() && (s.shown.is_empty() || s.shown == "[]")
     }
 
-    /// 高亮的那个设置:(名字, 说明)。插件页把说明折行写全在详情下面(行里不写)
+    /// The highlighted setting: (name, description). The plugins page wraps the full description under the details (not in
+    /// the row)
     pub fn hint(&self) -> Option<(&str, &str)> {
         match self.at() {
             Some(At::Set(i)) => Some(&self.data.settings[i]).filter(|s| !s.desc.is_empty()).map(|s| (s.name.as_str(), s.desc.as_str())),
@@ -267,7 +275,8 @@ impl Detail {
         }
     }
 
-    /// 设置那一段:名字、值对齐成两列,改过的标出来(说明不在行里,见 [`Detail::hint`])
+    /// The settings section: name and value aligned in two columns, changed ones marked (the description isn't in the row,
+    /// see [`Detail::hint`])
     fn set_lines(&self, w: usize, focused: bool, out: &mut Vec<Line<'static>>, hl: &mut Option<usize>) {
         let name_w = self.data.settings.iter().map(|s| s.name.width()).max().unwrap_or(0).min(16);
         let val_w = self.data.settings.iter().map(|s| Self::value(s).width()).max().unwrap_or(0).clamp(4, 22);
@@ -305,7 +314,7 @@ impl Detail {
                         (false, true) => Style::new().add_modifier(Modifier::BOLD),
                         (false, false) => Style::new(),
                     };
-                    // 「改过」一列对齐在最长的值后面
+                    // The "changed" column lines up after the longest value
                     let pad = val_w.saturating_sub(v.width());
                     spans.push(Span::styled(v, st));
                     if s.changed {
@@ -358,7 +367,8 @@ impl Detail {
         pick(line.spans, w, on)
     }
 
-    /// 这一栏的行;focused = 高亮在这一栏。也给出高亮那行是第几行(行多了跟着它滚)
+    /// This pane's lines; focused = the highlight is in this pane. Also gives the index of the highlighted line (with many
+    /// lines, scrolling follows it)
     pub fn body(&self, w: usize, focused: bool) -> (Vec<Line<'static>>, Option<usize>) {
         let d = &self.data;
         let mut out = vec![];
@@ -405,7 +415,7 @@ impl Detail {
         (out, hl)
     }
 
-    /// 高亮在这一栏时,底下写的键
+    /// The keys shown at the bottom while the highlight is in this pane
     pub fn keys(&self) -> Vec<(&'static str, &'static str)> {
         if self.waiting {
             return vec![("Esc", t!("取消", "keep"))];
@@ -436,7 +446,7 @@ impl Detail {
         let id = self.data.id.clone();
         if self.waiting {
             self.waiting = false;
-            // 别的键(Esc)= 不换,不用说
+            // Any other key (Esc) = no change, nothing to say
             if let (KeyCode::Char(c), Some(At::Bind(i))) = (k.code, self.at())
                 && !ctrl
             {
@@ -453,7 +463,7 @@ impl Detail {
                     self.input = None;
                     if let Some(At::Set(i)) = self.at() {
                         let s = &self.data.settings[i];
-                        // secret 的从空的开始填:什么都没填就是不改
+                        // A secret starts empty: entering nothing means no change
                         if !(s.secret && v.is_empty()) {
                             self.job(Act::Setting(id, s.name.clone(), Some(v)), fx);
                         }
@@ -575,24 +585,25 @@ mod tests {
         i18n::with(Lang::Zh, || {
             let d = Detail::new(fake("aca.discord"));
             let t = text(&d, 84, true);
-            // 设置:名字、值对齐,改过的标出来,开关写开 / 关,secret 打码;高亮那行行首一道竖条。说明不在行里
+            // Settings: name and value aligned, changed ones marked, switches say on / off, secrets masked; the highlighted
+            // row starts with a bar. Descriptions aren't in the row
             assert!(t.contains("▌ url       ••••abcd  已修改\n"), "{t}");
             assert!(t.contains("  workers   关\n") && !t.contains("worker 也发"), "{t}");
-            // 高亮的那个设置:名字和说明交给插件页写在下面
+            // The highlighted setting: name and description go to the plugins page to write below
             assert_eq!(d.hint(), Some(("url", "webhook 地址")));
-            // 给 agent 的工具:只写标题,不写 id;要不要重启不在这里讲
+            // Tools for agents: title only, no id; whether a restart is needed isn't covered here
             assert!(t.contains("提供给 agent 的工具 ─") && t.contains("✓ 列出挂载\n") && t.contains("需明确允许"), "{t}");
-            // 插件菜单:标题就说是 : 菜单里的键
+            // Plugin menu: the heading says these are keys in the : menu
             assert!(t.contains(": 菜单中的按键 ─"), "{t}");
             assert!(t.contains("m  挂载") && t.contains("已修改(原为 t)") && t.contains("e 已被其他插件占用"), "{t}");
             assert!(t.contains("⚠ 键 e 已分配给") && t.contains("给 agent  claude 的 skill / 斜杠命令"), "{t}");
             assert_eq!(d.keys()[0], ("⏎", "修改"));
-            // 高亮不在这一栏:哪行都不标
+            // Highlight not in this pane: no row marked
             let (_, hl) = d.body(84, false);
             assert!(hl.is_none() && !text(&d, 84, false).contains('▌'));
-            // 窄屏(手机)不出界
+            // A narrow screen (phone) doesn't overflow
             assert!(d.body(40, true).0.iter().all(|l| l.width() <= 40), "{}", text(&d, 40, true));
-            // 高亮落到工具、菜单键上:没有设置的说明
+            // Highlight on tools / menu keys: no setting description
             let mut d = d;
             for _ in 0..3 {
                 press(&mut d, KeyCode::Char('j'));
@@ -605,7 +616,7 @@ mod tests {
     fn enter_edits_a_setting_space_flips_a_switch_and_minus_goes_back_to_the_default() {
         i18n::with(Lang::Zh, || {
             let mut d = Detail::new(fake("aca.discord"));
-            // secret 的:从空的开始填,说原来的不显示;什么都不填 = 不改
+            // A secret: starts empty and says the old value is hidden; entering nothing = no change
             press(&mut d, KeyCode::Enter);
             assert!(d.typing() && text(&d, 84, true).contains("> ▏") && text(&d, 84, true).contains("不显示原值"));
             assert!(job(press(&mut d, KeyCode::Enter)).is_none());
@@ -618,7 +629,7 @@ mod tests {
                 Some(Act::Setting("aca.discord".into(), "url".into(), Some("https://x/y".into())))
             );
             assert_eq!(job(press(&mut d, KeyCode::Char('-'))), Some(Act::Setting("aca.discord".into(), "url".into(), None)));
-            // 开关:空格切换;没改过的按 - 说已经是默认
+            // A switch: space toggles; - on an unchanged one says it's already the default
             press(&mut d, KeyCode::Char('j'));
             assert_eq!(
                 job(press(&mut d, KeyCode::Char(' '))),
@@ -626,7 +637,8 @@ mod tests {
             );
             let fx = press(&mut d, KeyCode::Char('-'));
             assert!(fx.job.is_none() && fx.flash.unwrap().contains("已是默认值"));
-            // 普通的:先填上现在的值,改了存;打字时 q 是字,不是回列表
+            // A plain one: pre-filled with the current value, saved after editing; while typing, q is a character, not back
+            // to the list
             press(&mut d, KeyCode::Char('j'));
             press(&mut d, KeyCode::Enter);
             assert!(text(&d, 84, true).contains("> aca▏"));
@@ -653,14 +665,14 @@ mod tests {
             press(&mut d, KeyCode::Char('j'));
             press(&mut d, KeyCode::Enter);
             assert!(d.typing() && text(&d, 84, true).contains("为「挂载」按下一个键") && d.keys() == [("Esc", "取消")]);
-            // Esc:不换,也不用说
+            // Esc: no change, nothing to say
             let fx = press(&mut d, KeyCode::Esc);
             assert!(fx.job.is_none() && fx.flash.is_none() && !d.typing());
             press(&mut d, KeyCode::Enter);
             assert_eq!(job(press(&mut d, KeyCode::Char('q'))), Some(Act::Key("aca.tailnet".into(), "mounts".into(), Some("q".into()))));
             assert_eq!(job(press(&mut d, KeyCode::Backspace)), Some(Act::Key("aca.tailnet".into(), "mounts".into(), Some(String::new()))));
             assert_eq!(job(press(&mut d, KeyCode::Char('-'))), Some(Act::Key("aca.tailnet".into(), "mounts".into(), None)));
-            // Esc 回列表;重读同一个插件高亮还在原来那行
+            // Esc goes back to the list; reloading the same plugin keeps the highlight on the same row
             d.swap(fake("aca.tailnet"));
             assert_eq!(d.keys()[0], ("⏎", "更换按键"));
             assert_eq!(d.on_key(KeyEvent::from(KeyCode::Esc), &mut Fx::default()), Back::Leave);

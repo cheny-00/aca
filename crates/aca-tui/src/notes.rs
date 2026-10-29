@@ -1,9 +1,13 @@
-//! 便签:写给某个会话的下一句话,平时就是便签;按 `E`(桌面 kitty 里 Shift+Enter 也行)进去时才填进它的输入框
-//! (不发送),填完就删 —— 像 Claude Code 的 stash。
-//! 存在 ~/.local/state/aca/ui/notes(JSON)。
-//! 按会话的键记(登记的是它的 id,改名、重启都不变;普通 tmux 会话是会话名)。
-//! 分组也有一条(停在分组上 `e`):记这一组整体的想法,不填进哪个会话;组改名跟着改,删组时跟着进回收站。
-//! 和置顶一样,每次刷新都重读,改之前先重读,手机和桌面各开一个 aca 不会互相覆盖。
+//! Notes: the next thing to say to a session, otherwise just a note; only when you go in with `E` (Shift+Enter works too in
+//! kitty on the desktop) is it filled into the session's input box
+//! (not sent), then deleted: like Claude Code's stash.
+//! Stored in ~/.local/state/aca/ui/notes (JSON).
+//! Keyed by the session's key (for registered ones their id, unchanged by renames and restarts; for plain tmux sessions the
+//! session name).
+//! A group can have one too (`e` on a group): thoughts on the group as a whole, not filled into any session; it follows the
+//! group's renames and goes to the trash along with the group when it's deleted.
+//! Like pins, reread on every refresh and before every change, so an aca open on the phone and one on the desktop don't
+//! overwrite each other.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -16,19 +20,20 @@ use crate::state::{state_file, write_atomic};
 
 #[derive(Default)]
 pub struct Notes {
-    /// None = 只在内存里(单元测试、--snapshot)
+    /// None = in memory only (unit tests, --snapshot)
     path: Option<PathBuf>,
     map: BTreeMap<String, String>,
 }
 
-/// 会话记在哪个键下
+/// The key a session is stored under
 pub fn key(s: &Session) -> String {
     if s.deck_id.is_empty() { format!("tmux:{}", s.name) } else { s.deck_id.clone() }
 }
 
 const GROUP: &str = "group:";
 
-/// 分组记在哪个键下(界面里 terms / glances 按分组记的也用它)。tmux 会话名里没有「:」,和会话的撞不上
+/// The key a group is stored under (the interface's per-group terms / glances use it too). tmux session names never contain
+/// `:`, so it can't clash with a session's
 pub fn group_key(g: &str) -> String {
     format!("{GROUP}{g}")
 }
@@ -48,7 +53,7 @@ impl Notes {
         n
     }
 
-    /// 读完就和文件断开,之后的改动只在内存里
+    /// Cut loose from the file after reading; later changes stay in memory only
     pub fn detached(mut self) -> Self {
         self.path = None;
         self
@@ -63,7 +68,7 @@ impl Notes {
         self.map.get(key).map(String::as_str)
     }
 
-    /// 存便签;只剩空白 = 删掉
+    /// Save a note; nothing but whitespace = delete it
     pub fn set(&mut self, key: &str, text: &str) -> std::io::Result<()> {
         self.reload();
         if text.trim().is_empty() {
@@ -74,7 +79,7 @@ impl Notes {
         self.save()
     }
 
-    /// 分组 from 改名成 to:它和子分组的便签跟过去(登记表那边改成了才调)
+    /// Group from renamed to to: its notes and its subgroups' follow (called only once the registry rename succeeded)
     pub fn rename_group(&mut self, from: &str, to: &str) -> std::io::Result<()> {
         let (from, to) = (from.trim_matches('/'), to.trim_matches('/'));
         self.reload();
@@ -94,7 +99,7 @@ impl Notes {
         self.save()
     }
 
-    /// 填进会话之后删掉
+    /// Delete it once it's filled into the session
     pub fn take(&mut self, key: &str) -> std::io::Result<Option<String>> {
         self.reload();
         let t = self.map.remove(key);
@@ -110,31 +115,32 @@ impl Notes {
     }
 }
 
-/// ^G 用的编辑器:$VISUAL → $EDITOR → vi(可以带参数,比如 `code -w`)
+/// The editor for ^G: $VISUAL → $EDITOR → vi (may carry arguments, e.g. `code -w`)
 pub(crate) fn editor() -> String {
     ["VISUAL", "EDITOR"].iter().filter_map(|k| std::env::var(k).ok()).find(|v| !v.trim().is_empty()).unwrap_or_else(|| "vi".into())
 }
 
-/// 底栏提示里写的编辑器名字
+/// The editor name written in the bottom bar hint
 pub fn editor_name() -> String {
     let e = editor();
     let first = e.split_whitespace().next().unwrap_or("vi");
     first.rsplit('/').next().unwrap_or(first).to_string()
 }
 
-/// ^G:交给编辑器写,返回写完的内容(去掉结尾的换行)。编辑器没正常退出(比如 nvim 的 `:cq`)= 不算数
+/// ^G: let the editor write it; returns the result (trailing newlines stripped). The editor not exiting cleanly (e.g. nvim's
+/// `:cq`) = doesn't count
 pub fn edit_in_editor(text: &str) -> Result<String, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = std::env::temp_dir().join(format!("aca-note-{}.md", std::process::id()));
     let write = |p: &PathBuf| -> std::io::Result<()> {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)?;
-        // 空的就给空文件,不然编辑器里开头多一个空行
+        // Empty gives an empty file, otherwise the editor starts with an extra blank line
         f.write_all(if text.is_empty() { String::new() } else { format!("{text}\n") }.as_bytes())
     };
     write(&path).map_err(|e| tr!("无法写入临时文件:{e}", "can't write the temp file: {e}"))?;
     let ed = editor();
-    // 交给 sh:$EDITOR 可以带参数
+    // Through sh: $EDITOR may carry arguments
     let st = Command::new("sh").arg("-c").arg(format!("{ed} \"$1\"")).arg("sh").arg(&path).status();
     let got = std::fs::read_to_string(&path);
     let _ = std::fs::remove_file(&path);
@@ -156,7 +162,7 @@ mod tests {
         let mut phone = Notes::open(Some(path.clone()));
         let mut desk = Notes::open(Some(path.clone()));
         phone.set("a", "下一步:补测试\n再跑一遍").unwrap();
-        desk.set("b", "看看 CI").unwrap(); // 写之前重读,a 不丢
+        desk.set("b", "看看 CI").unwrap(); // rereads before writing, a isn't lost
         let fresh = Notes::open(Some(path.clone()));
         assert_eq!(fresh.get("a"), Some("下一步:补测试\n再跑一遍"));
         assert_eq!(fresh.get("b"), Some("看看 CI"));

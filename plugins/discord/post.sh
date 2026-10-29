@@ -1,11 +1,13 @@
 #!/bin/sh
-# aca.discord:事件来了往频道发一条。地址是设置 url(ACA_SETTING_URL);有人正连着这个会话就不发;派出去的 worker 看设置 workers。
+# aca.discord: post one message to the channel per event. The address is the url setting (ACA_SETTING_URL); nothing is posted
+# while someone is attached to the session; for workers that were sent out, see the workers setting.
 url="$ACA_SETTING_URL"
 [ -n "$url" ] || { echo "aca.discord: no url set (aca plugin setting aca.discord url <webhook>)"; exit 0; }
 for c in curl jq; do
   command -v "$c" >/dev/null 2>&1 || { echo "aca.discord: needs $c"; exit 0; }
 done
-# post 标题 正文 [@谁]:Discord 一条最多 2000 字,正文截短;只许 @ 设置里的那个人
+# post TITLE BODY [@WHO]: a Discord message holds at most 2000 characters, so the body is cut short; only the person in the
+# settings may be @-mentioned
 post() {
   body=$(jq -n --arg t "$1" --arg b "$2" --arg m "$3" --arg u "${ACA_SETTING_USERNAME:-aca}" '{
     username: $u,

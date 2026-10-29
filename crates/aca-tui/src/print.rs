@@ -1,9 +1,11 @@
-//! 命令行打出来的东西在终端里的样子(cat → bat 那样):`aca ls` / `show` / `output` / `help` / `names` / `group ls`
-//! 照界面的配色上色、按列对齐,回复照 Markdown 排、代码按语言上色(和界面里看记录是同一套:`trace::md`、`hl`)。
+//! How the command line's output looks in a terminal (like cat → bat): `aca ls` / `show` / `output` / `help` / `names` /
+//! `group ls` are colored with the interface's theme and aligned in columns, replies laid out as Markdown, code colored by
+//! language (the same machinery as reading a record in the interface: `trace::md`, `hl`).
 //!
-//! 只在标准输出是终端时这么打:这里每个函数返回 true = 打了;false = 不是终端,没管,调用的地方照原样打
-//! (cli.rs 里原来那几行字,一个字不变)。脚本、agent 读的是那一份,给程序读的仍然是 `--json`。
-//! 设了 `NO_COLOR` 的终端里照样排,只是不带颜色。
+//! Only printed this way when stdout is a terminal: each function here returns true = printed; false = not a terminal, left
+//! alone, and the caller prints as before (the original lines in cli.rs, unchanged to the letter). Scripts and agents read that
+//! version; for programs it's still `--json`.
+//! In a terminal with `NO_COLOR` set it's laid out the same, just without color.
 
 use std::io::{IsTerminal, Write};
 
@@ -21,12 +23,12 @@ use crate::ansi::Styled;
 use crate::trace::{self, seg};
 use crate::{create, data, hl, theme, ui};
 
-/// 标准输出是终端 = 人在看
+/// stdout is a terminal = a person is looking
 fn human() -> bool {
     std::io::stdout().is_terminal()
 }
 
-/// 带不带颜色:设了 NO_COLOR(不空)、终端是 dumb 的不带
+/// Whether to color: not when NO_COLOR is set (non-empty) or the terminal is dumb
 fn colored(no_color: Option<&str>, term: Option<&str>) -> bool {
     no_color.is_none_or(str::is_empty) && term != Some("dumb")
 }
@@ -35,7 +37,7 @@ fn color() -> bool {
     colored(std::env::var("NO_COLOR").ok().as_deref(), std::env::var("TERM").ok().as_deref())
 }
 
-/// 终端多宽(问不到照 COLUMNS,再不行 80)
+/// Terminal width (COLUMNS if it can't be queried, else 80)
 fn width() -> usize {
     ratatui::crossterm::terminal::size()
         .ok()
@@ -50,7 +52,7 @@ fn put(lines: &[Styled]) {
     let mut out = std::io::stdout().lock();
     for l in lines {
         let s: String = l.iter().map(|x| if color { crate::ansi(&x.text, x.style) } else { x.text.clone() }).collect();
-        // 终端关了、接到提前退出的翻页器里:安静退出,别 panic
+        // Terminal closed, or piped into a pager that quit early: exit quietly, don't panic
         if writeln!(out, "{}", s.trim_end()).is_err() {
             return;
         }
@@ -65,7 +67,7 @@ fn bold() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
 
-/// 多久:12秒 / 3分 / 5时 / 2天
+/// How long: 12s / 3m / 5h / 2d
 pub fn age(sec: u64) -> String {
     match sec {
         0..60 => tr!("{sec}秒", "{sec}s"),
@@ -75,7 +77,7 @@ pub fn age(sec: u64) -> String {
     }
 }
 
-/// 状态图标的颜色(和界面的列表一套,见 `ui::icon`)和它的叫法
+/// A state icon's color (same as the interface's list, see `ui::icon`) and its name
 fn state(s: State) -> (Style, &'static str) {
     let p = theme::pal();
     let strong = |c| Style::new().fg(c).add_modifier(Modifier::BOLD);
@@ -89,8 +91,10 @@ fn state(s: State) -> (Style, &'static str) {
     }
 }
 
-/// 「工具:账号」:账号照哪一家上色(Claude 橙、Codex 蓝,见 theme.rs),前面的工具名是次要的字;没写账号的只有工具名。
-/// `brief` = 只打账号(和界面的列表一样靠颜色认哪一家):终端窄、标题放不下时用
+/// "tool:account": the account colored by its agent (Claude orange, Codex blue, see theme.rs), the tool name before it in the
+/// minor color; with no account, just the tool name.
+/// `brief` = print only the account (the color tells which agent, as in the interface's list): for a narrow terminal where
+/// titles don't fit
 fn who(cfg: &Config, tool: &str, account: &str, brief: bool) -> Styled {
     let st = ui::agent_style(data::agent_of_tool(cfg, tool));
     let name = seg(aca_core::agent::account_label(account), st);
@@ -109,8 +113,10 @@ fn spaces(n: usize) -> crate::ansi::Seg {
     text(" ".repeat(n))
 }
 
-/// 一个 id 打哪一截、其中开头几位就够敲。打前 8 位(这样还和别的分不开就打到分得开);够敲的 = 和登记着的别的 id
-/// 都分得开的那几位(`all` 连归档的:`aca show 12` 是照开头在全部里找的),至少 2 位,免得新建一个会话就不够了
+/// Which part of an id to print, and how many leading characters are enough to type. Print the first 8 (or more, until it's
+/// told apart from the others); enough to type = the characters that tell it apart from every other registered id (`all`
+/// includes archived ones: `aca show 12` looks the prefix up among them all), at least 2, so one new session doesn't make it
+/// too few
 fn short(id: &str, all: &[String]) -> (String, usize) {
     let n = id.chars().count();
     let same = |o: &String| o.chars().zip(id.chars()).take_while(|(a, b)| a == b).count();
@@ -119,7 +125,7 @@ fn short(id: &str, all: &[String]) -> (String, usize) {
     (id.chars().take(lit.max(8).min(n)).collect(), lit)
 }
 
-/// 登记着的全部 id(连归档的);读不出来就只跟列出来的这些比
+/// All registered ids (archived included); if they can't be read, compare only with the ones listed
 fn all_ids(store: &Store, rows: &[Row]) -> Vec<String> {
     match store.sessions(true) {
         Ok(v) if !v.is_empty() => v.into_iter().map(|s| s.id).collect(),
@@ -127,7 +133,7 @@ fn all_ids(store: &Store, rows: &[Row]) -> Vec<String> {
     }
 }
 
-/// id 那一格:够敲的那几位照常,后面的淡下去,补到 w 格
+/// The id cell: the characters enough to type as usual, the rest faint, padded to w columns
 fn id_cell((shown, lit): &(String, usize), w: usize) -> Styled {
     let head: String = shown.chars().take(*lit).collect();
     let tail: String = shown.chars().skip(*lit).collect();
@@ -135,10 +141,11 @@ fn id_cell((shown, lit): &(String, usize), w: usize) -> Styled {
     vec![seg(head, bold()), seg(format!("{tail}{}", " ".repeat(pad)), theme::faint())]
 }
 
-/// 标题那一列至少留这么宽(终端再窄就让它折行)
+/// Keep the title column at least this wide (if the terminal is narrower still, let it wrap)
 const TITLE_MIN: usize = 12;
 
-/// `aca ls`:一组一段,组名后面是个数;一行 = 状态、id、标题、工具:账号、多久没动,各成一列;最底下一行总数
+/// `aca ls`: one block per group, the count after the group name; one row = state, id, title, tool:account, how long idle,
+/// each its own column; totals on the last line
 fn list(cfg: &Config, rows: &[Row], all: &[String], w: usize, now: u64) -> Vec<Styled> {
     if rows.is_empty() {
         return vec![vec![seg(
@@ -156,8 +163,8 @@ fn list(cfg: &Config, rows: &[Row], all: &[String], w: usize, now: u64) -> Vec<S
     let idw = most(&mut ids.iter().map(|i| i.0.width()));
     let agew = most(&mut ages.iter().map(|a| a.width()));
     let longest = most(&mut rows.iter().map(|r| r.title.width()));
-    // 「  ● id  标题  工具:账号  多久 [挂的字]」:标题照最长的那个。一行放不下(手机上):先不打工具名、只留账号,
-    // 还放不下再把标题截到终端的宽度
+    // "  ● id  title  tool:account  age [tags]": titles as wide as the longest. If a row doesn't fit (on a phone): first drop
+    // the tool name and keep only the account; if it still doesn't fit, cut titles to the terminal width
     let fit = |brief: bool| {
         let whos: Vec<Styled> = rows.iter().map(|r| who(cfg, &r.tool, &r.account, brief)).collect();
         let whow = most(&mut whos.iter().map(wide));
@@ -175,7 +182,7 @@ fn list(cfg: &Config, rows: &[Row], all: &[String], w: usize, now: u64) -> Vec<S
             out.push(vec![seg(name, bold()), seg(format!("  {n}"), theme::minor())]);
             group = Some(&r.group);
         }
-        // 没在跑的整行淡一档
+        // Not running: the whole row a shade fainter
         let off = matches!(r.state, State::Exited | State::Stopped);
         let mut line = vec![spaces(2), seg(r.glyph(), state(r.state).0), spaces(1)];
         line.extend(id_cell(&ids[i], idw));
@@ -187,7 +194,7 @@ fn list(cfg: &Config, rows: &[Row], all: &[String], w: usize, now: u64) -> Vec<S
         line.push(seg(marks[i].clone(), theme::minor()));
         out.push(line);
         if !r.ask.is_empty() {
-            // 在等你时它问的那句,接在标题底下
+            // When it needs you, its question goes under the title
             let indent = 4 + idw + 2;
             let ask = ui::clip(&trace::clean(&r.ask), w.saturating_sub(indent + 2).max(TITLE_MIN));
             out.push(vec![spaces(indent), seg("└ ", theme::faint()), seg(ask.trim_end(), Style::new().fg(theme::pal().red))]);
@@ -198,7 +205,8 @@ fn list(cfg: &Config, rows: &[Row], all: &[String], w: usize, now: u64) -> Vec<S
     out
 }
 
-/// 最底下那行:一共几个,几个在等你、跑完没看、在跑、出错(列表比一屏长时不用往回翻)
+/// The last line: how many in all, how many need you, unread, running, errored (no scrolling back when the list is longer
+/// than a screen)
 fn summary(rows: &[Row]) -> Styled {
     let mut line = vec![seg(tr!("{} 个会话", "sessions: {}", rows.len()), theme::minor())];
     for s in [State::Ask, State::Unread, State::Running, State::Error] {
@@ -211,16 +219,17 @@ fn summary(rows: &[Row]) -> Styled {
     line
 }
 
-/// 一节的标题:和 `aca cost` 的一样,后面一条线画到 w 格
+/// A section heading: like `aca cost`'s, followed by a rule drawn to w columns
 fn head(title: &str, w: usize) -> Styled {
     let rule = w.saturating_sub(title.width() + 2);
     vec![spaces(1), seg(title, theme::accent().add_modifier(Modifier::BOLD)), seg(format!(" {}", "─".repeat(rule)), theme::faint())]
 }
 
-/// 回复最宽排到这么多格(终端再宽,一行太长也不好读)
+/// Lay replies out at most this wide (however wide the terminal, overly long lines are hard to read)
 const PROSE: usize = 100;
 
-/// 回复照 Markdown 排好、折到 w 格(界面里看记录的那一套);不带颜色时照原样,记号留着
+/// Lay the reply out as Markdown, wrapped to w columns (the interface's record-reading machinery); without color it's left as
+/// is, marks kept
 fn markdown(reply: &str, w: usize, color: bool) -> Vec<Styled> {
     if !color {
         return reply.lines().map(|l| vec![text(trace::clean(l))]).collect();
@@ -228,12 +237,12 @@ fn markdown(reply: &str, w: usize, color: bool) -> Vec<Styled> {
     trace::wrap(&trace::md(reply, Style::new()), w.clamp(20, PROSE))
 }
 
-/// `aca show <id>`:第一行状态和标题,下面一项一行,最后是排好的最后一条回复
+/// `aca show <id>`: state and title on the first line, then one field per line, finally the last reply laid out
 fn card(cfg: &Config, row: &Row, run: &Run, all: &[String], w: usize, now: u64, color: bool) -> Vec<Styled> {
     let (st, word) = state(row.state);
     let word = if row.idle_stopped > 0 { t!("自动停止", "stopped by aca for idling") } else { word };
     let mut out = vec![vec![seg(row.glyph(), st), spaces(1), seg(trace::clean(&row.title), bold())]];
-    // 名字那一栏:中文两个字(4 格)空两格;英文最长的 account 也空两格
+    // The name column: Chinese names are two characters (4 columns) plus two spaces; in English the longest, account, also gets two
     let col: usize = if lang() == Lang::En { 9 } else { 6 };
     let mut field = |name: &str, value: Styled| {
         let mut line = vec![spaces(2), seg(format!("{name}{}", " ".repeat(col.saturating_sub(name.width()))), theme::minor())];
@@ -275,7 +284,8 @@ fn card(cfg: &Config, row: &Row, run: &Run, all: &[String], w: usize, now: u64, 
     out
 }
 
-/// 用法里的一截上色:命令和固定的词是强调色(`strong` 再加粗),`<…>` `[…]` 里的、`--` 后面的是次要的字,`|` `…` 是分隔
+/// Color a piece of usage: commands and fixed words in the accent color (bold too with `strong`), what's inside `<…>` `[…]` and
+/// after `--` in the minor color, `|` `…` as separators
 fn usage(s: &str, strong: bool) -> Styled {
     let lit = if strong { theme::accent().add_modifier(Modifier::BOLD) } else { theme::accent() };
     let mut out: Styled = vec![];
@@ -286,7 +296,7 @@ fn usage(s: &str, strong: bool) -> Styled {
     let (mut depth, mut passed) = (0usize, false);
     let chars: Vec<char> = s.chars().collect();
     for (i, &c) in chars.iter().enumerate() {
-        // 单独的 --:后面是原样交给别人的
+        // A lone --: what follows is handed on to something else as is
         let alone = |at: usize| at == 0 || chars[at - 1] == ' ';
         if depth == 0 && c == '-' && chars.get(i + 1) == Some(&'-') && alone(i) && chars.get(i + 2).is_none_or(|x| *x == ' ') {
             passed = true;
@@ -308,12 +318,12 @@ fn usage(s: &str, strong: bool) -> Styled {
     out
 }
 
-/// 是不是一行用法:`aca`,或者 `aca ` 后面接着命令、选项
+/// Whether a line is usage: `aca`, or `aca ` followed by a command or option
 fn is_usage(l: &str) -> bool {
     l == "aca" || l.strip_prefix("aca ").is_some_and(|r| r.starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '<' | '[' | '-')))
 }
 
-/// 是不是一行 config.toml 的写法:`[表]`、`键 = 值`、`# 注释`
+/// Whether a line is config.toml syntax: `[table]`, `key = value`, `# comment`
 fn is_toml(body: &str) -> bool {
     if body.starts_with('#') {
         return true;
@@ -327,7 +337,8 @@ fn is_toml(body: &str) -> bool {
         && body[key.len()..].starts_with(" = ")
 }
 
-/// 「  名字  说明」那样的一行(缩进两格,名字和说明之间至少隔两格):说明从第几个字节开始
+/// A line like "  name  description" (indented two, at least two spaces between name and description): the byte where the
+/// description starts
 fn gap(l: &str) -> Option<usize> {
     let body = l.strip_prefix("  ").filter(|b| !b.starts_with(' '))?;
     let at = body.find("  ")?;
@@ -335,18 +346,19 @@ fn gap(l: &str) -> Option<usize> {
     (!more.is_empty()).then(|| l.len() - more.len())
 }
 
-/// 名字那一栏最宽这么多格,再宽的当成一句话(里面碰巧有两个空格)
+/// The name column is at most this wide; anything wider is taken as a sentence (that happens to contain two spaces)
 const TERM_MAX: usize = 40;
 
-/// 这一行在 `col` 格的地方分成名字和说明(名字太长、和说明只隔了一格的那行,照同一段别的行的位置分)
+/// Split this line into name and description at column `col` (a line whose name is too long, only one space from its
+/// description, is split where the other lines of the same paragraph are)
 fn split_at_col(l: &str, col: usize) -> Option<usize> {
     l.strip_prefix("  ").filter(|b| !b.starts_with(' '))?;
     let at = l.char_indices().map(|(i, _)| i).find(|i| l[..*i].width() >= col)?;
     (l[..at].width() == col && l[..at].ends_with(' ') && !l[at..].starts_with(' ')).then_some(at)
 }
 
-/// help 的一页上色:用法、小标题、每一项的名字(命令、选项、键)、例子里的命令、config.toml 的写法各有各的颜色。
-/// 字和空格一个不动(本来就是排好的),只上色
+/// Color a help page: usage, subheadings, each item's name (command, option, key), commands in examples, config.toml syntax
+/// each get their own color. Not a letter or space changes (it's already laid out), only color
 fn doc(page: &str) -> Vec<Styled> {
     let lines: Vec<&str> = page.lines().collect();
     let (mut sh, mut toml) = (hl::Hl::for_lang("sh"), hl::Hl::for_lang("toml"));
@@ -377,7 +389,7 @@ fn doc(page: &str) -> Vec<Styled> {
             out.push(vec![]);
             continue;
         }
-        // 一段(空行隔开)里说明从第几格开始:头一个「名字  说明」的行定
+        // The column where descriptions start in a paragraph (separated by blank lines): set by its first "name  description" line
         if col.is_none() {
             col = lines[i..].iter().take_while(|x| !x.trim().is_empty()).find_map(|x| gap(x).map(|at| x[..at].width()));
         }
@@ -388,7 +400,7 @@ fn doc(page: &str) -> Vec<Styled> {
         } else if let Some(rest) = l.strip_prefix("aca — ").filter(|_| i == 0) {
             vec![seg("aca", bold()), text(format!(" — {rest}"))]
         } else if !l.starts_with(' ') {
-            // 小标题:紧跟着的是缩进的行;以句号收尾的是一句话,不算
+            // Subheading: followed by an indented line; one ending in a period is a sentence and doesn't count
             let title = lines.get(i + 1).is_some_and(|n| n.starts_with("  ")) && !l.ends_with(['。', '.']);
             vec![seg(*l, if title { bold() } else { Style::new() })]
         } else if is_toml(body) {
@@ -421,7 +433,7 @@ pub fn show(cfg: &Config, store: &Store, row: &Row, run: &Run) -> bool {
     human()
 }
 
-/// `aca output <id>`:最后一条回复
+/// `aca output <id>`: the last reply
 pub fn reply(reply: &str) -> bool {
     if human() {
         put(&markdown(reply, width(), color()));
@@ -429,7 +441,7 @@ pub fn reply(reply: &str) -> bool {
     human()
 }
 
-/// `aca help`、`aca help <名字>`、`aca <命令> --help`
+/// `aca help`, `aca help <NAME>`, `aca <COMMAND> --help`
 pub fn help(page: &str) -> bool {
     if human() {
         put(&doc(page));
@@ -437,7 +449,7 @@ pub fn help(page: &str) -> bool {
     human()
 }
 
-/// `aca names`:一行一个「工具」或「工具:账号」
+/// `aca names`: one "tool" or "tool:account" per line
 pub fn names(cfg: &Config, names: &[String]) -> bool {
     if human() {
         put(&names
@@ -448,7 +460,7 @@ pub fn names(cfg: &Config, names: &[String]) -> bool {
     human()
 }
 
-/// `aca group ls`:先后、路径、默认目录
+/// `aca group ls`: order, path, default directory
 fn group_lines(groups: &[Group]) -> Vec<Styled> {
     let pathw = groups.iter().map(|g| g.path.width()).max().unwrap_or(0);
     groups
@@ -472,7 +484,7 @@ pub fn groups(groups: &[Group]) -> bool {
     human()
 }
 
-/// `aca account ls`:一行 (claude / codex, 账号, 配置目录)
+/// `aca account ls`: one row per (claude / codex, account, config directory)
 fn account_lines(all: &[(&str, &str, &str)]) -> Vec<Styled> {
     let whos: Vec<Styled> = all.iter().map(|(tool, name, _)| who(&Config::default(), tool, name, false)).collect();
     let w = whos.iter().map(wide).max().unwrap_or(0);
@@ -502,7 +514,7 @@ mod tests {
         lines.iter().map(plain).collect::<Vec<_>>().join("\n")
     }
 
-    /// 这一行里写着 `what` 的那一段是什么样式
+    /// The style of the segment in this line containing `what`
     fn style_of(l: &Styled, what: &str) -> Style {
         l.iter().find(|x| x.text.contains(what)).unwrap_or_else(|| panic!("没有 {what}:{}", plain(l))).style
     }
@@ -535,7 +547,7 @@ mod tests {
         }
     }
 
-    /// 测试里的「现在」
+    /// "Now" in the tests
     const NOW: u64 = 10_000_000;
 
     fn ids(rows: &[Row]) -> Vec<String> {
@@ -554,14 +566,14 @@ mod tests {
     fn an_id_shows_eight_letters_and_lights_the_ones_you_need_to_type() {
         let all: Vec<String> =
             ["887f90d1", "88aa0000-1790000000", "c6eaa5b3-1791295731", "c6eaa5b3-1791295999", "ab"].map(String::from).to_vec();
-        // 和另一个只共开头两位:三位够了
+        // Shares only its first two characters with another: three are enough
         assert_eq!(short("887f90d1", &all), ("887f90d1".to_string(), 3));
-        // 没有像的:也至少两位;长的 id 只打前 8 位
+        // Nothing similar: still at least two; a long id prints only its first 8
         assert_eq!(short("ab", &all), ("ab".to_string(), 2));
         assert_eq!(short("88aa0000-1790000000", &all), ("88aa0000".to_string(), 3));
-        // 前 8 位分不开的:打到分得开
+        // Can't be told apart in the first 8: print until it can
         assert_eq!(short("c6eaa5b3-1791295731", &all), ("c6eaa5b3-1791295731".chars().take(17).collect(), 17));
-        // 归档的不在列表里,也要和它分开(`all` 里有)
+        // An archived one isn't in the list but must be told apart too (it's in `all`)
         assert_eq!(short("887f90d1", &["887f90d1".to_string()]), ("887f90d1".to_string(), 2));
         let cell = id_cell(&short("887f90d1", &all), 10);
         assert_eq!((cell[0].text.as_str(), cell[1].text.as_str()), ("887", "f90d1  "));
@@ -577,7 +589,7 @@ mod tests {
             row("44444444", "闲着停的", State::Exited, "", "claude:~/.claude-x", 86400 * 3),
         ];
         rows[1].ask = "Allow Bash(rm -rf)?".into();
-        // 闲着被 aca 停掉的画 ☾,和人停的 ■ 分开
+        // One aca stopped for idling is drawn ☾, apart from ■ stopped by a person
         rows[3].idle_stopped = NOW - 3600;
         rows[1].tokens.insert("pr".into(), "#12".into());
         let out = list(&Config::default(), &rows, &ids(&rows), 100, NOW);
@@ -594,7 +606,7 @@ mod tests {
              4 个会话 · ◆ 1 等待回应 · ● 1 运行中"
         );
         let p = theme::pal();
-        // 状态、账号的颜色和界面的列表一套;没在跑的标题淡一档
+        // State and account colors match the interface's list; titles of ones not running a shade fainter
         assert_eq!(style_of(&out[1], "●").fg, Some(p.green));
         assert_eq!(style_of(&out[2], "◆").fg, Some(p.red));
         assert_eq!(style_of(&out[1], "sub").fg, Some(p.claude));
@@ -613,18 +625,18 @@ mod tests {
             row("22222222", "短的", State::Idle, "g", "codex", 5),
         ];
         let at = |w: usize| list(&Config::default(), &rows, &ids(&rows), w, NOW);
-        // 放得下:工具名和账号都打
+        // Fits: both tool name and account printed
         assert_eq!(plain(&at(65)[1]), "  ○ 11111111  一个很长很长很长很长很长很长的标题  claude:sub  5秒");
-        // 差一点:只留账号(颜色还是那一家的),标题不用截
+        // Just short: only the account kept (still in its agent's color), titles not cut
         let out = at(60);
         assert_eq!(plain(&out[1]), "  ○ 11111111  一个很长很长很长很长很长很长的标题  sub    5秒");
         assert_eq!(plain(&out[2]), "  ○ 22222222  短的                                codex  5秒");
         assert_eq!(style_of(&out[1], "sub").fg, Some(theme::pal().claude));
-        // 再窄:标题截到终端的宽度,一行不折
+        // Narrower: titles cut to the terminal width, no row wraps
         let out = at(46);
         assert!(out.iter().all(|l| plain(l).width() <= 46), "{}", page(&out));
         assert_eq!(plain(&out[1]), "  ○ 11111111  一个很长很长很长很…   sub    5秒");
-        // 窄到没法看:也给标题留几个字(那就让终端折行)
+        // Too narrow to read: still leave a few characters of title (and let the terminal wrap)
         assert_eq!(plain(&at(20)[1]), "  ○ 11111111  一个很长很…   sub    5秒");
     }
 
@@ -658,12 +670,12 @@ mod tests {
              \x20 │ let x = 1;"
         );
         assert_eq!(out[9].iter().map(|x| x.text.width()).sum::<usize>(), 60);
-        // 粗体、行内代码去掉记号换成样式;代码块按语言上色
+        // Bold and inline code lose their marks for styles; code blocks colored by language
         let p = theme::pal();
         assert_eq!(style_of(&out[12], "原因"), bold());
         assert_eq!(style_of(&out[12], "session"), theme::accent());
         assert_eq!(style_of(&out[14], "let").fg, Some(p.syn_kw));
-        // 在跑的写跑了多久;在等你的多一行它问的;没起来的写明白
+        // A running one says how long it's run; one that needs you gets an extra line with its question; one not started says so
         let mut r = row("887f90d1", "t", State::Running, "", "shell", 0);
         (r.ran, r.ask) = (125, "选哪个?".into());
         let out = card(&Config::default(), &r, &Run::default(), &[], 60, NOW, true);
@@ -678,7 +690,7 @@ mod tests {
         let reply = "- **原因**:`x`\n\x1b[31m红\x1b[0m";
         assert_eq!(page(&markdown(reply, 80, false)), "- **原因**:`x`\n红");
         assert_eq!(page(&markdown(reply, 80, true)), "• 原因:x\n红");
-        // 太长的行折到终端的宽度,最宽 PROSE 格
+        // Overly long lines wrap at the terminal width, PROSE columns at most
         let long = "word ".repeat(60);
         assert!(markdown(&long, 40, true).iter().all(|l| plain(l).width() <= 40));
         assert!(markdown(&long, 400, true).iter().all(|l| plain(l).width() <= PROSE));
@@ -712,25 +724,26 @@ mod tests {
     fn a_help_page_keeps_every_letter_and_colors_by_what_a_line_is() {
         let text = "aca new <工具[:账号]> [目录] [-- 参数…]\naca new --hold\n\n新建会话并启动\n\n  工具[:账号]      认哪些名字:aca names\n                   不写账号用默认的\n  --as 工具[:账号] 照这个登记\n  --hold           只登记  不启动\n\n例:\n  aca new claude -g .            # 当前目录\n  aca new codex . -- --search\n\n不带参数是一张表。\n  ↑↓ 挑账号 · ←→ 换接法\n\n工具\n  [tools.claude]                   # 默认值\n  account = \"sub\"\n  没登记的目录不用写在这:aca new codex:~/.x";
         let out = doc(text);
-        // 一个字、一个空格都不动
+        // Not a letter or a space changes
         assert_eq!(page(&out), text);
         let p = theme::pal();
         let strong = theme::accent().add_modifier(Modifier::BOLD);
-        // 用法:命令加粗的强调色,要填的是次要的字
+        // Usage: commands in bold accent, what you fill in in the minor color
         assert_eq!((style_of(&out[0], "aca new"), style_of(&out[0], "目录")), (strong, theme::minor()));
         assert_eq!(style_of(&out[1], "--hold"), strong);
         assert_eq!(style_of(&out[3], "新建"), Style::new());
-        // 一项一行:名字上色,说明照常;折下来的那行、名字太长只隔一格的那行也分得对
+        // One item per line: name colored, description plain; the wrapped line, and the line whose too-long name is one space
+        // from its description, split right too
         assert_eq!((style_of(&out[5], "工具"), style_of(&out[5], "认哪些")), (theme::accent(), Style::new()));
         assert_eq!(out[6].len(), 1);
         assert_eq!((style_of(&out[7], "--as"), style_of(&out[7], "照这个")), (theme::accent(), Style::new()));
         assert_eq!((style_of(&out[8], "--hold"), style_of(&out[8], "只登记  不启动")), (theme::accent(), Style::new()));
-        // 小标题加粗;一句话后面跟着缩进的行不算小标题
+        // Subheadings bold; a sentence followed by indented lines isn't a subheading
         assert_eq!(style_of(&out[10], "例"), bold());
         assert_eq!(style_of(&out[17], "工具"), bold());
         assert_eq!(style_of(&out[14], "不带参数"), Style::new());
         assert_eq!(out[15].len(), 1);
-        // 例子按 shell 上色,config.toml 的写法按 TOML;夹在里面的一句话不上色
+        // Examples colored as shell, config.toml syntax as TOML; a sentence in between isn't colored
         assert_eq!(style_of(&out[11], "# 当前目录").fg, Some(p.syn_com));
         assert_eq!(style_of(&out[11], "aca").fg, Some(p.syn_fn));
         assert_eq!(style_of(&out[18], "# 默认值").fg, Some(p.syn_com));
@@ -765,7 +778,7 @@ mod tests {
         let accounts = account_lines(&[("claude", "sub", "~/.claude-sub"), ("codex", "labs", "~/.labs")]);
         assert_eq!(page(&accounts), "claude:sub  ~/.claude-sub\ncodex:labs  ~/.labs");
         assert_eq!(style_of(&accounts[1], "labs").fg, Some(theme::pal().codex));
-        // 没写账号的只有工具名,照它那一家的颜色;shell 不上色
+        // No account: just the tool name, in its agent's color; shell isn't colored
         assert_eq!(who(&cfg, "claude", "", false)[0].style.fg, Some(theme::pal().claude));
         assert_eq!(who(&cfg, "shell", "", true), vec![text("shell")]);
     }

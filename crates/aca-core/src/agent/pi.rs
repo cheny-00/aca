@@ -1,13 +1,18 @@
-//! pi(earendil-works/pi)。hook 用 `-e <扩展>` 在启动时带进去:扩展是旁边的 `pi_ext.ts`,写进 `state/hooks/`,
-//! 它把 pi 的事件换成 hook 协议的形状报给 `aca hook pi`。对话 id 能在启动参数里指定(`--session-id`),和 Claude 一样登记时就定下来。
+//! pi (earendil-works/pi). Hooks are passed at startup with `-e <extension>`: the extension is the `pi_ext.ts` next to this
+//! file, written into `state/hooks/`, which turns pi's events into hook-protocol shape and reports them to `aca hook pi`.
+//! The conversation id can be set as a startup argument (`--session-id`), so like Claude it's fixed at registration.
 //!
-//! 1.3.0 上实测:
-//! - `--session-id <id>`:有这段就接着,没有就用这个 id 新开。只在当前目录的那个项目里找,换了目录会用同一个 id 新开一段
-//! - `--fork <id> --session-id <新 id>`:分叉成新的一段(名字也带过去)
-//! - 上游出错它自己重试(3 次),每试一次都有一个 `agent_end`,`agent_settled` 才是真的结束;Esc 打断它报 `aborted`
-//! - 没有自带的权限框;装了权限类扩展的,一轮里弹的框报成「在等你」
-//! - 不自己起标题。`/name` 起的名字它报上来,也写在窗格标题里(`π - <名字> - <目录>`)
-//! - 进程名就是 `pi`
+//! Tested on 1.3.0:
+//! - `--session-id <id>`: resumes it if it exists, else starts a new one with this id. Only searches the project of the
+//!   current directory; in another directory it starts a new one with the same id
+//! - `--fork <id> --session-id <new id>`: forks into a new one (the name carries over too)
+//! - On upstream errors it retries itself (3 times), with an `agent_end` per attempt; `agent_settled` is the real end; an
+//!   Esc interrupt is reported as `aborted`
+//! - No built-in permission prompt; with a permission extension installed, a prompt it pops up during a turn is reported
+//!   as "needs you"
+//! - It doesn't come up with a title itself. A name set with `/name` is reported, and also in the pane title
+//!   (`π - <name> - <directory>`)
+//! - The process name is just `pi`
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -26,7 +31,7 @@ pub struct Pi;
 
 const EXTENSION: &str = include_str!("pi_ext.ts");
 
-/// 在跑时输入框上面那条分隔线:「── ⠹ Working ─────」
+/// The divider above the input box while running: "── ⠹ Working ─────"
 static WORKING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^─+ \S+ Working\b").unwrap());
 
 fn plan(tool: &Tool, s: &Session, how: &How, ext: &str) -> Vec<String> {
@@ -48,7 +53,8 @@ fn plan(tool: &Tool, s: &Session, how: &How, ext: &str) -> Vec<String> {
     argv
 }
 
-/// 接管时不照搬的:接哪段对话的那几个开关、aca 带进去的扩展(起的时候会重新拼)
+/// Not carried over when adopting: the flags saying which conversation to resume, and the extension aca passed in (rebuilt
+/// on start)
 fn not_carried(rest: &[String]) -> usize {
     match rest[0].as_str() {
         "-c" | "--continue" | "-r" | "--resume" => 1,
@@ -57,7 +63,7 @@ fn not_carried(rest: &[String]) -> usize {
     }
 }
 
-/// 窗格标题 `π - 修登录 - api` → `修登录`;没起名字时只有 `π - api`
+/// Pane title `π - 修登录 - api` → `修登录` ("fix login"); with no name it's just `π - api`
 fn pane_title(title: &str) -> Option<String> {
     let rest = title.trim().strip_prefix("π - ")?;
     let (name, _dir) = rest.rsplit_once(" - ")?;
@@ -65,7 +71,7 @@ fn pane_title(title: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// 对话记录里最后一段回复的字:被打断的、出错的那几条不算
+/// The text of the last reply in the conversation record: interrupted and errored ones don't count
 fn last_reply(text: &str) -> Option<String> {
     text.lines().rev().filter(|l| l.contains("\"assistant\"")).find_map(|l| {
         let v: serde_json::Value = serde_json::from_str(l).ok()?;
@@ -92,7 +98,7 @@ impl Agent for Pi {
         Some("~/.pi/agent")
     }
 
-    /// 对话记录 `sessions/--<目录>--/<时刻>_<id>.jsonl`
+    /// The conversation record `sessions/--<directory>--/<time>_<id>.jsonl`
     fn conv_files(&self, home: &Path, conv: &str) -> Vec<PathBuf> {
         if conv.is_empty() || conv.contains('/') {
             return vec![];
@@ -119,7 +125,8 @@ impl Agent for Pi {
         Ok(plan(tool, s, how, &ext.to_string_lossy()))
     }
 
-    /// 开着的插件给的 MCP 服务:一份按内容起名的清单,路径放在 `ACA_PI_MCP` 里,aca 的扩展起来时一个个挂上(只对这一次启动)
+    /// MCP servers from enabled plugins: a list named by its content, its path in `ACA_PI_MCP`, mounted one by one when aca's
+    /// extension starts (for this start only)
     fn env(&self, tool: &Tool, aca: &str, _set: &[(String, String)]) -> Res<Vec<(String, String)>> {
         if tool.mcp.is_empty() {
             return Ok(vec![]);
@@ -131,7 +138,8 @@ impl Agent for Pi {
         Ok(vec![("ACA_PI_MCP".to_string(), file.to_string_lossy().into_owned())])
     }
 
-    /// 对话记录在就接着;分叉出来没说过话的从原来那段重新分;别的用登记的 id 新开(`--session-id` 有就接、没有就新开)
+    /// Resume if the conversation record exists; a fork never talked to forks again from the original; otherwise start with the
+    /// registered id (`--session-id` resumes if it exists, else starts new)
     fn resume(&self, conv: &str, r: &Run) -> How {
         let known = !conv.is_empty() && Path::new(&r.transcript).is_file();
         match (known, r.fork_from.is_empty()) {
@@ -141,7 +149,7 @@ impl Agent for Pi {
         }
     }
 
-    /// hook 报的名字;没报(接管来还没重启的)看窗格标题
+    /// The name the hook reports; if none (adopted, not restarted yet), the pane title
     fn title(&self, r: &Run, pane: &str) -> Option<String> {
         (!r.hook_title.is_empty()).then(|| r.hook_title.clone()).or_else(|| pane_title(pane))
     }
@@ -156,7 +164,7 @@ impl Agent for Pi {
         last_reply(&tail(&r.transcript, 1024 * 1024)?)
     }
 
-    /// Esc 一下就停,扩展报 `Interrupt`
+    /// One Esc stops it; the extension reports `Interrupt`
     fn interrupt_keys(&self) -> Option<&'static [&'static str]> {
         Some(&["Escape"])
     }
@@ -165,12 +173,13 @@ impl Agent for Pi {
         true
     }
 
-    /// `pi -- <那句话>`:起来就发
+    /// `pi -- <message>`: sent once it's up
     fn opening(&self, text: &str) -> Option<Vec<String>> {
         super::opening_after_dashes(text)
     }
 
-    /// 在跑时分隔线上写着 Working。别的(扩展弹的框长什么样不一定)认不出,听 hook 的
+    /// While running the divider says Working. Anything else (an extension's prompt can look different) can't be recognized;
+    /// follow the hook
     fn screen(&self, lines: &[String]) -> Seen {
         let nonempty: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
         let tail = &nonempty[nonempty.len().saturating_sub(8)..];
@@ -201,7 +210,7 @@ mod tests {
             run(&sess("c-2"), How::Fork("c-1".into())),
             "pi --fork c-1 --session-id c-2 -e /st/hooks/pi.ts --thinking high --model fake-1"
         );
-        // 自己定了命令:接在它后面
+        // Its own command: follow it
         let wrapped = Tool { cmd: vec!["/w/pi.sh".into()], ..Default::default() };
         assert_eq!(plan(&wrapped, &sess("c"), &How::Fresh, "/e")[..3], ["/w/pi.sh", "--session-id", "c"]);
     }
@@ -233,7 +242,7 @@ mod tests {
 
     #[test]
     fn the_last_reply_skips_aborted_and_failed_turns() {
-        // 1.3.0 的记录里抓的几行(跑完一轮、被 Esc 打断、上游 400)
+        // A few lines captured from a 1.3.0 record (a finished turn, an Esc interrupt, an upstream 400)
         let log = r#"{"type":"message","id":"7831cf92","parentId":"1fc152b8","message":{"role":"assistant","content":[{"type":"text","text":"the command ran: x\n"}],"stopReason":"stop","errorMessage":null}}
 {"type":"message","id":"8ddfee5a","parentId":"a44f3d2f","message":{"role":"assistant","content":[{"type":"text","text":"slow slow slow "}],"stopReason":"aborted","errorMessage":"Operation aborted"}}
 {"type":"message","id":"ebf2e912","parentId":"7ffb91a6","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"400: {\"message\":\"fake model rejected the request\"}"}}"#;
@@ -247,7 +256,7 @@ mod tests {
         assert_eq!(Pi.screen(&lines(busy)), Seen::Running(0));
         let idle = " ok: hello there friend\n─────────────────────────────────\n─────────────────────────────────\n~/proj (master)\n↑10 ↓5 0.0%/100k (auto)   fake-1\n";
         assert_eq!(Pi.screen(&lines(idle)), Seen::Unsure);
-        // 正文里提到 Working 的不算
+        // Working mentioned in text doesn't count
         assert_eq!(Pi.screen(&lines("I am Working on it\n────\n~/proj\n")), Seen::Unsure);
     }
 

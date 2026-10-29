@@ -1,9 +1,11 @@
-//! gateway 下面的一个 MCP 服务(一个子进程,stdio,一行一个 JSON-RPC)。
+//! One MCP server under the gateway (a child process, stdio, one JSON-RPC message per line).
 //!
-//! 几个连接共用它时:请求编号由 gateway 重新发(谁的请求、原来的编号记在 `pending` 里,回来再换回去);
-//! 握手(initialize)只做一次,工具列表缓存着,它说变了(list_changed)再重新拉;progress 的令牌也换成 gateway 自己的。
-//! 它反过来问的:roots/list 回空的(每会话一份的回那个会话的目录),别的(sampling、elicitation)回「不支持」。
-//! 进程退出了,在等它回答的都回出错;下次有人要再起,连着失败就等一会儿(2、4、8…最多 30 秒),连败 5 次停下不再自己起。
+//! When several connections share it: the gateway issues request ids anew (whose request it is and its original id are kept in
+//! `pending`, and swapped back on reply); the handshake (initialize) happens once, the tool list is cached and fetched again when
+//! it says it changed (list_changed); progress tokens are swapped for the gateway's own too. What it asks in return: roots/list
+//! gets an empty answer (a per-session one gets that session's directory), anything else (sampling, elicitation) gets "not
+//! supported". When the process exits, everything waiting for its answer gets an error; the next one to need it starts it again,
+//! and after consecutive failures it waits a while (2, 4, 8… up to 30 seconds); after 5 failures in a row it stops starting itself.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -22,7 +24,7 @@ use crate::{t, tr};
 
 const PROTOCOL: &str = "2025-11-25";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
-/// 连着失败这么多次就不再自己起(要 `aca plugin gateway restart <名字>` 或者改配置)
+/// After this many failures in a row it no longer starts itself (needs `aca plugin gateway restart <name>` or a config change)
 pub(crate) const GIVE_UP: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,32 +34,32 @@ pub(crate) enum State {
     Failed { msg: String, at: Instant, fails: u32 },
 }
 
-/// 一个在等回答的请求
+/// A request waiting for an answer
 enum Waiter {
-    /// gateway 自己问的(握手、列工具):回答交给等着的那个
+    /// Asked by the gateway itself (handshake, listing tools): the answer goes to whoever is waiting
     Sync(mpsc::Sender<Value>),
-    /// 替某个连接转的:回答换回它原来的编号交给它
+    /// Forwarded for a connection: the answer gets its original id back and goes to it
     Client { client: Weak<Client>, id: Value, started: Instant, tool: String },
 }
 
 pub(crate) struct Down {
     pub spec: Spec,
-    /// 每会话一份的那个会话;共用的是空的
+    /// For a per-session one, that session; empty for shared ones
     pub session: String,
-    /// 每会话一份的:会话的目录(它问 roots 时回这个)
+    /// For a per-session one: the session's directory (the answer when it asks for roots)
     root: String,
     state: Mutex<State>,
     tools: Mutex<Vec<Value>>,
     child: Mutex<Option<Child>>,
     stdin: Mutex<Option<ChildStdin>>,
     pending: Mutex<HashMap<u64, Waiter>>,
-    /// gateway 的 progress 令牌 → (哪个连接, 它原来的令牌)
+    /// The gateway's progress token → (which connection, its original token)
     progress: Mutex<HashMap<String, (Weak<Client>, Value)>>,
     next: AtomicU64,
-    /// 第几次起的:老进程的读线程收尾时别动新进程的状态
+    /// Which start this is: when an old process's reader thread wraps up, it mustn't touch the new process's state
     generation: AtomicU64,
     starting: Mutex<()>,
-    /// 它的工具变了:gateway 去告诉连着的 agent
+    /// Its tools changed: the gateway goes and tells the connected agents
     on_change: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -88,7 +90,7 @@ impl Down {
         self.tools.lock().unwrap().clone()
     }
 
-    /// 在跑就好;没跑起来过、退出了的,起一个(失败过的照退避的时间来)。返回原因
+    /// Fine if it's running; if it never started or exited, start one (one that failed goes by its backoff time). Returns the reason
     pub fn ensure(self: &Arc<Self>) -> Res<()> {
         let _one = self.starting.lock().unwrap();
         match self.state() {
@@ -124,7 +126,7 @@ impl Down {
         if !self.session.is_empty() {
             c.env("ACA_SESSION_ID", &self.session);
         } else {
-            // 共用的:不带哪个会话的身份(调用者在每个请求的 _meta 里)
+            // Shared: carries no session's identity (the caller is in each request's _meta)
             c.env_remove("ACA_SESSION_ID");
         }
         if !self.root.is_empty() {
@@ -158,7 +160,7 @@ impl Down {
         Ok(())
     }
 
-    /// 拉一遍工具列表(分页的接着拉)
+    /// Fetch the tool list once (following pages)
     fn list_tools(&self) -> Res<Vec<Value>> {
         let mut all = vec![];
         let mut cursor: Option<String> = None;
@@ -178,7 +180,7 @@ impl Down {
         Ok(all)
     }
 
-    /// 自己问一句,等回答(最多 [`START_TIMEOUT`])
+    /// Ask it something ourselves and wait for the answer (at most [`START_TIMEOUT`])
     fn request(&self, method: &str, params: Value) -> Res<Value> {
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
@@ -196,10 +198,11 @@ impl Down {
         writeln!(w, "{msg}").and_then(|_| w.flush()).map_err(|e| tr!("无法写入:{e}", "can't write to it: {e}"))
     }
 
-    /// 替连接转一个工具调用(不等:回答来了由读线程交给它)。`params` 里的工具名已经换回它自己的
+    /// Forward a tool call for a connection (no waiting: the reader thread hands it the answer when it comes). The tool name in
+    /// `params` has already been changed back to its own
     pub fn forward(&self, client: &Arc<Client>, id: Value, mut params: Value, tool: &str) {
         let gid = self.next.fetch_add(1, Ordering::SeqCst);
-        // progress 令牌换成 gateway 的,回来再换回去
+        // Swap the progress token for the gateway's, and back again on the way back
         if let Some(tok) = params.pointer("/_meta/progressToken").cloned() {
             let mine = format!("gw-{gid}");
             self.progress.lock().unwrap().insert(mine.clone(), (Arc::downgrade(client), tok));
@@ -215,7 +218,7 @@ impl Down {
         }
     }
 
-    /// 连接说不要了(notifications/cancelled):找到它那条,告诉下面
+    /// The connection says it no longer wants it (notifications/cancelled): find its entry and tell the server below
     pub fn cancel(&self, client: &Arc<Client>, id: &Value) {
         let gid = self.pending.lock().unwrap().iter().find_map(|(g, w)| match w {
             Waiter::Client { client: c, id: i, .. } if i == id && c.upgrade().is_some_and(|c| Arc::ptr_eq(&c, client)) => Some(*g),
@@ -226,7 +229,7 @@ impl Down {
         }
     }
 
-    /// 停掉(下次有人要再起),连败的记录清掉
+    /// Stop it (the next one to need it starts it again), and clear the failure record
     pub fn reset(&self) {
         self.stop_child();
         *self.state.lock().unwrap() = State::Idle;
@@ -252,7 +255,7 @@ impl Down {
         }
     }
 
-    /// 它反过来问的
+    /// What it asks in return
     fn answer(&self, msg: &Value) {
         let id = msg["id"].clone();
         let reply = match msg["method"].as_str().unwrap_or("") {
@@ -268,7 +271,7 @@ impl Down {
     }
 }
 
-/// 读它的标准输出:回答交给等着的,它问的回它,通知照管
+/// Read its standard output: answers go to whoever is waiting, its questions get answered, notifications are handled
 fn read_loop(me: Weak<Down>, out: std::process::ChildStdout, generation: u64) {
     for line in BufReader::new(out).lines() {
         let Ok(line) = line else { break };
@@ -324,7 +327,7 @@ fn read_loop(me: Weak<Down>, out: std::process::ChildStdout, generation: u64) {
             _ => {}
         }
     }
-    // 退出了:这一代的状态记成失败,等着的都回出错
+    // It exited: record this generation's state as failed, and everything waiting gets an error
     let Some(d) = me.upgrade() else { return };
     if d.generation.load(Ordering::SeqCst) == generation {
         let was_ready = d.state() == State::Ready;
@@ -346,7 +349,7 @@ fn read_loop(me: Weak<Down>, out: std::process::ChildStdout, generation: u64) {
     }
 }
 
-/// 一次调用记一行(谁在用、调了什么、多久、成没成):status 和界面从这看
+/// One line per call (who's using it, what was called, how long, whether it worked): status and the interface read from here
 fn log_call(server: &str, tool: &str, session: &str, took: Duration, ok: bool) {
     let line = json!({ "ts": paths::now(), "session": session, "server": server, "tool": tool, "ms": took.as_millis() as u64, "ok": ok });
     let path = calls_log();

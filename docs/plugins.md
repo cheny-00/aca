@@ -401,7 +401,7 @@ One JSON object per line. Common fields: `ts` (milliseconds), `event`, `session`
 | `agent.waiting` | `ask` `kind` (choice / permission / empty = can't tell) `options` (the choices of a multiple-choice question) | waiting for you to confirm or answer |
 | `agent.exited` | `reason` | the agent process exited |
 | `conversation.changed` | `conv` `from` | the conversation id changed (/clear) |
-| `message.sent` | `id` (of this message) `from` `kind` (msg / notice) `what` (what a notice is about; null for other messages) `wake` `text` | a message was put in this session's inbox (`aca msg`, or a notice sent automatically by a worker it dispatched) |
+| `message.sent` | `id` (of this message) `from` `kind` (msg / notice) `what` (what a notice is about; null for other messages) `wake` `text` `at` (when a scheduled one is due, in seconds; null otherwise) | a message was put in this session's inbox (`aca msg`, or a notice sent automatically by a worker it dispatched). A scheduled one (`aca msg --in`) sends this when it's put in; the delivered one waits until it's due |
 | `message.delivered` | `id` `how` (bell / queue / type / wait) | that message reached it |
 | `message.throttled` | `from` `count` `secs` | one session sent messages too often; later ones are stored without waking it |
 | `ask.answered` | `by` (who answered for it; `you` = from outside) `answer` `ask` `kind` (choice / permission; a confirmation shown at startup is `gate`) | `aca answer` answered a confirmation for it |
@@ -517,7 +517,9 @@ load, and linking says to upgrade aca first). Within one version aca only adds t
   from; a fork has no `parent`) `tmux` (the tmux session name) `pane` (the agent's pane) `attached` (how many terminals
   are attached) `conv` (the conversation id) `ask` (the question while it waits for you) `ran` (seconds this turn has
   run) `active` (the last time something happened) `bg` (background tasks) `locked` `created` `order` `tokens` (text set
-  with `meta set`) `idle_stopped` (when aca stopped it for idling, drawn ☾ in the list; 0 otherwise).
+  with `meta set`) `idle_stopped` (when aca stopped it for idling, drawn ☾ in the list; 0 otherwise). `aca show --json`
+  also has `work`: the directory it's really working in (where the agent cd'd to, or the repository of the file it last
+  changed; `dir` when neither is known).
 - `run` in `aca show --json` is aca's own bookkeeping, **not part of the interface**; its fields can change at any time.
 - `aca plugin actions --json`: one command per line, `{"id", "title", "contexts", "args", "expose"}`.
 - Times: an event's `ts` is in milliseconds, everything else in seconds. JSON is printed compactly on one line; read it
@@ -546,7 +548,7 @@ these "built-in", `aca plugin ls` "ships with aca").
 | Plugin | What it gives |
 |---|---|
 | `aca.delegate` | `/aca:delegate` (a slash command in Claude — typing `/dele` completes to it; a skill in Codex): the lead plans, dispatches workers through aca, checks their work and reports; a worker's transient failures are continued automatically. It also brings `/aca:spec`: one change from proposal to archive (`openspec/changes/<slug>/`), each task done through `/aca:delegate`, done only once verified live. Settings: `worker` (who to dispatch to, default `codex`), `language` (which language to answer you in; empty = yours), `say` (what to say for a worker), `max_continue`, `delay` |
-| `aca.core` | aca's core abilities as agent tools (for both agents): `sessions` to look at sessions, `dispatch` to dispatch a worker (under the caller, optionally on a worktree branch), `message` to pass a message, `wait` to wait (up to 240 seconds per call), `answer` to answer for it, `interrupt` to stop it. Only workers the caller dispatched itself can be answered for or stopped |
+| `aca.core` | aca's core abilities as agent tools (for both agents): `sessions` to look at sessions, `dispatch` to dispatch a worker (under the caller, optionally on a worktree branch), `message` to pass a message, `wait` to wait (up to 240 seconds per call), `answer` to answer for it, `interrupt` to stop it, `wakeup` to wake itself later (a scheduled message to itself, `aca msg --in`). Only workers the caller dispatched itself can be answered for or stopped. Codex also gets a `wakeup` skill: end the turn instead of waiting minutes inside it, and have aca wake it to check back |
 | `aca.gateway` | the MCP gateway, see the next section |
 | `aca.remote` | remote tasks, entirely in the plugin's script (sh + jq + curl + ssh): runs a long task on another machine in the background; when it ends, the result arrives as a message in the inbox of the session that sent it. In the `:` menu: `r` sends one, `t` lists them (⏎ copies the command to read its log, `x` cancels, `r` collects now), and an entry to test the server; agents get two tools, `run` and `list`. Callbacks first land on a server that's always on ([jobhook](https://github.com/cheny-00/jobhook)); settings: `url`, `token`. A timer that collects every 5 minutes is on only while something is waiting |
 | `aca.tailnet` | tailnet mounts, entirely in the plugin's script (sh + jq; needs `jq`): `m` in the `:` menu is a list with one `tailscale serve` per row (and whether its target is listening); ⏎ copies the URL, `x` removes it (and says how to add it back), `a` mounts a local port, `p` turns publishing on or off (with tpub installed). Agents can list; mounting a port is `agent?`, given only when you opt in (`aca plugin allow aca.tailnet add`) |

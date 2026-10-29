@@ -1,16 +1,17 @@
-//! 点了桌面通知。kitty 的通知(OSC 99)带 `a=report` 时,点一下 kitty 往发通知的那个窗口回一串
-//! `ESC ] 99 ; i=<id> ; ESC \`。界面正在那个窗口的前台时,这串进的是 aca 的输入:crossterm 不认 OSC,
-//! 拆成 Alt+] 加一个个字符再 Alt+\ —— 不拣出来就是一串按键(`i` `a` `c` 都有用处)。
-//! id 是 `aca-<会话 id>` 的进那个会话;别的只拣掉。界面不在前台(进了会话,前台是 tmux)时由 tmux 的
-//! user-keys 接住,见本机的 notify-jump 插件。
+//! A desktop notification was clicked. When a kitty notification (OSC 99) carries `a=report`, a click makes kitty send
+//! `ESC ] 99 ; i=<id> ; ESC \` back to the window that sent it. When the interface is in that window's foreground, this goes
+//! into aca's input: crossterm doesn't know OSC and splits it into Alt+], the characters one by one, then Alt+\; if not
+//! picked out it's a string of keypresses (`i` `a` `c` all do something).
+//! An id of `aca-<session id>` goes into that session; anything else is just picked out. When the interface isn't in the
+//! foreground (inside a session, tmux is in front) tmux's user-keys catch it, see this machine's notify-jump plugin.
 
 use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
-/// 一串回报最长多少字:再长就不是了,照按键处理
+/// The longest a report can be: anything longer isn't one, handled as keys
 const MAX: usize = 256;
 
-/// 拣出这一批里收了尾的 OSC(`ESC ]` 后面、`ESC \` 或 BEL 前面的那段字),剩下的照旧当按键。
-/// kitty 一次写完一整串,读的时候在同一批里
+/// Pick out the terminated OSCs in this batch (the text after `ESC ]` and before `ESC \` or BEL); the rest stay keys as before.
+/// kitty writes a whole report at once, so it's read in the same batch
 pub fn take(batch: &mut Vec<Event>) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -27,11 +28,11 @@ pub fn take(batch: &mut Vec<Event>) -> Vec<String> {
     out
 }
 
-/// `ESC ]` 后面到收尾的字,和收尾那个在 rest 里的位置
+/// The text after `ESC ]` up to the terminator, and the terminator's position in rest
 fn body(rest: &[Event]) -> Option<(String, usize)> {
     let mut text = String::new();
     for (j, e) in rest.iter().enumerate() {
-        // ST(ESC \,拆出来是 Alt+\)或 BEL(Ctrl+G)
+        // ST (ESC \, split into Alt+\) or BEL (Ctrl+G)
         if is(e, '\\', KeyModifiers::ALT) || is(e, 'g', KeyModifiers::CONTROL) {
             return Some((text, j));
         }
@@ -54,7 +55,8 @@ fn is(e: &Event, c: char, m: KeyModifiers) -> bool {
     matches!(e, Event::Key(k) if k.kind == KeyEventKind::Press && k.code == KeyCode::Char(c) && k.modifiers == m)
 }
 
-/// 点的是哪个会话:`99;i=aca-<id>;`(点在按钮上是 `;1` `;2`,也算)。关掉了、问还在不在(带 `p=`)的不算
+/// Which session was clicked: `99;i=aca-<id>;` (a click on a button is `;1` `;2`, that counts too). Closed, or asking whether
+/// it's still there (with `p=`), doesn't count
 pub fn session(osc: &str) -> Option<&str> {
     let (meta, _) = osc.strip_prefix("99;")?.split_once(';')?;
     let mut id = None;
@@ -73,7 +75,7 @@ mod tests {
     use super::*;
     use ratatui::crossterm::event::KeyEvent;
 
-    /// 字节照 crossterm 的拆法变成事件:ESC 加一个字符 = Alt+它,0x01–0x1A = Ctrl+字母
+    /// Bytes turned into events the way crossterm splits them: ESC plus a character = Alt+it, 0x01-0x1A = Ctrl+letter
     fn events(bytes: &str) -> Vec<Event> {
         let mut out = Vec::new();
         let mut it = bytes.chars();

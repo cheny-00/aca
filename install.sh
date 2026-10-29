@@ -1,16 +1,17 @@
 #!/bin/sh
-# 装 / 升级 aca。只做一件事:把 aca 这一个程序放到 <prefix>/bin/aca。
-# 别的都不装(tmux、Rust、fzf、yazi、lazygit … 缺了只说一声),不改 shell 的配置,不碰你的 tmux.conf。
+# Install / upgrade aca. It does one thing: put the one aca program at <prefix>/bin/aca.
+# Installs nothing else (tmux, Rust, fzf, yazi, lazygit … if missing, it only says so), changes no shell config, and leaves
+# your tmux.conf alone.
 #
 #   curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | sh
-#                                    下载编好的(macOS / Linux,arm64 / x86_64);参数接在 sh -s -- 后面
-#   ./install.sh                     在仓库里:从这份源码编(要 Rust 1.89+),装或者升级
+#                                    downloads a prebuilt one (macOS / Linux, arm64 / x86_64); arguments go after sh -s --
+#   ./install.sh                     in the repo: builds from this source (needs Rust 1.89+), installs or upgrades
 #
-# 参数见下面的 usage。说哪种话和 aca 自己一样:ACA_LANG > config.toml 的 [ui] lang > 英文。
+# Arguments: see usage below. The language is chosen the same way aca chooses it: ACA_LANG > [ui] lang in config.toml > English.
 set -eu
 
 repo=${ACA_REPO:-cheny-00/aca}
-# 测试、镜像用:release 从哪下、源码从哪克隆
+# For tests and mirrors: where releases are downloaded from, where the source is cloned from
 releases=${ACA_RELEASES:-https://github.com/$repo/releases}
 source_url=${ACA_SOURCE:-https://github.com/$repo}
 
@@ -25,7 +26,7 @@ if [ -z "$lang" ] && [ -z "${ACA_HOME:-}" ] && [ -f "$HOME/.config/aca/config.to
   lang=$(sed -n '/^\[ui\]/,/^\[/s/^[[:space:]]*lang[[:space:]]*=[[:space:]]*"\([a-zA-Z]*\).*/\1/p' "$HOME/.config/aca/config.toml" | head -n 1)
 fi
 case $lang in zh*) zh=yes ;; *) zh=no ;; esac
-# say <中文> <english>
+# say <chinese> <english>
 say() { if [ "$zh" = yes ]; then printf '%s\n' "$1"; else printf '%s\n' "$2"; fi; }
 die() { say "$1" "$2" >&2; exit 1; }
 
@@ -96,7 +97,7 @@ need_cargo() {
       "Building from source needs Rust (1.89+): https://rustup.rs — this script won't install it for you."
 }
 
-# fetch <地址> <存成哪个文件>
+# fetch <url> <file to save it as>
 fetch() {
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL --retry 2 -o "$2" "$1"
@@ -107,14 +108,14 @@ fetch() {
   fi
 }
 
-# 编好的是哪一个:<架构>-<系统>,和 release 里的文件名对着
+# Which prebuilt one: <arch>-<os>, matching the file names in the release
 target() {
   os=$(uname -s)
   arch=$(uname -m)
   case $os in
     Darwin)
       os=apple-darwin
-      # Rosetta 里的 shell 报 x86_64:机器是 Apple 芯片就装 arm64 的
+      # A shell under Rosetta reports x86_64: if the machine has Apple silicon, install the arm64 one
       [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ] && arch=arm64
       ;;
     Linux) os=unknown-linux-gnu ;;
@@ -136,7 +137,8 @@ sha256() {
   fi
 }
 
-# 在仓库里跑(./install.sh)就从这份源码编;管道里跑(curl … | sh)没有这个文件,下载编好的
+# Run in the repo (./install.sh): build from this source; run from a pipe (curl … | sh): this file is not there, so download
+# a prebuilt one
 here=
 if [ -f "$0" ]; then
   d=$(cd "$(dirname "$0")" && pwd)
@@ -153,7 +155,7 @@ elif [ "$from_source" = yes ]; then
   tmp=$(mktemp -d)
   say "正在从源码编译,需要几分钟。编译在临时目录中进行;cargo 最后提示把该目录加入 PATH,可以忽略。" \
     "Building from source; this takes a few minutes. It builds in a temporary directory first, so ignore cargo's closing note about adding that directory to PATH."
-  # --root 指到临时目录:cargo 自己记账的那两个文件不落在你的 prefix 里
+  # --root points to a temp directory: the two files cargo keeps its records in do not land in your prefix
   if [ -n "$version" ]; then
     cargo install --git "$source_url" --tag "$version" --locked --root "$tmp" aca
   else
@@ -188,20 +190,21 @@ dest=$prefix/bin/aca
 first=yes
 [ -e "$dest" ] && first=no
 mkdir -p "$prefix/bin"
-# 换名字装:各会话的 hook、状态栏随时在跑这个程序,开着的界面也是它,不能直接往原文件上拷
+# Install under another name, then rename: the hooks and status bars of sessions run this program at any moment, and so does an
+# open UI, so it must not be copied over the original file
 cp "$built" "$dest.new.$$"
 chmod 755 "$dest.new.$$"
 mv -f "$dest.new.$$" "$dest"
 v=$("$dest" --version)
 say "已安装 $v:$dest" "Installed $v at $dest"
 
-# 装过 aca 的 tmux 设置(aca tmux install)的:那份照新的重写,开着的 tmux 也换上
+# If aca tmux settings were installed (aca tmux install): rewrite them from the new build, and load them into the running tmux too
 if [ -e "$HOME/.config/aca/tmux.conf" ] && [ -z "${ACA_HOME:-}" ]; then
   "$dest" tmux install </dev/null >/dev/null &&
     say "已更新 aca 的 tmux 设置(aca help tmux)" "Rewrote aca's tmux settings to match (aca help tmux)"
 fi
 
-# 下面只说、不装。没有 tmux 也装得上,但一个会话都起不了
+# From here on: only report, install nothing. aca installs fine without tmux, but then not a single session can start
 if command -v tmux >/dev/null 2>&1; then
   set -- $(tmux -V | sed 's/[^0-9]*\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/')
   if [ "${1:-0}" -lt 3 ] || { [ "${1:-0}" -eq 3 ] && [ "${2:-0}" -lt 3 ]; }; then
@@ -220,8 +223,8 @@ for tool in git fzf jq yazi lazygit zoxide; do
   command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 if [ -n "$missing" ]; then
-  say "以下可选工具未安装:${missing}。不安装也能使用,只是缺少对应的功能;各自的用途见 README 的「可选的工具」。" \
-    "Optional tools not found:$missing. aca works without them; each one only adds a feature. See \"Optional tools\" in the README."
+  say "以下可选工具未安装:${missing}。不安装也能使用,只是缺少对应的功能;各自的用途见「可选的工具」一节:https://github.com/cheny-00/aca/blob/main/docs/install.zh-CN.md" \
+    "Optional tools not found:$missing. aca works without them; each one only adds a feature. What each adds: https://github.com/cheny-00/aca/blob/main/docs/install.md#optional-tools"
 fi
 case ":$PATH:" in
   *":$prefix/bin:"*) ;;
@@ -239,7 +242,7 @@ elif [ -t 0 ] && [ -t 1 ]; then
   echo
   "$dest" setup
 else
-  # 管道里跑的(curl … | sh):这时的标准输入是脚本本身,表开不了,只说下一步
+  # Run from a pipe (curl … | sh): stdin is the script itself, so the table cannot open; only say the next step
   say "下一步:
   aca setup    可跳过。添加其他账号,选择是否让 aca 显示 Claude 的订阅额度;按 Esc 不做任何修改
   aca          打开界面(按 n 新建会话,按 ? 查看快捷键)" \

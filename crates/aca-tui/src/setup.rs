@@ -1,20 +1,28 @@
-//! `aca setup`:装完之后要定的两样 —— 登记哪些账号、Claude 各账号的状态栏接不接。
+//! `aca setup`: the two things to settle after installing — which accounts to register, and whether each Claude account's
+//! status bar is wired up.
 //!
-//! 在终端里是一张表([`Page`]):一行一个账号,Claude 的账号右边是状态栏的接法,←→ 换;`+` 登记一个账号
-//! (名字 + 配置目录,写的是界面设置页里 `+` 的同一行)。回车才一起办,Esc 什么都不动。
-//! 给了 `--statusline`、或者不在终端里:不开表,所有账号照那一种接 / 只列出来。`aca account add` 是不开表登记账号的写法。
+//! In a terminal it's a table ([`Page`]): one row per account; to the right of a Claude account is how its status bar is wired,
+//! switched with ←→; `+` registers an account (name + config directory; writes the same line as `+` on the UI's settings page).
+//! Nothing happens until Enter; Esc changes nothing.
+//! Given `--statusline`, or not in a terminal: no table; every account is wired that one way / just listed.
+//! `aca account add` is the way to register an account without the table.
 //!
-//! 账号不扫、不猜,只认登记的「名字 = 配置目录」;登录是工具自己的事,这里只把那条命令打出来。
+//! Accounts aren't scanned or guessed: only a registered "name = config directory" counts. Logging in is the tool's own business;
+//! this only prints that command.
 //!
-//! Claude 只在状态栏的输入里给订阅额度,所以要看额度,就得在它每个账号的 settings.json 里把 statusLine 指到 aca。
-//! 三种接法:`aca`(状态栏交给 `aca statusline` 画)、`wrap`(留着你自己的状态栏,前面套一层 `aca limits --` 只记额度)、
-//! `off`(不接;接过的撤掉,恢复成接之前的样子)。
+//! Claude gives subscription quotas only in the status bar's input, so to see quotas, statusLine in the settings.json of each of
+//! its accounts has to point at aca. Three ways to wire it: `aca` (the status bar is drawn by `aca statusline`), `wrap` (keep your
+//! own status bar, with an `aca limits --` layer in front that only records quotas), `off` (not wired; one that was wired is undone,
+//! back to how it was before).
 //!
-//! 改的是别人的配置文件,所以:
-//! - 只换 `statusLine` 那一个值的那一段文字,别的地方一个字节不动(不是读进来再整个写回去:那样键的顺序、缩进都会变);
-//! - 改完先当 JSON 读一遍,除了 statusLine 别的都和原来一样才写,写是先写临时文件再改名;
-//! - 第一次动一个账号时,把它原来的 statusLine 原文记在 `<state>/setup/statusline.json`,`off` 照它恢复;
-//! - 读不懂的(不是 JSON、statusLine 不是带 command 的对象)不碰,告诉你自己加哪一行。
+//! These are someone else's config files, so:
+//! - only the text of the one `statusLine` value is replaced, and no other byte moves (not read in and written back whole:
+//!   that would change key order and indentation);
+//! - after the edit it's read once as JSON, and written only if everything but statusLine is unchanged; writing goes to a temp
+//!   file, then a rename;
+//! - the first time an account is touched, its original statusLine text is recorded in `<state>/setup/statusline.json`,
+//!   and `off` restores from it;
+//! - anything unreadable (not JSON, statusLine not an object with a command) is left alone, and you're told which line to add.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -57,7 +65,7 @@ impl Mode {
         }
     }
 
-    /// 表里写的
+    /// What the table shows
     fn label(self) -> &'static str {
         match self {
             Mode::Aca => t!("aca 的", "aca's"),
@@ -67,23 +75,23 @@ impl Mode {
     }
 }
 
-/// 一个账号的 statusLine 现在是什么
+/// What an account's statusLine is now
 #[derive(Clone, Debug, PartialEq)]
 enum Now {
-    /// 没有 settings.json,或者里面没有 statusLine
+    /// No settings.json, or no statusLine in it
     Nothing,
     /// `aca statusline`
     Aca,
-    /// `aca limits -- <你的命令>`
+    /// `aca limits -- <your command>`
     Wrapped(String),
-    /// 你自己的命令
+    /// Your own command
     Own(String),
 }
 
-/// 接之前的 statusLine 原文,按账号目录记;`None` = 接之前没有
+/// The statusLine text from before wiring, by account directory; `None` = there was none before
 type Saved = BTreeMap<String, Option<String>>;
 
-/// 要写回去的内容,和这次之后「接之前的原文」该记成什么(`None` = 记录不动)
+/// What to write back, and what the "text from before wiring" record should become after this (`None` = record unchanged)
 #[derive(Debug, PartialEq)]
 struct Change {
     text: String,
@@ -91,21 +99,21 @@ struct Change {
     said: String,
 }
 
-/// 读写的那几处(测试里换成临时目录)
+/// The places read and written (temp directories in tests)
 #[derive(Clone, Debug)]
 struct Env {
     /// config.toml
     config: PathBuf,
     home: String,
-    /// 接之前的 statusLine 原文记在哪
+    /// Where the statusLine text from before wiring is recorded
     record: PathBuf,
-    /// 写进 statusLine 的那个程序
+    /// The program written into statusLine
     aca: String,
-    /// 登记着的会话各用的(哪一家, 账号, 标题):`account rm` 删之前看谁在用
+    /// What each registered session uses (agent, account, title): `account rm` checks who uses it before deleting
     sessions: fn() -> Vec<(Agent, String, String)>,
-    /// 问工具这个账号登录着没有(`account status`)
+    /// Ask the tool whether this account is logged in (`account status`)
     ask: fn(Agent, &str) -> accounts::Login,
-    /// 这个程序装了没有(`account status` 只列装着的那家自己的默认)
+    /// Whether this program is installed (`account status` lists only the installed tools' own defaults)
     installed: fn(&str) -> bool,
 }
 
@@ -122,7 +130,7 @@ impl Env {
         }
     }
 
-    /// config.toml 的全文(没有 = 空的)
+    /// The full text of config.toml (none = empty)
     fn text(&self) -> String {
         std::fs::read_to_string(&self.config).unwrap_or_default()
     }
@@ -146,7 +154,7 @@ impl Env {
     }
 }
 
-/// 登记着的会话各用的(哪一家, 账号, 标题;没标题的写目录名)
+/// What each registered session uses (agent, account, title; untitled ones get the directory name)
 pub(crate) fn session_accounts() -> Vec<(Agent, String, String)> {
     let cfg = aca_core::config::load();
     let all = aca_core::store::Store::open().and_then(|s| s.sessions(false)).unwrap_or_default();
@@ -157,7 +165,8 @@ pub(crate) fn session_accounts() -> Vec<(Agent, String, String)> {
     all.into_iter().map(|s| (crate::data::agent_of_tool(&cfg, &s.tool), s.account.clone(), name(&s))).collect()
 }
 
-/// 这个配置目录的 Claude 状态栏现在用谁的(账号页右边那一栏写的,叫法同表里的;要改是这里的表),和 aca 记不记得到额度
+/// Whose Claude status bar this config directory uses now (written in the right-hand column of the accounts page, named as in
+/// the table; the table here is where to change it), and whether aca gets its quotas
 pub(crate) fn bar_of(dir: &Path) -> (&'static str, bool) {
     match read(dir).and_then(|t| now(&t)) {
         Ok(Now::Aca) => (Mode::Aca.label(), true),
@@ -172,8 +181,8 @@ pub fn run(args: &[String]) -> i32 {
     told(setup(args.to_vec()))
 }
 
-/// `aca account [ls]`、`aca account status`、`aca account add <claude | codex> <名字> [目录] [--statusline aca|wrap]`、
-/// `aca account rm <claude | codex> <名字> [--force]`
+/// `aca account [ls]`, `aca account status`, `aca account add <claude | codex> <name> [dir] [--statusline aca|wrap]`,
+/// `aca account rm <claude | codex> <name> [--force]`
 pub fn account(args: &[String]) -> i32 {
     config_warning();
     told(account_cmd(args.to_vec(), &Env::real()))
@@ -186,7 +195,7 @@ fn told(r: Res<i32>) -> i32 {
     })
 }
 
-/// 取出 `--flag 值`;给了 flag 没给值是写错了
+/// Take out `--flag value`; a flag without a value is a mistake
 fn value_of(args: &mut Vec<String>, flag: &str) -> Res<Option<String>> {
     let Some(i) = args.iter().position(|a| a == flag) else { return Ok(None) };
     if i + 1 >= args.len() {
@@ -196,7 +205,7 @@ fn value_of(args: &mut Vec<String>, flag: &str) -> Res<Option<String>> {
     Ok(Some(args.remove(i)))
 }
 
-/// 写坏了的 config.toml 是当成没写的:人敲的命令提醒一句
+/// A broken config.toml is treated as not written: commands someone typed get a one-line reminder
 fn config_warning() {
     if let Some(e) = aca_core::config::problem() {
         eprintln!("{}", tr!("config.toml 有误,已忽略:{e}", "config.toml has a problem and is ignored: {e}"));
@@ -222,7 +231,7 @@ fn setup(mut args: Vec<String>) -> Res<i32> {
     }
 }
 
-/// 在终端里:开那张表,关了之后把办了什么打出来
+/// In a terminal: open the table, and print what was done once it closes
 fn table(env: Env) -> Res<i32> {
     let mut page = Page::load(env, true);
     show(&mut page).map_err(|e| {
@@ -242,7 +251,7 @@ fn table(env: Env) -> Res<i32> {
     Ok(i32::from(report.failed))
 }
 
-/// 不开表:列出 Claude 的账号现在各是什么;给了接法就所有账号照它接
+/// No table: list what each Claude account is now; given a wiring mode, wire every account that way
 fn every(mode: Option<Mode>, env: &Env) -> Res<i32> {
     let dirs = claude_dirs(&env.config(), &env.home);
     println!("{}", tr!("Claude 的状态栏和订阅额度", "Claude's status bar and subscription quotas"));
@@ -269,7 +278,7 @@ fn every(mode: Option<Mode>, env: &Env) -> Res<i32> {
         dirs.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0),
         dirs.iter().map(|(_, d)| env.tilde(d).chars().count()).max().unwrap_or(0),
     );
-    // 读得懂的账号是不是都接了(读不懂的不会去动,不算在里面)
+    // Whether every readable account is wired (unreadable ones are never touched, so they don't count)
     let (mut ours, mut others) = (0, 0);
     for (name, dir) in &dirs {
         let state = read(dir).and_then(|t| now(&t));
@@ -313,7 +322,7 @@ fn every(mode: Option<Mode>, env: &Env) -> Res<i32> {
     for (name, dir) in &dirs {
         match wire(dir, mode, &env.aca, &mut saved) {
             Ok(said) => println!("  {name}:{said}"),
-            // 读不懂的本来就没接过:撤的时候不算没办成
+            // An unreadable one was never wired: when unwiring, it doesn't count as a failure
             Err(e) => {
                 failed |= mode != Mode::Off;
                 println!("{}", tr!("  {name}:未更改({e})", "  {name}: unchanged ({e})"));
@@ -347,7 +356,7 @@ const ACCOUNT_USAGE: Tr = Tr::new(
     "usage: aca account ls\n       aca account status\n       aca account add <claude | codex> <NAME> [DIR] [--statusline aca|wrap]\n       aca account rm <claude | codex> <NAME> [--force]",
 );
 
-/// 命令行上写的哪一家
+/// Which agent the command line names
 fn family(tool: &str) -> Res<Agent> {
     match tool {
         "claude" => Ok(Agent::Claude),
@@ -356,7 +365,7 @@ fn family(tool: &str) -> Res<Agent> {
     }
 }
 
-/// `aca account status` 里一个账号的那句话:目录对不对、登录着没有(问工具自己)
+/// The line for one account in `aca account status`: whether the directory is right, whether it's logged in (asks the tool itself)
 fn account_state(env: &Env, a: &accounts::Account, abs: &str) -> String {
     use accounts::Login;
     if let Some((other, why)) = (!abs.is_empty()).then(|| accounts::foreign(a.agent, abs, &env.home)).flatten() {
@@ -382,7 +391,8 @@ fn account_state(env: &Env, a: &accounts::Account, abs: &str) -> String {
     }
 }
 
-/// `account status` 列的:登记着的,再加上不登记时各家用的那个(账号名空着、目录的完整路径也空着 —— 不查它是不是另一家的)
+/// What `account status` lists: the registered ones, plus the one each agent uses when none is registered (account name empty,
+/// full directory path empty too — not checked for belonging to the other agent)
 fn status_rows(env: &Env) -> Vec<(accounts::Account, String)> {
     let text = env.text();
     let own = accounts::defaults(&text, &env.home, env.installed).into_iter().map(|a| (a, String::new()));
@@ -400,7 +410,7 @@ fn account_cmd(mut args: Vec<String>, env: &Env) -> Res<i32> {
             }
             let cells: Vec<(&str, &str, &str)> =
                 all.iter().map(|a| (accounts::fam(a.agent).unwrap_or("claude"), a.name.as_str(), place(a))).collect();
-            // 终端里上色(print.rs),接到别处照原样
+            // Colored in a terminal (print.rs); as is when piped elsewhere
             if !crate::print::accounts(&cells) {
                 let wide = all.iter().map(|a| spec(a.agent, &a.name).len()).max().unwrap_or(0);
                 all.iter().for_each(|a| println!("{:wide$}  {}", spec(a.agent, &a.name), place(a)));
@@ -482,7 +492,7 @@ fn account_cmd(mut args: Vec<String>, env: &Env) -> Res<i32> {
             }
             Ok(i32::from(failed))
         }
-        // 各账号登录着没有:一个账号一个线程去问它的工具
+        // Whether each account is logged in: one thread per account asks its tool
         Some("status") => {
             if let Some(x) = args.next() {
                 return Err(tr!("account status 不支持 {x}\n{ACCOUNT_USAGE}", "account status doesn't take {x}\n{ACCOUNT_USAGE}"));
@@ -515,7 +525,8 @@ fn account_cmd(mut args: Vec<String>, env: &Env) -> Res<i32> {
             }
             Ok(0)
         }
-        // 只去掉登记那一行;有会话在用、是哪个工具的默认账号的,先说清楚,加 --force 才删
+        // Only remove the registration line; if a session uses it or it's a tool's default account, say so first, and delete only
+        // with --force
         Some("rm") => {
             let mut rest: Vec<String> = args.collect();
             let force = rest.iter().any(|a| a == "--force");
@@ -572,7 +583,8 @@ fn spec(agent: Agent, name: &str) -> String {
     crate::tools::spec(accounts::fam(agent).unwrap_or("claude"), name)
 }
 
-/// 新账号登录要敲的那条(工具自己的登录,aca 只把账号的环境带上):Claude 新目录第一次起来就会走登录
+/// The command to log in a new account (the tool's own login; aca only brings along the account's environment): a new Claude
+/// directory goes to login on its first start
 fn login_hint(agent: Agent, name: &str) -> String {
     format!("aca run {}{}", spec(agent, name), if agent == Agent::Codex { " -- login" } else { "" })
 }
@@ -587,7 +599,8 @@ fn state_said(state: &Res<Now>) -> String {
     }
 }
 
-/// 照 `mode` 改这个目录的 settings.json,记录跟着变;回办了什么(不用动也说一句)
+/// Change this directory's settings.json according to `mode`, updating the record along with it; returns what was done
+/// (a line even when nothing needed doing)
 fn wire(dir: &Path, mode: Mode, aca: &str, saved: &mut Saved) -> Res<String> {
     let key = dir.to_string_lossy().into_owned();
     let text = read(dir)?;
@@ -609,14 +622,15 @@ fn wire(dir: &Path, mode: Mode, aca: &str, saved: &mut Saved) -> Res<String> {
     Ok(change.said)
 }
 
-/// 写进 statusLine 的那个程序:现在跑着的这个 aca 的完整路径(路径里有空格、引号的加引号)
+/// The program written into statusLine: the full path of the aca running now (quoted if the path has spaces or quotes)
 fn program() -> String {
     let exe = aca_core::agent::self_exe();
     let plain = exe.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+@".contains(&b));
     if plain { exe } else { format!("'{}'", exe.replace('\'', "'\\''")) }
 }
 
-/// Claude 的配置目录:(名字, 目录)。登记的账号在前,`~/.claude` 没登记的话排最后;目录不在的不算
+/// Claude config directories: (name, directory). Registered accounts first; `~/.claude` last if it isn't registered;
+/// missing directories don't count
 fn claude_dirs(cfg: &Config, home: &str) -> Vec<(String, PathBuf)> {
     let registered =
         cfg.accounts.get("claude").into_iter().flatten().filter(|(_, a)| !a.home.is_empty()).map(|(n, a)| (n.clone(), a.home.clone()));
@@ -630,7 +644,7 @@ fn claude_dirs(cfg: &Config, home: &str) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// settings.json 的原文;没有这个文件 = 空对象
+/// settings.json's text; no such file = an empty object
 fn read(dir: &Path) -> Res<String> {
     match std::fs::read_to_string(dir.join("settings.json")) {
         Ok(t) => Ok(t),
@@ -639,7 +653,8 @@ fn read(dir: &Path) -> Res<String> {
     }
 }
 
-/// 先写临时文件再改名(链接到别处的写到它指的那个文件上);原来的权限照旧。内容没变不写
+/// Write a temp file, then rename (a link to elsewhere is written through to the file it points at); the original permissions
+/// stay. Not written if the content is unchanged
 fn write(path: &Path, old: &str, new: &str) -> Res<()> {
     if old == new {
         return Ok(());
@@ -653,7 +668,7 @@ fn write(path: &Path, old: &str, new: &str) -> Res<()> {
     std::fs::rename(&tmp, &path).map_err(|e| tr!("无法替换 {}:{e}", "can't replace {}: {e}", path.display()))
 }
 
-/// 这份 settings.json 的 statusLine 现在是哪一种;读不懂的说为什么
+/// Which kind this settings.json's statusLine is now; for an unreadable one, why
 fn now(text: &str) -> Res<Now> {
     let all: Value = serde_json::from_str(text).map_err(|e| tr!("settings.json 不是有效的 JSON:{e}", "settings.json isn't JSON: {e}"))?;
     let all = all.as_object().ok_or(t!("settings.json 不是 JSON 对象", "settings.json isn't a JSON object"))?;
@@ -669,7 +684,7 @@ fn now(text: &str) -> Res<Now> {
     })
 }
 
-/// 这条命令调的是不是 aca:回(子命令, 后面的)
+/// Whether this command calls aca: returns (subcommand, the rest)
 fn ours(cmd: &str) -> Option<(&str, &str)> {
     let cmd = cmd.trim_start();
     let (prog, rest) = match cmd.strip_prefix('\'') {
@@ -684,7 +699,8 @@ fn ours(cmd: &str) -> Option<(&str, &str)> {
     Some((sub, tail.trim_start()))
 }
 
-/// 照 `mode`,这份 settings.json 该变成什么;`None` = 不用动。`saved` 是这个账号记着的「接之前的原文」
+/// What this settings.json should become under `mode`; `None` = leave it. `saved` is this account's recorded
+/// "text from before wiring"
 fn plan(text: &str, mode: Mode, aca: &str, saved: Option<&Option<String>>) -> Res<Option<Change>> {
     let state = now(text)?;
     let (members, _) = members(text).ok_or(t!("无法识别 settings.json 的写法", "can't make out how this settings.json is written"))?;
@@ -694,7 +710,7 @@ fn plan(text: &str, mode: Mode, aca: &str, saved: Option<&Option<String>>) -> Re
         put(value, "command", Some(&Value::from(cmd).to_string()))
             .ok_or(t!("无法识别 statusLine 的写法", "can't make out how this statusLine is written").to_string())
     };
-    // 第一次动它才记原文:已经记过的是更早的那份,不盖
+    // Record the original text only the first time it's touched: one already recorded is older, don't overwrite it
     let keep = |before: Option<String>| saved.is_none().then_some(Some(before));
     let (want, said, record): (Option<String>, String, Option<Option<Option<String>>>) = match (mode, &state) {
         (Mode::Aca, Now::Aca) => {
@@ -740,7 +756,7 @@ fn plan(text: &str, mode: Mode, aca: &str, saved: Option<&Option<String>>) -> Re
             t!("记录额度的命令已更新为当前的 aca", "the quota command now points at this aca").into(),
             None,
         ),
-        // 现在是 aca 画的:记着你原来那份的话,换回它、套上记额度的那层
+        // aca draws it now: if your original one is recorded, switch back to it and add the quota-recording layer
         (Mode::Wrap, Now::Aca) => {
             match saved.and_then(|s| s.as_deref()).map(|before| (before, now(&format!("{{\"statusLine\":{before}}}")))) {
                 Some((before, Ok(Now::Own(own)))) => (
@@ -773,7 +789,7 @@ fn plan(text: &str, mode: Mode, aca: &str, saved: Option<&Option<String>>) -> Re
     };
     let new = put(text, "statusLine", want.as_deref())
         .ok_or(t!("无法识别 settings.json 的写法", "can't make out how this settings.json is written"))?;
-    // 除了 statusLine,别的一样都不能变
+    // Apart from statusLine, nothing may change
     let strip = |t: &str| serde_json::from_str::<Value>(t).ok().map(|mut v| v.as_object_mut().map(|o| o.remove("statusLine")).map(|_| v));
     match (strip(text), strip(&new)) {
         (Some(a), Some(b)) if a == b => {}
@@ -782,7 +798,7 @@ fn plan(text: &str, mode: Mode, aca: &str, saved: Option<&Option<String>>) -> Re
     Ok((new != text).then_some(Change { text: new, saved: record, said }))
 }
 
-/// 新写的那个 statusLine;`indent` 是这份文件一层缩进用的什么
+/// The newly written statusLine; `indent` is what this file uses for one level of indentation
 fn fresh(aca: &str, indent: &str) -> String {
     let cmd = Value::from(format!("{aca} statusline"));
     format!(
@@ -790,16 +806,16 @@ fn fresh(aca: &str, indent: &str) -> String {
     )
 }
 
-/// 一个 JSON 对象里的一个成员在原文里的位置
+/// Where one member of a JSON object sits in the text
 #[derive(Debug, PartialEq)]
 struct Member {
     key: String,
-    /// 键的引号开始的地方
+    /// Where the key's opening quote is
     start: usize,
     value: Range<usize>,
 }
 
-/// 最外层对象的成员,和结尾那个 `}` 的位置。只认合法的 JSON(调用前已经当 JSON 读过)
+/// The top-level object's members, and where its closing `}` is. Valid JSON only (it has been read as JSON before this is called)
 fn members(text: &str) -> Option<(Vec<Member>, usize)> {
     let b = text.as_bytes();
     let ws = |mut i: usize| {
@@ -833,7 +849,7 @@ fn members(text: &str) -> Option<(Vec<Member>, usize)> {
     }
 }
 
-/// 从 `i` 这个值的开头跳到它后面
+/// Skip from the start of the value at `i` to just past it
 fn skip(b: &[u8], i: usize) -> Option<usize> {
     match *b.get(i)? {
         b'"' => {
@@ -873,13 +889,15 @@ fn skip(b: &[u8], i: usize) -> Option<usize> {
     }
 }
 
-/// 这份文件一层缩进用的什么:第一个成员前面那段空白;都写在一行的、空对象的,按两个空格
+/// What this file uses for one level of indentation: the whitespace before the first member; all on one line, or an empty object:
+/// two spaces
 fn indent_of(text: &str, members: &[Member]) -> String {
     let lead = members.first().map(|m| &text[text[..m.start].rfind('\n').map_or(0, |n| n + 1)..m.start]);
     lead.filter(|l| !l.is_empty() && l.chars().all(char::is_whitespace)).unwrap_or("  ").to_string()
 }
 
-/// 把对象 `text` 里 `key` 的值换成 `value`(没有就加在最后),`None` = 去掉这个成员。别的地方原样
+/// Replace the value of `key` in object `text` with `value` (appended at the end if absent); `None` = remove that member.
+/// Everything else as is
 fn put(text: &str, key: &str, value: Option<&str>) -> Option<String> {
     let (members, close) = members(text)?;
     let at = members.iter().position(|m| m.key == key);
@@ -892,7 +910,7 @@ fn put(text: &str, key: &str, value: Option<&str>) -> Option<String> {
                 None => format!("{}\n{indent}\"{key}\": {v}\n{}", &text[..close], &text[close..]),
             }
         }
-        // 不是第一个:连前面的逗号一起去;是第一个:连后面的逗号一起去
+        // Not the first: remove it along with the comma before it; the first: along with the comma after it
         (Some(i), None) if i > 0 => format!("{}{}", &text[..members[i - 1].value.end], &text[members[i].value.end..]),
         (Some(i), None) => match members.get(i + 1) {
             Some(next) => format!("{}{}", &text[..members[i].start], &text[next.start..]),
@@ -902,14 +920,14 @@ fn put(text: &str, key: &str, value: Option<&str>) -> Option<String> {
     })
 }
 
-// ---------- 那张表 ----------
+// ---------- The table ----------
 
-/// 这个账号有没有自己的状态栏可留(留不了的账号,「自己的 + 记额度」不给选)
+/// Whether this account has a status bar of its own to keep ("yours + quota" isn't offered to accounts that can't keep one)
 fn has_own(state: &Now, saved: Option<&Option<String>>) -> bool {
     match state {
         Now::Own(_) => true,
         Now::Wrapped(own) => !own.is_empty(),
-        // 现在是 aca 画的:记着接之前那份的话,还换得回去
+        // aca draws it now: if the one from before wiring is recorded, it can still switch back
         Now::Aca => {
             saved.and_then(|s| s.as_deref()).is_some_and(|before| matches!(now(&format!("{{\"statusLine\":{before}}}")), Ok(Now::Own(_))))
         }
@@ -917,14 +935,14 @@ fn has_own(state: &Now, saved: Option<&Option<String>>) -> bool {
     }
 }
 
-/// 一个 Claude 账号的状态栏:现在是什么、要接成什么
+/// A Claude account's status bar: what it is now, what to wire it as
 #[derive(Clone, Debug)]
 struct Wire {
-    /// settings.json 在哪个目录
+    /// Which directory settings.json is in
     dir: PathBuf,
-    /// 读不懂的说为什么(不会动它)
+    /// For an unreadable one, why (it won't be touched)
     now: Res<Now>,
-    /// 现在算哪一种接法
+    /// Which wiring mode it counts as now
     was: Mode,
     pick: Mode,
     own: bool,
@@ -942,7 +960,7 @@ impl Wire {
         Wire { dir, now, was, pick: was, own }
     }
 
-    /// 能选的接法,按 ←→ 换的顺序
+    /// The wiring modes to pick from, in the order ←→ cycles through them
     fn choices(&self) -> Vec<Mode> {
         if self.now.is_err() {
             return vec![];
@@ -955,27 +973,28 @@ impl Wire {
     }
 }
 
-/// 表里的一行
+/// One row of the table
 #[derive(Clone, Debug)]
 struct Row {
     agent: Agent,
     name: String,
-    /// 配置目录,家目录下的写成 ~/…;不换目录的账号是空的
+    /// Config directory, written as ~/… when under home; empty for accounts that don't change directory
     shown: String,
-    /// 这次要登记的(回车才写进 config.toml):展开的目录
+    /// To be registered this time (written to config.toml only on Enter): the expanded directory
     new: Option<String>,
-    /// 没登记的那个 `~/.claude`(这次正登记它的也算:`x` 不登记了要把它放回来)
+    /// The unregistered `~/.claude` (also when it's the one being registered now: if `x` drops the registration, it has to come back)
     plain: bool,
-    /// Claude 的、目录在的才有
+    /// Only Claude's, and only when the directory exists
     wire: Option<Wire>,
-    /// 登记着的 Claude 账号没得接:为什么(说明那一块写的)。Codex 的额度不靠状态栏,不写
+    /// Why a registered Claude account can't be wired (written in the detail block). Codex's quota doesn't depend on the status bar,
+    /// so nothing is written for it
     why: &'static str,
 }
 
-/// 回车办完的结果
+/// What Enter got done
 #[derive(Debug, Default)]
 pub struct Report {
-    /// 一行一句,开表的命令关表之后打出来
+    /// One line each, printed after the table closes by the command that opened it
     pub lines: Vec<String>,
     pub failed: bool,
     added: usize,
@@ -983,7 +1002,7 @@ pub struct Report {
 }
 
 impl Report {
-    /// 界面里底栏说的那一句;什么都没办是空的(不说)
+    /// The line the footer shows in the UI; empty (says nothing) when nothing was done
     fn brief(&self) -> String {
         let mut parts = vec![];
         if self.added > 0 {
@@ -999,7 +1018,8 @@ impl Report {
     }
 }
 
-/// 账号和状态栏的那张表。`aca setup` 单独开它;界面里从设置页的账号进(那里自己有 `+`,这里就不给加)
+/// The table of accounts and status bars. `aca setup` opens it on its own; in the UI it's reached from accounts on the settings
+/// page (which has its own `+`, so adding isn't offered here)
 pub struct Page {
     env: Env,
     rows: Vec<Row>,
@@ -1007,13 +1027,14 @@ pub struct Page {
     can_add: bool,
     form: Option<Form>,
     saved: Saved,
-    /// 开了 Claude mod(`[tools.claude] mod = true`):额度从它那来,状态栏接不接只管样子
+    /// Claude mod on (`[tools.claude] mod = true`): quotas come from it, and wiring the status bar only affects looks
     mods: bool,
-    /// 回车办完的;Esc 关的是 None
+    /// What Enter got done; None when closed with Esc
     pub done: Option<Report>,
 }
 
-/// Claude 只在状态栏的输入里给订阅额度,所以要接;不接别的都照常。开了 mod 就不用靠它
+/// Claude gives subscription quotas only in the status bar's input, hence the wiring; without it everything else works as usual.
+/// With the mod on it isn't needed
 const INTRO: Tr = Tr::new(
     "接入状态栏后才能看到 Claude 的额度(计费页、n 菜单、账号页)。",
     "Claude's quotas show up (billing page, n menu, accounts) only with the status bar wired.",
@@ -1022,11 +1043,12 @@ const INTRO_MOD: Tr = Tr::new(
     "Claude 的额度已从 mod 获取,这里只设置 Claude 底部的状态栏。",
     "Claude's quotas already come from the mod; this only picks whose status bar Claude shows.",
 );
-/// 说明那一块占几行(固定,高亮上下挪时表不跳):一句话加 aca 状态栏的两行样子;窄的(手机)一句话要折成两行
+/// How many lines the detail block takes (fixed, so the table doesn't jump as the highlight moves): one sentence plus two lines
+/// showing aca's status bar; when narrow (phone), the sentence wraps to two lines
 fn detail_rows(w: usize) -> usize {
     if w >= 60 { 3 } else { 5 }
 }
-/// 接法那一列:「‹ 」+ 最长的那个 +「 ›」
+/// The wiring column: "‹ " + the longest one + " ›"
 const PICK_W: usize = 15;
 
 impl Page {
@@ -1047,7 +1069,8 @@ impl Page {
         for agent in [Agent::Claude, Agent::Codex] {
             let claude = agent == Agent::Claude;
             for (a, abs) in listed.iter().filter(|(a, _)| a.agent == agent) {
-                // 目录其实是另一家的(把 ~/.codex 登记成了 Claude 的账号):不往里接状态栏
+                // The directory actually belongs to the other agent (~/.codex registered as a Claude account):
+                // don't wire a status bar into it
                 let foreign = !abs.is_empty() && accounts::foreign(agent, abs, &env.home).is_some();
                 let wire = if claude && !abs.is_empty() && !foreign { wire_of(abs, &mut seen) } else { None };
                 let why = if !claude || wire.is_some() {
@@ -1063,7 +1086,7 @@ impl Page {
                 };
                 rows.push(Row { agent, name: a.name.clone(), shown: a.dir.clone(), new: None, plain: false, wire, why });
             }
-            // 没登记的 ~/.claude 也是个账号:不登记也能用的那个
+            // The unregistered ~/.claude is an account too: the one that works without registering
             if claude && let Some(wire) = wire_of(&format!("{}/.claude", env.home), &mut seen) {
                 let (shown, wire) = ("~/.claude".to_string(), Some(wire));
                 rows.push(Row { agent, name: "claude".into(), shown, new: None, plain: true, wire, why: "" });
@@ -1073,13 +1096,13 @@ impl Page {
         Page { env, rows, sel: 0, can_add, form: None, saved, mods, done: None }
     }
 
-    /// 要登记几个、要改几个账号的状态栏
+    /// How many accounts to register, and how many accounts' status bars to change
     fn pending(&self) -> (usize, usize) {
         let new = self.rows.iter().filter(|r| r.new.is_some()).count();
         (new, self.rows.iter().filter(|r| r.wire.as_ref().is_some_and(Wire::changed)).count())
     }
 
-    /// ←→:高亮那个账号换一种接法
+    /// ←→: switch the highlighted account to another wiring mode
     fn cycle(&mut self, forward: bool) {
         let Some(w) = self.rows.get_mut(self.sel).and_then(|r| r.wire.as_mut()) else { return };
         let all = w.choices();
@@ -1087,7 +1110,7 @@ impl Page {
         w.pick = all[(at + if forward { 1 } else { all.len() - 1 }) % all.len()];
     }
 
-    /// a:选得了这种接法的账号都照高亮这一行
+    /// a: every account that can take this wiring mode follows the highlighted row
     fn all_like_this(&mut self) {
         let Some(pick) = self.rows.get(self.sel).and_then(|r| r.wire.as_ref()).filter(|w| w.now.is_ok()).map(|w| w.pick) else { return };
         for w in self.rows.iter_mut().filter_map(|r| r.wire.as_mut()) {
@@ -1097,7 +1120,7 @@ impl Page {
         }
     }
 
-    /// 新登记的 Claude 账号先照别的账号的接法摆着(回车前看得到、换得了)
+    /// A newly registered Claude account starts out wired like the other accounts (visible and changeable before Enter)
     fn like_others(&self, w: &Wire) -> Mode {
         let picks: Vec<Mode> = self.rows.iter().filter_map(|r| r.wire.as_ref()).filter(|o| o.now.is_ok()).map(|o| o.pick).collect();
         if w.now.is_err() || w.was != Mode::Off {
@@ -1111,7 +1134,8 @@ impl Page {
         }
     }
 
-    /// `+` 开着:键给表单(哪个工具 → 名字 → 配置目录,见 acctpage.rs);目录填完了列进表里
+    /// `+` open: keys go to the form (which tool → name → config directory, see acctpage.rs); once the directory is filled in,
+    /// it's listed in the table
     fn form_key(&mut self, k: KeyEvent) {
         let Some(f) = self.form.as_mut() else { return };
         let rows = &self.rows;
@@ -1135,9 +1159,9 @@ impl Page {
         self.form = None;
         let shown = accounts::tilde(&abs, &self.env.home);
         let mut row = Row { agent, name, shown, new: Some(abs.clone()), plain: false, wire: None, why: "" };
-        // 目录已经在的读它现在的状态栏;还没有的回车后才建
+        // If the directory already exists, read its current status bar; if not, it's created after Enter
         let real = std::fs::canonicalize(&abs).unwrap_or_else(|_| PathBuf::from(&abs));
-        // 登记的就是没登记时列着的那个 ~/.claude:换掉那一行,挑好的接法带过来
+        // Registering the very ~/.claude listed while unregistered: replace that row, bringing its chosen wiring along
         if let Some(i) = self.rows.iter().position(|r| r.plain && r.new.is_none() && r.wire.as_ref().is_some_and(|w| w.dir == real)) {
             (row.wire, row.plain) = (self.rows[i].wire.take(), true);
             self.rows[i] = row;
@@ -1148,14 +1172,14 @@ impl Page {
             w.pick = self.like_others(&w);
             row.wire = Some(w);
         }
-        // 排在自己那一家的最后
+        // Placed last among its own agent's rows
         let at =
             self.rows.iter().rposition(|r| r.agent == agent).map_or(if agent == Agent::Claude { 0 } else { self.rows.len() }, |i| i + 1);
         self.rows.insert(at, row);
         self.sel = at;
     }
 
-    /// 回车:先登记账号,再改状态栏(只动挑的和现在不一样的)
+    /// Enter: register accounts first, then change status bars (only those whose pick differs from now)
     fn apply(&mut self) -> Report {
         let mut r = Report::default();
         let (mut accounts_said, mut wires_said, mut logins) = (vec![], vec![], vec![]);
@@ -1176,7 +1200,7 @@ impl Page {
                     if added.created {
                         logins.push(format!("  {}", login_hint(row.agent, &row.name)));
                     }
-                    // 目录现在有了:记录里的名字照真实路径(和以后再开表时读到的一样)
+                    // The directory exists now: the name in the record follows the real path (the same as reopening the table later reads)
                     if let (Some(w), Ok(real)) = (row.wire.as_mut(), std::fs::canonicalize(&added.dir)) {
                         w.dir = real;
                     }
@@ -1223,7 +1247,8 @@ impl Page {
         r
     }
 
-    /// 高亮那一行下面的说明:挑的这种接法 Claude 底下是什么样;aca 的直接画个样子出来
+    /// The detail under the highlighted row: what the bottom of Claude looks like with the chosen wiring; for aca's, a sample is
+    /// drawn right there
     fn detail(&self, row: &Row, w: usize) -> Vec<Line<'static>> {
         let said = |text: &str, st: Style| {
             let lines = if text.is_empty() { vec![] } else { fold(text, w) };
@@ -1242,7 +1267,7 @@ impl Page {
             out.extend(said(row.why, kit::dim()));
             return out;
         };
-        // 那一行写着「读不懂,不动」,这里是为什么
+        // That row says "unreadable, untouched"; here's why
         if let Err(e) = &wire.now {
             out.extend(said(e, theme::warn()));
             return out;
@@ -1261,7 +1286,7 @@ impl Page {
                     "After Enter, Claude uses your own status bar; aca records quotas from it"
                 )
             }
-            // 本来就不接、也不改:没什么可说的(不接少了什么,表头那句说了)
+            // Not wired and not changing: nothing to say (what not wiring loses, the header line already says)
             (Mode::Off, false) => return out,
             (Mode::Off, true) if self.mods => t!("回车后撤销,恢复接入前的设置", "After Enter it's removed, back to how it was"),
             (Mode::Off, true) => {
@@ -1282,9 +1307,9 @@ impl Page {
 
     fn row_line(&self, i: usize, row: &Row, name_w: usize, w: usize) -> Line<'static> {
         let on = i == self.sel && self.form.is_none();
-        // 右边:改没改的记号两格 + 接法那一格
+        // Right side: two cells for the changed mark + the wiring cell
         let right_w = 2 + 2 + PICK_W + 2;
-        // 名字和接法一定写;地方不够(手机)先把「新加」缩成「新」,再不够就不写目录
+        // Name and wiring are always written; short on room (phone), first shrink "new account" to "new", then drop the directory
         let room = w.saturating_sub(1 + name_w + 2 + right_w);
         let tag = match row.new {
             Some(_) if room >= 20 => t!("  新增", "  new account"),
@@ -1295,7 +1320,7 @@ impl Page {
         let dir = if row.shown.is_empty() { t!("(默认目录)", "(default directory)") } else { row.shown.as_str() };
         let mut left = vec![Span::raw(" "), Span::styled(kit::clip(&row.name, name_w), crate::ui::agent_style(row.agent))];
         if dir_w >= 8 {
-            // 目录太长留结尾:几个账号的目录多半只差最后几个字
+            // Too-long directory keeps its end: several accounts' directories mostly differ only in the last few characters
             left.extend([Span::raw("  "), Span::styled(tail(dir, dir_w), kit::dim())]);
         }
         left.push(Span::styled(tag, theme::accent()));
@@ -1341,7 +1366,7 @@ impl Overlay for Page {
             if last != Some(row.agent) {
                 let claude = row.agent == Agent::Claude;
                 let head = vec![who_span(row.agent)];
-                // Codex 的额度 aca 自己从它的对话记录里读,没有状态栏要接
+                // aca reads Codex's quota from its conversation records itself; no status bar to wire
                 let col = t!("状态栏", "Status bar");
                 let col = if claude { col } else { t!("额度无需接入", "no wiring needed") };
                 let col = vec![Span::styled(format!("    {}", kit::clip(col, PICK_W + 2)), kit::dim())];
@@ -1364,14 +1389,14 @@ impl Overlay for Page {
         out.extend(detail);
         out.push(Line::raw(""));
         let (new, changed) = self.pending();
-        // 没有要办的不写
+        // Nothing to do: write nothing
         let todo = match (new, changed) {
             (0, 0) => String::new(),
             (0, c) => tr!("修改 {c} 个状态栏", "change status bars: {c}"),
             (n, 0) => tr!("添加 {n} 个账号", "add accounts: {n}"),
             (n, c) => tr!("添加 {n} 个账号,修改 {c} 个状态栏", "add accounts: {n}, change status bars: {c}"),
         };
-        // 放不下时后面的键先不写:最要紧的排前面
+        // When it doesn't fit, the later keys are dropped first: the most important go first
         let mut keys = vec![("⏎", t!("确定", "do it")), ("←→", t!("切换", "switch"))];
         if self.rows.get(self.sel).is_some_and(|r| r.new.is_some()) {
             keys.push(("x", t!("取消", "drop it")));
@@ -1381,7 +1406,7 @@ impl Overlay for Page {
         }
         keys.push(("a", t!("全部应用此项", "all like this")));
         let todo = Span::styled(todo, theme::accent());
-        // 窄的:要办什么单独一行(没有要办的也占着,表不跳),键另起一行
+        // Narrow: what's to be done gets its own line (kept even when empty, so the table doesn't jump), keys on another line
         if w >= 60 {
             out.push(kit::keys_line(&keys, vec![todo], w));
         } else {
@@ -1404,7 +1429,7 @@ impl Overlay for Page {
             KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => self.cycle(false),
             KeyCode::Char('a') => self.all_like_this(),
             KeyCode::Char('+') if self.can_add => self.form = Some(Form::new()),
-            // 这次登记的那行:不登记了(登记的是 ~/.claude 的话,它原来那行回来)
+            // The row registered this time: drop the registration (if it was ~/.claude, its original row comes back)
             KeyCode::Char('x') | KeyCode::Delete if self.rows.get(self.sel).is_some_and(|r| r.new.is_some()) => {
                 let gone = self.rows.remove(self.sel);
                 if gone.plain {
@@ -1431,9 +1456,10 @@ impl Overlay for Page {
     }
 }
 
-/// 按宽度折行;句读不甩到下一行的开头(留两格给它挂在行尾)。
-/// 英文的词不从中间断(同 ui.rs 的 `wrap_width`):正写到一个词的半截,就把这半截带到下一行;一个词比一行还宽时照样硬断。
-/// 中文照旧哪里都能断
+/// Wrap to width; punctuation isn't pushed to the start of the next line (two cells are left for it to hang at the end).
+/// English words aren't broken mid-word (as with ui.rs's `wrap_width`): when a line ends partway through a word, that part moves
+/// to the next line; a word wider than a line is still hard-broken.
+/// Chinese can break anywhere, as before
 pub(crate) fn fold(text: &str, w: usize) -> Vec<String> {
     let mut out = vec![String::new()];
     let mut used = 0;
@@ -1447,7 +1473,7 @@ pub(crate) fn fold(text: &str, w: usize) -> Vec<String> {
                 _ => String::new(),
             };
             cur.truncate(cur.trim_end().len());
-            // 断在空格上:这个空格不带到下一行的开头
+            // Break on a space: that space isn't carried to the start of the next line
             if c == ' ' && half.is_empty() {
                 out.push(String::new());
                 used = 0;
@@ -1462,7 +1488,7 @@ pub(crate) fn fold(text: &str, w: usize) -> Vec<String> {
     out
 }
 
-/// 输入框里太长的只留结尾(刚打的字看得见)
+/// Input box text that's too long keeps only its end (so what was just typed is visible)
 pub(crate) fn tail(text: &str, room: usize) -> String {
     if text.width() <= room {
         return text.to_string();
@@ -1478,7 +1504,7 @@ pub(crate) fn tail(text: &str, room: usize) -> String {
     format!("…{}", kept.into_iter().rev().collect::<String>())
 }
 
-/// `aca setup` 单独开这张表:占住终端,回车 / Esc / ^C 关
+/// `aca setup` opens this table on its own: takes over the terminal; Enter / Esc / ^C closes it
 fn show(page: &mut Page) -> std::io::Result<()> {
     let mut term = ratatui::try_init()?;
     let out = (|| -> std::io::Result<()> {
@@ -1494,14 +1520,15 @@ fn show(page: &mut Page) -> std::io::Result<()> {
             }
         }
     })();
-    // 终端没了(窗口被关)就还不回去,也别再打印:往没了的终端打印会出错(见 exitlog.rs)
+    // If the terminal is gone (window closed) it can't be restored, so don't print either: printing to a gone terminal errors
+    // (see exitlog.rs)
     if ratatui::try_restore().is_err() {
         return Ok(());
     }
     out
 }
 
-/// 够宽够高居中、左右留白;窄的(手机)顶着上边占满宽
+/// Centered with side margins when wide and tall enough; narrow (phone): at the top, full width
 fn draw(f: &mut Frame, page: &Page) {
     let full = f.area();
     let roomy = full.width >= 70 && full.height >= 20;
@@ -1529,7 +1556,7 @@ mod tests {
 
     const ACA: &str = "/opt/bin/aca";
 
-    /// 接之前、接之后各一份,中间的 `saved` 照 `run` 那样跟着变
+    /// One copy before wiring and one after; `saved` in between changes along the way, as in `run`
     fn step(text: &str, mode: Mode, saved: &mut Option<Option<String>>) -> Option<(String, String)> {
         let c = plan(text, mode, ACA, saved.as_ref()).unwrap()?;
         match c.saved {
@@ -1542,7 +1569,7 @@ mod tests {
 
     #[test]
     fn only_the_status_line_changes_and_off_puts_back_exactly_what_was_there() {
-        // 四个空格缩进、键的顺序、行尾的空格、别的设置:都得原样
+        // Four-space indentation, key order, trailing spaces, other settings: all must stay as they were
         let mine = "{\n    \"model\": \"opus\",\n    \"statusLine\": {\"type\": \"command\",  \"command\": \"bash ~/bar.sh --x '{}'\", \"padding\": 2},\n    \"env\": {\"A\": \"}\\\"{\"}\n}\n";
         let mut saved = None;
         let (to_aca, said) = step(mine, Mode::Aca, &mut saved).unwrap();
@@ -1552,12 +1579,12 @@ mod tests {
         );
         assert!(said.contains("已换成 aca 状态栏"), "{said}");
         assert_eq!(now(&to_aca), Ok(Now::Aca));
-        // 再接一次不用动;换成只记额度:回到你那份,只多一层
+        // Wiring again needs no change; switching to quota-only: back to yours, with just one extra layer
         assert_eq!(step(&to_aca, Mode::Aca, &mut saved), None);
         let (wrapped, _) = step(&to_aca, Mode::Wrap, &mut saved).unwrap();
         assert_eq!(wrapped, mine.replace("bash ~/bar.sh", "/opt/bin/aca limits -- bash ~/bar.sh"));
         assert_eq!(now(&wrapped), Ok(Now::Wrapped("bash ~/bar.sh --x '{}'".into())));
-        // 撤掉:和接之前一个字节不差,记录也清了
+        // Unwired: byte for byte as before wiring, and the record is cleared
         let (back, said) = step(&wrapped, Mode::Off, &mut saved).unwrap();
         assert_eq!((back.as_str(), said.as_str(), &saved), (mine, "已恢复你原来的状态栏", &None));
         assert_eq!(step(&back, Mode::Off, &mut saved), None);
@@ -1566,7 +1593,7 @@ mod tests {
     #[test]
     fn an_account_without_a_status_line_gets_one_and_loses_it_again() {
         let mut saved = None;
-        // 没有 settings.json(当成空对象)、只有别的设置、都写在一行的
+        // No settings.json (treated as an empty object), only other settings, everything on one line
         let (made, _) = step("{}\n", Mode::Aca, &mut saved).unwrap();
         assert_eq!(
             made,
@@ -1586,28 +1613,28 @@ mod tests {
         let (made, _) = step("{\"a\":1}", Mode::Aca, &mut saved).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&made).unwrap()["statusLine"]["command"], "/opt/bin/aca statusline");
         assert_eq!(step(&made, Mode::Off, &mut saved).unwrap().0, "{\"a\":1}");
-        // 只记额度:没有自己的状态栏就没东西可包
+        // Quota-only: without a status bar of its own there's nothing to wrap
         assert_eq!(step(plain, Mode::Wrap, &mut None), None);
         assert_eq!(step(plain, Mode::Off, &mut None), None);
     }
 
     #[test]
     fn what_was_wired_by_hand_is_recognised_and_undone_without_a_record() {
-        // 手改成 aca 的(没有记录):认得出;撤掉 = 去掉那一项
+        // Changed to aca's by hand (no record): recognized; unwiring = removing that entry
         let by_hand = "{\n  \"a\": 1,\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"/Users/x/.local/bin/aca statusline\",\n    \"refreshInterval\": 10\n  }\n}\n";
         assert_eq!(now(by_hand), Ok(Now::Aca));
-        // 路径不是现在这个 aca:换成现在的,别的字段不动
+        // The path isn't this aca: replace it with the current one, leave the other fields alone
         let (fixed, said) = step(by_hand, Mode::Aca, &mut None).unwrap();
         assert_eq!((fixed, said.as_str()), (by_hand.replace("/Users/x/.local/bin/aca", ACA), "状态栏命令已更新为当前的 aca"));
         assert_eq!(step(by_hand, Mode::Off, &mut None).unwrap().0, "{\n  \"a\": 1\n}\n");
-        // 手包的一层(路径带引号的也认):撤掉 = 剥掉那一层
+        // A layer wrapped by hand (a quoted path works too): unwiring = peeling that layer off
         let wrapped = "{\"statusLine\":{\"type\":\"command\",\"command\":\"'/my apps/aca' limits -- npx -y ccstatusline@latest\"}}";
         assert_eq!(now(wrapped), Ok(Now::Wrapped("npx -y ccstatusline@latest".into())));
         assert_eq!(
             step(wrapped, Mode::Off, &mut None).unwrap().0,
             "{\"statusLine\":{\"type\":\"command\",\"command\":\"npx -y ccstatusline@latest\"}}"
         );
-        // 名字里带 aca 的别的程序不算
+        // Other programs with aca in their name don't count
         assert_eq!(now("{\"statusLine\":{\"command\":\"/x/aca-bar statusline\"}}"), Ok(Now::Own("/x/aca-bar statusline".into())));
         assert_eq!(now("{\"statusLine\":{\"command\":\"bash aca statusline\"}}"), Ok(Now::Own("bash aca statusline".into())));
     }
@@ -1617,7 +1644,7 @@ mod tests {
         assert!(plan("{ // 注释\n \"a\": 1 }", Mode::Aca, ACA, None).unwrap_err().contains("不是有效的 JSON"));
         assert!(plan("[1, 2]", Mode::Aca, ACA, None).unwrap_err().contains("不是 JSON 对象"));
         assert!(plan("{\"statusLine\": \"bash x.sh\"}", Mode::Aca, ACA, None).unwrap_err().contains("不是包含 command 的对象"));
-        // statusLine 写成 null 的当成没有
+        // statusLine written as null counts as none
         assert_eq!(now("{\"statusLine\": null}"), Ok(Now::Nothing));
     }
 
@@ -1630,7 +1657,7 @@ mod tests {
             [("a", "\"x,}\\\\\\\"\""), ("b", "[1,{\"c\":\"]\"}]"), ("d", "true")]
         );
         assert_eq!(&text[close..], "}");
-        // 去掉第一个、中间的、最后一个、唯一的
+        // Remove the first, a middle, the last, the only one
         assert_eq!(put("{\"a\":1, \"b\":2, \"c\":3}", "a", None).unwrap(), "{\"b\":2, \"c\":3}");
         assert_eq!(put("{\"a\":1, \"b\":2, \"c\":3}", "b", None).unwrap(), "{\"a\":1, \"c\":3}");
         assert_eq!(put("{\"a\":1, \"b\":2, \"c\":3}", "c", None).unwrap(), "{\"a\":1, \"b\":2}");
@@ -1646,7 +1673,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("dot")).unwrap();
         std::fs::create_dir_all(root.join("acct")).unwrap();
-        // 配置目录里的 settings.json 是个链接(放在 dotfiles 里管的)
+        // settings.json in the config directory is a link (managed in dotfiles)
         let real = root.join("dot/settings.json");
         std::fs::write(&real, "{}\n").unwrap();
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1657,19 +1684,19 @@ mod tests {
         assert!(std::fs::symlink_metadata(root.join("acct/settings.json")).unwrap().file_type().is_symlink());
         assert_eq!(now(&std::fs::read_to_string(&real).unwrap()), Ok(Now::Aca));
         assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
-        // 没有 settings.json 的目录:读成空对象,写出来是新文件
+        // A directory without settings.json: read as an empty object, written out as a new file
         std::fs::create_dir_all(root.join("new")).unwrap();
         assert_eq!(read(&root.join("new")).unwrap(), "{}\n");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    // ---------- 那张表 ----------
+    // ---------- The table ----------
 
     const MINE: &str = "{\n  \"model\": \"opus\",\n  \"statusLine\": {\"type\": \"command\", \"command\": \"bash ~/bar.sh\"},\n  \"theme\": \"light\"\n}\n";
     const BY_HAND: &str =
         "{\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"/somewhere/else/aca statusline\"\n  }\n}\n";
 
-    /// 一个临时的家:config.toml、记录都在里面,`~` 也是它
+    /// A temporary home: config.toml and the records are all in it, and it's `~` too
     fn home(name: &str, config: &str) -> (PathBuf, Env) {
         let root = std::env::temp_dir().join(format!("aca-setup-page-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1686,7 +1713,7 @@ mod tests {
                 (_, "work") => accounts::Login::In("max · me@example.com".into()),
                 _ => accounts::Login::Out,
             },
-            // 这个家里只装了 Claude
+            // Only Claude is installed in this home
             installed: |prog| prog == "claude",
         };
         if !config.is_empty() {
@@ -1716,7 +1743,7 @@ mod tests {
         }
     }
 
-    /// 输入框清空(^U)再打
+    /// Clear the input box (^U) and type again
     fn retype(p: &mut Page, text: &str) {
         p.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), &mut Fx::default());
         type_in(p, text);
@@ -1741,21 +1768,21 @@ mod tests {
         account_dir(&root, ".claude", Some(BY_HAND));
         account_dir(&root, ".codex-cx", None);
         let mut p = Page::load(env.clone(), true);
-        // 登记的在前(目录不在的列着但不接),没登记的 ~/.claude 跟在后面,再是 Codex
+        // Registered first (a missing directory is listed but not wired), then the unregistered ~/.claude, then Codex
         assert_eq!(
             picks(&p),
             [("gone", None), ("mine", Some(Mode::Off)), ("plain", Some(Mode::Off)), ("claude", Some(Mode::Aca)), ("cx", None)]
         );
-        // 有自己状态栏的才有「自己的 + 额度」
+        // Only those with a status bar of their own get 「自己的 + 额度」 ("yours + quota")
         let choices = |p: &Page, i: usize| p.rows[i].wire.as_ref().unwrap().choices();
         assert_eq!((choices(&p, 1), choices(&p, 2)), (vec![Mode::Aca, Mode::Wrap, Mode::Off], vec![Mode::Aca, Mode::Off]));
-        // 目录不在的那行、Codex 那行:←→ 没东西可换;说明那一块写为什么
+        // The row with a missing directory, the Codex row: ←→ has nothing to switch; the detail block says why
         assert!(shown(&p, 78).iter().any(|l| l == "目录不存在"), "{:#?}", shown(&p, 78));
         press(&mut p, &[KeyCode::Right]);
         assert_eq!(p.pending(), (0, 0));
         press(&mut p, &[KeyCode::Down, KeyCode::Right, KeyCode::Right]);
         assert_eq!(p.rows[1].wire.as_ref().unwrap().pick, Mode::Wrap);
-        // a:都照这一行 —— 选不了这种的(没有自己状态栏的)不动
+        // a: all follow this row — those that can't take it (no status bar of their own) stay as they are
         press(&mut p, &[KeyCode::Char('a')]);
         assert_eq!(picks(&p)[1..4], [("mine", Some(Mode::Wrap)), ("plain", Some(Mode::Off)), ("claude", Some(Mode::Aca))]);
         press(&mut p, &[KeyCode::Down, KeyCode::Left]);
@@ -1763,12 +1790,12 @@ mod tests {
         let text = shown(&p, 78);
         assert!(text.iter().any(|l| l.contains("plain") && l.contains("* ‹ aca 的 ›")), "{text:#?}");
         assert!(text.last().unwrap().ends_with("修改 2 个状态栏"), "{text:#?}");
-        // 说明那一块:换成什么,和 aca 的状态栏画出来的样子(第二行是这个账号的额度)
+        // The detail block: what it changes to, and a sample of aca's status bar (the second line is this account's quota)
         let said = text.iter().position(|l| l == "回车后 Claude 底部换成 aca 状态栏:").unwrap_or_else(|| panic!("{text:#?}"));
         assert!(text[said + 1].contains("42%") && text[said + 2].starts_with("plain 5h 23% · 7d 41%"), "{text:#?}");
-        // Codex 那段:额度不用接
+        // The Codex part: quota needs no wiring
         assert!(text.iter().any(|l| l.starts_with("Codex") && l.trim_end().ends_with("额度无需接入")), "{text:#?}");
-        // 回车之前什么都没写
+        // Nothing written before Enter
         assert_eq!((settings(&root, ".claude-mine").as_str(), env.record.exists()), (MINE, false));
         assert_eq!(press(&mut p, &[KeyCode::Enter]), Flow::Close);
         let report = p.done.take().unwrap();
@@ -1784,9 +1811,10 @@ mod tests {
         assert_eq!((report.failed, report.brief().as_str()), (false, "已修改 2 个账号的状态栏"));
         assert_eq!(settings(&root, ".claude-mine"), MINE.replace("bash ~/bar.sh", "/opt/bin/aca limits -- bash ~/bar.sh"));
         assert_eq!(now(&settings(&root, ".claude-plain")), Ok(Now::Aca));
-        // 没挑它的不碰:手接的那个命令里不是现在这个 aca,也留着
+        // Not picked, not touched: the hand-wired one, whose command isn't this aca, is kept as well
         assert_eq!(settings(&root, ".claude"), BY_HAND);
-        // 再开:现在的接法就是刚挑的;都挑回不接,和接之前一个字节不差,记录也清了
+        // Reopen: the current wiring is what was just picked; pick not wired for all, and it's byte for byte as before wiring,
+        // record cleared
         let mut p = Page::load(env.clone(), true);
         assert_eq!(picks(&p)[1..3], [("mine", Some(Mode::Wrap)), ("plain", Some(Mode::Aca))]);
         press(&mut p, &[KeyCode::Down, KeyCode::Right, KeyCode::Down, KeyCode::Right, KeyCode::Enter]);
@@ -1807,29 +1835,29 @@ mod tests {
         account_dir(&root, ".claude-mine", Some(BY_HAND));
         let mut p = Page::load(env.clone(), true);
         press(&mut p, &[KeyCode::Char('+')]);
-        // 第一步挑哪个工具:两个摆出来,不是在打字;回车才到名字
+        // Step one picks which tool: both laid out, not typing; Enter goes on to the name
         assert!(!p.typing() && shown(&p, 78).iter().any(|l| l.starts_with("› Claude Code")), "{:#?}", shown(&p, 78));
         press(&mut p, &[KeyCode::Enter]);
         assert!(p.typing());
-        // 名字:写得不对、重了的当场说
+        // Name: an invalid or duplicate one is reported right away
         type_in(&mut p, "a b");
         press(&mut p, &[KeyCode::Enter]);
         assert!(shown(&p, 78).iter().any(|l| l == "账号名只能包含字母、数字、- 和 _"));
         retype(&mut p, "mine");
         press(&mut p, &[KeyCode::Enter]);
         assert_eq!(p.form.as_ref().unwrap().hint, "账号已存在:mine");
-        // Esc 退回第一步换成 Codex,再换回来
+        // Esc back to step one, switch to Codex, then back again
         press(&mut p, &[KeyCode::Esc, KeyCode::Down, KeyCode::Enter]);
         assert!(shown(&p, 78).iter().any(|l| l == "添加 Codex 账号 · 名字"), "{:#?}", shown(&p, 78));
         press(&mut p, &[KeyCode::Esc, KeyCode::Down, KeyCode::Enter]);
         retype(&mut p, "work");
         press(&mut p, &[KeyCode::Enter]);
-        // 目录填好了默认的;Esc 退回名字,再回车又到目录
+        // The directory is prefilled with the default; Esc goes back to the name, Enter again reaches the directory
         assert_eq!(p.form.as_ref().map(|f| (f.name.as_str(), f.text.as_str())), Some(("work", "~/.claude-work")));
         press(&mut p, &[KeyCode::Esc]);
         assert_eq!(p.form.as_ref().map(|f| (f.name.as_str(), f.text.as_str())), Some(("", "work")));
         press(&mut p, &[KeyCode::Enter, KeyCode::Enter]);
-        // 列进表里了:排在 Claude 的最后,高亮在它上面,状态栏先照别的账号摆着
+        // Listed in the table: last among Claude's, highlighted, its status bar starting out like the other accounts'
         assert!(!p.typing());
         assert_eq!((picks(&p), p.sel, p.pending()), (vec![("mine", Some(Mode::Aca)), ("work", Some(Mode::Aca))], 1, (1, 1)));
         let text = shown(&p, 78);
@@ -1839,21 +1867,21 @@ mod tests {
                 && text.last().unwrap().ends_with("添加 1 个账号,修改 1 个状态栏"),
             "{text:#?}"
         );
-        // 同一个目录这次不能登记两回;Codex 的排在最后,没有状态栏那一格
+        // The same directory can't be registered twice this time; Codex's goes last, without a status bar cell
         press(&mut p, &[KeyCode::Char('+'), KeyCode::Enter]);
         type_in(&mut p, "work2");
         press(&mut p, &[KeyCode::Enter]);
         retype(&mut p, "~/.claude-work/");
         press(&mut p, &[KeyCode::Enter]);
         assert_eq!(p.form.as_ref().unwrap().hint, "该目录本次已添加给 work");
-        // Esc 三下(目录 → 名字 → 哪个工具 → 不加了),再加一个 Codex 的
+        // Esc three times (directory → name → which tool → don't add), then add a Codex one
         press(&mut p, &[KeyCode::Esc, KeyCode::Esc, KeyCode::Esc]);
         assert!(p.form.is_none());
         press(&mut p, &[KeyCode::Char('+'), KeyCode::Down, KeyCode::Enter]);
         type_in(&mut p, "cx");
         press(&mut p, &[KeyCode::Enter, KeyCode::Enter]);
         assert_eq!(picks(&p)[2], ("cx", None));
-        // 到这什么都没写;Esc 关掉就是什么都没发生
+        // Nothing written so far; closing with Esc means nothing happened
         let untouched =
             |root: &Path| std::fs::read_to_string(root.join("aca/config.toml")).unwrap() == on_disk && !root.join(".claude-work").exists();
         assert!(untouched(&root));
@@ -1862,7 +1890,7 @@ mod tests {
         type_in(&mut gone, "nope");
         assert_eq!(press(&mut gone, &[KeyCode::Enter, KeyCode::Enter, KeyCode::Esc]), Flow::Close);
         assert!(gone.done.is_none() && untouched(&root) && !root.join(".claude-nope").exists());
-        // 回车:登记、接状态栏、把登录的命令打出来
+        // Enter: register, wire the status bar, print the login commands
         assert_eq!(press(&mut p, &[KeyCode::Enter]), Flow::Close);
         let report = p.done.take().unwrap();
         assert_eq!(
@@ -1880,14 +1908,14 @@ mod tests {
             ]
         );
         assert_eq!(report.brief(), "已添加 2 个账号,已修改 1 个账号的状态栏");
-        // config.toml:各加一行,别的原样(登记的目录写成 ~/…)
+        // config.toml: one line added for each, the rest as is (registered directories written as ~/…)
         assert_eq!(
             std::fs::read_to_string(&env.config).unwrap(),
             on_disk.replace("\n\n[ui]", "\nwork = \"~/.claude-work\"\n\n[ui]") + "\n[accounts.codex]\ncx = \"~/.codex-cx\"\n"
         );
         assert_eq!(now(&settings(&root, ".claude-work")), Ok(Now::Aca));
         assert!(root.join(".codex-cx").is_dir() && !root.join(".codex-cx/settings.json").exists());
-        // 记录里是这个目录的真实路径:接之前没有状态栏
+        // The record has this directory's real path: no status bar before wiring
         assert_eq!(env.saved(), Saved::from([(root.join(".claude-work").to_string_lossy().into_owned(), None)]));
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1896,7 +1924,7 @@ mod tests {
     fn the_unregistered_claude_dir_can_be_given_a_name_or_left_alone() {
         let (root, env) = home("plain", "");
         account_dir(&root, ".claude", Some(MINE));
-        // 什么都没挑就回车:关掉,底栏不说
+        // Enter with nothing picked: closes, the footer says nothing
         let mut fx = Fx::default();
         assert_eq!(Page::load(env.clone(), true).on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut fx), Flow::Close);
         assert!(fx.flash.is_none() && settings(&root, ".claude") == MINE);
@@ -1907,9 +1935,9 @@ mod tests {
         press(&mut p, &[KeyCode::Enter]);
         retype(&mut p, "~/.claude");
         press(&mut p, &[KeyCode::Enter]);
-        // 还是那一行,换了名字,挑好的接法带着
+        // Still that row, with a new name, its chosen wiring carried along
         assert_eq!((picks(&p), p.pending()), (vec![("main", Some(Mode::Aca))], (1, 1)));
-        // x:不登记了,它原来那行回来
+        // x: drop the registration, its original row comes back
         press(&mut p, &[KeyCode::Char('x')]);
         assert_eq!((picks(&p), p.pending()), (vec![("claude", Some(Mode::Aca))], (0, 1)));
         press(&mut p, &[KeyCode::Char('+'), KeyCode::Enter]);
@@ -1917,7 +1945,7 @@ mod tests {
         press(&mut p, &[KeyCode::Enter]);
         retype(&mut p, "~/.claude");
         press(&mut p, &[KeyCode::Enter, KeyCode::Enter]);
-        // 目录本来就在:不用登录,不打登录的命令
+        // The directory already existed: no login needed, no login command printed
         assert_eq!(
             p.done.take().unwrap().lines,
             [
@@ -1940,7 +1968,8 @@ mod tests {
         account_dir(&root, ".claude-ok", None);
         let mut p = Page::load(env.clone(), false);
         assert!(shown(&p, 78).iter().any(|l| l.contains("bad") && l.contains("无法解析,不修改")));
-        // 读不懂的那行换不了;a 也带不上它;这张表不给加账号(界面的账号页自己有 +)
+        // The unreadable row can't switch; a doesn't carry it along either; this table doesn't offer adding accounts
+        // (the UI's accounts page has its own +)
         press(&mut p, &[KeyCode::Right, KeyCode::Char('+'), KeyCode::Down, KeyCode::Right, KeyCode::Char('a')]);
         assert!(!p.typing() && !shown(&p, 78).last().unwrap().contains("添加账号"));
         assert_eq!((p.rows[0].wire.as_ref().unwrap().pick, p.pending()), (Mode::Off, (0, 1)));
@@ -1961,7 +1990,7 @@ mod tests {
             account_dir(&root, ".claude-bar", Some(BY_HAND));
             let mut p = Page::load(env, false);
             assert!(shown(&p, 78).iter().any(|l| l == intro), "{:#?}", shown(&p, 78));
-            // 接着 aca 的,换成不接:开着 mod 的额度照样有
+            // Wired to aca, switched to not wired: with the mod on, quotas are still there
             press(&mut p, &[KeyCode::Right]);
             assert_eq!(p.rows[0].wire.as_ref().unwrap().pick, Mode::Off);
             assert!(shown(&p, 78).iter().any(|l| l == off), "{:#?}", shown(&p, 78));
@@ -1982,11 +2011,11 @@ mod tests {
             let over: Vec<String> = shown(&p, w).into_iter().filter(|l| l.width() > w).collect();
             assert!(over.is_empty(), "{w} 宽放不下:{over:#?}");
         }
-        // 手机那么宽:接法那一格、要办什么、回车那个键都还在
+        // Phone width: the wiring cell, what's to be done and the Enter key are all still there
         let narrow = shown(&p, 42);
         assert!(narrow.iter().any(|l| l.contains("* ‹ aca 的 ›")) && narrow.iter().any(|l| l == "修改 1 个状态栏"), "{narrow:#?}");
         assert!(narrow.last().unwrap().starts_with("⏎ 确定 • ←→ 切换"), "{narrow:#?}");
-        // 说明那一块行数固定:高亮挪到没有状态栏可接的那行,表不跳
+        // The detail block has a fixed line count: with the highlight moved to a row with no status bar to wire, the table doesn't jump
         let tall = shown(&p, 78).len();
         press(&mut p, &[KeyCode::Down]);
         assert_eq!(shown(&p, 78).len(), tall);
@@ -2006,13 +2035,13 @@ mod tests {
         assert_eq!(run(&["add", "claude", "work", "--statusline", "aca"]), Ok(0));
         assert_eq!(std::fs::read_to_string(&env.config).unwrap(), "[accounts.claude]\nwork = \"~/.claude-work\"\n");
         assert_eq!(now(&settings(&root, ".claude-work")), Ok(Now::Aca));
-        // 目录可以自己给;不带 --statusline 就不接
+        // The directory can be given; without --statusline nothing is wired
         assert_eq!(run(&["add", "claude", "side", "~/elsewhere"]), Ok(0));
         assert!(root.join("elsewhere").is_dir() && !root.join("elsewhere/settings.json").exists());
         assert_eq!(run(&["add", "codex", "cx"]), Ok(0));
         assert_eq!(run(&["ls"]), Ok(0));
         assert_eq!(run(&[]), Ok(0));
-        // 写错的:说哪里不对,什么都不加
+        // Mistakes: say what's wrong, add nothing
         let before = std::fs::read_to_string(&env.config).unwrap();
         assert!(run(&["add", "codex", "c2", "--statusline", "aca"]).unwrap_err().contains("仅适用于 Claude"));
         assert!(run(&["add", "gemini", "g"]).unwrap_err().contains("只有 claude、codex 支持账号"));
@@ -2035,16 +2064,16 @@ mod tests {
         let run = |args: &[&str]| account_cmd(args.iter().map(|a| a.to_string()).collect(), &env);
         let config = || std::fs::read_to_string(&env.config).unwrap();
         let before = config();
-        // 有会话在用的、是工具默认账号的:不删,说为什么、怎么硬删
+        // Used by a session, or a tool's default account: not deleted; says why and how to force it
         let busy = run(&["rm", "claude", "busy"]).unwrap_err();
         assert!(busy.starts_with("未删除 claude:busy:2 个会话正在使用它") && busy.ends_with("确定要删除请加 --force"), "{busy}");
         assert!(run(&["rm", "claude", "main"]).unwrap_err().contains("aca new claude 未指定账号时使用它([tools.claude] account)"));
-        // 写错的:什么都不动
+        // Mistakes: nothing changes
         assert!(run(&["rm", "claude"]).unwrap_err().contains("account rm 需要指定工具和账号名\n用法:aca account ls"));
         assert!(run(&["rm", "gemini", "x"]).unwrap_err().contains("只有 claude、codex 支持账号"));
         assert_eq!(run(&["rm", "claude", "nope"]).unwrap_err(), "账号不存在:claude:nope");
         assert_eq!(config(), before);
-        // 没人用的:只去掉那一行,目录和里面的东西都在
+        // Unused: only that line goes; the directory and its contents stay
         let without = |text: &str, name: &str| text.lines().filter(|l| !l.starts_with(name)).map(|l| format!("{l}\n")).collect::<String>();
         assert_eq!(run(&["rm", "claude", "work"]), Ok(0));
         assert_eq!(config(), without(&before, "work = "));
@@ -2063,7 +2092,7 @@ mod tests {
         account_dir(&root, ".claude-firm", None);
         account_dir(&root, ".claude-work", None);
         account_dir(&root, ".codex-cx", None);
-        // Codex 的目录登记成了 Claude 的账号
+        // A Codex directory registered as a Claude account
         account_dir(&root, ".cx", None);
         std::fs::write(root.join(".cx/auth.json"), "{}").unwrap();
         std::fs::write(root.join(".cx/config.toml"), "").unwrap();
@@ -2089,11 +2118,11 @@ mod tests {
             "Claude only hands out subscription quotas in the status bar's input: route it through aca and the billing panel shows them.";
         let lines = fold(en, 30);
         assert!(lines.iter().all(|l| l.width() <= 30 && !l.starts_with(' ') && !l.ends_with(' ')), "{lines:#?}");
-        // 都断在空格上:断处补回一个空格就是原文
+        // All break on spaces: putting a space back at each break gives the original
         assert_eq!(lines.join(" "), en);
-        // 一个词比一行还长:硬断
+        // A word longer than a line: hard break
         assert_eq!(fold(&"x".repeat(25), 12), ["x".repeat(10), "x".repeat(10), "x".repeat(5)]);
-        // 中文照旧哪里都能断,句读挂在行尾
+        // Chinese can break anywhere as before, punctuation hanging at the line end
         assert_eq!(fold("一二三四五六七八。九十", 10), ["一二三四", "五六七八。", "九十"]);
     }
 
@@ -2102,12 +2131,13 @@ mod tests {
         let rows = |env: &Env| -> Vec<(String, String, String)> {
             status_rows(env).iter().map(|(a, abs)| (spec(a.agent, &a.name), a.dir.clone(), account_state(env, a, abs))).collect()
         };
-        // 什么都没登记:装着的那家(Claude)自己的列出来,带着怎么登录;没装的(Codex)不列
+        // Nothing registered: the installed agent's (Claude's) own is listed, with how to log in; the one not installed (Codex) isn't
         let (root, env) = home("own", "");
         let want = ("claude".to_string(), "~/.claude".to_string(), "未登录(登录:aca run claude -- auth login)".to_string());
         assert_eq!(rows(&env), [want]);
         std::fs::remove_dir_all(&root).unwrap();
-        // 写了默认账号的、自己的目录已经登记成账号的:列着的就是它,不再多一行
+        // A default account set in config, or the agent's own directory already registered as an account: that's what is listed,
+        // no extra row
         for config in [
             "[tools.claude]\naccount = \"work\"\n\n[accounts.claude]\nwork = \"~/.claude-work\"\n",
             "[accounts.claude]\nofficial = \"~/.claude\"\n",

@@ -1,12 +1,15 @@
-//! 插件出了什么错:事件钩子、定时上次没跑成,gateway 下面的服务连着失败停下了。
-//! tmux 状态栏(`aca tmux-status`)、界面顶栏、插件页、`aca plugin ls` 都读这里。
+//! What went wrong in plugins: an event hook or a timer whose last run failed, or a server under the gateway that kept
+//! failing and was stopped. The tmux status bar (`aca tmux-status`), the interface's top bar, the plugins page and
+//! `aca plugin ls` all read this.
 //!
-//! - 钩子:起的时候外面包一层 sh([`WRAP`]),跑完把退出码写进 `state/plugin-health/<插件>/hook-<第几个>`
-//!   (钩子不等,aca 早走了;时刻是那个文件的修改时间)。清单换了(重新登记)就清掉:第几个对不上了
-//! - 定时:[`super::timer`] 自己记着上次的退出码
-//! - gateway:问在跑的 gateway(最多等一小会儿);没在跑就没什么可说的
+//! - Hooks: started wrapped in an sh ([`WRAP`]) that writes the exit code to `state/plugin-health/<plugin>/hook-<index>`
+//!   when done (hooks aren't waited for, aca is long gone; the time is that file's modification time). Cleared when the
+//!   manifest changes (re-registered): the indexes no longer match
+//! - Timers: [`super::timer`] keeps the last exit code itself
+//! - Gateway: ask the running gateway (waiting a short while at most); if it isn't running there's nothing to say
 //!
-//! 只算开着的插件;上次没成、[`RECENT`] 以内的才算 —— 下次跑成了、插件停了、过了一天都不再提。
+//! Only enabled plugins count, and only last runs that failed within [`RECENT`] — once the next run succeeds, the plugin
+//! is disabled, or a day has passed, it's no longer mentioned.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,28 +18,29 @@ use super::{read_manifest, registry};
 use crate::paths;
 use crate::tr;
 
-/// 多久以前的不再提
+/// Older than this is no longer mentioned
 pub const RECENT: u64 = 24 * 3600;
-/// 问 gateway 最多等这么久(状态栏每隔几秒问一次,不能被它拖住)
+/// How long to wait for the gateway at most (the status bar asks every few seconds and can't be held up by it)
 const GATEWAY_WAIT: Duration = Duration::from_millis(300);
 
-/// 包在钩子外面的 sh:`sh -c WRAP sh <记录的文件> <命令> <参数…>`。跑完把退出码写进那个文件,退出码照原样交出去
+/// The sh wrapped around a hook: `sh -c WRAP sh <record file> <command> <args…>`. Writes the exit code to that file when
+/// done, and passes the exit code on unchanged
 pub(crate) const WRAP: &str = r#"f=$1; shift; "$@"; rc=$?; printf '%s\n' "$rc" >"$f.$$" && mv -f "$f.$$" "$f"; exit $rc"#;
 
-/// 一个插件的一处毛病
+/// One problem of a plugin
 #[derive(Clone, Debug, PartialEq)]
 pub struct Problem {
     pub plugin: String,
-    /// 哪一处:「钩子 turn.done」「定时 collect」「服务 web」
+    /// Where: "hook turn.done", "timer collect", "server web"
     pub what: String,
-    /// 怎么了:「退出码 3」、为什么
+    /// What happened: "exit code 3", or why
     pub detail: String,
-    /// 什么时候(秒);gateway 的是现在
+    /// When (seconds); for the gateway it's now
     pub at: u64,
 }
 
 impl Problem {
-    /// 「钩子 turn.done 退出码 3 · 5m 前」
+    /// "hook turn.done exit code 3 · 5m ago"
     pub fn text(&self, now: u64) -> String {
         let ago = super::timer::span(now.saturating_sub(self.at));
         tr!("{} {} · {ago} 前", "{} {} · {ago} ago", self.what, self.detail)
@@ -47,12 +51,12 @@ fn dir(plugin: &str) -> PathBuf {
     paths::state_dir().join("plugin-health").join(plugin)
 }
 
-/// 第几个事件钩子(清单里 `[[events]]` 的顺序,从 0 数)跑完记在哪
+/// Where the event hook with this index (the order of `[[events]]` in the manifest, from 0) records its finished run
 pub(crate) fn hook_file(plugin: &str, index: usize) -> PathBuf {
     dir(plugin).join(format!("hook-{index}"))
 }
 
-/// 插件重新登记 / 不用了:它的钩子记录对不上了,清掉
+/// The plugin was re-registered / is gone: its hook records no longer match, clear them
 pub(crate) fn clear(plugin: &str) {
     let _ = std::fs::remove_dir_all(dir(plugin));
 }
@@ -64,7 +68,8 @@ fn exit_text(code: i32) -> String {
     }
 }
 
-/// 开着的插件现在的毛病,先插件后哪一处。状态栏每隔几秒问一次:没有记录的插件连清单都不读
+/// Current problems of enabled plugins, by plugin then by where. The status bar asks every few seconds: plugins without
+/// records don't even get their manifest read
 pub fn problems() -> Vec<Problem> {
     let now = paths::now();
     let recent = |at: u64| now.saturating_sub(at) <= RECENT;
@@ -73,7 +78,7 @@ pub fn problems() -> Vec<Problem> {
     for e in registry().into_iter().filter(|e| e.enabled) {
         let gw = e.id == crate::gateway::PLUGIN;
         let failed_timer = timers.iter().any(|s| s.plugin == e.id && s.last > 0 && s.rc != Some(0) && recent(s.last));
-        // 钩子:第几个 → (退出码, 时刻),只留没成的
+        // Hooks: index → (exit code, time), only the failed ones kept
         let hooks: Vec<(usize, i32, u64)> = std::fs::read_dir(dir(&e.id))
             .into_iter()
             .flatten()
@@ -112,7 +117,8 @@ pub fn problems() -> Vec<Problem> {
     out
 }
 
-/// gateway 下面连着失败停下了的服务(要 `aca plugin gateway restart` 或者改配置才会再起)
+/// Servers under the gateway that kept failing and were stopped (they only start again after `aca plugin gateway restart`
+/// or a config change)
 fn gateway(plugin: &str, now: u64) -> Vec<Problem> {
     if !crate::gateway::sock_path().exists() {
         return vec![];
@@ -176,7 +182,8 @@ mod tests {
         });
     }
 
-    /// 包在钩子外面的那层:退出码照原样交出去,也记进文件;命令的参数原样传
+    /// The wrapper around a hook: the exit code is passed on unchanged and also written to the file; the command's arguments
+    /// are passed as they are
     #[test]
     fn the_wrapper_keeps_the_exit_code_and_writes_it_down() {
         let d = std::env::temp_dir().join(format!("aca-health-{}", std::process::id()));

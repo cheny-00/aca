@@ -1,15 +1,20 @@
-//! `M`:看 / 改会话挂的 MCP。
+//! `M`: view / change the MCPs attached to a session.
 //!
-//! gateway 插件开着时,最上面是这个会话从 gateway 看得到的服务(见 `aca_core::gateway::seen_by`):空格只对这个会话关掉 /
-//! 打开,⏎ 当场生效(Claude 马上重新拉工具列表,Codex 重启后)。已经收进 gateway 的 `[mcps.*]` 不再在「项目」里重复给。
+//! While the gateway plugin is on, the top rows are the servers this session sees through the gateway (see
+//! `aca_core::gateway::seen_by`): space turns one off / on for this session only, ⏎ applies it on the spot (Claude re-fetches
+//! the tool list right away, Codex after a restart). `[mcps.*]` already served through the gateway aren't offered again
+//! under 「项目」 (project).
 //!
-//! 能改的只有 Claude 会话的「项目」一层:目录是 config.toml 里的 `[mcps.<名字>]`(除了 `description`,
-//! 别的键原样就是写进 `.mcp.json` 的那一项),挂上 / 卸下就是改会话登记目录的 `.mcp.json`,重启后生效。别的只列不改:
-//! - 全局(账号目录 `.claude.json` 顶层的 mcpServers):几个会话共用,读会话实际用的那个目录
-//! - Codex:都在 `$CODEX_HOME/config.toml` 的 `[mcp_servers]`,用同一个 CODEX_HOME 的会话全跟着变
+//! Only the 「项目」 (project) layer of a Claude session can be changed: the catalog is `[mcps.<name>]` in config.toml (apart
+//! from `description`, the other keys are exactly the entry written into `.mcp.json`); attaching / detaching edits the
+//! `.mcp.json` in the session's registered directory, effective after a restart. The rest is listed, not changed:
+//! - Global (top-level mcpServers in the account dir's `.claude.json`): shared by several sessions; read from the dir the
+//!   session actually uses
+//! - Codex: all in `[mcp_servers]` of `$CODEX_HOME/config.toml`; every session on the same CODEX_HOME changes with it
 //!
-//! `.mcp.json` 是这里在项目目录里建的:仓库里没有它时,挂上的同时写进本地的 `.git/info/exclude`
-//! (只在这台机器、不入库),免得被 `git add -A` 带进提交;全卸掉后删掉只剩空表的 `.mcp.json`。
+//! `.mcp.json` is created here in the project dir: when the repo has none, attaching also writes it into the local
+//! `.git/info/exclude` (this machine only, not committed), so `git add -A` doesn't pull it into a commit; once everything is
+//! detached, a `.mcp.json` left with only an empty table is deleted.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -28,13 +33,13 @@ use crate::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
-    /// gateway 下面、这个会话看得到的:空格只对这个会话关掉 / 打开
+    /// Under the gateway and visible to this session: space turns it off / on for this session only
     Gateway,
-    /// 目录(`[mcps.*]`)里有:空格挂上 / 卸下(写 .mcp.json)
+    /// In the catalog (`[mcps.*]`): space attaches / detaches (writes .mcp.json)
     Project,
-    /// .mcp.json 里有、目录里没有:只列
+    /// In .mcp.json but not in the catalog: listed only
     Extra,
-    /// 账号目录里的(Claude 的 .claude.json / Codex 的 config.toml):只列
+    /// In the account dir (Claude's .claude.json / Codex's config.toml): listed only
     Global,
 }
 
@@ -43,14 +48,14 @@ pub struct Row {
     pub name: String,
     pub desc: String,
     pub kind: Kind,
-    /// 现在挂着
+    /// Attached now
     pub on: bool,
-    /// 按了空格之后要的;应用时只动和 on 不一样的
+    /// What's wanted after space presses; applying touches only the ones that differ from on
     pub want: bool,
 }
 
-/// 各行:能改的在前(目录的顺序),再是 .mcp.json 里另有的,最后是全局的。
-/// 全局已经有的不再给「项目」那一行:两处都挂等于同一个起两份
+/// The rows: editable ones first (in catalog order), then extra ones in .mcp.json, global ones last.
+/// One already global gets no 「项目」 (project) row: attaching it in both places starts the same one twice
 pub fn rows(agent: Agent, catalog: &[(String, String)], project: &[String], global: &[String]) -> Vec<Row> {
     let desc = |n: &str| catalog.iter().find(|(c, _)| c == n).map(|(_, d)| d.clone()).unwrap_or_default();
     let row = |name: &str, kind, on| Row { name: name.to_string(), desc: desc(name), kind, on, want: on };
@@ -67,22 +72,22 @@ pub fn rows(agent: Agent, catalog: &[(String, String)], project: &[String], glob
     out
 }
 
-/// gateway 那组里这个会话要关掉的(全部,不只是改了的)
+/// The ones in the gateway group this session turns off (all of them, not only the changed ones)
 pub fn gateway_off(rows: &[Row]) -> Vec<String> {
     rows.iter().filter(|r| r.kind == Kind::Gateway && !r.want).map(|r| r.name.clone()).collect()
 }
 
-/// 要挂上的、要卸下的
+/// The ones to attach, the ones to detach
 pub fn changes(rows: &[Row]) -> (Vec<String>, Vec<String>) {
     let pick = |on: bool| rows.iter().filter(|r| r.kind == Kind::Project && r.want == on && r.on != on).map(|r| r.name.clone()).collect();
     (pick(true), pick(false))
 }
 
-/// `M` 的弹窗:一行一个 MCP「[x] 名字  项目 / 全局  说明」,空格挂上 / 卸下,⏎ 应用。
-/// 能改的是方框,只读的是圆点;改过还没应用的名字用强调色
+/// The `M` popup: one MCP per row, "[x] name  project / global  description", space attaches / detaches, ⏎ applies.
+/// Editable ones get a box, read-only ones a dot; names changed but not applied yet are in the accent color
 pub struct View {
     t: Target,
-    /// 写 .mcp.json 的地方(会话登记的目录)
+    /// Where .mcp.json is written (the session's registered dir)
     dir: String,
     rows: Vec<Row>,
     sel: usize,
@@ -156,8 +161,8 @@ impl Overlay for View {
                 let (on, off) = changes(&self.rows);
                 let gw_changed = self.rows.iter().any(|r| r.kind == Kind::Gateway && r.want != r.on);
                 if gw_changed {
-                    // gateway 那组当场改:写这个会话的名单,在跑的 gateway 通知它重新拉工具列表
-                    // Claude 马上重新拉工具列表,Codex 要重启
+                    // The gateway group changes on the spot: write this session's list, and tell the running gateway so
+                    // the tool list is re-fetched. Claude re-fetches it right away, Codex needs a restart
                     match aca_core::gateway::set_off(&self.t.id, &gateway_off(&self.rows)) {
                         Ok(()) => fx.say(t!("已修改 · Codex 重启后生效", "changed · Codex picks it up after a restart")),
                         Err(e) => fx.say(e),
@@ -177,19 +182,19 @@ impl Overlay for View {
     }
 }
 
-/// 读出来的:会话实际用的配置目录(读不出就空)、各行
+/// What was read: the config dir the session actually uses (empty if it can't be read), the rows
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Info {
     pub home: String,
     pub rows: Vec<Row>,
 }
 
-/// 按 M 时读:都是本地文件
+/// Read when M is pressed: all local files
 pub fn load(s: &Session) -> Info {
     let home = home_of(s);
     let (project, global) = match s.agent {
         Agent::Claude => {
-            // 没设 CLAUDE_CONFIG_DIR 的 Claude 用的是 ~/.claude.json(不在 ~/.claude 里面)
+            // Claude without CLAUDE_CONFIG_DIR uses ~/.claude.json (not inside ~/.claude)
             let cfg = if home.is_empty() { PathBuf::from(env_home()).join(".claude.json") } else { Path::new(&home).join(".claude.json") };
             (json_servers(&Path::new(&s.dir).join(".mcp.json")), json_servers(&cfg))
         }
@@ -203,7 +208,7 @@ pub fn load(s: &Session) -> Info {
     let mut gw = vec![];
     if aca_core::gateway::enabled() && !s.deck_id.is_empty() {
         gw = gateway_rows(&s.deck_id, &cat);
-        // 已经经 gateway 给了的,不再在「项目」里给一份
+        // Ones already offered through the gateway aren't offered again under 「项目」 (project)
         let served = aca_core::gateway::settings().servers;
         cat.retain(|(n, _)| !served.contains(n));
     }
@@ -211,13 +216,13 @@ pub fn load(s: &Session) -> Info {
     Info { rows: gw, home }
 }
 
-/// 这个会话从 gateway 看得到的服务,关掉的 want / on 都是 false
+/// The servers this session sees through the gateway; turned-off ones have want / on both false
 fn gateway_rows(session: &str, cat: &[(String, String)]) -> Vec<Row> {
     aca_core::gateway::seen_by(session)
         .into_iter()
         .map(|(spec, off)| {
             let desc = match (&spec.plugin, spec.tools) {
-                // 名字已经是从插件 id 来的,不再写一遍
+                // The name already comes from the plugin id, so it isn't written again
                 (Some(_), _) => t!("来自插件", "from a plugin").to_string(),
                 (None, true) => t!("插件提供给 agent 的工具", "plugin tools for agents").to_string(),
                 (None, false) => {
@@ -244,7 +249,7 @@ fn config() -> toml::Table {
     std::fs::read_to_string(crate::config::path()).ok().and_then(|t| t.parse().ok()).unwrap_or_default()
 }
 
-/// 目录:config.toml 的 `[mcps.<名>]`,(名字, 说明),按名字排
+/// The catalog: config.toml's `[mcps.<name>]`, as (name, description), sorted by name
 fn catalog() -> Vec<(String, String)> {
     catalog_of(&config())
 }
@@ -261,7 +266,8 @@ fn catalog_of(t: &toml::Table) -> Vec<(String, String)> {
     v
 }
 
-/// 目录里这一项写进 `.mcp.json` 是什么样:`[mcps.<名>]` 里除了 `description`、`scope`(给 gateway 看的)的键原样搬过去
+/// What this catalog entry looks like in `.mcp.json`: the keys of `[mcps.<name>]` other than `description` and `scope`
+/// (meant for the gateway) are carried over as is
 fn entry_of(t: &toml::Table, name: &str) -> Option<serde_json::Value> {
     let mut def = t.get("mcps")?.get(name)?.as_table()?.clone();
     def.remove("description");
@@ -269,7 +275,8 @@ fn entry_of(t: &toml::Table, name: &str) -> Option<serde_json::Value> {
     serde_json::to_value(def).ok()
 }
 
-/// 挂上 on、卸下 off 之后的 `.mcp.json`(别的键、别的 MCP 原样留着)。目录里没有的名字放在 Err 里
+/// `.mcp.json` after attaching on and detaching off (other keys and other MCPs left as they are). A name not in the catalog
+/// goes in Err
 fn applied(text: &str, cat: &toml::Table, on: &[String], off: &[String]) -> Result<String, String> {
     let mut doc: serde_json::Value = if text.trim().is_empty() {
         serde_json::json!({})
@@ -294,7 +301,7 @@ fn applied(text: &str, cat: &toml::Table, on: &[String], off: &[String]) -> Resu
     Ok(out)
 }
 
-/// `M` 里按了 ⏎:改 dir 下的 `.mcp.json`,再收拾一下(见 `tidy`)
+/// ⏎ pressed in `M`: edit `.mcp.json` under dir, then tidy up (see `tidy`)
 pub fn apply(dir: &str, on: &[String], off: &[String]) -> Outcome {
     let path = Path::new(dir).join(".mcp.json");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -317,7 +324,7 @@ pub fn apply(dir: &str, on: &[String], off: &[String]) -> Outcome {
     Outcome::Done(parts.join(" · "))
 }
 
-/// JSON 文件里 mcpServers 的名字(.mcp.json / .claude.json),读不了就空
+/// The mcpServers names in a JSON file (.mcp.json / .claude.json), empty if unreadable
 fn json_servers(p: &Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(p) else { return vec![] };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return vec![] };
@@ -326,7 +333,7 @@ fn json_servers(p: &Path) -> Vec<String> {
     names
 }
 
-/// Codex config.toml 里 `[mcp_servers.<名>]` 的名字
+/// The names of `[mcp_servers.<name>]` in Codex's config.toml
 fn toml_servers(p: &Path) -> Vec<String> {
     let t: toml::Table = std::fs::read_to_string(p).ok().and_then(|t| t.parse().ok()).unwrap_or_default();
     let mut names: Vec<String> = t.get("mcp_servers").and_then(|m| m.as_table()).map(|m| m.keys().cloned().collect()).unwrap_or_default();
@@ -334,8 +341,8 @@ fn toml_servers(p: &Path) -> Vec<String> {
     names
 }
 
-/// 会话实际用的配置目录。在跑的:agent 进程里的 CLAUDE_CONFIG_DIR / CODEX_HOME(和 t 终端带的一样);
-/// 停着的:登记的账号那一层的 `home`。推不出 = 空(用各家的默认目录)
+/// The config dir the session actually uses. Running: CLAUDE_CONFIG_DIR / CODEX_HOME in the agent process (the same as the
+/// `t` temporary terminal gets); stopped: the registered account's `home`. Can't tell = empty (each family's default dir)
 pub(crate) fn home_of(s: &Session) -> String {
     let key = if s.agent == Agent::Codex { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
     if !s.pane.is_empty()
@@ -364,12 +371,13 @@ fn git(dir: &str, args: &[&str]) -> Option<String> {
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string())
 }
 
-/// 仓库里有这个文件(纳入版本管理的):别动它,也不往 exclude 里写
+/// The repo has this file (under version control): leave it alone, and don't write it into exclude
 fn tracked(dir: &str, file: &str) -> bool {
     git(dir, &["ls-files", "--error-unmatch", "--", file]).is_some()
 }
 
-/// 挂 / 卸完收拾项目目录:挂上了就把 .mcp.json 写进本地 exclude;只剩空表就删掉;空的锁文件(`.mcp.json.lock`,别的工具留下的)也删掉
+/// Tidy the project dir after attaching / detaching: if something was attached, write .mcp.json into the local exclude;
+/// delete it if only an empty table is left; also delete an empty lock file (`.mcp.json.lock`, left by other tools)
 pub fn tidy(dir: &str, attached: bool) {
     let json = Path::new(dir).join(".mcp.json");
     if attached {
@@ -387,13 +395,14 @@ pub fn tidy(dir: &str, attached: bool) {
     }
 }
 
-/// 把 .mcp.json(和锁文件)写进这个仓库本地的 .git/info/exclude。已经被忽略的(全局 gitignore、仓库的 .gitignore)不写;
-/// 按仓库根写全路径:会话登记在子目录时只忽略那一处
+/// Write .mcp.json (and the lock file) into this repo's local .git/info/exclude. Ones already ignored (global gitignore, the
+/// repo's .gitignore) aren't written; the full path from the repo root is written, so a session registered in a subdirectory
+/// only ignores that spot
 fn exclude(dir: &str) {
     if tracked(dir, ".mcp.json") {
         return;
     }
-    // check-ignore -q:被忽略时退出码 0
+    // check-ignore -q: exit code 0 when ignored
     let files: Vec<&str> =
         [".mcp.json", ".mcp.json.lock"].into_iter().filter(|f| git(dir, &["check-ignore", "-q", "--", f]).is_none()).collect();
     if files.is_empty() {
@@ -420,7 +429,7 @@ fn exclude(dir: &str) {
     let _ = std::fs::write(&path, out);
 }
 
-/// exclude 里还缺的那几行(已有的不重复写)
+/// The lines exclude still lacks (existing ones aren't written again)
 fn exclude_lines(text: &str, prefix: &str, files: &[&str]) -> String {
     let want: Vec<String> = files.iter().map(|f| format!("/{prefix}{f}")).collect();
     let missing: Vec<&String> = want.iter().filter(|w| !text.lines().any(|l| l.trim() == w.as_str())).collect();
@@ -456,7 +465,7 @@ mod tests {
                 ("alpha".into(), Kind::Project, false),
                 ("beta".into(), Kind::Project, true),
                 ("own".into(), Kind::Extra, true),
-                // 全局已有的不再给「项目」那一行
+                // One already global gets no 「项目」 (project) row
                 ("gamma".into(), Kind::Global, true),
                 ("zeta".into(), Kind::Global, true),
             ]
@@ -474,9 +483,9 @@ mod tests {
     fn only_flipped_project_rows_are_applied() {
         let mut r = rows(Agent::Claude, &cat(), &["beta".into()], &["gamma".into()]);
         assert_eq!(changes(&r), (vec![], vec![]));
-        r[0].want = true; // alpha 挂上
-        r[1].want = false; // beta 卸下
-        r[2].want = false; // 全局的改不了,改了也不算
+        r[0].want = true; // alpha attached
+        r[1].want = false; // beta detached
+        r[2].want = false; // a global one can't change; flipping it doesn't count
         assert_eq!(changes(&r), (vec!["alpha".to_string()], vec!["beta".to_string()]));
     }
 
@@ -487,9 +496,9 @@ mod tests {
         );
         assert_eq!(home_from_config(&cfg, "claude", "team"), "/acct/team");
         assert_eq!(home_from_config(&cfg, "codex", "cx"), "/homes/cx");
-        // 直接写目录的账号
+        // An account given directly as a dir
         assert_eq!(home_from_config(&cfg, "claude", "/h/.x"), "/h/.x");
-        // 没写账号、没有这个账号、开成 shell 的:用各家默认的
+        // No account, an unknown account, opened as shell: each family's default
         assert_eq!(home_from_config(&cfg, "claude", ""), "");
         assert_eq!(home_from_config(&cfg, "claude", "nope"), "");
         assert_eq!(home_from_config(&cfg, "", ""), "");
@@ -503,18 +512,18 @@ mod tests {
                 .parse()
                 .unwrap();
         let v = |t: &str| serde_json::from_str::<serde_json::Value>(t).unwrap();
-        // 还没有文件:建出来
+        // No file yet: created
         let got = applied("", &cat, &["web".into()], &[]).unwrap();
         assert_eq!(v(&got), serde_json::json!({"mcpServers": {"web": {"command": "npx", "args": ["-y", "web-mcp"], "env": {"KEY": "k"}}}}));
         assert!(got.ends_with("}\n"));
-        // 自己手写的 MCP、别的键都留着;卸下的拿掉
+        // Hand-written MCPs and other keys stay; detached ones are removed
         let had = r#"{"other": 1, "mcpServers": {"own": {"command": "x"}, "web": {"command": "old"}}}"#;
         let got = applied(had, &cat, &["docs".into()], &["web".into()]).unwrap();
         assert_eq!(
             v(&got),
             serde_json::json!({"other": 1, "mcpServers": {"own": {"command": "x"}, "docs": {"type": "http", "url": "https://x/mcp"}}})
         );
-        // 目录里没有的、文件写坏了的:不动,说清楚
+        // Not in the catalog, or a broken file: nothing touched, and it says why
         assert!(applied(had, &cat, &["nope".into()], &[]).unwrap_err().contains("nope"));
         assert!(applied("{", &cat, &[], &["web".into()]).unwrap_err().contains("无法解析"));
         assert!(applied("[]", &cat, &[], &[]).unwrap_err().contains("不是 JSON 对象"));
@@ -551,7 +560,7 @@ mod tests {
         std::fs::write(d.join(".mcp.json.lock"), "").unwrap();
         tidy(s, false);
         assert!(!d.join(".mcp.json").exists() && !d.join(".mcp.json.lock").exists());
-        // 还挂着的 / 带别的键的不删
+        // Still attached / with other keys: not deleted
         std::fs::write(d.join(".mcp.json"), r#"{"mcpServers":{"a":{}}}"#).unwrap();
         tidy(s, false);
         assert!(d.join(".mcp.json").exists());
@@ -566,9 +575,9 @@ mod tests {
         let d = scratch("git");
         let s = d.to_str().unwrap();
         if git(s, &["init", "-q"]).is_none() {
-            return; // 没有 git 就不测
+            return; // no git, no test
         }
-        // 不受本机全局 gitignore 影响
+        // Unaffected by this machine's global gitignore
         git(s, &["config", "core.excludesFile", "/dev/null"]).unwrap();
         std::fs::create_dir_all(d.join("sub")).unwrap();
         let sub = d.join("sub");
@@ -577,15 +586,15 @@ mod tests {
         let ex = std::fs::read_to_string(d.join(".git/info/exclude")).unwrap();
         assert!(ex.contains("/sub/.mcp.json\n") && ex.contains("/sub/.mcp.json.lock\n"), "{ex}");
         assert_eq!(git(s, &["status", "--porcelain"]).unwrap(), "");
-        // 再挂一次不重复写
+        // Attaching again doesn't write it twice
         tidy(sub.to_str().unwrap(), true);
         assert_eq!(std::fs::read_to_string(d.join(".git/info/exclude")).unwrap(), ex);
-        // 仓库里本来就有的:清空了也不删
+        // Already in the repo: not deleted even when emptied
         std::fs::write(d.join(".mcp.json"), "{\"mcpServers\":{}}").unwrap();
         git(s, &["add", ".mcp.json"]).unwrap();
         tidy(s, false);
         assert!(d.join(".mcp.json").exists());
-        // 仓库的 .gitignore 已经忽略了的,不再往 exclude 里写
+        // Already ignored by the repo's .gitignore: not written into exclude
         let d2 = scratch("ignored");
         let s2 = d2.to_str().unwrap();
         git(s2, &["init", "-q"]).unwrap();

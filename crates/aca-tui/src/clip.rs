@@ -1,18 +1,18 @@
-//! 复制到剪贴板。
+//! Copy to the clipboard.
 //!
-//! - 从 ssh 连进来(手机):用 OSC 52 交给终端,Moshi 会把它放进手机的剪贴板
-//! - 在 tmux 里跑(桌面):`tmux load-buffer -w`,tmux 自己用 OSC 52 转给外层终端
-//! - 本机直接跑:pbcopy
+//! - Connected over ssh (phone): hand it to the terminal with OSC 52; Moshi puts it into the phone's clipboard
+//! - Running in tmux (desktop): `tmux load-buffer -w`; tmux itself passes it on to the outer terminal with OSC 52
+//! - Running directly on this machine: pbcopy
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 use aca_core::tr;
 
-/// OSC 52 太长时有的终端直接丢掉;最后一条回复一般远小于这个
+/// Some terminals drop an OSC 52 that's too long; the last reply is usually far smaller than this
 const MAX: usize = 64 * 1024;
 
-/// 返回「怎么复制的」,给底栏提示用
+/// Returns "how it was copied", for the bottom bar hint
 pub fn copy(text: &str) -> Result<&'static str, String> {
     let text = cut(text, MAX);
     let remote = std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
@@ -32,7 +32,7 @@ pub fn copy(text: &str) -> Result<&'static str, String> {
     Ok("pbcopy")
 }
 
-/// 按字节截断,但不切在字中间
+/// Truncate by bytes, but never in the middle of a character
 fn cut(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;

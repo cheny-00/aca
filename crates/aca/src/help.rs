@@ -1,27 +1,32 @@
-//! `aca help`:总览一屏看完;一条命令的细节是 `aca help <命令>`(`aca <命令> --help` 也到这)。
+//! `aca help`: the overview fits on one screen; the details of a command are `aca help <COMMAND>` (`aca <COMMAND> --help` lands
+//! there too).
 //!
-//! 每条命令的写法只记在这张表里:总览里的那一行、细节页、参数给错时提示的用法,都从这出。
-//! **加命令 = `cli.rs` 一个分支 + 这里一项**:表里没有的名字 `cli.rs` 不认,到不了它的分支。
+//! How each command is written is recorded only in this table: its line in the overview, its detail page, and the usage shown
+//! when arguments are wrong all come from here.
+//! **Adding a command = one branch in `cli.rs` + one entry here**: `cli.rs` doesn't accept names missing from the table, so
+//! they never reach its branch.
 //!
-//! 每样都是中英两份(`Tr::new(中文, 英文)`),并排写,改一边顺手改另一边。英文的用法里占位词全大写
-//! (`<TITLE>`、`-g GROUP`),小写的是原样敲的词:补全靠这个分(complete.rs),测试查两边拆出来一样。
+//! Everything comes in Chinese and English (`Tr::new(chinese, english)`), written side by side: change one, change the other
+//! along with it. In English usages, placeholder words are all uppercase
+//! (`<TITLE>`, `-g GROUP`), and lowercase ones are words typed as is: completion tells them apart by this (complete.rs), and a
+//! test checks that both sides split the same way.
 
 use aca_core::i18n::{Lang, Tr, lang};
 use aca_core::tr;
 
 pub struct Cmd {
-    /// 名字;共用一条说明的(start / stop)都列上
+    /// Names; every name sharing one description is listed (start / stop)
     pub names: &'static [&'static str],
-    /// 总览里的写法(短的那种)和那一句话
+    /// How it's written in the overview (the short form) and its one sentence
     pub short: Tr,
     pub brief: Tr,
-    /// 完整用法,一行一种,不带开头的 `aca `
+    /// The full usage, one form per line, without the leading `aca `
     pub usage: &'static [Tr],
-    /// 每个参数是什么、要知道的事、例子;空 = 没有要补充的
+    /// What each argument is, things to know, examples; empty = nothing to add
     pub more: Tr,
 }
 
-/// 总览里的分区,按这个顺序
+/// The sections of the overview, in this order
 pub const GROUPS: &[(Tr, &[Cmd])] = &[
     (
         Tr::new("界面", "Interface"),
@@ -338,6 +343,7 @@ kept as [keys] next in config.toml; to change it: aca tmux key next <key>.
                  (从未上报过 hook 的,比如 shell,多久以前的都算)。以下不会停止:本轮未结束的(hook 只报了开始,屏幕看起来再空闲也不停)、未读的、
                  等待回应的、出错的、有人连着的、有后台任务的、输入框里有未发送文字的、派出去的会话仍未停止的、
                  自己设了定时且还没到点的(Claude 的 CronCreate、/loop 的下一次:只存在于它的进程里,停止后就没了)、
+                 收件箱里有还没到点的定时消息的(aca msg --in:停止了到点就送不进去)、
                  重新启动后无法恢复原来对话的。会打印停止了哪些
   start          未运行时在原地重新启动,继续原来的对话(启动后没说过话的会开始新的一段);tmux 里整个不存在了(电脑重启过)就重新创建
 
@@ -355,8 +361,9 @@ aca 界面打开时每 5 分钟按 stop --idle 3h 执行一次(你连接在某�
                  never reported a hook, like a shell). Never stopped: a turn that hasn't finished (the hook reported
                  only its start, however idle the screen looks), finished-unread, waiting for you, failed, attached,
                  background tasks, unsent text in its input box, dispatched sessions still open, a schedule of its own
-                 not yet due (Claude's CronCreate, /loop's next wakeup: they live only in its process), or one that
-                 can't resume its conversation. Prints the ones it stopped
+                 not yet due (Claude's CronCreate, /loop's next wakeup: they live only in its process), a scheduled
+                 message not yet due in its inbox (aca msg --in: stopped, it couldn't be delivered on time), or one
+                 that can't resume its conversation. Prints the ones it stopped
   start          not running: start it again in place, resuming the conversation (one that never talked starts fresh);
                  gone from tmux entirely (after a reboot): create it again
 
@@ -588,12 +595,14 @@ To pass a message to another session (without touching its input box, kept until
                     "给别的会话传一句话:放进它的收件箱,在它方便时送达",
                     "pass a message: into its inbox, delivered when it's convenient",
                 ),
-                usage: &[Tr::new("msg <id | parent> [话…]", "msg <id | parent> [TEXT…]")],
+                usage: &[Tr::new("msg [--in 时长] <id | parent> [话…]", "msg [--in DURATION] <id | parent> [TEXT…]")],
                 more: Tr::new(
                     "\
   id             发给谁:会话 id 或名字
   parent         派你出来的那个会话(在某个会话里发送时)
   话             不写时读标准输入
+  --in 时长      过这么久再送(90s、10m、1h30m,最长 7 天);定时的可以发给自己,到点叫醒自己。
+                 没到点的在 aca inbox 里是 [定时],列表上标 ◷;有它的闲着也不会被自动停
 在某个会话里发送的,发件人是那个会话;在外面发送的,发件人是「你」。
 
 送达方式取决于对方的工具,都不动它的输入框:
@@ -613,6 +622,9 @@ To pass a message to another session (without touching its input box, kept until
   id             who to: a session id or a name
   parent         the one that dispatched you (when sent from inside a session)
   TEXT           default: read standard input
+  --in DURATION  deliver it after this long (90s, 10m, 1h30m; 7 days at most); a scheduled one can go to
+                 yourself, to wake you up then. Until then it's [scheduled] in aca inbox and ◷ in the list,
+                 and the session isn't stopped for being idle
 Sent from inside a session, the sender is that session; from outside it's \"you\".
 
 How it gets in depends on the agent; none of them touch its input box:
@@ -645,12 +657,13 @@ More than 20 from one session to another within 10 minutes: the rest are kept, n
   -n 条数   最近几条(默认 20)
   --json    一行一条 JSON(供脚本读取)
 
-[未送达] 还在收件箱里  [排队中] 已放进 Codex 的队列,它还没为这条开始一轮  [已送达] 已交给它",
+[定时 10:20] 还没到点  [未送达] 还在收件箱里  [排队中] 已放进 Codex 的队列,它还没为这条开始一轮  [已送达] 已交给它",
                     "  id         default: inside a session, its own; outside, which sessions have undelivered messages
   -n COUNT   the latest few (default 20)
   --json     one JSON message per line (for scripts)
 
-[undelivered] still in the inbox  [queued] in Codex's queue, no turn for it yet  [delivered] in front of it",
+[scheduled 10:20] not due yet  [undelivered] still in the inbox  [queued] in Codex's queue, no turn for it yet
+[delivered] in front of it",
                 ),
             },
             Cmd {
@@ -1119,11 +1132,11 @@ The environment variable ACA_THEME=<name> overrides the config (dark / light are
                     "  -f         持续读取新事件
   -n 行数    先打印最近几行(默认 20;带 -f 时默认不打印)
 
-有哪些事件、各自带哪些字段:docs/plugins.zh-CN.md。",
+有哪些事件、各自带哪些字段:https://github.com/cheny-00/aca/blob/main/docs/plugins.zh-CN.md",
                     "  -f          keep following
   -n LINES    print the last few lines first (default 20; with -f, none by default)
 
-Which events there are and their fields: docs/plugins.md.",
+Which events there are and their fields: https://github.com/cheny-00/aca/blob/main/docs/plugins.md",
                 ),
             },
             Cmd {
@@ -1200,7 +1213,8 @@ Which events there are and their fields: docs/plugins.md.",
                 more: Tr::new(
                     "\
 插件 = 一个目录 + 一份 aca-plugin.toml(能力、事件钩子、定时、窗格、设置、带给 agent 的目录和 MCP),再通过 aca 的命令行回调。
-写法:docs/plugins.zh-CN.md。用哪些插件、给哪些 agent、各项设置写在 ~/.config/aca/plugins.toml;下面这些命令也会修改它。
+写法:https://github.com/cheny-00/aca/blob/main/docs/plugins.zh-CN.md
+用哪些插件、给哪些 agent、各项设置写在 ~/.config/aca/plugins.toml;下面这些命令也会修改它。
 不想单独建插件:写好 ~/.config/aca/user/aca-plugin.toml 就生效(id 固定为 user,无需 link),删除就失效。
 
   install        git 地址的克隆到 ~/.local/share/aca/plugins/<id>;owner/repo 指 GitHub 上的仓库;本地目录等同于 link;
@@ -1265,7 +1279,8 @@ Which events there are and their fields: docs/plugins.md.",
   --client       弹窗显示在哪个 tmux 客户端上",
                     "\
 A plugin = a directory + an aca-plugin.toml (commands, event hooks, timers, panes, settings, a directory and an MCP server
-it brings to agents) that calls back into aca's command line. How to write one: docs/plugins.md.
+it brings to agents) that calls back into aca's command line.
+How to write one: https://github.com/cheny-00/aca/blob/main/docs/plugins.md
 Which plugins, for which agents, and their settings live in ~/.config/aca/plugins.toml; these commands edit it too.
 No plugin to make: write ~/.config/aca/user/aca-plugin.toml and it's there (its id is always user, no link); delete it and it's gone.
 
@@ -1366,7 +1381,7 @@ environment.",
     ),
 ];
 
-/// 不是命令的几页
+/// The pages that aren't commands
 pub const TOPICS: &[(&str, Tr)] =
     &[("keys", Tr::new("界面快捷键", "interface keys")), ("config", Tr::new("config.toml 的写法", "writing config.toml"))];
 
@@ -1441,7 +1456,7 @@ aca 绑定在 tmux 上的键(不用前缀,只在 aca 的会话里拦截;不写�
   [theme] name · [ime] auto · [new_group] default_path · [hooks] url / token
                                    # 这几项在界面的 ^S 设置页里修改,不用手写
 
-当前可用的名字:aca names。账号的每个选项、防止账号混用的规则:README 的「账号」。";
+当前可用的名字:aca names。账号的每个选项、防止账号混用的规则:https://github.com/cheny-00/aca/blob/main/docs/accounts.zh-CN.md";
 
 const CONFIG_EN: &str = "\
 ~/.config/aca/config.toml — all optional; it works with nothing in it (claude / codex use their default config dirs).
@@ -1520,9 +1535,10 @@ Interface
   [theme] name · [ime] auto · [new_group] default_path · [hooks] url / token
                                    # these are set in the interface's ^S settings page, no need to write them
 
-Which names work now: aca names. Every account option and the rules that keep accounts apart: \"Accounts\" in the README.";
+Which names work now: aca names. Every account option and the rules that keep accounts apart: https://github.com/cheny-00/aca/blob/main/docs/accounts.md";
 
-/// 在终端里占几格:中日韩的字和全角标点两格,别的一格(`…` `·` `→` 这些在多数终端里是一格)
+/// How many cells it takes in a terminal: CJK characters and full-width punctuation take two, everything else one (`…` `·`
+/// `→` and the like are one in most terminals)
 fn width(s: &str) -> usize {
     let wide = |c: char| matches!(c as u32, 0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6);
     s.chars().map(|c| if wide(c) { 2 } else { 1 }).sum()
@@ -1532,19 +1548,19 @@ pub fn find(name: &str) -> Option<&'static Cmd> {
     GROUPS.iter().flat_map(|g| g.1.iter()).find(|c| c.names.contains(&name))
 }
 
-/// 敲错了的名字像哪条命令:它是某个名字的开头,或者只差一两个字母
+/// Which command a mistyped name resembles: it's the start of some name, or only a letter or two off
 pub fn guess(name: &str) -> Option<&'static str> {
     let names = || GROUPS.iter().flat_map(|g| g.1.iter()).flat_map(|c| c.names.iter().copied());
     let starts: Vec<&str> = names().filter(|n| !name.is_empty() && n.starts_with(name)).collect();
     if let [one] = starts.as_slice() {
         return Some(one);
     }
-    // 短的名字差两个字母就是另一个词了(nope 不是 move)
+    // For short names, two letters off is another word (nope isn't move)
     let far = if name.chars().count() < 5 { 1 } else { 2 };
     names().map(|n| (distance(name, n), n)).filter(|(d, _)| *d <= far && *d < name.chars().count()).min().map(|x| x.1)
 }
 
-/// 两个词差几个字母(增、删、改各算一个)
+/// How many letters two words differ by (an insertion, deletion or change counts as one each)
 fn distance(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let mut row: Vec<usize> = (0..=b.len()).collect();
@@ -1560,13 +1576,13 @@ fn distance(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
-/// 参数给错时打在用法前面的;第二种用法起缩进到和它一样宽
+/// Printed before the usage when arguments are wrong; usage forms from the second on are indented to the same width
 pub const USAGE: Tr = Tr::new("用法:", "usage: ");
 
-/// 一条命令的用法,一行一种(参数给错时也打这个)
+/// The usage of a command, one form per line (also printed when arguments are wrong)
 pub fn usage(name: &str) -> Option<String> {
     let c = find(name)?;
-    // 几个名字共用一项的:只打这个名字的那几行
+    // Several names sharing one entry: print only the lines of this name
     let own: Vec<&Tr> = c.usage.iter().filter(|u| u.split_whitespace().next() == Some(name)).collect();
     let lines: Vec<String> = if own.is_empty() {
         c.usage.iter().map(|u| format!("aca {u}")).collect()
@@ -1576,7 +1592,7 @@ pub fn usage(name: &str) -> Option<String> {
     Some(lines.join(&format!("\n{}", " ".repeat(width(&USAGE)))))
 }
 
-/// 总览
+/// The overview
 pub fn overview() -> String {
     let pad = GROUPS.iter().flat_map(|g| g.1.iter()).map(|c| width(&c.short)).max().unwrap_or(0) + 3;
     let row = |left: &str, right: &str| format!("  {left}{}{right}\n", " ".repeat(pad.saturating_sub(width(left))));
@@ -1614,7 +1630,7 @@ pub fn overview() -> String {
     out
 }
 
-/// `aca help <名字>`:一条命令的细节,或者那几页;没有这个名字 = None
+/// `aca help <NAME>`: the details of a command, or one of those pages; no such name = None
 pub fn of(name: &str) -> Option<String> {
     match name {
         "keys" => return Some(aca_tui::KEYS.trim_end().to_string()),
@@ -1633,7 +1649,8 @@ pub fn of(name: &str) -> Option<String> {
     Some(out)
 }
 
-/// 参数里是不是在求助:`--` 前面有 `-h` / `--help`。跟在要带一段话的参数后面的不算(`-m --help` 是要发的话)
+/// Whether the arguments ask for help: `-h` / `--help` before `--`. Not when it follows an argument that takes a message
+/// (`-m --help` is the message to send)
 pub fn asked(args: &[String]) -> bool {
     let own = args.iter().position(|a| a == "--").map_or(args, |i| &args[..i]);
     own.iter()
@@ -1657,15 +1674,15 @@ mod tests {
             with(l, || {
                 let o = overview();
                 assert!(o.lines().count() <= 60, "{l:?}:总览有 {} 行,一屏看不完了", o.lines().count());
-                // 100 列的终端里不折行
+                // No wrapping in a 100-column terminal
                 assert!(o.lines().all(|l| width(l) <= 100), "{l:?}:{:#?}", o.lines().filter(|l| width(l) > 100).collect::<Vec<_>>());
                 for c in GROUPS.iter().flat_map(|g| g.1.iter()) {
                     assert_eq!(o.matches(&format!("\n  {} ", &*c.short)).count(), 1, "{l:?}:{}", &*c.short);
-                    // 写法里的第一个词就是名字;每种用法都以自己的某个名字开头
+                    // The first word of the short form is the name; every usage form starts with one of its names
                     assert_eq!(c.short.split_whitespace().next(), Some(c.names[0]));
                     assert!(c.usage.iter().all(|u| c.names.contains(&u.split_whitespace().next().unwrap())), "{:?}", c.names);
                 }
-                // 说明那一列是对齐的(中文按两格算):每行「  写法」后面空到同一格
+                // The description column is aligned (Chinese counted as two cells): every line pads "  FORM" out to the same cell
                 let col = |r: &str| {
                     let body = &r[2..];
                     let end = body.find("  ").unwrap();
@@ -1686,7 +1703,7 @@ mod tests {
     fn one_command_page_has_its_usage_its_line_and_its_details() {
         let new = of("new").unwrap();
         assert!(new.starts_with("aca new <工具[:账号]> [目录]") && new.contains("--say 话") && new.contains("例:"), "{new}");
-        // 共用一项的两个名字都找得到同一页;用法只打自己的那一行
+        // Two names sharing one entry both find the same page; the usage prints only its own line
         assert_eq!(of("stop"), of("start"));
         assert_eq!(usage("stop").as_deref(), Some("aca stop <id>\n     aca stop --idle <时长>"));
         assert_eq!(usage("rename").as_deref(), Some("aca rename <id> <标题>\n     aca rename <id> --auto"));
@@ -1700,7 +1717,8 @@ mod tests {
         assert!(en.2.contains("[accounts.claude]") && en.2.contains("lang = \"zh\""));
     }
 
-    /// 两种话的细节页排得一样:参数表的第一行和后面几行一样缩进着,没有哪行意外地缩进一格
+    /// The detail pages are laid out the same in both languages: the first line of the argument table is indented like the lines
+    /// after it, and no line is accidentally indented by one cell
     #[test]
     fn detail_pages_are_indented_the_same_way_in_both_languages() {
         for l in [Lang::Zh, Lang::En] {
@@ -1708,7 +1726,7 @@ mod tests {
                 for c in GROUPS.iter().flat_map(|g| g.1.iter()) {
                     let page = of(c.names[0]).unwrap();
                     assert!(page.lines().all(|l| l.starts_with("  ") || !l.starts_with(' ')), "{l:?} {}", c.names[0]);
-                    // 两边都有、或者都没有补充的
+                    // Both have notes to add, or neither does
                     assert_eq!(c.more.zh.is_empty(), c.more.en.is_empty(), "{}", c.names[0]);
                 }
                 for name in ["group", "ls", "send", "events", "fork", "rename", "import", "cost", "meta", "plugin", "hook", "completion"] {
@@ -1726,7 +1744,7 @@ mod tests {
         assert_eq!(guess("renmae"), Some("rename"));
         assert_eq!(guess("rest"), Some("restart"));
         assert_eq!(guess("adop"), Some("adopt"));
-        // 开头对得上好几个的、差太远的:不猜
+        // A start that matches several, or one too far off: no guess
         assert_eq!((guess("s"), guess("xyzzy"), guess(""), guess("nope")), (None, None, None, None));
         assert_eq!(guess("l"), None);
         assert_eq!((distance("kitten", "sitting"), distance("", "ab"), distance("ls", "ls")), (3, 2, 0));

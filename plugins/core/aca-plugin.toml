@@ -2,12 +2,19 @@ id = "aca.core"
 name = "aca core tools"
 version = "0.1.0"
 api = 1
-description = "把 aca 的核心能力作为工具提供给 agent:查看会话、派出 worker、传话、等待、代为回答、中止。默认不安装"
-description_en = "aca's core abilities as agent tools: list sessions, dispatch workers, message, wait, answer, interrupt. Not installed by default."
+description = "把 aca 的核心能力作为工具提供给 agent:查看会话、派出 worker、传话、等待、代为回答、中止、过会儿叫醒自己。默认不安装"
+description_en = "aca's core abilities as agent tools: list sessions, dispatch workers, message, wait, answer, interrupt, wake yourself later. Not installed by default."
 
-# 每个工具就是一条 aca 命令(core.sh),调用的会话就是 ACA_SESSION_ID:新开的 worker 挂在它下面,
-# 替谁回答、中止谁,只能是它自己派出去的那些(aca answer / interrupt 自己就是这么查的)。
-# 只想给某几个账号:plugins.toml 里 [plugins."aca.core"] agents = ["claude:work"]
+# Each tool is one aca command (core.sh), and the calling session is ACA_SESSION_ID: new workers go under it, and the ones it
+# answers for or interrupts can only be those it sent out itself (that's how aca answer / interrupt check it themselves).
+# To offer it to only some accounts: [plugins."aca.core"] agents = ["claude:work"] in plugins.toml
+
+# Codex also gets a skill (wakeup): for work that takes several minutes, rather than sit waiting in this turn, it has
+# `aca msg --in` wake it later and comes back to check. Given only the tool, it doesn't reach for it on its own (verified 2026-10-29).
+# Claude has its own ScheduleWakeup, so it doesn't get this
+[agent]
+for = ["codex"]
+dir = "agent"
 
 [[commands]]
 id = "sessions"
@@ -53,6 +60,15 @@ desc = "Without answer: show what a session you dispatched is asking. With answe
 args = { id = "string", answer = "string?" }
 expose = ["agent"]
 command = ["sh", "core.sh", "answer"]
+
+[[commands]]
+id = "wakeup"
+title = "过会儿叫醒自己"
+title_en = "Wake yourself later"
+desc = "Have aca hand you text as a new message after a delay (after: like 90s, 10m, 1h30m; 7 days at most). It comes even after this turn ends, so end the turn instead of polling or sleeping while something slow runs, and check back then."
+args = { after = "string", text = "string" }
+expose = ["agent"]
+command = ["sh", "core.sh", "wakeup"]
 
 [[commands]]
 id = "interrupt"

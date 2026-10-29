@@ -1,4 +1,5 @@
-//! `^S` 设置页里「自动信任目录」那一行:`[trust] folder`(开关在 aca-core 的 config.rs,替你答的那一步在它的 trust.rs)。
+//! The 「自动信任目录」 (auto-trust folders) row in the `^S` settings page: `[trust] folder` (the switch is in aca-core's
+//! config.rs, the step that answers for you is in its trust.rs).
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
@@ -73,7 +74,7 @@ mod tests {
         row.enter(&mut fx);
         assert_eq!(*WROTE.lock().unwrap(), [("trust".to_string(), "folder".to_string(), toml::Value::Boolean(true))]);
         assert!(fx.flash.is_some());
-        // 写不进去:说原因,不装作开了
+        // Can't write it: say why, don't pretend it's on
         let stuck = TrustRow { on: || false, set: |_, _, _| Err("没记下".into()) };
         let mut fx = Fx::default();
         stuck.enter(&mut fx);

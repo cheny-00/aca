@@ -1,9 +1,12 @@
-//! `X`:换个账号接着跑。一个账号额度用完了、活还没干完时用:在原地换成同一家的另一个账号重启、接着这段对话
-//! (对话记录拷过去,上下文原样带着,见 `aca_core::session::rehome`)。
+//! `X`: carry on under another account. For when an account's quota ran out before the work is done: restart in place on
+//! another account of the same kind and resume this conversation (the conversation record is copied over and the context comes
+//! along whole, see `aca_core::session::rehome`).
 //!
-//! 框里摆的是挑账号要看的:顶上是它现在用的账号和那个账号的额度;下面只列能换过去的(同一家的别的账号),
-//! 每个一行:登录着没有(放到后台问,问到了下一帧就显示)、额度(5h / 7d 用了多少,过七成黄、过九成红,同计费页)。
-//! ⏎ / 数字直接换,不再弹第二个框;没登录的不让换。a 去账号页登录、+ 加账号(这个框先收起,登好了再按 X)。
+//! The box shows what you need to pick an account: on top the account it uses now and that account's quota; below, only the
+//! ones it can move to (other accounts of the same kind), one row each: logged in or not (asked in the background, shown the
+//! frame after the answer arrives) and quota (5h / 7d used; amber past 70%, red past 90%, as on the billing page).
+//! ⏎ / a digit switches directly, no second box; a logged-out one can't be picked. a goes to the accounts page to log in, +
+//! adds an account (this box closes first; press X again once logged in).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,24 +26,24 @@ use crate::tools::Tool;
 use crate::ui::agent_style;
 use crate::usage::{Quota, Source};
 
-/// 外面给的:问登录、开账号页。测试里换成假的、当场问
+/// Provided from outside: asking about logins, opening the accounts page. Tests swap in fakes that answer on the spot
 #[derive(Clone, Copy)]
 pub struct Env {
     pub ask: fn(Agent, &str) -> Login,
-    /// 放到后台问(界面里);测试里当场问
+    /// Ask in the background (in the interface); tests ask on the spot
     pub background: bool,
-    /// 账号页;参数 = 直接进加账号
+    /// The accounts page; the argument = go straight to adding an account
     pub accounts: Option<fn(bool) -> Box<dyn Overlay>>,
 }
 
-/// 能换过去的一个账号(`n` 菜单里的那一项)
+/// An account it can move to (its entry in the `n` menu)
 struct Acct {
-    /// 菜单里的名字
+    /// The name in the menu
     name: String,
     account: String,
-    /// 换过去用的「工具:账号」
+    /// The "tool:account" to move to
     spec: String,
-    /// 起不了的原因(账号没登记好、工具写坏了)
+    /// Why it can't start (the account isn't registered properly, the tool is misconfigured)
     problem: Option<String>,
     quota: Option<Quota>,
 }
@@ -48,23 +51,23 @@ struct Acct {
 pub struct Menu {
     t: Target,
     agent: Agent,
-    /// 「Claude·ding」
+    /// "Claude·ding"
     label: String,
     now: Option<Quota>,
     rows: Vec<Acct>,
     sel: usize,
-    /// 它在跑 / 在等你选:换会打断这一轮
+    /// It's running / needs you to choose: switching interrupts this turn
     busy: bool,
-    /// 拿额度的时刻(算重置时间、「几小时前的数」)和本地时区偏移
+    /// When the quota was fetched (for reset times and "numbers from N hours ago") and the local timezone offset
     at: i64,
     off: i64,
     env: Env,
-    /// 「工具:账号」→ 登录着没有;还没问到的不在里面
+    /// "tool:account" → logged in or not; ones not answered yet aren't in it
     logins: Arc<Mutex<HashMap<String, Login>>>,
 }
 
-/// 这一家所有账号现在的额度:Claude 是状态栏记下的(`limits`),Codex 读它最近的对话记录(`usage::codex_now`,
-/// 用 API key 登录的没有,见 `usage::subscribed`)
+/// The current quota of every account of this kind: Claude's as recorded by its status line (`limits`), Codex's read from its
+/// latest conversation record (`usage::codex_now`; none for ones logged in with an API key, see `usage::subscribed`)
 pub fn quotas(agent: Agent) -> Vec<Quota> {
     let cfg = aca_core::config::load();
     let home = std::env::var("HOME").unwrap_or_default();
@@ -85,13 +88,14 @@ pub fn quotas(agent: Agent) -> Vec<Quota> {
     }
 }
 
-/// 额度按账号名对上(两个账号共用一个目录的记成「甲·乙」,写哪个都算)
+/// Match quotas by account name (two accounts sharing one directory are recorded as "A·B"; either name matches)
 pub fn quota_of(qs: &[Quota], agent: Agent, name: &str) -> Option<Quota> {
     qs.iter().find(|q| q.agent == agent && !name.is_empty() && (q.who == name || q.who.split('·').any(|w| w == name))).cloned()
 }
 
-/// 「5h 98% · 7d 61%  今天 17:00 重置」:颜色同计费页;用满了的说什么时候重置,数是一小时前的说一声;没记到的空着。
-/// at 是拿额度的时刻,off 是本地时区偏移。`n` 的菜单也用它
+/// "5h 98% · 7d 61%  resets today 17:00": colors as on the billing page; a used-up window says when it resets, numbers over an
+/// hour old say so; nothing recorded = empty.
+/// at is when the quota was fetched, off the local timezone offset. The `n` menu uses it too
 pub fn quota_spans(q: Option<&Quota>, at: i64, off: i64) -> Vec<Span<'static>> {
     let Some(q) = q else { return vec![] };
     let p = theme::pal();
@@ -101,7 +105,7 @@ pub fn quota_spans(q: Option<&Quota>, at: i64, off: i64) -> Vec<Span<'static>> {
             v.push(Span::styled(" · ", theme::faint()));
         }
         v.push(Span::styled(format!("{} ", win.label), kit::dim()));
-        // 过了重置时间还没有新数:不知道现在用了多少,只知道重置过
+        // Past the reset time with no new numbers: usage now is unknown, only that it reset
         if win.resets.is_some_and(|r| r <= at) {
             v.push(Span::styled(t!("已重置", "reset"), Style::new().fg(p.green)));
             continue;
@@ -124,7 +128,8 @@ pub fn quota_spans(q: Option<&Quota>, at: i64, off: i64) -> Vec<Span<'static>> {
 }
 
 impl Menu {
-    /// s 是高亮的会话(登记的 Claude / Codex),tools 是 `n` 的菜单,quotas 是这一家各账号的额度
+    /// s is the highlighted session (a registered Claude / Codex), tools the `n` menu, quotas the quota of each account of this
+    /// kind
     pub fn new(t: Target, s: &Session, tools: Vec<Tool>, quotas: &[Quota], (at, off): (i64, i64), env: Env) -> Menu {
         let current = if s.account.is_empty() { s.who.as_str() } else { s.account.as_str() };
         let rows = tools
@@ -174,7 +179,7 @@ impl Menu {
         self.logins.lock().unwrap_or_else(|e| e.into_inner()).get(&r.spec).cloned()
     }
 
-    /// 换过去:起不了的、没登录的不换,说为什么
+    /// Move over: not for one that can't start or isn't logged in; say why
     fn go(&mut self, i: usize, fx: &mut Fx) -> Flow {
         self.sel = i;
         let r = &self.rows[i];
@@ -194,7 +199,7 @@ impl Menu {
         quota_spans(q, self.at, self.off)
     }
 
-    /// 登录那一栏,宽度固定(后面的额度对得齐)
+    /// The login column, fixed width (so the quotas after it line up)
     fn login_span(&self, r: &Acct) -> Span<'static> {
         let p = theme::pal();
         let (text, st) = match (&r.problem, r.account.is_empty(), self.login(r)) {
@@ -209,7 +214,7 @@ impl Menu {
     }
 }
 
-/// 登录那一栏占几格
+/// How many columns the login column takes
 const LOGIN_W: usize = 14;
 
 impl Overlay for Menu {
@@ -271,7 +276,8 @@ impl Overlay for Menu {
             KeyCode::Up | KeyCode::Char('k') if n > 0 => self.sel = (self.sel + n - 1) % n,
             KeyCode::Enter if n > 0 => return self.go(self.sel, fx),
             KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < n => return self.go(c as usize - '1' as usize, fx),
-            // 登录 / 加账号在账号页里做;这个框收起,登好了再按 X(登录着没有会重新问)
+            // Logging in / adding an account happens on the accounts page; this box closes, press X again once logged in
+            // (login state is asked again)
             KeyCode::Char(c @ ('a' | '+')) => {
                 if let Some(page) = self.env.accounts {
                     fx.open = Some(page(c == '+'));

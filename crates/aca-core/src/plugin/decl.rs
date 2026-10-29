@@ -1,24 +1,29 @@
-//! `~/.config/aca/plugins.toml`:要哪些插件,像 vim-plug 列在 vimrc 里。可以跟 dotfiles 一起放,换台机器 `aca plugin sync` 一条。
+//! `~/.config/aca/plugins.toml`: which plugins you want, the way vim-plug lists them in your vimrc. Keep it with your
+//! dotfiles; on another machine it's a single `aca plugin sync`.
 //!
 //! ```toml
 //! [plugins."aca.delegate"]
-//! source = "~/src/aca/plugins/delegate"   # 本地目录 = 链接;git 地址 / owner/repo = 克隆
-//! agents = ["claude:*", "codex:work"]    # 给哪几个「工具[:账号]」带东西;不写 = 清单里给的那几家全给
-//! settings = { max_continue = 3 }        # 盖过清单里的默认值
-//! tools = ["dispatch"]                   # 哪些能力给 agent 当工具;不写 = 清单里写 agent 的那些(写 agent? 的要点名)
-//! keys = { tasks = "T", run = "" }       # : 菜单里的键:能力 / 窗格 / 视图 → 键,"" = 不要键;不写的照清单
-//! hotkeys = { pad = "M-n" }              # 会话里面的热键:窗格 → tmux 的键名,"" = 不要;不写的照清单
+//! source = "~/src/aca/plugins/delegate"   # a local directory = link; a git URL / owner/repo = clone
+//! agents = ["claude:*", "codex:work"]    # which "tool[:account]" get what it brings; not written = every agent the manifest names
+//! settings = { max_continue = 3 }        # overrides the manifest's defaults
+//! tools = ["dispatch"]                   # which commands agents get as tools; not written = those marked agent in the manifest
+//!                                        # (agent? ones must be named)
+//! keys = { tasks = "T", run = "" }       # keys in the : menu: command / pane / view → key, "" = no key; the rest follow the manifest
+//! hotkeys = { pad = "M-n" }              # hotkeys inside sessions: pane → tmux key name, "" = none; the rest follow the manifest
 //!
 //! [plugins."owner/gh-glance"]
 //! source = "owner/gh-glance"
-//! ref = "v1.2"                           # 钉在一个标签 / 分支 / 提交上
-//! enabled = false                        # 先停着
+//! ref = "v1.2"                           # pinned to a tag / branch / commit
+//! enabled = false                        # disabled for now
 //! ```
 //!
-//! `plugins.lock` 记 git 装的每个插件现在是哪个提交:`sync` 照它装(换机器装出来一样),`update` 拉新的后改它。
+//! `plugins.lock` records the commit of each plugin installed from git: `sync` installs exactly those (another machine
+//! ends up the same), and `update` changes it after pulling.
 //!
-//! 命令行和界面里的装、删、开停都顺手改这份文件(只改那一个插件的那几行,别的、注释原样留着);
-//! 你手改了它,`aca plugin sync` 让本机跟它一致。还没有这个文件时,第一次用到就照现在登记的插件写一份。
+//! Installing, removing, enabling and disabling from the command line or the interface update this file as they go (only
+//! that plugin's lines; everything else, comments included, stays as it is); when you edit it by hand, `aca plugin sync`
+//! makes this machine match it. If the file doesn't exist yet, one is written from the registered plugins the first time
+//! it's needed.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -35,14 +40,15 @@ pub struct Want {
     #[serde(rename = "ref")]
     pub rev: String,
     pub enabled: Option<bool>,
-    /// 给哪几个「工具[:账号]」带东西:`claude`、`claude:*`(这一家的哪个账号都行)、`codex:work`;不写 = 全给
+    /// Which "tool[:account]" get what it brings: `claude`, `claude:*` (any account of that tool), `codex:work`; not written = all
     pub agents: Vec<String>,
     pub settings: toml::Table,
-    /// 哪些能力给 agent 当工具(能力 id);None = 照清单(写 `agent` 的给,`agent?` 的不给)
+    /// Which commands agents get as tools (command ids); None = as the manifest says (`agent` ones yes, `agent?` ones no)
     pub tools: Option<Vec<String>>,
-    /// `:` 菜单里的键:能力 / 窗格 / 视图的 id → 一个字符;空字符串 = 不要键。没写的照清单的 `[[keys]]`
+    /// Keys in the `:` menu: command / pane / view id → one character; empty string = no key. The rest follow the manifest's
+    /// `[[keys]]`
     pub keys: BTreeMap<String, String>,
-    /// 会话里面的热键:窗格的 id → tmux 的键名;空字符串 = 不要。没写的照清单的 `[[hotkeys]]`
+    /// Hotkeys inside sessions: pane id → tmux key name; empty string = none. The rest follow the manifest's `[[hotkeys]]`
     pub hotkeys: BTreeMap<String, String>,
 }
 
@@ -51,8 +57,8 @@ impl Want {
         self.enabled.unwrap_or(true)
     }
 
-    /// 这个会话带不带:`tool` 是会话的工具名(`aca new` 后面那个),`kind` 是它按哪一家起的(claude / codex),
-    /// 两个都认;`account` 是账号名
+    /// Whether this session gets it: `tool` is the session's tool name (the one after `aca new`), `kind` is which built-in
+    /// tool it starts as (claude / codex); either matches. `account` is the account name
     pub fn reaches(&self, tool: &str, kind: &str, account: &str) -> bool {
         let named = |t: &str| t == tool || t == kind;
         self.agents.is_empty()
@@ -78,7 +84,7 @@ pub fn lock_file() -> PathBuf {
     paths::config_dir().join("plugins.lock")
 }
 
-/// 读 plugins.toml。没有这个文件 = 空的;写坏了 = Err(说哪不对)
+/// Reads plugins.toml. No such file = empty; broken = Err (saying what's wrong)
 pub fn wants() -> Res<BTreeMap<String, Want>> {
     match std::fs::read_to_string(decl_file()) {
         Ok(text) => parse_decl(&text),
@@ -92,19 +98,20 @@ fn parse_decl(text: &str) -> Res<BTreeMap<String, Want>> {
         .map_err(|e| tr!("无法解析 plugins.toml:{}", "can't parse plugins.toml: {}", e.message()))
 }
 
-/// 一个插件在 plugins.toml 里的那一段;没写 / 文件坏了 = 默认的(开着、全给、没有设置)
+/// One plugin's section in plugins.toml; not written / broken file = the default (enabled, given to all, no settings)
 pub fn want(id: &str) -> Want {
     wants().ok().and_then(|mut w| w.remove(id)).unwrap_or_default()
 }
 
-/// 交给插件命令的设置:清单里的默认值,plugins.toml 里写了的盖上去
+/// Settings handed to plugin commands: the manifest's defaults, with what plugins.toml says on top
 pub fn settings(id: &str, m: &super::Manifest) -> toml::Table {
     let mut all = m.defaults();
     all.extend(want(id).settings);
     all
 }
 
-/// `[plugins."<id>"]` 这一段的表头(id 里没有点、只有字母数字 _ - 的也认不带引号的写法)
+/// The header of the `[plugins."<id>"]` section (an id without dots, only letters, digits, _ -, may also be written
+/// unquoted)
 fn is_head(line: &str, id: &str) -> bool {
     let bare = line.split('#').next().unwrap_or("").trim();
     bare == format!("[plugins.\"{id}\"]")
@@ -115,7 +122,8 @@ fn is_any_head(line: &str) -> bool {
     line.trim_start().starts_with('[')
 }
 
-/// 表头在 `h` 的那一段到哪为止(不含):下一个表头前面,紧挨着它的注释、空行算下一段的
+/// Where the section whose header is at `h` ends (exclusive): before the next header; the comments and blank lines right
+/// above it belong to the next section
 fn block_end(lines: &[String], h: usize) -> usize {
     let mut end = lines[h + 1..].iter().position(|l| is_any_head(l)).map_or(lines.len(), |i| h + 1 + i);
     if end < lines.len() {
@@ -126,8 +134,9 @@ fn block_end(lines: &[String], h: usize) -> usize {
     end
 }
 
-/// 把一个插件的一项改成 value(None = 删掉这项),别的行、注释原样留着;没有这一段就在末尾加。
-/// 改完读回来对不上(值写成了好几行之类),这一段整个照现在的值重写
+/// Sets one key of a plugin to value (None = remove it), leaving other lines and comments as they are; adds the section
+/// at the end if there isn't one. If reading it back doesn't match (the value got written over several lines or the
+/// like), the whole section is rewritten from the current values
 pub(crate) fn edit(text: &str, id: &str, key: &str, value: Option<&toml::Value>) -> Res<String> {
     let current = parse_decl(text)?;
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
@@ -142,7 +151,7 @@ pub(crate) fn edit(text: &str, id: &str, key: &str, value: Option<&toml::Value>)
                     lines.remove(i);
                 }
                 (None, Some(v)) => {
-                    // 放在这一段最后一个非空行后面
+                    // Goes after the section's last non-empty line
                     let last = (h..end).rev().find(|&i| !lines[i].trim().is_empty()).unwrap_or(h);
                     lines.insert(last + 1, format!("{key} = {v}"));
                 }
@@ -193,7 +202,7 @@ fn set_field(w: &mut Want, key: &str, value: Option<&toml::Value>) {
     }
 }
 
-/// 这一段整个换成 `w` 的样子(段里的注释没了,别的段不动)
+/// Replaces the whole section with what `w` says (comments in the section are lost, other sections untouched)
 fn rewrite_block(text: &str, id: &str, w: &Want) -> String {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     let block = render(id, w);
@@ -241,7 +250,7 @@ fn render(id: &str, w: &Want) -> String {
     out
 }
 
-/// 删掉一个插件的那一段(连同紧挨在表头上面的注释)
+/// Removes one plugin's section (with the comments right above its header)
 pub(crate) fn drop_block(text: &str, id: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     if let Some(h) = lines.iter().position(|l| is_head(l, id)) {
@@ -258,18 +267,18 @@ const HEADER: &str = "\
 # 要哪些插件(aca help plugin)。改了之后 aca plugin sync 让本机跟它一致;命令行、界面里装 / 删 / 开停也会改这里。
 ";
 
-/// 只有自己能读:插件的设置里有口令(webhook 地址、server 的 token)
+/// Readable only by you: plugin settings hold secrets (webhook URLs, server tokens)
 fn write_decl(text: &str) -> Res<()> {
     paths::write_private(&decl_file(), text).map_err(|e| tr!("无法写入 plugins.toml:{e}", "can't write plugins.toml: {e}"))
 }
 
-/// 还没有 plugins.toml:照登记表写一份(之前用 link / install 装的那些)
+/// No plugins.toml yet: write one from the registry (the ones installed earlier with link / install)
 pub fn ensure() -> Res<()> {
     if decl_file().exists() {
         return Ok(());
     }
     let mut text = HEADER.to_string();
-    // 你自己的那份(~/.config/aca/user/)不用写在这里
+    // Your own one (~/.config/aca/user/) doesn't need to be written here
     for e in super::registry().into_iter().filter(|e| e.source != super::user::SOURCE) {
         let w = Want {
             source: match e.source.as_str() {
@@ -287,14 +296,14 @@ pub fn ensure() -> Res<()> {
     write_decl(&text)
 }
 
-/// 改 plugins.toml 里一个插件的一项(没有这个文件先照登记表写一份)
+/// Changes one key of a plugin in plugins.toml (writes one from the registry first if the file doesn't exist)
 pub fn set(id: &str, key: &str, value: Option<toml::Value>) -> Res<()> {
     ensure()?;
     let text = std::fs::read_to_string(decl_file()).unwrap_or_default();
     write_decl(&edit(&text, id, key, value.as_ref())?)
 }
 
-/// plugins.toml 里有这个插件的一段(没有就加一个光秃秃的表头:aca 自带的不用写 source)
+/// Makes sure plugins.toml has a section for this plugin (adds a bare header if not: plugins shipped with aca need no source)
 pub fn declare(id: &str) -> Res<()> {
     ensure()?;
     let text = std::fs::read_to_string(decl_file()).unwrap_or_default();
@@ -304,14 +313,14 @@ pub fn declare(id: &str) -> Res<()> {
     write_decl(&rewrite_block(&text, id, &Want::default()))
 }
 
-/// 这个插件那一段在 plugins.toml 的第几行(从 1 数;没有这一段 = 最后一行):编辑器打开时停在这
+/// The line of this plugin's section in plugins.toml (from 1; no section = the last line): where the editor opens
 pub fn line_of(id: &str) -> usize {
     let text = std::fs::read_to_string(decl_file()).unwrap_or_default();
     let lines: Vec<String> = text.lines().map(str::to_string).collect();
     lines.iter().position(|l| is_head(l, id)).map_or(lines.len().max(1), |i| i + 1)
 }
 
-/// 从 plugins.toml 里删掉一个插件
+/// Removes a plugin from plugins.toml
 pub fn forget(id: &str) -> Res<()> {
     ensure()?;
     let text = std::fs::read_to_string(decl_file()).unwrap_or_default();
@@ -330,13 +339,13 @@ struct Locked {
     commit: String,
 }
 
-/// plugins.lock:git 装的插件各是哪个提交
+/// plugins.lock: which commit each plugin installed from git is at
 pub fn locked() -> BTreeMap<String, String> {
     let text = std::fs::read_to_string(lock_file()).unwrap_or_default();
     toml::from_str::<Lock>(&text).map(|l| l.plugins.into_iter().map(|(k, v)| (k, v.commit)).collect()).unwrap_or_default()
 }
 
-/// 记下(或者删掉:None)一个插件的提交
+/// Records (or removes: None) a plugin's commit
 pub fn lock(id: &str, commit: Option<&str>) -> Res<()> {
     let mut all = locked();
     match commit {
@@ -374,12 +383,12 @@ source = \"owner/bark\"
         let w = parse_decl(&out).unwrap();
         assert_eq!((w["aca.delegate"].on(), w["bark"].on()), (false, true));
         assert_eq!(w["aca.delegate"].settings.get("max_continue"), Some(&toml::Value::Integer(3)));
-        // 已有的那项就地换;去掉一项
+        // An existing key is replaced in place; a key is removed
         let out = edit(&out, "aca.delegate", "enabled", Some(&true.into())).unwrap();
         assert_eq!(out.matches("enabled").count(), 1);
         let out = edit(&out, "aca.delegate", "enabled", None).unwrap();
         assert!(!out.contains("enabled"));
-        // 不带引号的表头也认;没有的插件加在末尾
+        // Unquoted headers work too; a plugin that isn't there is added at the end
         let out = edit(TEXT, "bark", "ref", Some(&"v2".into())).unwrap();
         assert_eq!(parse_decl(&out).unwrap()["bark"].rev, "v2");
         let out = edit(TEXT, "new.one", "source", Some(&"x/y".into())).unwrap();
@@ -407,13 +416,13 @@ source = \"owner/bark\"
         let out = edit(&out, "bark", "hotkeys", Some(&toml::Value::Table(hot))).unwrap();
         let w = parse_decl(&out).unwrap();
         assert_eq!((w["bark"].hotkeys["pad"].as_str(), w["bark"].keys.len()), ("M-n", 2));
-        // 一个都不给(空数组)和没写(照清单)不一样
+        // Giving none (an empty array) is different from not writing it (follow the manifest)
         let out = edit(&out, "bark", "tools", Some(&toml::Value::Array(vec![]))).unwrap();
         assert_eq!(parse_decl(&out).unwrap()["bark"].tools, Some(vec![]));
         let out = edit(&out, "bark", "tools", None).unwrap();
         assert_eq!(parse_decl(&out).unwrap()["bark"].tools, None);
         assert!(out.contains("# 推送"), "{out}");
-        // 整段重写时也带着
+        // Kept when the whole section is rewritten too
         let w = Want {
             tools: Some(vec!["a".into()]),
             keys: [("v".to_string(), "V".to_string())].into(),
@@ -437,7 +446,7 @@ source = \"owner/bark\"
         assert!(w(&["claude:*"]).reaches("claude", "claude", "sub") && !w(&["claude:*"]).reaches("codex", "codex", ""));
         assert!(w(&["codex:labs"]).reaches("codex", "codex", "labs") && !w(&["codex:labs"]).reaches("codex", "codex", "other"));
         assert!(w(&["claude"]).reaches("claude", "claude", "sub"));
-        // 自己起名的工具(ccx 按 claude 起):写工具名、写 claude 都算
+        // A tool you named yourself (ccx starts as claude): naming the tool or claude both count
         assert!(w(&["ccx"]).reaches("ccx", "claude", "") && w(&["claude:*"]).reaches("ccx", "claude", ""));
     }
 }

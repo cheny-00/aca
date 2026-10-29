@@ -1,5 +1,6 @@
 #!/bin/sh
-# 假的 tpub:现在的状态在 $FAKE/tpub(on / off / half / broken / busy);$FAKE/pub_stuck 在 = on / off 报成功但不变
+# Fake tpub: the current state is in $FAKE/tpub (on / off / half / broken / busy); $FAKE/pub_stuck exists = on / off report
+# success but nothing changes
 F=${FAKE:?}
 now=$(cat "$F/tpub")
 note=

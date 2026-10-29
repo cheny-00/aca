@@ -1,7 +1,8 @@
-//! 代码上色:语法定义用 bat 那一套(two-face 打包的 syntect 语法,认得 TOML、TypeScript 这些),
-//! 颜色只用调色板里的(`theme::Pal` 的 syn_*,浅色 / 深色各一套)。按行喂,跨行的状态(多行字符串、注释)记在 `Hl` 里。
-//! 语法第一次用到时才编译(onig,一种语言 1~2 毫秒);上色一行几十微秒(语法是一堆正则逐行匹配),
-//! 所以只给屏幕上看得见的上色(见 `plain`)。
+//! Code coloring: syntax definitions are bat's set (syntect syntaxes packaged by two-face, which know TOML, TypeScript and
+//! the like); colors come only from the palette (`theme::Pal`'s syn_*, one set each for light / dark). Fed line by line;
+//! state across lines (multi-line strings, comments) is kept in `Hl`.
+//! A syntax is compiled the first time it's used (onig, 1-2 ms per language); coloring a line takes tens of microseconds
+//! (a syntax is a pile of regexes matched line by line), so only what's visible on screen is colored (see `plain`).
 
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -17,12 +18,13 @@ use crate::theme;
 
 thread_local! {
     static NO_COLOR: Cell<bool> = const { Cell::new(false) };
-    /// 还能上色几行(用完了后面的行照原样)
+    /// How many more lines can be colored (once used up, later lines stay as they are)
     static BUDGET: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
-/// 不上色地做(一行几十微秒,屏幕外的不值得):上色不改字,折出来的行一样多,
-/// 所以先不上色地排、量出每块多高,看得见的块再上色重排
+/// Run without coloring (tens of microseconds a line, not worth it off screen): coloring doesn't change the text and wraps
+/// into the same number of lines, so lay out uncolored first to measure each block's height, then color and relayout the
+/// visible blocks
 pub fn plain<R>(f: impl FnOnce() -> R) -> R {
     let was = NO_COLOR.replace(true);
     let r = f();
@@ -30,7 +32,8 @@ pub fn plain<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// 最多上色 n 行地做:一块只露出上面一截时,屏幕底下那截先不上色(每段代码得从头喂,只能省后面的)
+/// Run with at most n lines colored: when only the top part of a block shows, the part below the screen isn't colored for now
+/// (each piece of code has to be fed from the start, so only the tail can be saved)
 pub fn upto<R>(n: usize, f: impl FnOnce() -> R) -> R {
     let was = BUDGET.replace(n);
     let r = f();
@@ -38,7 +41,8 @@ pub fn upto<R>(n: usize, f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// 太长的一行(压成一行的 JSON、日志)不上色:一行上千字要几毫秒,也看不出什么
+/// Overlong lines (JSON squashed into one line, logs) aren't colored: a line of thousands of characters takes milliseconds,
+/// and shows nothing useful anyway
 const LONG: usize = 400;
 
 fn syntaxes() -> &'static SyntaxSet {
@@ -46,11 +50,12 @@ fn syntaxes() -> &'static SyntaxSet {
     S.get_or_init(two_face::syntax::extra_newlines)
 }
 
-/// 语法主题里记的不是颜色,是「哪一类」(r = 类的编号,a = 1):画的时候才从现在的调色板取颜色,
-/// 所以主题实时换(`theme::set`)时跟着变,主题文件里写终端的颜色名(blue、reset)也行。a = 0 = 没这一类(变量、标点),用段落本来的颜色
+/// The syntax theme records not a color but "which class" (r = the class number, a = 1): the color is taken from the current
+/// palette only when drawing, so it follows a live theme change (`theme::set`), and terminal color names (blue, reset) in
+/// the theme file work too. a = 0 = no class (variables, punctuation), uses the span's own color
 const PLAIN: SColor = SColor { r: 0, g: 0, b: 0, a: 0 };
 
-/// 第 k 类用调色板的哪个颜色
+/// Which palette color class k uses
 fn slot(p: &theme::Pal, k: u8) -> Option<Color> {
     Some(match k {
         1 => p.syn_com,
@@ -68,7 +73,7 @@ fn slot(p: &theme::Pal, k: u8) -> Option<Color> {
 fn theme() -> &'static Theme {
     static T: OnceLock<Theme> = OnceLock::new();
     T.get_or_init(|| {
-        // 越具体的选择器越优先(syntect 自己比);运算符、标点不上色(0)
+        // More specific selectors win (syntect compares them itself); operators and punctuation aren't colored (0)
         let (com, string, num, kw, func, ty, ins, del) = (1, 2, 3, 4, 5, 6, 7, 8);
         let rules: [(&str, u8); 20] = [
             ("comment, punctuation.definition.comment", com),
@@ -106,19 +111,19 @@ fn theme() -> &'static Theme {
     })
 }
 
-/// 一段代码的上色器
+/// The colorer for one piece of code
 pub struct Hl {
     syn: &'static SyntaxReference,
     hl: Highlighter<'static>,
     parse: ParseState,
     state: HighlightState,
-    /// 喂给语法的那行(带换行),接着用免得每行分配
+    /// The line fed to the syntax (with newline), reused to avoid allocating per line
     buf: String,
 }
 
 impl Hl {
     fn new(syn: &'static SyntaxReference) -> Option<Hl> {
-        // 纯文本不用上色
+        // Plain text needs no coloring
         if syn.name == "Plain Text" || NO_COLOR.get() {
             return None;
         }
@@ -127,7 +132,8 @@ impl Hl {
         Some(Hl { syn, hl, parse: ParseState::new(syn), state, buf: String::new() })
     }
 
-    /// 按文件名认语言:扩展名,没有扩展名的认整个名字(Makefile、Dockerfile),再认第一行(#!/bin/bash)
+    /// Detect the language from the file name: the extension, the whole name when there's no extension (Makefile,
+    /// Dockerfile), then the first line (#!/bin/bash)
     pub fn for_path(path: &str, first: Option<&str>) -> Option<Hl> {
         if NO_COLOR.get() {
             return None;
@@ -142,7 +148,7 @@ impl Hl {
         Hl::new(syn)
     }
 
-    /// 按代码块写的语言认(```rust、```sh、```ts)
+    /// Detect from the language a code block names (```rust, ```sh, ```ts)
     pub fn for_lang(token: &str) -> Option<Hl> {
         if NO_COLOR.get() {
             return None;
@@ -160,13 +166,13 @@ impl Hl {
         Hl::new(ss.find_syntax_by_token(t)?)
     }
 
-    /// 从头来(两段不连着的代码中间,比如改动的两处)
+    /// Start over (between two pieces of code that aren't contiguous, e.g. two hunks of a diff)
     pub fn reset(&mut self) {
         self.parse = ParseState::new(self.syn);
         self.state = HighlightState::new(&self.hl, ScopeStack::new());
     }
 
-    /// 上色一行(已经去掉控制字符、Tab 换成空格的)。没配颜色的部分用 base
+    /// Color one line (control characters already removed, Tabs turned into spaces). Parts with no color assigned use base
     pub fn line(&mut self, text: &str, base: Style) -> Styled {
         let left = BUDGET.get();
         if left == 0 || text.len() > LONG {
@@ -214,11 +220,11 @@ mod tests {
         assert_eq!(color("\"hi\""), Some(Some(p.syn_str)), "{segs:?}");
         assert_eq!(color("// done"), Some(Some(p.syn_com)), "{segs:?}");
         assert_eq!(segs.iter().map(|s| s.text.as_str()).collect::<String>(), "fn main() { let s = \"hi\"; } // done");
-        // 跨行的状态:多行注释里的下一行还是注释
+        // State across lines: the next line inside a multi-line comment is still comment
         let mut h = Hl::for_path("a.rs", None).unwrap();
         h.line("/* start", Style::new());
         assert_eq!(h.line("still comment */", Style::new())[0].style.fg, Some(p.syn_com));
-        // 认得 TOML、TypeScript、shell、代码块写的语言;纯文本不上色
+        // Knows TOML, TypeScript, shell, the language a code block names; plain text isn't colored
         for path in ["Cargo.toml", "a.ts", "x.tsx", "run.sh", "Makefile", "Dockerfile"] {
             assert!(Hl::for_path(path, None).is_some(), "{path}");
         }
@@ -233,7 +239,7 @@ mod tests {
     fn colors_come_from_the_theme_in_use_right_now() {
         let mut h = Hl::for_path("a.rs", None).unwrap();
         assert_eq!(h.line("fn a() {}", Style::new())[0].style.fg, Some(theme::pal().syn_kw));
-        // 换了主题(预览、主题文件改了):接着上色的行用新颜色;终端的颜色名也行
+        // Theme changed (preview, theme file edited): lines colored after that use the new colors; terminal color names work too
         let mut p = *theme::pal();
         p.syn_kw = Color::Blue;
         theme::set(Box::leak(Box::new(p)));

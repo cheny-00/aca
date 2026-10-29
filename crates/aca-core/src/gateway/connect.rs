@@ -1,6 +1,7 @@
-//! 转接(`aca plugin gateway connect`):agent 起的 MCP 服务就是它。stdio 进,gateway 的 Unix socket 出,只转字节,
-//! 不跑 MCP —— MCP 还是 gateway 下面那一份。连上先说一句「我是哪个会话」(环境里的 `ACA_SESSION_ID`)。
-//! gateway 没在跑:加锁(两个 agent 同时起,只拉起一个),再看一眼,还没有就起一个,等它听上了再连。
+//! The relay (`aca plugin gateway connect`): this is the MCP server agents start. stdio in, the gateway's Unix socket out; it only
+//! passes bytes and doesn't run MCP — MCP is still the one copy under the gateway. On connecting it first says "which session I
+//! am" (`ACA_SESSION_ID` from the environment). If the gateway isn't running: take a lock (two agents starting at once start only
+//! one), look again, start one if there's still none, and connect once it's listening.
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -19,18 +20,18 @@ pub fn connect() -> Res<i32> {
     let mut w = s.try_clone().map_err(|e| e.to_string())?;
     let hello = json!({ "aca": "hello", "session": std::env::var("ACA_SESSION_ID").unwrap_or_default(), "pid": std::process::id() });
     writeln!(w, "{hello}").map_err(|e| e.to_string())?;
-    // agent → gateway:agent 关了输入就半关 socket,gateway 那头收到结束
+    // agent → gateway: when the agent closes its input, half-close the socket so the gateway side sees the end
     std::thread::spawn(move || {
         let _ = pump(&mut std::io::stdin().lock(), &mut w);
         let _ = w.shutdown(std::net::Shutdown::Write);
     });
-    // gateway → agent:gateway 那头断了,这个进程也就结束(agent 会看到服务退出)
+    // gateway → agent: when the gateway side closes, this process ends too (the agent sees the server exit)
     let mut r = s;
     let _ = pump(&mut r, &mut std::io::stdout().lock());
     Ok(0)
 }
 
-/// 照搬字节,每读到一块就写出去、冲掉(MCP 一行一条,不能攒着)
+/// Copy bytes as they are, writing out and flushing every chunk read (MCP is one message per line; nothing can be held back)
 fn pump(r: &mut impl Read, w: &mut impl Write) -> std::io::Result<()> {
     let mut buf = [0u8; 16 * 1024];
     loop {
@@ -43,7 +44,7 @@ fn pump(r: &mut impl Read, w: &mut impl Write) -> std::io::Result<()> {
     }
 }
 
-/// 连上在跑的 gateway;没在跑就起一个
+/// Connect to the running gateway; start one if it isn't running
 pub fn reach() -> Res<UnixStream> {
     let sock = sock_path();
     if let Ok(s) = UnixStream::connect(&sock) {
@@ -51,14 +52,14 @@ pub fn reach() -> Res<UnixStream> {
     }
     std::fs::create_dir_all(dir()).map_err(|e| e.to_string())?;
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock_path()).map_err(|e| e.to_string())?;
-    // 排队:别的转接正在起它的话,等它起完
+    // Queue up: if another relay is starting it, wait until it's done
     unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
     if let Ok(s) = UnixStream::connect(&sock) {
         return Ok(s);
     }
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir().join("gateway.log")).map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
-    // 自成一组:起它的这个转接(和 agent)退了,它接着跑
+    // Its own group: it keeps running when the relay that started it (and the agent) exit
     crate::proc::detach(
         Command::new(crate::agent::self_exe()).args(["plugin", "gateway", "serve"]).stdin(Stdio::null()).stdout(log).stderr(err),
     )

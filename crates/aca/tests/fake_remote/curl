@@ -1,7 +1,8 @@
 #!/bin/sh
-# 假的 curl:当 server(jobhook 的那几个接口),记录放在 $FAKE/hub/<id>.json,口令在 $FAKE/token。
-# 只认 aca.remote 和远端包装用到的写法:配置从标准输入来(-K -),-w 带上状态码,--data-binary @文件。
-# $FAKE/down 在 = 连不上
+# Fake curl: plays the server (the few endpoints of jobhook); records are kept in $FAKE/hub/<id>.json, the token in $FAKE/token.
+# Only understands the forms aca.remote and the remote wrapper use: config from stdin (-K -), -w with the status code,
+# --data-binary @FILE.
+# $FAKE/down exists = cannot connect
 set -u
 H="$FAKE/hub"
 mkdir -p "$H"
@@ -21,7 +22,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 cfg=$(cat)
-# 配置里的值去掉引号、去掉一层 \ 转义
+# A value from the config, with the quotes and one level of \ escaping removed
 val() { printf '%s\n' "$cfg" | sed -n "s/^$1 = \"\\(.*\\)\"\$/\\1/p" | sed 's/\\\(.\)/\1/g'; }
 url=$(val url | head -n 1)
 req=$(val request | head -n 1)
@@ -65,7 +66,7 @@ case "$method $path" in
     reply 200 '{"ok": true}'
     ;;
   "POST /h/"*)
-    # 远端的回调:/h/<id>?rc=N,正文是日志末尾,不用口令
+    # The callback from the remote: /h/<id>?rc=N, the body is the tail of the log, no token needed
     id=${path#/h/}
     id=${id%%\?*}
     rc=${path##*rc=}

@@ -1,11 +1,14 @@
-//! `aca import agent-deck`:把 agent-deck 登记的分组和会话搬进 aca 的登记表。只读它的库,不动它任何东西。
+//! `aca import agent-deck`: move the groups and sessions registered in agent-deck into aca's registry. Its database is only read;
+//! nothing of it is touched.
 //!
-//! 搬过来的是**登记**(标题、分组、顺序、工具、账号、目录、对话 id),不是在跑的进程:
-//! 在 aca 里 `start` 会用同一个对话 id 另起一个 agent。所以默认只搬 agent-deck 那边已经没在跑的;
-//! 还在跑的先在那边停掉再搬(`--all` 连在跑的也登记进来,但别两边同时开同一段对话)。
+//! What moves over is the **registration** (title, group, order, tool, account, directory, conversation id), not running
+//! processes: `start` in aca starts another agent with the same conversation id. So by default only the ones no longer running on
+//! the agent-deck side are moved; stop running ones there first, then move them (`--all` registers running ones too, but don't
+//! have the same conversation open on both sides at once).
 //!
-//! 会话 id 沿用 agent-deck 的:便签、置顶这些按 id 记的东西接得上。
-//! 账号按对话记录实际在哪个配置目录认,不靠 agent-deck 的账号槽(它那边空着的槽背后是分组级 / 全局的默认)。
+//! Session ids are kept from agent-deck: notes, pins and other things kept by id carry over.
+//! The account is recognized by which configuration directory the conversation record is actually in, not by agent-deck's
+//! account slot (an empty slot there stands for a group-level / global default).
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +24,7 @@ struct Found {
     s: Session,
     alive: bool,
     transcript: Option<PathBuf>,
-    /// 搬不了的原因
+    /// Why it can't be moved
     skip: Option<String>,
 }
 
@@ -29,12 +32,14 @@ fn open_ro(db: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(format!("file:{}?mode=ro", db.display()), OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)
 }
 
-/// 这段对话的记录在哪个账号的配置目录里:(账号名, 记录)。怎么找是各家自己的([`crate::agent::Agent::conv_files`])。
-/// 几个账号都找得到(Codex 的几个账号常把 `sessions` 链到同一个目录)时,`prefer` 那个账号也有就是它
+/// Which account's configuration directory this conversation's record is in: (account name, record). How to look is up to each
+/// tool ([`crate::agent::Agent::conv_files`]). When several accounts have it (Codex accounts often link `sessions` to the same
+/// directory), it's the `prefer` account if that one has it too
 pub(crate) fn locate(cfg: &Config, kind: &str, conv: &str, prefer: &str) -> Option<(String, PathBuf)> {
     let agent = crate::agent::builtin(kind)?;
     let accounts = cfg.accounts.get(kind)?;
-    // 不换目录的账号(只带 env / 参数)对话记在默认目录里,认不出是谁的
+    // Accounts that keep the directory (only env / arguments) record conversations in the default directory, so whose it is can't
+    // be told
     let homes = accounts.iter().filter(|(_, a)| !a.home.is_empty());
     let first = homes.clone().filter(|(name, _)| name.as_str() == prefer);
     first.chain(homes).find_map(|(name, a)| {
@@ -44,13 +49,13 @@ pub(crate) fn locate(cfg: &Config, kind: &str, conv: &str, prefer: &str) -> Opti
     })
 }
 
-/// 分组:(路径, 先后, 默认目录)
+/// Groups: (path, order, default directory)
 type Groups = Vec<(String, i64, String)>;
 
 const INSTANCE: &str = "id, title, title_locked, group_path, sort_order, tool, coalesce(account, ''), project_path, tool_data, \
                         tmux_session, coalesce(archived_at, 0), coalesce(parent_session_id, ''), created_at";
 
-/// agent-deck 的一条 → (照 aca 的样子摆好的一行, 它的 tmux 会话名)
+/// One row of agent-deck → (a row laid out the aca way, its tmux session name)
 fn instance(r: &rusqlite::Row) -> rusqlite::Result<(Session, String)> {
     let tool_data: serde_json::Value = serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default();
     Ok((
@@ -67,7 +72,7 @@ fn instance(r: &rusqlite::Row) -> rusqlite::Result<(Session, String)> {
             conv: tool_data["claude_session_id"].as_str().or(tool_data["codex_session_id"].as_str()).unwrap_or("").to_string(),
             parent: r.get(11)?,
             fork_of: String::new(),
-            // agent-deck 记的是纳秒或秒,统一成秒
+            // agent-deck records nanoseconds or seconds; make it seconds
             created: match r.get::<_, i64>(12)? as u64 {
                 t if t > 100_000_000_000 => t / 1_000_000_000,
                 t => t,
@@ -78,7 +83,7 @@ fn instance(r: &rusqlite::Row) -> rusqlite::Result<(Session, String)> {
     ))
 }
 
-/// 各个 profile 的库
+/// Each profile's database
 fn dbs(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut dbs: Vec<PathBuf> = std::fs::read_dir(root)?.flatten().map(|d| d.path().join("state.db")).filter(|p| p.is_file()).collect();
     dbs.sort();
@@ -89,18 +94,19 @@ fn root() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share/agent-deck/profiles")
 }
 
-/// agent-deck 那边登记的一条:接管([`crate::adopt`])它起的、正在跑的会话时,标题、分组、id 照那边的
+/// One row registered on the agent-deck side: when adopting ([`crate::adopt`]) a running session it started, title, group and id
+/// are taken from there
 #[derive(Clone, Debug, PartialEq)]
 pub struct Record {
     pub profile: String,
-    /// 照 aca 的样子摆好的一行;工具和账号是 agent-deck 的叫法,接管时不用(看进程认)
+    /// A row laid out the aca way; tool and account are agent-deck's naming, not used when adopting (recognized from the process)
     pub s: Session,
 }
 
 fn record_in(root: &Path, instance_id: Option<&str>, tmux: &str) -> Option<Record> {
     dbs(root).ok()?.into_iter().find_map(|db| {
         let conn = open_ro(&db).ok()?;
-        // 先按它自己的 id 认(进程环境里带着),再按 tmux 会话名
+        // First by its own id (carried in the process environment), then by tmux session name
         let sql = format!("select {INSTANCE} from instances where id = ?1 or (tmux_session = ?2 and ?2 != '') order by id != ?1 limit 1");
         let (s, _) = conn.query_row(&sql, [instance_id.unwrap_or(""), tmux], instance).ok()?;
         let profile = db.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -108,8 +114,8 @@ fn record_in(root: &Path, instance_id: Option<&str>, tmux: &str) -> Option<Recor
     })
 }
 
-/// 这个 tmux 会话是不是 agent-deck 起的:按它的会话 id(进程环境里的 `AGENTDECK_INSTANCE_ID`)找,没有再按 tmux 会话名。
-/// 没装 agent-deck、不是它的 = None。只读
+/// Whether this tmux session was started by agent-deck: look it up by its session id (`AGENTDECK_INSTANCE_ID` in the process
+/// environment), then by tmux session name. agent-deck not installed, or not its session = None. Read only
 pub fn agent_deck_record(instance_id: Option<&str>, tmux: &str) -> Option<Record> {
     record_in(&root(), instance_id, tmux)
 }
@@ -122,8 +128,9 @@ fn hook_in(deck: &Path, id: &str) -> Option<(String, u64)> {
     Some((v["event"].as_str()?.to_string(), v["ts"].as_u64()?))
 }
 
-/// agent-deck 的 hook 给这个会话记的最后一件事:(事件名, 时刻)。它起的进程带着它的 hook(装在各账号的 settings.json 里),
-/// 接管过来、还没重启时照常往 `hooks/<id>.json` 写,id 就是接管时沿用的那个。没有这个文件 = None。只读
+/// The last thing agent-deck's hook recorded for this session: (event name, time). Processes it starts carry its hooks (installed
+/// in each account's settings.json), and once adopted, until a restart, they keep writing `hooks/<id>.json`, the id being the one
+/// kept when adopting. No such file = None. Read only
 pub fn agent_deck_hook(id: &str) -> Option<(String, u64)> {
     hook_in(root().parent()?, id)
 }
@@ -162,7 +169,7 @@ fn read(db: &Path, cfg: &Config, live: &[String]) -> rusqlite::Result<(Groups, V
 pub fn agent_deck(store: &Store, cfg: &Config, apply: bool, all: bool) -> Res<()> {
     let root = root();
     let dbs = dbs(&root).map_err(|e| format!("{}:{e}", root.display()))?;
-    // agent-deck 的会话在真的那个 tmux 服务上,不看 ACA_TMUX_SOCKET
+    // agent-deck's sessions are on the real tmux server; ACA_TMUX_SOCKET isn't consulted
     let live: Vec<String> = std::process::Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
@@ -251,7 +258,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("aca-deck-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("work")).unwrap();
-        // 没有库的 profile 目录跳过
+        // A profile directory without a database is skipped
         std::fs::create_dir_all(root.join("empty")).unwrap();
         let conn = Connection::open(root.join("work/state.db")).unwrap();
         conn.execute_batch(
@@ -265,15 +272,15 @@ mod tests {
         drop(conn);
         let r = record_in(&root, None, "agentdeck_a_1").unwrap();
         assert_eq!((r.profile.as_str(), r.s.id.as_str(), r.s.title.as_str(), r.s.title_locked), ("work", "ad-1", "修登录", true));
-        // 纳秒记的创建时间统一成秒;对话 id 从它的 tool_data 里取
+        // A creation time recorded in nanoseconds becomes seconds; the conversation id is taken from its tool_data
         assert_eq!((r.s.group.as_str(), r.s.conv.as_str(), r.s.parent.as_str(), r.s.created), ("work/app", "c-1", "ad-0", 1_790_000_000));
-        // 进程环境里带着的 id 比 tmux 会话名可靠:两个都给时听 id 的
+        // The id carried in the process environment is more reliable than the tmux session name: when both are given, the id wins
         assert_eq!(record_in(&root, Some("ad-2"), "agentdeck_a_1").unwrap().s.id, "ad-2");
         assert_eq!(record_in(&root, Some("没有的"), "agentdeck_b_2").unwrap().s.id, "ad-2");
         assert_eq!(record_in(&root, None, "别的会话"), None);
         assert_eq!(record_in(&root, None, ""), None);
         assert_eq!(record_in(&root.join("nowhere"), None, "agentdeck_a_1"), None);
-        // 它的 hook 记的最后一件事,按会话 id 一个文件
+        // The last thing its hook recorded, one file per session id
         std::fs::create_dir_all(root.join("hooks")).unwrap();
         std::fs::write(
             root.join("hooks/ad-1.json"),

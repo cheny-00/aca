@@ -1,30 +1,36 @@
-//! 界面的颜色,像 kitty 的主题:一套一套有名字,内置 latte(浅色,默认)和 mocha(深色),自己的放
-//! ~/.config/aca/themes/<名字>.toml。用 `aca theme use <名字>` 换(或者 `^S` 设置页的「主题」:↑↓ 整屏实时预览,
-//! ui.rs 的 `open_themes`);用哪套记在 config.toml:
+//! The interface's colors, like kitty themes: named sets, with latte (light, the default) and mocha (dark) built in; your own
+//! go in ~/.config/aca/themes/<NAME>.toml. Switch with `aca theme use <NAME>` (or 「主题」 (theme) on the `^S` settings page:
+//! ↑↓ previews live on the whole screen, `open_themes` in ui.rs); which one is used is kept in config.toml:
 //!
 //! ```toml
 //! [theme]
 //! name = "latte"
 //! ```
 //!
-//! 环境变量 ACA_THEME=<名字> 压过它(dark / light 是 mocha / latte 的别名。手机经 mosh 连过来时查不到终端底色,没法自动判断深浅)。
+//! The ACA_THEME=<NAME> environment variable overrides it (dark / light are aliases for mocha / latte. A phone connecting over
+//! mosh can't query the terminal background, so dark vs light can't be told automatically).
 //!
-//! 主题文件只写跟 base 不一样的,颜色的名字就是 `aca theme` 列的那些(`aca theme new <名字>` 生成一份全注释掉的):
+//! A theme file writes only what differs from base; the color names are the ones `aca theme` lists (`aca theme new <NAME>`
+//! generates one with everything commented out):
 //!
 //! ```toml
-//! base = "latte"      # 从哪套改起,不写 = latte。和内置同名的文件盖掉内置那套,它里面的 base = "latte" 指内置的
-//! dark = false        # 是不是深色主题(列表里分开列),不写跟 base
+//! base = "latte"      # which theme to start from, omitted = latte. A file named like a built-in replaces it,
+//!                     # and base = "latte" in it means the built-in
+//! dark = false        # whether it's a dark theme (listed separately), omitted = as base
 //! accent = "#1E66F5"
-//! series = ["#5992E7", "#F09362", "#51BFBB", "#C66CA1", "#71B262", "#DF8E1D"]   # 多写一个 = 多一个账号有颜色
+//! series = ["#5992E7", "#F09362", "#51BFBB", "#C66CA1", "#71B262", "#DF8E1D"]   # one more = one more account gets a color
 //! ```
 //!
-//! 颜色写 "#RRGGBB"、终端的颜色名(red、lightblue、darkgray…,跟着终端的配色走)、0~255 的色号,或 "reset"(终端默认的字色)。
-//! 存盘后开着的 aca 一秒内换上;名字、颜色写错的当没写(series / parts 里有一个错就整组当没写),`aca theme` 会列出来。
-//! 底色和正文的字不归这里管,用终端自己的。
+//! Colors are "#RRGGBB", terminal color names (red, lightblue, darkgray…, following the terminal's palette), color numbers
+//! 0~255, or "reset" (the terminal's default text color).
+//! A running aca switches within a second of saving; a wrong name or color counts as not written (one bad entry in series /
+//! parts and the whole list counts as not written), and `aca theme` lists them.
+//! The background and body text aren't handled here; they're the terminal's own.
 //!
-//! 内置的两套:终端的 16 色里没有「淡紫底」这种颜色,只能写死 RGB;状态、次要的字、提示、账号也写死:
-//! 终端自己的黄、绿在浅底上对比度只有 2~3,DIM(kitty 默认按 0.4 变淡)只有 1.9,次要的字整片都要费劲认。
-//! latte 的字对比度都 ≥ 4.3(分隔符除外)。
+//! The two built-ins: the terminal's 16 colors have nothing like a "pale purple background", so RGB is hard-coded; state,
+//! minor text, hints and accounts are hard-coded too: the terminal's own yellow and green have contrast of only 2~3 on a light
+//! background, DIM (kitty fades by 0.4 by default) only 1.9, so whole areas of minor text are a strain to read.
+//! All of latte's text has contrast ≥ 4.3 (separators aside).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
@@ -36,7 +42,7 @@ use unicode_width::UnicodeWidthStr;
 use aca_core::i18n::Tr;
 use aca_core::{t, tr};
 
-/// 每一种是什么、用在哪见 `tokens()`(主题文件里写的名字就是字段名)
+/// What each one is and where it's used: see `tokens()` (the names written in theme files are the field names)
 #[derive(Clone, Copy)]
 pub struct Pal {
     pub accent: Color,
@@ -63,32 +69,37 @@ pub struct Pal {
     pub total: Color,
     pub other: Color,
     pub track: Color,
-    /// 计费面板里账号的颜色,一个账号一个位子(位子记在 slots.rs,跟着账号走、不跟排名走),有几个颜色就有几个位子。
-    /// 默认是 Catppuccin 的 blue / peach / teal / pink / green 这几个色相,避开状态的红、黄和强调的紫(紫的归不分账号的条)。
-    /// 原色是写字用的,铺成条太艳;彩度压得太低、亮度又在中间,暖色就发脏(砖红、灰紫)。所以彩度留在 0.13 上下
-    /// (teal 到不了,0.10),暖色往亮里放:浅色主题亮度 0.65~0.75,深色主题 0.53~0.65。
-    /// 顺序和每个的亮度是跑配色验证挑的(浅色底 #EFF1F5、深色底 #1E1E2E):相邻两个在色盲模拟和正常视觉下都分得清
-    /// (粉和青色相撞,靠亮度差开,所以粉最深),前三个两两都分得清;
-    /// 再加第六个(lavender / sky / flamingo …)总会和前面某个撞色,所以默认只有五个,多的账号画 other 的灰
+    /// Account colors in the billing panel, one slot per account (slots are kept in slots.rs and follow the account, not its
+    /// rank); as many slots as colors.
+    /// The defaults are Catppuccin's blue / peach / teal / pink / green hues, avoiding state red and yellow and accent purple
+    /// (purple belongs to the bars not split by account).
+    /// The originals are meant for text and too loud as bars; with chroma pushed too low and lightness in the middle, warm
+    /// colors turn muddy (brick red, grayish purple). So chroma stays around 0.13
+    /// (teal can't reach it, 0.10), and warm colors go lighter: lightness 0.65~0.75 in the light theme, 0.53~0.65 in the dark.
+    /// The order and each one's lightness were picked by running a palette check (light background #EFF1F5, dark background
+    /// #1E1E2E): neighbors are told apart under color-blindness simulation and normal vision
+    /// (pink and teal clash in hue and are separated by lightness, so pink is the darkest), the first three all pairwise;
+    /// a sixth (lavender / sky / flamingo …) always clashes with one before it, so there are only five by default, and extra
+    /// accounts are drawn in other's gray
     pub series: &'static [Color],
-    /// 钱花在哪那根条的五段:强调色那个色相从浅到深(深色主题从深到浅),不跟账号、状态抢颜色;
-    /// 最浅的那段在底色上对比度也有 2:1
+    /// The five segments of the where-the-money-went bar: the accent hue from light to dark (dark to light in a dark theme),
+    /// not competing with account or state colors; even the lightest segment has 2:1 contrast against the background
     pub parts: [Color; 5],
-    /// 星期 × 钟点的四档,花得越多越深
+    /// The four levels of weekday × hour, darker for more spent
     pub heat: [Color; 4],
-    /// 代码上色(见 `hl`):关键字、字符串、数字和常量、函数、类型、注释
+    /// Code highlighting (see `hl`): keywords, strings, numbers and constants, functions, types, comments
     pub syn_kw: Color,
     pub syn_str: Color,
     pub syn_num: Color,
     pub syn_fn: Color,
     pub syn_ty: Color,
     pub syn_com: Color,
-    /// 改动里加的 / 删的那行的底色
+    /// Background of added / removed lines in changes
     pub add_bg: Color,
     pub del_bg: Color,
 }
 
-/// (分类, 名字, 用在哪, 那个字段)。`aca theme` 按这个顺序列,改颜色按名字找
+/// (category, name, where it's used, the field). `aca theme` lists them in this order; changing a color looks it up by name
 fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color); 32] {
     [
         (
@@ -190,7 +201,7 @@ fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color
     ]
 }
 
-/// 钱花在哪那根条的五段,parts 按这个顺序写
+/// The five segments of the where-the-money-went bar; parts is written in this order
 const PARTS: [Tr; 5] = [
     Tr::new("输入", "input"),
     Tr::new("缓存写", "cache write"),
@@ -198,7 +209,7 @@ const PARTS: [Tr; 5] = [
     Tr::new("输出", "output"),
     Tr::new("搜索", "search"),
 ];
-/// 星期 × 钟点的四档,heat 按这个顺序写
+/// The four levels of weekday × hour; heat is written in this order
 const HEAT: [Tr; 4] = [Tr::new("最少", "least"), Tr::new("少", "less"), Tr::new("多", "more"), Tr::new("最多", "most")];
 
 const LIGHT: Pal = Pal {
@@ -301,18 +312,18 @@ const DARK: Pal = Pal {
     del_bg: Color::Rgb(0x45, 0x29, 0x3A),
 };
 
-/// 内置的主题:(名字, 深色?, 颜色)
+/// Built-in themes: (name, dark?, colors)
 const BUILTIN: [(&str, bool, &Pal); 2] = [("latte", false, &LIGHT), ("mocha", true, &DARK)];
 
-/// 一套主题
+/// One theme
 #[derive(Clone)]
 pub struct Theme {
     pub name: String,
     pub dark: bool,
     pub pal: Pal,
-    /// 主题文件;内置的是 None
+    /// The theme file; None for built-ins
     pub file: Option<PathBuf>,
-    /// base 那套(`aca theme` 标出改过的);内置的是 None
+    /// The base theme (`aca theme` marks what's changed); None for built-ins
     parent: Option<(String, Pal)>,
 }
 
@@ -324,18 +335,19 @@ fn latte() -> Theme {
     builtin("latte").expect("内置")
 }
 
-/// 主题文件放哪:config.toml 旁边的 themes/(测试时跟着 ACA_CONFIG 走)
+/// Where theme files live: themes/ next to config.toml (follows ACA_CONFIG in tests)
 fn themes_dir() -> PathBuf {
     crate::config::path().parent().map_or_else(|| PathBuf::from("themes"), |d| d.join("themes"))
 }
 
-/// 名字能不能当文件名
+/// Whether the name works as a file name
 fn valid_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('.') && !name.contains(['/', '\\'])
 }
 
-/// 按名字找:themes/ 里的文件优先(正在解析它自己时除外,比如 latte.toml 里的 base = "latte"),再是内置的。
-/// seen:这一串 base 里已经在解析的文件,绕回来就当没有
+/// Look up by name: a file in themes/ first (except while that file itself is being parsed, e.g. base = "latte" in latte.toml),
+/// then the built-ins.
+/// seen: files already being parsed in this chain of bases; looping back counts as missing
 fn resolve(name: &str, dir: &Path, seen: &mut Vec<String>, bad: &mut Vec<String>) -> Option<Theme> {
     let file = dir.join(format!("{name}.toml"));
     if !valid_name(name) || seen.iter().any(|s| s == name) || !file.is_file() {
@@ -381,7 +393,7 @@ fn color(v: &toml::Value) -> Option<Color> {
     v.as_str()?.trim().parse().ok()
 }
 
-/// 在 base 的颜色上改。series 整组换掉(写几个就是几个位子),parts 从头往后改(可以只写前几个)
+/// Change base's colors. series is replaced whole (as many slots as written), parts is changed from the start (the first few will do)
 fn apply(mut p: Pal, over: &toml::Table, at: &str, bad: &mut Vec<String>) -> Pal {
     for (k, v) in over {
         let list = |v: &toml::Value, max: usize, bad: &mut Vec<String>| {
@@ -404,7 +416,7 @@ fn apply(mut p: Pal, over: &toml::Table, at: &str, bad: &mut Vec<String>) -> Pal
             "base" | "dark" => {}
             "series" => {
                 if let Some(c) = list(v, usize::MAX, bad) {
-                    // 读一次主题漏一点点内存:只在打开、改了主题文件、打开主题列表的时候发生
+                    // Each theme read leaks a little memory: only on startup, when a theme file changes, and when the theme list opens
                     p.series = c.leak();
                 }
             }
@@ -430,7 +442,7 @@ fn apply(mut p: Pal, over: &toml::Table, at: &str, bad: &mut Vec<String>) -> Pal
     p
 }
 
-/// config.toml 的 [theme] name
+/// [theme] name in config.toml
 fn configured(text: &str, bad: &mut Vec<String>) -> Option<String> {
     let t = match text.parse::<toml::Table>() {
         Ok(t) => t,
@@ -452,7 +464,7 @@ fn configured(text: &str, bad: &mut Vec<String>) -> Option<String> {
     name
 }
 
-/// ACA_THEME 的 dark / light
+/// ACA_THEME's dark / light
 fn alias(v: &str) -> String {
     match v.trim().to_ascii_lowercase().as_str() {
         "dark" => "mocha".into(),
@@ -461,7 +473,7 @@ fn alias(v: &str) -> String {
     }
 }
 
-/// 用哪套:界面里挑过的(只在设了 ACA_THEME 的终端里才有)> ACA_THEME > config.toml > latte
+/// Which one to use: picked in the interface (only in a terminal with ACA_THEME set) > ACA_THEME > config.toml > latte
 fn pick(cfg: &str, dir: &Path, env: Option<&str>, chosen: Option<&str>) -> (Theme, Vec<String>) {
     let mut bad = vec![];
     let from_cfg = configured(cfg, &mut bad);
@@ -477,7 +489,7 @@ fn pick(cfg: &str, dir: &Path, env: Option<&str>, chosen: Option<&str>) -> (Them
     (t, bad)
 }
 
-/// 所有主题:浅色在前、深色在后,各自内置的在前、再按名字
+/// All themes: light first, then dark; within each, built-ins first, then by name
 fn all_in(dir: &Path, bad: &mut Vec<String>) -> Vec<Theme> {
     let mut names: Vec<String> = BUILTIN.iter().map(|b| b.0.to_string()).collect();
     let mut files: Vec<String> = std::fs::read_dir(dir)
@@ -495,12 +507,13 @@ fn all_in(dir: &Path, bad: &mut Vec<String>) -> Vec<Theme> {
 }
 
 static PAL: RwLock<Option<&'static Pal>> = RwLock::new(None);
-/// 设了 ACA_THEME 的终端里在界面里挑的:这个 aca 就用它(不然存进 config.toml 后一重读又被 ACA_THEME 压回去)
+/// Picked in the interface in a terminal with ACA_THEME set: this aca uses it (otherwise, once saved to config.toml, the next
+/// reload is overridden by ACA_THEME again)
 static CHOSEN: Mutex<Option<String>> = Mutex::new(None);
 
 #[cfg(test)]
 thread_local! {
-    /// 测试各跑各的线程:主题列表的预览只换这个线程看到的
+    /// Each test runs on its own thread: the theme list's preview only changes what this thread sees
     static TEST_PAL: std::cell::Cell<Option<&'static Pal>> = const { std::cell::Cell::new(None) };
 }
 
@@ -508,7 +521,7 @@ fn env() -> Option<String> {
     std::env::var("ACA_THEME").ok().filter(|v| !v.trim().is_empty())
 }
 
-/// 现在该用的那套(测试里只用内置的 latte,不读本机的配置)
+/// The theme to use now (tests only use the built-in latte, never this machine's config)
 fn load() -> (Theme, Vec<String>) {
     if cfg!(test) {
         return (latte(), vec![]);
@@ -531,7 +544,7 @@ pub fn pal() -> &'static Pal {
     p
 }
 
-/// 整个界面换成这套(主题列表的预览)
+/// Switch the whole interface to this one (the theme list's preview)
 pub fn set(p: &'static Pal) {
     #[cfg(test)]
     {
@@ -544,18 +557,18 @@ pub fn set(p: &'static Pal) {
     }
 }
 
-/// 测试里看某个主题文件画出来什么样(bill 的 show)
+/// In tests, see how a theme file draws (bill's show)
 #[cfg(test)]
 pub fn from_dir(name: &str, dir: &Path) -> Option<Pal> {
     resolve(name, dir, &mut vec![], &mut vec![]).map(|t| t.pal)
 }
 
-/// 现在用的那套叫什么
+/// The name of the theme in use
 pub fn current() -> String {
     load().0.name
 }
 
-/// 主题列表列的:所有主题
+/// What the theme list lists: all themes
 pub fn list() -> Vec<Theme> {
     if cfg!(test) {
         return BUILTIN.iter().filter_map(|b| builtin(b.0)).collect();
@@ -563,7 +576,7 @@ pub fn list() -> Vec<Theme> {
     all_in(&themes_dir(), &mut vec![])
 }
 
-/// 用这套:记进 config.toml 的 [theme] name(别的内容、注释原样留着)。Err 是给底栏的一句话
+/// Use this one: written to [theme] name in config.toml (other content and comments kept as is). Err is a line for the bottom bar
 pub fn choose(name: &str) -> Result<(), String> {
     if cfg!(test) {
         return Ok(());
@@ -574,18 +587,18 @@ pub fn choose(name: &str) -> Result<(), String> {
     crate::config::set("theme", "name", toml::Value::String(name.to_string()))
 }
 
-/// 把 [theme] name 改成 name(见 `config::with_value`)
+/// Set [theme] name to name (see `config::with_value`)
 #[cfg(test)]
 fn with_name(text: &str, name: &str) -> Option<String> {
     crate::config::with_value(text, "theme", "name", &toml::Value::String(name.to_string()))
 }
 
-/// 设了 ACA_THEME:设置页在名字后面标出来(这个终端里听它的)
+/// ACA_THEME is set: the settings page marks it after the name (this terminal follows it)
 pub fn forced() -> bool {
     env().is_some()
 }
 
-/// config.toml 的 [theme]、themes/ 里的文件写错了的(当没写),设置页列出来
+/// Mistakes in config.toml's [theme] and in the files in themes/ (treated as not written), listed on the settings page
 pub fn problems() -> Vec<String> {
     if cfg!(test) {
         return vec![];
@@ -596,7 +609,7 @@ pub fn problems() -> Vec<String> {
     bad
 }
 
-/// config.toml 和 themes/ 里每个文件的修改时间、大小,用来看改没改
+/// Mtime and size of config.toml and of each file in themes/, to tell whether they changed
 fn stamp() -> Vec<(PathBuf, Option<(SystemTime, u64)>)> {
     let one = |p: PathBuf| {
         let m = std::fs::metadata(&p).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
@@ -609,8 +622,9 @@ fn stamp() -> Vec<(PathBuf, Option<(SystemTime, u64)>)> {
     v
 }
 
-/// 主循环每一帧叫一次:最多一秒看一次 config.toml、themes/ 改没改,改了就重读(下一帧整屏用新颜色)。
-/// 改了返回 true:config.toml 里别的设置(输入法)也跟着重读
+/// Called by the main loop every frame: at most once a second, checks whether config.toml or themes/ changed and if so reloads
+/// (the next frame uses the new colors everywhere).
+/// Returns true on a change: the other settings in config.toml (input method) are reloaded too
 pub fn refresh() -> bool {
     type Seen = Option<(Instant, Vec<(PathBuf, Option<(SystemTime, u64)>)>)>;
     static SEEN: Mutex<Seen> = Mutex::new(None);
@@ -627,17 +641,17 @@ pub fn refresh() -> bool {
     changed
 }
 
-/// 次要的字
+/// Minor text
 pub fn minor() -> Style {
     Style::new().fg(pal().minor)
 }
 
-/// 分隔符
+/// Separators
 pub fn faint() -> Style {
     Style::new().fg(pal().faint)
 }
 
-/// 提示 / 警告
+/// Hint / warning
 pub fn warn() -> Style {
     Style::new().fg(pal().warn)
 }
@@ -646,14 +660,14 @@ pub fn accent() -> Style {
     Style::new().fg(pal().accent)
 }
 
-/// 强调色底的小标签 / 当前按钮
+/// Small label / current button on the accent color
 pub fn chip() -> Style {
     Style::new().fg(pal().on_accent).bg(pal().accent).add_modifier(Modifier::BOLD)
 }
 
 // ---------- aca theme ----------
 
-/// 色块:终端的颜色名用终端的 ANSI 底色,跟着终端的配色走
+/// Swatch: terminal color names use the terminal's ANSI background, following the terminal's palette
 fn swatch(c: Color) -> String {
     let bg = match c {
         Color::Reset => return "      ".into(),
@@ -679,7 +693,7 @@ fn swatch(c: Color) -> String {
     format!("\x1b[{bg}m      \x1b[0m")
 }
 
-/// 一行:色块、名字、值(和 base 不一样的标 *,后面写 base 里是什么)、用在哪
+/// One row: swatch, name, value (marked * when it differs from base, followed by what it is in base), where it's used
 fn row(color: bool, name: &str, c: Color, was: Option<(&str, Color)>, about: &str) -> String {
     let changed = was.filter(|w| w.1 != c);
     let val = if changed.is_some() { format!("{c} *") } else { c.to_string() };
@@ -688,7 +702,7 @@ fn row(color: bool, name: &str, c: Color, was: Option<(&str, Color)>, about: &st
     format!("  {sw} {name:<12} {val:<10} {about}{tail}")
 }
 
-/// 路径里的家目录写成 ~
+/// Write the home directory in a path as ~
 fn tilde(p: &Path) -> String {
     let s = p.display().to_string();
     let home = std::env::var("HOME").unwrap_or_default();
@@ -706,7 +720,7 @@ fn kind(t: &Theme) -> String {
     }
 }
 
-/// 一套主题的每种颜色
+/// Every color of one theme
 fn show(t: &Theme, now: &str, color: bool) {
     let using = if t.name == now { t!(" · 当前使用", " · in use") } else { "" };
     println!("{}", tr!("aca 的配色:{}({}{using})", "aca colors: {} ({}{using})", t.name, kind(t)));
@@ -740,7 +754,7 @@ fn show(t: &Theme, now: &str, color: bool) {
         }
         println!("{}", row(color, name, *c, t.parent.as_ref().map(|_| (bname, old)), about));
     }
-    // 位子现在给了谁(slots.rs 记的)
+    // Who each slot belongs to now (as kept by slots.rs)
     let owners = crate::state::state_file("colors").and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
     let owner = |i: usize| owners.lines().filter_map(|l| l.split_once('\t')).find(|x| x.0 == i.to_string()).map(|x| x.1.to_string());
     let changed = t.parent.is_some() && p.series != base.series;
@@ -769,7 +783,7 @@ fn show(t: &Theme, now: &str, color: bool) {
     }
 }
 
-/// 所有主题一行一个:现在用的打 ●,后面一排色块(强调色、状态、账号的颜色)
+/// All themes, one per line: the one in use marked ●, then a row of swatches (accent, state, account colors)
 fn show_list(v: &[Theme], now: &str, color: bool) {
     println!(
         "{}",
@@ -801,8 +815,8 @@ fn show_list(v: &[Theme], now: &str, color: bool) {
     }
 }
 
-/// `aca theme`:现在用的那套的颜色和所有主题;`aca theme <名字>` 看那套;
-/// `aca theme use <名字>` 换过去;`aca theme new <名字> [从哪套]` 生成主题文件
+/// `aca theme`: the colors of the theme in use, and all themes; `aca theme <NAME>` shows that one;
+/// `aca theme use <NAME>` switches to it; `aca theme new <NAME> [FROM]` generates a theme file
 pub fn run(args: &[String], color: bool) -> i32 {
     let dir = themes_dir();
     let mut bad = vec![];
@@ -917,7 +931,8 @@ pub fn run(args: &[String], color: bool) -> i32 {
     code
 }
 
-/// `aca theme new` 生成的文件:base 指向那套,每种颜色一行、全注释掉(值是 base 里的),去掉 # 就是改它
+/// The file `aca theme new` generates: base points at that theme, one line per color, all commented out (values from base);
+/// removing a # changes that one
 fn template(name: &str, base: &Theme) -> String {
     let q = |c: Color| format!("\"{c}\"");
     let mut p = base.pal;
@@ -997,13 +1012,13 @@ mod tests {
         assert_eq!((&t.pal.heat[..2], &t.pal.heat[2..]), (&[Color::Rgb(1, 1, 1), Color::Rgb(2, 2, 2)][..], &LIGHT.heat[2..]));
         assert_eq!(bad.len(), 2, "{bad:?}");
         assert!(bad.iter().any(|b| b.contains("acent")) && bad.iter().any(|b| b.contains("sel")));
-        // base 一层层往上找;series 有一个写错整组不要;dark 可以改
+        // base is followed up level by level; one bad entry in series drops the whole list; dark can be changed
         let mut bad = vec![];
         let t = resolve("deeper", &d, &mut vec![], &mut bad).unwrap();
         assert_eq!((t.dark, t.pal.accent, t.pal.series), (false, DARK.accent, DARK.series));
         assert_eq!(t.parent.as_ref().unwrap().0, "night");
         assert_eq!(bad.len(), 1, "{bad:?}");
-        // 列表:浅色在前,内置的在前
+        // List: light first, built-ins first
         let names: Vec<String> = all_in(&d, &mut vec![]).into_iter().map(|t| t.name).collect();
         assert_eq!(names, ["latte", "blue", "deeper", "mocha", "night"]);
         std::fs::remove_dir_all(&d).unwrap();
@@ -1024,7 +1039,7 @@ mod tests {
         let t = resolve("latte", &d, &mut vec![], &mut bad).unwrap();
         assert_eq!((t.pal.accent, t.pal.sel), (Color::Rgb(0x12, 0x34, 0x56), LIGHT.sel));
         assert!(bad.is_empty(), "{bad:?}");
-        // a → b → a 绕回来:当没有,从 latte 改起,说一声
+        // a → b → a loops back: treated as missing, starts from latte, and says so
         let t = resolve("a", &d, &mut vec![], &mut bad).unwrap();
         assert_eq!(t.pal.accent, Color::Rgb(0x65, 0x43, 0x21));
         assert_eq!(bad.len(), 1, "{bad:?}");
@@ -1077,7 +1092,7 @@ mod tests {
         let (x, y): (Vec<Color>, Vec<Color>) =
             (tokens(&mut a).into_iter().map(|x| *x.3).collect(), tokens(&mut b).into_iter().map(|x| *x.3).collect());
         assert_eq!(x, y);
-        // 每种颜色都在里面,去掉 # 就是一行合法的设置
+        // Every color is in there; removing the # gives a valid setting line
         let on = text
             .replace("# accent = ", "accent = ")
             .replace("# series = ", "series = ")

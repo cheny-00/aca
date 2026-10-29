@@ -1,21 +1,27 @@
-//! 插件管理:列表上按 `P` 开这一页(像 vim 的插件管理器,lazy.nvim 的 `:Lazy`)。框的大小固定(桌面上占大半屏),
-//! 左边一行一个插件(开着 ● / 关着 ○ / 坏了 ✕、名字),aca 自带还没装的列在下面「可装」里;右边是高亮那个的详情:
-//! 名字版本、从哪来(一两个字)、开没开、说明,再往下是能改的(设置、给 agent 的工具、插件菜单里的键,见 plugtune.rs)。
-//! 窄屏(手机)上下叠着:列表在上,详情在下。
+//! Plugin manager: `P` on the list opens this page (like a vim plugin manager, lazy.nvim's `:Lazy`). The box has a fixed size
+//! (most of the screen on a desktop). On the left, one plugin per row (on ● / off ○ / broken ✕, name), with aca's bundled ones not
+//! yet installed listed below under "Available"; on the right, details of the highlighted one: name and version, where it's from
+//! (a word or two), on or off, description, and below that what can be changed (settings, tools for the agent, keys in the plugin
+//! menu, see plugtune.rs).
+//! On a narrow screen (phone) they stack: list on top, details below.
 //!
-//! - ⏎ 进到右边那一栏改(Esc 回列表);可装的 ⏎ 装上;gateway 那一行 `m` 管它下面的 MCP(gwpage.rs)
-//! - `i` 装一个:输入 git 地址、`owner/repo`(GitHub)、本地目录(本地的就是链接),或者 aca 自带的 `aca.<名字>`,⏎ 装
-//! - 空格 开 / 关:关着的不跑它的钩子、不给 agent 带它的东西(agent 下次启动才变)
-//! - `u` 更新这一个,`U` 更新全部:git 装的拉新的(只快进);钉了版本的、链接的不动;自带的跟着 aca 走
-//! - `x` 按两次删:git 装的、自带的连目录删,链接的只取消登记;插件自己的配置、状态都留着
-//! - `e` 用编辑器打开 `plugins.toml`,停在高亮那个插件那一段;改完回来自己同步(改了才同步)。
-//!   你自己的那份(`~/.config/aca/user/`)打开它的清单
-//! - plugins.toml 跟本机对不上(别处改的、dotfiles 拉下来的)时底下写出差在哪,`S` 照它同步;对得上就不提
-//! - `l` 看它的日志(事件钩子的输出)
+//! - ⏎ goes into the right column to change things (Esc back to the list); ⏎ on an available one installs it; `m` on the gateway
+//!   row manages the MCP servers under it (gwpage.rs)
+//! - `i` installs one: type a git URL, `owner/repo` (GitHub), a local directory (local means linked), or a bundled `aca.<name>`, ⏎
+//!   to install
+//! - Space turns on / off: an off plugin's hooks don't run and the agent doesn't get its things (the agent changes on its next start)
+//! - `u` updates this one, `U` updates all: git installs pull (fast-forward only); pinned and linked ones stay; bundled ones follow aca
+//! - `x` twice removes: git and bundled installs are deleted with their directory, linked ones are only unregistered; the plugin's
+//!   own config and state stay
+//! - `e` opens `plugins.toml` in the editor at the highlighted plugin's section; syncs by itself on return (only if changed).
+//!   For your own one (`~/.config/aca/user/`) it opens its manifest
+//! - When plugins.toml doesn't match this machine (changed elsewhere, pulled in with dotfiles), the bottom says where it differs,
+//!   `S` syncs to it; nothing is said when it matches
+//! - `l` shows its log (event hook output)
 //!
-//! 装、更新、删、开停都放到后台跑(`Job::Plugins`,见 `aca_core::plugin`),做完这一页重读。
-//! 底下提醒哪些开着的会话起来时带的和现在不一样(要重启才带上,见 `mount::stale`):要重启才生效只在这里说,
-//! 别处(段标题、做完的提示)不再讲。
+//! Install, update, remove, on / off run in the background (`Job::Plugins`, see `aca_core::plugin`); the page reloads when done.
+//! The bottom flags which open sessions started with something different from now (need a restart to pick it up, see
+//! `mount::stale`): "takes effect after a restart" is said only here, not elsewhere (section titles, done messages).
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -33,52 +39,54 @@ use crate::overlay::{Flow, Fx, Overlay, kit};
 use crate::plugtune::{Back, Detail, Tune};
 use crate::theme;
 
-/// 来源最多输这么长
+/// Longest source that can be typed
 const INPUT_MAX: usize = 300;
-/// 高亮的设置的说明最多占几行
+/// Most lines the highlighted setting's description takes
 const HINT_MOST: usize = 6;
-/// 框至少这么高(行数,不算外框和底下那句话)
+/// Least height of the box (rows, not counting the frame and the sentence below)
 const LEAST_ROWS: usize = 20;
 
-/// 从哪来的
+/// Where it's from
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Origin {
-    /// 链接的本地目录
+    /// A linked local directory
     #[default]
     Linked,
     Git,
-    /// aca 自带的
+    /// Bundled with aca
     Bundled,
-    /// 你自己的那份(`~/.config/aca/user/`)
+    /// Your own one (`~/.config/aca/user/`)
     Mine,
 }
 
-/// 一个登记了的插件
+/// A registered plugin
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Row {
     pub id: String,
     pub enabled: bool,
-    /// 清单里的名字、版本、说明;清单读不了时空着,`problem` 写原因
+    /// Name, version, description from the manifest; empty when the manifest can't be read, with the reason in `problem`
     pub name: String,
     pub version: String,
     pub description: String,
     pub problem: Option<String>,
     pub from: Origin,
     pub path: String,
-    /// 清单 needs 里这台机器上没有的程序(列表里标「缺程序」,右边写缺哪个)
+    /// Programs in the manifest's needs that this machine lacks (marked "missing" in the list, the right side says which)
     pub lacks: Vec<String>,
-    /// 出错了的(钩子、定时上次没跑成,gateway 的服务停下了),一处一句:列表里标「出错了」,右边列出来
+    /// What's failing (a hook or a schedule didn't run last time, the gateway's server stopped), one line each: marked "failing" in the
+    /// list, listed on the right
     pub alerts: Vec<String>,
-    /// gateway 这个插件:它现在在不在跑、几个连接、下面几个服务
+    /// The gateway plugin: whether it's running now, how many connections, how many servers under it
     pub live: Option<String>,
-    /// aca 自带、还没装的:列在「可装」里,⏎ 装
+    /// Bundled with aca, not installed yet: listed under "Available", ⏎ installs
     pub available: bool,
-    /// 还没装的:装上会带来什么(清单说的,见 `Manifest::brings`)
+    /// Not installed yet: what installing it brings (as the manifest says, see `Manifest::brings`)
     pub brings: Vec<String>,
 }
 
 impl Origin {
-    /// 从哪来的,一两个字(右边标题那行,版本后面)。你自己的不写:标题就叫「你自己的」
+    /// Where it's from, a word or two (in the right side's title line, after the version). Not written for your own one: its title is
+    /// 「你自己的」 ("Your own")
     fn word(self) -> &'static str {
         match self {
             Origin::Linked => t!("本地", "local"),
@@ -89,8 +97,9 @@ impl Origin {
     }
 }
 
-/// 底栏里叫它什么:清单里的名字(你自己的那份叫「你自己的」);读不了(清单坏了、刚删掉)就用 id。
-/// item 给了的:它的一项(能力、窗格、视图)的标题
+/// What the status bar calls it: the manifest's name (your own one is 「你自己的」 ("Your own")); the id when unreadable
+/// (manifest broken, just removed).
+/// When item is given: the title of one of its items (capability, pane, view)
 fn called(id: &str, item: Option<&str>) -> String {
     let e = plugin::registry().into_iter().find(|e| e.id == id);
     if item.is_none() && e.as_ref().is_some_and(|e| e.source == plugin::user::SOURCE) {
@@ -111,9 +120,9 @@ fn called(id: &str, item: Option<&str>) -> String {
     found.filter(|n| !n.is_empty()).unwrap_or_else(|| item.unwrap_or(id).to_string())
 }
 
-/// 登记表里的插件,清单读进来
+/// Plugins in the registry, with their manifests read
 pub fn load() -> Vec<Row> {
-    // 刚升级了 aca:自带的先换成新的,这一页列的就是现在的
+    // aca was just upgraded: swap the bundled ones for the new ones first, so this page lists what's current
     plugin::first_party::refresh();
     let (problems, now) = (plugin::health::problems(), aca_core::paths::now());
     plugin::registry()
@@ -158,7 +167,8 @@ pub fn load() -> Vec<Row> {
         .collect()
 }
 
-/// gateway 现在的样子(一句话):问在跑的那个;没在跑、插件开着是空闲(第一个 agent 连上来时自己起),关着就不写
+/// The gateway's state now (one line): ask the running one; not running with the plugin on is idle (starts itself when the first
+/// agent connects), not written when off
 fn gateway_live(on: bool) -> Option<String> {
     match aca_core::gateway::ctl(serde_json::json!({ "cmd": "status" })) {
         Ok(v) => Some(tr!(
@@ -172,32 +182,32 @@ fn gateway_live(on: bool) -> Option<String> {
     }
 }
 
-/// 要放到后台做的
+/// Things to run in the background
 #[derive(Clone, Debug, PartialEq)]
 pub enum Act {
-    /// 从这里装(git 地址、owner/repo、本地目录、aca.<名字>)
+    /// Install from here (git URL, owner/repo, local directory, aca.<name>)
     Install(String),
-    /// 更新这一个;None = 全部(链接的不算)
+    /// Update this one; None = all (linked ones excluded)
     Update(Option<String>),
     Remove(String),
     Enable(String, bool),
-    /// 让本机跟 plugins.toml 一致
+    /// Bring this machine in line with plugins.toml
     Sync,
-    /// 编辑器里改过 plugins.toml 回来了:照它同步,说改了什么
+    /// Back from editing plugins.toml in the editor: sync to it and say what changed
     AfterEdit,
-    /// 给 / 不给 agent 一个能力当工具:(插件, 能力, 给不给)
+    /// Give / don't give the agent a capability as a tool: (plugin, capability, give or not)
     Tool(String, String, bool),
-    /// `:` 菜单里一个的键:(插件, 能力 / 窗格 / 视图, Some(键) / Some("") 不要键 / None 回到清单的)
+    /// A key in the `:` menu: (plugin, capability / pane / view, Some(key) / Some("") no key / None back to the manifest's)
     Key(String, String, Option<String>),
-    /// 改一个设置:(插件, 名字, Some(值) / None 回到默认)
+    /// Change a setting: (plugin, name, Some(value) / None back to the default)
     Setting(String, String, Option<String>),
 }
 
 impl Act {
-    /// 跑的时候底栏显示的
+    /// What the status bar shows while it runs
     pub fn doing(&self) -> String {
         match self {
-            // 「可装」里的给的是 id:换成清单里的名字;别处的(地址、目录)是你输的,照写
+            // Ones under "Available" come as an id: use the manifest's name; others (URL, directory) are what you typed, written as is
             Act::Install(src) => {
                 tr!("正在安装 {}…", "installing {}…", plugin::first_party::manifest(src).map_or_else(|| src.clone(), |m| m.name))
             }
@@ -215,7 +225,7 @@ impl Act {
     }
 }
 
-/// run 循环放进后台跑的(`Job::Plugins`)
+/// What the run loop puts in the background (`Job::Plugins`)
 pub fn job(a: &Act) -> Outcome {
     match a {
         Act::Install(src) => match plugin::install(src, None) {
@@ -276,12 +286,12 @@ pub fn job(a: &Act) -> Outcome {
     }
 }
 
-/// e 打开的文件和打开前的修改时间:回来时改了才同步
+/// The file e opened and its mtime before opening: sync on return only if changed
 #[derive(Debug)]
 pub struct Edited {
     path: PathBuf,
     before: Option<SystemTime>,
-    /// 是 plugins.toml(改了要同步);你自己的清单改了马上生效,不用
+    /// It's plugins.toml (sync if changed); your own manifest takes effect at once when changed, no sync needed
     sync: bool,
 }
 
@@ -289,7 +299,8 @@ fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).ok()?.modified().ok()
 }
 
-/// e:用编辑器打开 plugins.toml,停在这个插件那一段(没有这一段停在最后);`mine` 给了(你自己的那份)打开它的清单
+/// e: open plugins.toml in the editor at this plugin's section (at the end if there's none); with `mine` (your own one) open its
+/// manifest
 pub fn edit_file(id: Option<&str>, mine: Option<&str>, fx: &mut Fx) -> Option<Edited> {
     let (path, line, sync) = match mine {
         Some(p) => (PathBuf::from(p), 1, false),
@@ -306,7 +317,7 @@ pub fn edit_file(id: Option<&str>, mine: Option<&str>, fx: &mut Fx) -> Option<Ed
     Some(Edited { path, before, sync })
 }
 
-/// 从编辑器回来了:没改不说;改了 plugins.toml 就同步
+/// Back from the editor: say nothing if unchanged; sync if plugins.toml changed
 pub fn back_from(ed: Edited, fx: &mut Fx) {
     match (mtime(&ed.path) != ed.before, ed.sync) {
         (false, _) => {}
@@ -315,7 +326,7 @@ pub fn back_from(ed: Edited, fx: &mut Fx) {
     }
 }
 
-/// l:看它的日志(事件钩子的输出);name 是没有日志时底栏里叫它的
+/// l: show its log (event hook output); name is what the status bar calls it when there's no log
 pub fn show_log(id: &str, name: &str, fx: &mut Fx) {
     let log = plugin::log_file(id);
     if log.exists() {
@@ -325,50 +336,50 @@ pub fn show_log(id: &str, name: &str, fx: &mut Fx) {
     }
 }
 
-/// 高亮在哪一栏
+/// Which column the highlight is in
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
     List,
     Detail,
 }
 
-/// 两栏放得下的最窄宽度;再窄(手机)上下叠着
+/// Narrowest width that fits two columns; narrower (phone) stacks them
 pub(crate) const SPLIT_W: usize = 76;
-/// 两栏中间的分隔
+/// Divider between the two columns
 pub(crate) const DIVIDER: &str = " │  ";
 
-/// `P` 那一页
+/// The `P` page
 pub struct Page {
     load: fn() -> Vec<Row>,
     rows: Vec<Row>,
     sel: usize,
     focus: Focus,
-    /// 高亮那个插件的详情(右边那一栏);可装的、清单坏了的没有
+    /// Details of the highlighted plugin (the right column); none for available ones or ones with a broken manifest
     detail: Option<Detail>,
-    /// 按了一次 x,等再按一次
+    /// x pressed once, waiting for the second press
     armed: bool,
-    /// 正在输要装的来源
+    /// The source being typed for installing
     typing: Option<String>,
-    /// 开着的会话里要重启才带上插件改动的:标题
+    /// Open sessions that need a restart to pick up plugin changes: titles
     stale: Vec<String>,
     stale_of: fn() -> Vec<String>,
-    /// plugins.toml 跟本机对不上的地方
+    /// Where plugins.toml doesn't match this machine
     drift: Vec<String>,
     drift_of: fn() -> Vec<String>,
-    /// 读一个插件的详情(测试换成假的)
+    /// Reads one plugin's details (faked in tests)
     tune: fn(&str) -> Tune,
-    /// e 打开了文件:回来时改了就同步
+    /// e opened a file: sync on return if it changed
     edited: Option<Edited>,
-    /// 右边那一栏最多要几行(桌面宽度,所有插件里最长的,见 `measure`):定框高用
+    /// Most lines the right column needs (desktop width, the longest of all plugins, see `measure`): for sizing the box height
     tall: usize,
 }
 
-/// 开着的会话里,起来时带的和现在不一样的(标题)
+/// Open sessions that started with something different from now (titles)
 pub fn stale() -> Vec<String> {
     plugin::mount::stale().into_iter().map(|(_, title)| title).collect()
 }
 
-/// 列表里、右边标题上叫它什么:清单里的名字;你自己的那份叫「你自己的」
+/// What the list and the right-side title call it: the manifest's name; your own one is 「你自己的」 ("Your own")
 fn title(r: &Row) -> String {
     match r.from {
         Origin::Mine => t!("你自己的", "Your own").to_string(),
@@ -377,13 +388,14 @@ fn title(r: &Row) -> String {
     }
 }
 
-/// 一行拆成片段,整行的样式(底色、粗细)落到每一段上:两栏拼成一行时,左边的底色不能铺到右边去
+/// Split a line into spans, putting the whole line's style (background, weight) on each: when two columns join into one line, the
+/// left one's background mustn't spread to the right
 pub(crate) fn flat(line: Line<'static>) -> Vec<Span<'static>> {
     let st = line.style;
     line.spans.into_iter().map(|s| Span::styled(s.content, st.patch(s.style))).collect()
 }
 
-/// 补空格到 w 宽(两栏拼成一行用),整行的样式带上
+/// Pad with spaces to width w (for joining two columns into one line), carrying the whole line's style
 pub(crate) fn pad(line: Line<'static>, w: usize) -> Vec<Span<'static>> {
     let (st, n) = (line.style, w.saturating_sub(line.width()));
     let mut spans = flat(line);
@@ -393,7 +405,7 @@ pub(crate) fn pad(line: Line<'static>, w: usize) -> Vec<Span<'static>> {
     spans
 }
 
-/// 从第几行开始显示,让第 at 行落在 h 行里(放在偏上的位置,下面留点看得见的)
+/// Which line to start showing from so line at lands within h lines (placed high, leaving some visible below)
 pub(crate) fn scroll(at: Option<usize>, len: usize, h: usize) -> usize {
     match at {
         Some(i) if len > h => i.saturating_sub(h / 2).min(len - h),
@@ -401,7 +413,8 @@ pub(crate) fn scroll(at: Option<usize>, len: usize, h: usize) -> usize {
     }
 }
 
-/// 高亮落在一个设置上时它的说明最多占几行(前面空一行):定框高时按最长的那个算
+/// Most lines the description takes when the highlight is on a setting (plus a blank line before): the longest one counts when sizing
+/// the box height
 fn hint_tall(d: &Detail, w: usize) -> usize {
     d.data
         .settings
@@ -442,14 +455,15 @@ impl Page {
         self.rows.get(self.sel)
     }
 
-    /// 两栏各多宽:左边按最长的名字,其余给右边
+    /// Width of each column: the left by the longest name, the rest to the right
     fn split(&self, w: usize) -> (usize, usize) {
         let names = self.rows.iter().map(|r| title(r).width()).max().unwrap_or(0);
         let lw = (names + 4 + 5).clamp(22, 32);
         (lw, w.saturating_sub(lw + DIVIDER.width()))
     }
 
-    /// 右边那一栏最多要几行:每个插件都算一遍(高亮那个用现成的详情,别的现读),取最长的。定框高用,所以挪高亮不变
+    /// Most lines the right column needs: computed for every plugin (the highlighted one from its loaded details, others read now), the
+    /// longest wins. For sizing the box height, so moving the highlight doesn't change it
     fn measure(&mut self) {
         let (_, rw) = self.split(self.width() as usize - 6);
         let mut tall = 0;
@@ -468,12 +482,12 @@ impl Page {
         self.tall = tall;
     }
 
-    /// 「可装」那一段从第几行开始
+    /// Which row the "Available" section starts at
     fn first_available(&self) -> Option<usize> {
         self.rows.iter().position(|r| r.available)
     }
 
-    /// 高亮换了、重读了:右边那一栏换成高亮那个的;还是同一个插件就留着它里面的高亮
+    /// Highlight moved or reloaded: the right column switches to the highlighted one; for the same plugin keep the highlight inside it
     fn follow(&mut self) {
         let want = self.cur().filter(|r| !r.available && r.problem.is_none()).map(|r| r.id.clone());
         match want {
@@ -500,7 +514,7 @@ impl Page {
         self.edited = edit_file(id.as_deref(), mine.as_deref(), fx);
     }
 
-    /// 左边的列表:一行一个(开着 ● / 关着 ○ / 坏了 ✕、名字),「可装」的在下面。也给出高亮那行是第几行
+    /// The left list: one per row (on ● / off ○ / broken ✕, name), "Available" ones below. Also returns which row is highlighted
     fn list(&self, w: usize) -> (Vec<Line<'static>>, Option<usize>) {
         let mut out = vec![];
         let mut at = None;
@@ -549,7 +563,7 @@ impl Page {
         (out, at)
     }
 
-    /// 右边的标题:名字(强调色粗体)、淡的版本和从哪来(一两个字),右边写开着 / 关着
+    /// The right-side title: name (accent bold), the faint version and where it's from (a word or two), on / off at the right
     fn header(r: &Row, w: usize) -> Line<'static> {
         let (state, st) = match (r.available, &r.problem, r.enabled) {
             (true, ..) => (t!("未安装", "not installed"), kit::dim()),
@@ -570,7 +584,7 @@ impl Page {
         )
     }
 
-    /// 右边那一栏:高亮的插件是什么、能改什么。也给出高亮那行是第几行
+    /// The right column: what the highlighted plugin is and what can be changed. Also returns which row is highlighted
     fn right(&self, w: usize) -> (Vec<Line<'static>>, Option<usize>) {
         let wrap = |text: &str, st: Style, most: usize| {
             crate::ui::wrap_width(text, w).into_iter().take(most).map(move |l| Line::styled(l, st)).collect::<Vec<_>>()
@@ -595,7 +609,8 @@ impl Page {
         self.right_of(r, self.detail.as_ref(), w)
     }
 
-    /// 一个插件在右边那一栏的样子:标题、问题、说明(最多三行)、能改的(detail);定框高时每个插件都算一遍
+    /// How one plugin looks in the right column: title, problems, description (three lines at most), what can be changed (detail);
+    /// computed for every plugin when sizing the box height
     fn right_of(&self, r: &Row, detail: Option<&Detail>, w: usize) -> (Vec<Line<'static>>, Option<usize>) {
         let wrap = |text: &str, st: Style, most: usize| {
             crate::ui::wrap_width(text, w).into_iter().take(most).map(move |l| Line::styled(l, st)).collect::<Vec<_>>()
@@ -631,7 +646,7 @@ impl Page {
             out.push(Line::from(kit::button(t!("⏎ 安装", "⏎ install"), theme::pal().accent)));
             return (out, None);
         }
-        // gateway:现在在不在跑,写在能改的前面(它下面的 MCP 按 m 进去管,键栏里有)
+        // gateway: whether it's running now, written before what can be changed (its MCP servers are managed with m, shown in the key bar)
         if let Some(l) = &r.live {
             let label = t!("状态", "state");
             out.push(Line::from(vec![
@@ -649,7 +664,8 @@ impl Page {
         (out, hl)
     }
 
-    /// 高亮在右边一个设置上:「名字:说明」折行写全,放在详情下面(前面空一行,见 `right_in`);最多这么多行
+    /// Highlight on a setting in the right column: "name: description" wrapped in full, below the details (with a blank line before, see
+    /// `right_in`); at most this many lines
     fn hint(&self, w: usize) -> Vec<Line<'static>> {
         let Some((name, desc)) = self.detail.as_ref().filter(|_| self.focus == Focus::Detail).and_then(Detail::hint) else {
             return vec![];
@@ -660,7 +676,8 @@ impl Page {
         out
     }
 
-    /// 右边那一栏放进 h 行:高亮那个设置的说明接在详情后面;放不下就钉在最下面,详情跟着高亮滚
+    /// Fit the right column into h lines: the highlighted setting's description follows the details; if it doesn't fit, pin it at the
+    /// bottom and scroll the details with the highlight
     fn right_in(&self, w: usize, h: usize) -> Vec<Line<'static>> {
         let hint = self.hint(w);
         let (right, hl) = self.right(w);
@@ -678,7 +695,7 @@ impl Page {
         out
     }
 
-    /// 底下的提醒(删前确认、plugins.toml 对不上、要重启的会话),一条最多两行
+    /// Notices at the bottom (confirm before removing, plugins.toml mismatch, sessions needing a restart), each two lines at most
     fn banners(&self, w: usize) -> Vec<Line<'static>> {
         let wrap =
             |text: &str| crate::ui::wrap_width(text, w).into_iter().take(2).map(|l| Line::styled(l, theme::warn())).collect::<Vec<_>>();
@@ -699,7 +716,7 @@ impl Page {
                 self.drift.join(t!("、", ", "))
             )));
         }
-        // 改了插件(开关、给 agent 的工具),开着的会话要重启才带上:只在这里说一次,点名是哪些
+        // Plugins changed (on / off, tools for the agent), open sessions need a restart to pick it up: said only here, once, naming which
         if !self.stale.is_empty() {
             let names: Vec<String> = self.stale.iter().take(3).map(|t| format!("「{t}」")).collect();
             let (n, rest) = (self.stale.len(), self.stale.len().saturating_sub(3));
@@ -709,7 +726,7 @@ impl Page {
         out
     }
 
-    /// 底下那行键:跟着高亮在哪一栏、高亮的是什么
+    /// The key row at the bottom: follows which column the highlight is in and what's highlighted
     fn keys(&self) -> Vec<(&'static str, &'static str)> {
         if self.typing.is_some() {
             return vec![("⏎", t!("安装", "install")), ("^U", t!("清空", "clear")), ("Esc", t!("取消", "cancel"))];
@@ -762,8 +779,9 @@ impl Overlay for Page {
         true
     }
 
-    /// 高度照内容定:标题、两栏里长的那一栏(右边按所有插件里最长的,见 `measure`)、提醒、细线、键。
-    /// 挪高亮不变,装了 / 删了插件才变;x 问删不删那两行出来时跟着长一点
+    /// Height follows the content: title, the longer of the two columns (the right by the longest of all plugins, see `measure`),
+    /// notices, rule, keys. Moving the highlight doesn't change it, only installing / removing plugins does; a bit taller while the
+    /// two-line remove question from x is up
     fn fill_rows(&self) -> Option<u16> {
         let w = self.width() as usize - 6;
         let (lw, _) = self.split(w);
@@ -775,7 +793,7 @@ impl Overlay for Page {
         self.lines_in(w, 32)
     }
 
-    /// 标题、两栏(窄屏上下叠)、提醒、细线、键;正好 h 行,框的大小不跟着高亮变
+    /// Title, two columns (stacked on a narrow screen), notices, rule, keys; exactly h lines, the box size doesn't follow the highlight
     fn lines_in(&self, w: usize, h: usize) -> Vec<Line<'static>> {
         let in_detail = self.focus == Focus::Detail;
         let esc = if in_detail { t!("返回列表", "back to the list") } else { t!("关闭", "close") };
@@ -798,7 +816,7 @@ impl Overlay for Page {
                 out.push(Line::from(spans));
             }
         } else {
-            // 手机:列表在上、高亮那个的详情在下;进了详情只显示详情
+            // Phone: list on top, the highlighted one's details below; inside the details only the details show
             let mut body = vec![];
             if !in_detail {
                 let (left, at) = self.list(w);
@@ -837,7 +855,7 @@ impl Overlay for Page {
             }
             return Flow::Stay;
         }
-        // 高亮在右边那一栏:键归它;e、l 照样能按
+        // Highlight in the right column: keys go to it; e and l still work
         if self.focus == Focus::Detail {
             let typing = self.detail.as_ref().is_some_and(Detail::typing);
             match k.code {
@@ -857,7 +875,7 @@ impl Overlay for Page {
         }
         let armed = std::mem::take(&mut self.armed);
         let n = self.rows.len();
-        // 「可装」里的:⏎ / 空格装上;更新、删、看日志都还谈不上
+        // Under "Available": ⏎ / Space installs; update, remove and log don't apply yet
         if let Some(r) = self.cur().filter(|r| r.available) {
             match k.code {
                 KeyCode::Enter | KeyCode::Char(' ') => {
@@ -932,7 +950,7 @@ impl Overlay for Page {
         self.rows = (self.load)();
         self.stale = (self.stale_of)();
         self.drift = (self.drift_of)();
-        // 高亮跟着原来那个;它没了(刚删掉)就留在原来的位置上
+        // The highlight follows the same one; if it's gone (just removed) it stays at the same position
         let same = was.and_then(|id| self.rows.iter().position(|r| r.id == id));
         self.sel = same.unwrap_or(self.sel).min(self.rows.len().saturating_sub(1));
         self.armed = false;
@@ -960,7 +978,7 @@ mod tests {
     use std::cell::RefCell;
 
     thread_local! {
-        /// 假的登记表:页面每次重读都读它
+        /// Fake registry: the page reads it on every reload
         static REG: RefCell<Vec<Row>> = const { RefCell::new(vec![]) };
         static STALE: RefCell<Vec<String>> = const { RefCell::new(vec![]) };
         static DRIFT: RefCell<Vec<String>> = const { RefCell::new(vec![]) };
@@ -978,7 +996,7 @@ mod tests {
         DRIFT.with(|r| r.borrow().clone())
     }
 
-    /// 假的详情:aca.delegate 有一个设置、订了事件,别的什么都没有
+    /// Fake details: aca.delegate has one setting and subscribes to events, nothing else
     fn fake_tune(id: &str) -> Tune {
         match id {
             "aca.delegate" => Tune {
@@ -1044,7 +1062,7 @@ mod tests {
         (fx, f)
     }
 
-    /// 出错了的插件:列表里标「出错了」,右边列出哪一处、怎么了;停着的不标
+    /// A failing plugin: marked "failing" in the list, the right side lists where and what went wrong; paused ones aren't marked
     #[test]
     fn a_failing_plugin_is_marked_and_says_what_failed() {
         i18n::with(Lang::Zh, || {
@@ -1055,7 +1073,7 @@ mod tests {
             let p = page();
             let t = text_in(&p, 110, 30).join("\n");
             assert!(t.contains("出错") && t.contains("钩子 turn.done 退出码 3 · 5m 前") && t.contains("l 日志"), "{t}");
-            // 关着的(my.local)照旧标「关着」
+            // The off one (my.local) is still marked 「关着」 ("off") as before
             assert!(t.lines().any(|l| l.contains(" ○ Local") && !l.contains("已关闭")), "{t}");
         });
     }
@@ -1069,24 +1087,24 @@ mod tests {
             let t = lines.join("\n");
             assert_eq!(lines.len(), 30);
             assert!(lines.iter().all(|l| l.width() <= 110), "{t}");
-            // 左边:开没开、名字;关着的只画 ○,不再写一遍「关着」
+            // Left: on or off, name; an off one only draws ○, without writing 「关着」 ("off") again
             assert!(t.contains("▌● Delegate") && t.contains(" ○ Local"), "{t}");
             assert!(!t.lines().any(|l| l.contains(" ○ Local") && l.contains("已关闭")), "{t}");
-            // 右边:名字、版本和从哪来(一两个字)、开着,说明,能改的;id、来源地址不写
+            // Right: name, version and where it's from (a word or two), on, description, what can be changed; no id or source URL
             assert!(t.contains("Delegate  0.1.0 · git") && t.contains("● 已开启"), "{t}");
             assert!(!t.contains("aca.delegate") && !t.contains("github.com"), "{t}");
             assert!(
                 t.contains("派活给别的 agent") && t.contains("设置") && t.contains("say  continue") && t.contains("agents  skills"),
                 "{t}"
             );
-            // 设置的说明不挤在行里
+            // A setting's description isn't squeezed into its row
             assert!(!t.contains("what to say"), "{t}");
             assert!(t.contains("⏎ 进入") && t.contains("e 编辑") && t.contains("l 日志") && t.contains("Esc 关闭"), "{t}");
-            // 高亮的底色只铺左边那一栏,不漫到右边
+            // The highlight background covers only the left column, not spilling right
             let row = &p.lines_in(110, 30)[2];
             let div = row.spans.iter().position(|s| s.content == DIVIDER).unwrap();
             assert!(row.style.bg.is_none() && row.spans[0].style.bg.is_some() && row.spans[div..].iter().all(|s| s.style.bg.is_none()));
-            // 换一个高亮:框一样高,右边换成它的
+            // Another highlight: same box height, the right side switches to it
             press(&mut p, KeyCode::Char('j'));
             let lines = text_in(&p, 110, 30);
             let t = lines.join("\n");
@@ -1095,18 +1113,18 @@ mod tests {
                 t.contains("Local  0.0.1 · 本地") && t.contains("○ 已关闭") && !t.contains("say  continue") && !t.contains("⏎ 进入"),
                 "{t}"
             );
-            // 窄屏(手机):上下叠着,不出界,也是正好那么高
+            // Narrow screen (phone): stacked, within bounds, also exactly that tall
             let narrow = text_in(&p, 40, 24);
             assert!(narrow.len() == 24 && narrow.iter().all(|l| l.width() <= 40), "{narrow:?}");
             assert!(narrow.join("\n").contains("○ Local") && narrow.join("\n").contains("○ 已关闭"), "{narrow:?}");
-            // 清单坏了的标出来
+            // A broken manifest is flagged
             set(vec![Row { id: "bad".into(), problem: Some("清单读不懂".into()), ..Default::default() }]);
             let t = text(&page(), 110).join("\n");
             assert!(t.contains("✕ bad") && t.contains("有问题") && t.contains("清单有问题:清单读不懂"), "{t}");
-            // 要用的程序这台机器上没有:列表里标出来
+            // A needed program is missing on this machine: flagged in the list
             set(vec![Row { id: "x".into(), name: "X".into(), enabled: true, lacks: vec!["jq".into()], ..Default::default() }]);
             assert!(text(&page(), 110).join("\n").contains("缺少程序"));
-            // 一个都没有:告诉怎么装
+            // None at all: say how to install
             set(vec![]);
             let t = text(&page(), 110).join("\n");
             assert!(t.contains("尚未安装插件 · i 安装"), "{t}");
@@ -1119,7 +1137,8 @@ mod tests {
             set(two());
             let mut p = page();
             let (_, rw) = p.split(120 - 6);
-            // 右边按 Delegate 算:它的详情加上高亮一个设置时那两行说明;挪到 Local 上右边变短,框不变
+            // The right side is sized by Delegate: its details plus the two description lines when a setting is highlighted;
+            // on Local the right side gets shorter, the box doesn't
             let right = p.right(rw).0.len();
             assert_eq!(p.tall, right + 2, "{right}");
             let h = p.fill_rows().unwrap();
@@ -1127,7 +1146,7 @@ mod tests {
             assert!(p.right(rw).0.len() < right);
             assert_eq!((p.tall, p.fill_rows()), (right + 2, Some(h)));
             assert!(h >= LEAST_ROWS as u16 && h < 32, "{h}");
-            // 插件多了跟着列表长
+            // More plugins, taller list
             set((0..30).map(|i| Row { id: format!("p{i}"), name: format!("P{i}"), ..Default::default() }).collect());
             assert!(page().fill_rows().unwrap() >= 2 + 30 + 2);
         });
@@ -1151,13 +1170,14 @@ mod tests {
             assert!(!text(&p, 110).join("\n").contains("▌ say"));
             press(&mut p, KeyCode::Enter);
             let t = text(&p, 110).join("\n");
-            // 高亮到了右边:设置那行标出来,它的说明写在这一栏最下面,底下是它的键,左边那行不再铺底色
+            // Highlight moved right: the setting row is marked, its description at the bottom of this column, its keys below,
+            // the left row no longer has a background
             assert!(t.contains("▌ say") && t.contains("⏎ 修改") && t.contains("- 默认") && t.contains("Esc 返回列表"), "{t}");
             assert!(!t.contains("空格 开/关"), "{t}");
             let lines = text(&p, 110);
             let at = lines.iter().position(|l| l.contains("say:what to say")).expect("说明");
             assert!(lines[at - 1].trim_end().ends_with('│') && lines[at - 2].contains("skills"), "{t}");
-            // 说明很长:折行写全,不截断
+            // Long description: wrapped in full, not cut
             let desc = "开=你说「用delegate」时它自己接手:规划、派worker、验收、汇报,一路做完再回来告诉你结果".repeat(2);
             let mut long = fake_tune("aca.delegate");
             long.settings[0].desc = desc.clone();
@@ -1165,7 +1185,7 @@ mod tests {
             let right: String = text(&p, 110).iter().filter_map(|l| l.split(DIVIDER).nth(1)).map(str::trim_end).collect();
             assert!(right.contains(&desc), "{right}");
             p.detail = Some(Detail::new(fake_tune("aca.delegate")));
-            // 在右边改:⏎ 打字,打字时 q 是字;Esc 先退出打字,再回列表,再关
+            // Editing on the right: ⏎ types, and while typing q is a letter; Esc first leaves typing, then back to the list, then closes
             press(&mut p, KeyCode::Enter);
             assert!(p.typing());
             assert_eq!(press(&mut p, KeyCode::Char('q')).1, Flow::Stay);
@@ -1174,7 +1194,7 @@ mod tests {
             assert_eq!(press(&mut p, KeyCode::Esc).1, Flow::Stay);
             assert!(text(&p, 110).join("\n").contains("Esc 关闭"));
             assert_eq!(press(&mut p, KeyCode::Esc).1, Flow::Close);
-            // 没有能改的:⏎ 说一声,高亮留在列表
+            // Nothing to change: ⏎ says so, the highlight stays in the list
             let mut p = page();
             press(&mut p, KeyCode::Char('j'));
             let (fx, _) = press(&mut p, KeyCode::Enter);
@@ -1192,10 +1212,10 @@ mod tests {
             assert_eq!(press(&mut p, KeyCode::Char('u')).0.job, Some(Job::Plugins(Act::Update(Some("aca.delegate".into())))));
             assert_eq!(press(&mut p, KeyCode::Char('U')).0.job, Some(Job::Plugins(Act::Update(None))));
             assert_eq!(press(&mut p, KeyCode::Char('S')).0.job, Some(Job::Plugins(Act::Sync)));
-            // 停着的那个:空格是开
+            // On the paused one: Space turns it on
             press(&mut p, KeyCode::Char('j'));
             assert_eq!(press(&mut p, KeyCode::Char(' ')).0.job, Some(Job::Plugins(Act::Enable("my.local".into(), true))));
-            // x 第一次只提醒,写清楚会怎样;第二次才删;中间按别的就算了
+            // First x only warns, saying what will happen; the second removes; anything else in between cancels
             assert_eq!(press(&mut p, KeyCode::Char('x')).0.job, None);
             let t = text(&p, 110).join("\n");
             assert!(t.contains("删除 Local?仅取消登记,保留目录") && t.contains("x 删除 • Esc 取消"), "{t}");
@@ -1227,7 +1247,7 @@ mod tests {
             let ed = |sync| Edited { path: f.clone(), before: mtime(&f), sync };
             let mut fx = Fx::default();
             back_from(ed(true), &mut fx);
-            // 没改:什么都不做,也不说
+            // Unchanged: do nothing, say nothing
             assert!(fx.job.is_none() && fx.flash.is_none());
             let (e1, e2) = (ed(true), ed(false));
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1235,7 +1255,7 @@ mod tests {
             let mut fx = Fx::default();
             back_from(e1, &mut fx);
             assert_eq!(fx.job, Some(Job::Plugins(Act::AfterEdit)));
-            // 你自己的清单:改了马上生效,不用同步
+            // Your own manifest: takes effect at once when changed, no sync
             let mut fx = Fx::default();
             back_from(e2, &mut fx);
             assert!(fx.job.is_none() && fx.flash.unwrap().contains("已修改"));
@@ -1261,7 +1281,7 @@ mod tests {
             let mut p = page();
             let t = text(&p, 110).join("\n");
             assert!(t.contains("可安装") && t.contains("+ MCP Gateway"), "{t}");
-            // 装了的排前面,可装的在「可装」那一行下面
+            // Installed ones first, available ones under the "Available" row
             assert!(t.find("Local").unwrap() < t.find("可安装").unwrap(), "{t}");
             press(&mut p, KeyCode::Char('j'));
             press(&mut p, KeyCode::Char('j'));
@@ -1269,15 +1289,15 @@ mod tests {
             assert!(t.contains("MCP Gateway  0.1.0 · 自带") && t.contains("未安装") && !t.contains("aca.gateway"), "{t}");
             assert!(t.contains("所有 agent 共用的 MCP") && t.contains("安装后将添加") && t.contains("给 agent  一个 MCP 服务"), "{t}");
             assert!(t.contains("设置      servers") && t.contains(" ⏎ 安装 ") && t.contains("i 从其他来源安装"), "{t}");
-            // 还没装:删、更新、日志都说先装;⏎ / 空格装
+            // Not installed yet: remove, update and log all say install first; ⏎ / Space installs
             let (fx, _) = press(&mut p, KeyCode::Char('x'));
             assert_eq!(fx.job, None);
             assert!(fx.flash.unwrap().contains("MCP Gateway 未安装"));
             assert_eq!(press(&mut p, KeyCode::Enter).0.job, Some(Job::Plugins(Act::Install("aca.gateway".into()))));
             assert_eq!(press(&mut p, KeyCode::Char(' ')).0.job, Some(Job::Plugins(Act::Install("aca.gateway".into()))));
-            // 窄屏也不出界
+            // Narrow screen stays within bounds too
             assert!(text_in(&p, 40, 24).iter().all(|l| l.width() <= 40), "{:?}", text_in(&p, 40, 24));
-            // 只有可装的:左边说还没装插件
+            // Only available ones: the left says no plugins are installed yet
             set(vec![Row { id: "aca.bark".into(), from: Origin::Bundled, available: true, ..Default::default() }]);
             let t = text(&page(), 110).join("\n");
             assert!(t.contains("尚未安装插件") && t.contains("+ aca.bark"), "{t}");
@@ -1297,12 +1317,12 @@ mod tests {
             press(&mut p, KeyCode::Backspace);
             let t = text(&p, 110).join("\n");
             assert!(t.contains("从其他来源安装") && t.contains("安装来源 > x/aca-delegate▏") && t.contains("⏎ 安装"), "{t}");
-            // 打字时 q、x 是字,不是关掉 / 删除
+            // While typing, q and x are letters, not close / remove
             assert_eq!(press(&mut p, KeyCode::Char('q')).1, Flow::Stay);
             press(&mut p, KeyCode::Backspace);
             assert_eq!(press(&mut p, KeyCode::Enter).0.job, Some(Job::Plugins(Act::Install("x/aca-delegate".into()))));
             assert!(!p.typing());
-            // 空的不装;Esc 只退出输入
+            // Empty doesn't install; Esc only leaves the input
             press(&mut p, KeyCode::Char('i'));
             assert_eq!(press(&mut p, KeyCode::Enter).0.job, None);
             press(&mut p, KeyCode::Char('i'));
@@ -1319,7 +1339,7 @@ mod tests {
             let t = text(&page(), 120).join("\n");
             STALE.with(|s| s.borrow_mut().clear());
             assert!(t.contains("「主线」「读登录」重启后启用新插件"), "{t}");
-            // 多了只点名前三个
+            // With more, only the first three are named
             STALE.with(|s| *s.borrow_mut() = ["a", "b", "c", "d", "e"].map(String::from).to_vec());
             let t = text(&page(), 120).join("\n");
             STALE.with(|s| s.borrow_mut().clear());
@@ -1345,13 +1365,13 @@ mod tests {
             press(&mut p, KeyCode::Char('j'));
             press(&mut p, KeyCode::Char('j'));
             let t = text(&p, 120).join("\n");
-            // 名字叫「你自己的」,不写版本、路径
+            // Named 「你自己的」 ("Your own"), no version or path
             assert!(t.contains("▌● 你自己的") && !t.contains("/c/aca/user") && !t.contains("你自己的  0"), "{t}");
             assert!(t.contains("e 编辑"), "{t}");
             let (fx, _) = press(&mut p, KeyCode::Char('x'));
             assert!(fx.job.is_none() && fx.flash.unwrap().contains("无法删除你自己的插件"));
             assert!(!p.armed);
-            // e:你自己的那份打开它的清单
+            // e: your own one opens its manifest
             let (fx, _) = press(&mut p, KeyCode::Char('e'));
             assert_eq!(fx.external, Some(crate::ui::External::Edit { path: "/c/aca/user/aca-plugin.toml".into(), line: 1 }));
         });
@@ -1363,12 +1383,12 @@ mod tests {
         let mut p = page();
         press(&mut p, KeyCode::Enter);
         assert_eq!(p.focus, Focus::Detail);
-        // 改完重读:还在右边
+        // Reloaded after a change: still on the right
         p.reload();
         assert_eq!(p.focus, Focus::Detail);
         press(&mut p, KeyCode::Esc);
         press(&mut p, KeyCode::Char('j'));
-        // 前面那个删掉了:高亮还在 my.local 上
+        // The one before was removed: the highlight stays on my.local
         set(two().into_iter().skip(1).collect());
         p.reload();
         assert_eq!(p.cur().map(|r| r.id.as_str()), Some("my.local"));

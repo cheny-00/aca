@@ -2,12 +2,12 @@ id = "aca.delegate"
 name = "Delegate"
 version = "0.5.0"
 api = 1
-needs = ["jq"]                   # 只有替 worker 续跑那段(continue.sh)要用
+needs = ["jq"]                   # only the part that keeps a worker going (continue.sh) uses it
 description = "由你的 Claude / Codex 规划任务、派出 worker 执行、验收并汇报;遇到限流时自动继续"
 description_en = "Your Claude or Codex plans, dispatches workers, checks their work and reports; rate limits are ridden out automatically."
 
-# 可以在 plugins.toml 里改:[plugins."aca.delegate"] settings = { worker = "codex:work", max_continue = 3 }
-# 或者 aca plugin setting aca.delegate worker codex:work
+# Change it in plugins.toml: [plugins."aca.delegate"] settings = { worker = "codex:work", max_continue = 3 }
+# or with aca plugin setting aca.delegate worker codex:work
 [settings.worker]
 default = "codex"
 desc = "派给谁:aca new 支持的工具(可带 :账号),例如 codex、codex:work、claude:work"
@@ -38,21 +38,24 @@ default = 30
 desc = "第 n 次代为发送前等待 n × 该秒数"
 desc_en = "Before the nth time, wait n × this many seconds."
 
-# /aca:delegate:aca 起 Claude 时带上(只对那一次启动;敲 /dele 补全就是它:Claude Code 的插件命令带插件名)。
-# 命令文件头上写着「只有你敲才进上下文」,设置 auto 开着时不作数:Claude 自己也看得到它,你说「用 delegate」就走这份。
-# Codex 那边是叫 delegate、spec 的两个 skill,一直在它的 skill 列表里
+# /aca:delegate: passed in when aca starts Claude (for that one start only; it's what /dele completes to: Claude Code's plugin
+# commands carry the plugin name).
+# The header of the command file says "only enters the context when you type it"; with the auto setting on, that doesn't hold:
+# Claude sees it too, and saying "use delegate" goes through this one.
+# On the Codex side it's two skills, called delegate and spec, always in its skill list
 [agent]
 for = ["claude", "codex"]
 dir = "claude"
 auto = "auto"
 
-# 派出去的 worker(有 parent)一轮出错、是临时的(限流、过载、断流):过一阵替它说一句「继续」
+# A worker that was sent out (has a parent) failed a turn, transiently (rate limit, overload, dropped stream): after a while,
+# say "continue" for it
 [[events]]
 on = "turn.failed"
 if = { kind = "transient", parent = true }
 command = ["sh", "continue.sh"]
 
-# 派出去的 worker 正常跑完一轮:次数清零
+# A worker that was sent out finished a turn normally: reset the count
 [[events]]
 on = "turn.done"
 if = { parent = true }

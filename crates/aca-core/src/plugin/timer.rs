@@ -1,20 +1,25 @@
-//! 定时:清单里的 `[[timers]]` —— 每隔一阵跑插件的一个能力(`run`)。
+//! Timers: `[[timers]]` in the manifest — runs one of the plugin's commands (`run`) every so often.
 //!
-//! aca 没有常驻进程,到点靠 macOS 的 launchd:开着的定时一个一个 LaunchAgent
-//! (`~/Library/LaunchAgents/com.aca.timer.<插件>.<能力>.plist`,`StartInterval` = every),到点跑
-//! `aca plugin timer tick <插件.能力>`。合盖睡着错过的几次,醒来只补跑一次。
+//! aca has no resident process, so firing relies on macOS's launchd: one LaunchAgent per timer that's on
+//! (`~/Library/LaunchAgents/com.aca.timer.<plugin>.<command>.plist`, `StartInterval` = every), which runs
+//! `aca plugin timer tick <plugin.command>` when due. Runs missed while the lid was closed are made up only once on wake.
 //!
-//! 开没开是 aca 记的(`~/.local/state/aca/timers/<插件.能力>.json` 的 `on`),launchd 只管到点把它叫起来:
-//! - 没写 `manual` 的:插件开着就开着。链接、装、更新、开关、删插件时 [`sync`] / [`drop_plugin`] 照清单对一遍
-//! - `manual = true` 的:平时关着,插件自己 `aca plugin timer on / off`(有活才开:远端任务有在等的才每 5 分钟去取,
-//!   都了结了关掉 —— 没派任务的日子里什么都不跑)。插件停着时不跑,开回来照它原来的开关
+//! aca records whether it's on (`on` in `~/.local/state/aca/timers/<plugin.command>.json`); launchd only wakes it when due:
+//! - Without `manual`: on whenever the plugin is enabled. Linking, installing, updating, enabling / disabling and removing a
+//!   plugin run [`sync`] / [`drop_plugin`] to check it against the manifest
+//! - With `manual = true`: normally off; the plugin itself runs `aca plugin timer on / off` (on only while there's work:
+//!   it fetches every 5 minutes only while some remote task is pending, and switches off once all are settled — on days
+//!   with no delegated tasks nothing runs). Doesn't run while the plugin is disabled; re-enabled, it keeps its on / off
 //!
-//! 到点那一次([`tick`]):插件、清单里的这个定时都在、开着才跑,不然把自己卸掉;输出进插件的日志,最多跑 [`LIMIT`];
-//! 跑完记下时刻、用了多久、退出码(`aca plugin timer` 列出来)。
-//! 跑着的那一次里插件说 on / off(比如都了结了):先只记下,launchd 那头等它跑完再装 / 卸 ——
-//! 卸的时候 launchd 会把正在跑的这一次连同它起的进程一起收走。
+//! When it fires ([`tick`]): it runs only if the plugin and this timer in its manifest still exist and are on, otherwise
+//! it unloads itself; output goes to the plugin's log, at most [`LIMIT`]; afterwards it records the time, how long it
+//! took and the exit code (listed by `aca plugin timer`).
+//! When the plugin says on / off during the running fire (say, everything is settled): it's only recorded at first, and
+//! launchd is loaded / unloaded after the run ends — unloading makes launchd take down the running fire along with the
+//! processes it started.
 //!
-//! 测试、基准(设了 `ACA_HOME` 或 `ACA_TMUX_SOCKET`)不碰 launchd:plist 写在 `timers/` 里当作装上了,到点由测试自己 `tick`。
+//! Tests and benchmarks (`ACA_HOME` or `ACA_TMUX_SOCKET` set) don't touch launchd: the plist written in `timers/` counts
+//! as loaded, and the test calls `tick` itself.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -31,12 +36,13 @@ use crate::tr;
 
 pub use super::manifest::Timer;
 
-/// 一次最多跑这么久:到了先 TERM 它那一组,3 秒不退 KILL(卡住的一次会挡住后面每一次:launchd 不同时起两个)
+/// How long one run may take: then TERM its process group, KILL if it hasn't exited after 3 seconds (a stuck run blocks
+/// every later one: launchd doesn't start two at once)
 pub const LIMIT: Duration = Duration::from_secs(600);
-/// 最短隔多久
+/// The shortest interval
 pub const MIN_EVERY: u64 = 60;
 
-/// `every` 的写法:30s / 10m / 2h / 1d,光写数是秒
+/// How `every` is written: 30s / 10m / 2h / 1d; a bare number is seconds
 pub fn parse_every(s: &str) -> Option<u64> {
     let s = s.trim();
     let (num, unit) = match s.char_indices().last()? {
@@ -49,7 +55,7 @@ pub fn parse_every(s: &str) -> Option<u64> {
     num.trim().parse::<u64>().ok().filter(|n| *n > 0).and_then(|n| n.checked_mul(unit))
 }
 
-/// 多久:45s / 5m / 2h30m / 1d6h
+/// A duration: 45s / 5m / 2h30m / 1d6h
 pub fn span(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s"),
@@ -65,20 +71,21 @@ pub fn span(secs: u64) -> String {
     }
 }
 
-/// aca 记的一个定时
+/// A timer as aca records it
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct State {
     pub plugin: String,
     pub run: String,
-    /// 要它开着:manual 的是插件说的;别的插件开着就开着
+    /// Wanted on: for manual ones the plugin says; others are on whenever the plugin is
     pub on: bool,
     pub every: u64,
-    /// launchd 那头装的时候的 every(0 = 没装):和 every 不一样就重装
+    /// The every launchd was loaded with (0 = not loaded): reload if it differs from every
     pub installed: u64,
-    /// 开的时刻
+    /// When it was switched on
     pub since: u64,
-    /// 上次跑:开始的时刻(0 = 还没跑过)、用了几秒、退出码(None = 跑超了停掉 / 起不来,原因在 why)
+    /// Last run: start time (0 = never run), seconds taken, exit code (None = stopped for running over / couldn't start,
+    /// the reason is in why)
     pub last: u64,
     pub secs: u64,
     pub rc: Option<i32>,
@@ -130,12 +137,12 @@ pub(crate) fn all() -> Vec<State> {
     out
 }
 
-/// launchd 里的名字:com.aca.timer.<插件>.<能力>(点、冒号换成 -)
+/// The label in launchd: `com.aca.timer.<plugin>.<command>` (dots and colons turned into -)
 pub fn label(plugin: &str, run: &str) -> String {
     format!("com.aca.timer.{}.{}", super::mount::safe(plugin), super::mount::safe(run))
 }
 
-/// 测试、基准里不碰 launchd
+/// Tests and benchmarks don't touch launchd
 fn isolated() -> bool {
     ["ACA_HOME", "ACA_TMUX_SOCKET"].iter().any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
 }
@@ -148,7 +155,8 @@ fn xml(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// 到点跑 `<这个 aca> plugin timer tick <插件.能力>`。PATH 照开它时的抄(launchd 自己的 PATH 里没有 tmux、jq)
+/// Runs `<this aca> plugin timer tick <plugin.command>` when due. PATH is copied from when it was switched on (launchd's
+/// own PATH has no tmux or jq)
 pub fn plist(label: &str, exe: &str, q: &str, every: u64, path: &str, log: &str) -> String {
     let (label, exe, q, path, log) = (xml(label), xml(exe), xml(q), xml(path), xml(log));
     format!(
@@ -198,7 +206,7 @@ fn ctl(args: &[&str]) -> Res<()> {
     }
 }
 
-/// launchd 那头装着没有(测试里:plist 在不在)
+/// Whether launchd has it loaded (in tests: whether the plist exists)
 fn loaded(label: &str) -> bool {
     if isolated() {
         return plist_path(label).exists();
@@ -212,14 +220,14 @@ fn loaded(label: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// 让 launchd 跟记的一样:`want` 就装上(every 变了重装),不然卸掉
+/// Makes launchd match the record: load it if `want` (reload if every changed), otherwise unload
 fn apply(st: &mut State, want: bool) -> Res<()> {
     let label = label(&st.plugin, &st.run);
     let path = plist_path(&label);
     let service = format!("{}/{label}", domain());
     if !want {
         st.installed = 0;
-        // 先删文件再卸:到点跑的那一次就是它起的,卸的时候会被一起收走
+        // Delete the file before unloading: the running fire was started by it and gets taken down with the unload
         let _ = std::fs::remove_file(&path);
         if !isolated() && loaded(&label) {
             ctl(&["bootout", &service]).map_err(|e| tr!("无法卸载系统定时器:{e}", "the system timer didn't uninstall: {e}"))?;
@@ -247,7 +255,7 @@ fn apply(st: &mut State, want: bool) -> Res<()> {
     }
     paths::write_atomic(&path, &text).map_err(|e| tr!("无法写入定时器的 plist:{e}", "can't write the timer's plist: {e}"))?;
     if !isolated() {
-        // 进过 disabled 名单的服务,bootstrap 只报「5: Input/output error」
+        // For a service that was once on the disabled list, bootstrap only reports "5: Input/output error"
         let _ = ctl(&["enable", &service]);
         ctl(&["bootstrap", &domain(), &path.to_string_lossy()])
             .map_err(|e| tr!("系统定时器安装失败:{e}", "the system timer didn't install: {e}"))?;
@@ -256,16 +264,17 @@ fn apply(st: &mut State, want: bool) -> Res<()> {
     Ok(())
 }
 
-/// 在这个定时自己跑着的那一次里(它的命令又调了 `aca plugin timer on / off`):launchd 那头等这一次跑完再动
+/// Inside this timer's own running fire (its command called `aca plugin timer on / off` again): launchd waits until this
+/// run ends before changing
 fn inside(q: &str) -> bool {
     std::env::var("ACA_PLUGIN_TIMER").is_ok_and(|v| v == q)
 }
 
-/// `插件.能力` → 登记、清单、清单里的这个定时
+/// `plugin.command` → registry entry, manifest, and this timer in the manifest
 fn declared(q: &str) -> Res<(Entry, Manifest, Timer)> {
     let (pid, run) = split_qualified(q)?;
     let mut e = registry().into_iter().find(|e| e.id == pid).ok_or_else(|| tr!("未链接插件 {pid}", "{pid} isn't linked"))?;
-    // 自带的:刚升级了 aca 就先换成新写出来的那份
+    // Built-in: right after an aca upgrade, switch to the freshly written copy first
     if e.source == first_party::SOURCE && first_party::refresh_one(pid) {
         e = registry().into_iter().find(|e| e.id == pid).unwrap_or(e);
     }
@@ -279,7 +288,7 @@ fn declared(q: &str) -> Res<(Entry, Manifest, Timer)> {
     Ok((e, m, t))
 }
 
-/// `aca plugin timer on <插件.能力>`
+/// `aca plugin timer on <plugin.command>`
 pub fn on(q: &str) -> Res<String> {
     let (e, _, t) = declared(q)?;
     if !e.enabled {
@@ -302,7 +311,8 @@ pub fn on(q: &str) -> Res<String> {
     })
 }
 
-/// `aca plugin timer off <插件.能力>`。插件、清单里的定时没了也能关(收拾剩下的)
+/// `aca plugin timer off <plugin.command>`. Works even when the plugin or the timer in its manifest is gone (cleaning up
+/// what's left)
 pub fn off(q: &str) -> Res<String> {
     let found = declared(q);
     if let Ok((e, _, t)) = &found
@@ -329,10 +339,12 @@ pub fn off(q: &str) -> Res<String> {
     Ok(if was { tr!("已关闭 {q}", "turned off {q}") } else { tr!("{q} 已是关闭状态", "{q} was already off") })
 }
 
-/// 插件登记、更新、开关之后:照清单把它的定时对一遍 —— 清单里没了的卸掉、不记了;every 变了的重装;
-/// 没写 manual 的插件开着就开;插件停着的都卸掉(开没开照记的,开回来接着用)。返回没办成的(给链接时的提醒)
+/// After a plugin is registered, updated, enabled or disabled: checks its timers against the manifest — ones gone from
+/// the manifest are unloaded and forgotten; ones whose every changed are reloaded; without manual, on while the plugin is
+/// enabled; a disabled plugin's are all unloaded (on / off stays as recorded, for when it's re-enabled). Returns what
+/// didn't work (a note when linking)
 pub fn sync(id: &str) -> Vec<String> {
-    // 不经过 registry():它会先重新登记你自己的那份,而那又会回到这里
+    // Not through registry(): it re-registers your own plugin first, which comes back here
     let Some(e) = read_registry().into_iter().find(|e| e.id == id) else {
         drop_plugin(id);
         return vec![];
@@ -374,7 +386,7 @@ pub fn sync(id: &str) -> Vec<String> {
     problems
 }
 
-/// 插件不用了(删了、取消链接):它的定时都卸掉、不记了
+/// The plugin is gone (removed, unlinked): unload and forget all its timers
 pub fn drop_plugin(id: &str) {
     for mut st in all().into_iter().filter(|s| s.plugin == id) {
         let _ = apply(&mut st, false);
@@ -382,7 +394,8 @@ pub fn drop_plugin(id: &str) {
     }
 }
 
-/// 跑一次:插件的环境,`ACA_INVOKED_BY=timer`、`ACA_PLUGIN_TIMER=<插件.能力>`,没有会话,最多 [`LIMIT`]
+/// Runs once: the plugin's environment, `ACA_INVOKED_BY=timer`, `ACA_PLUGIN_TIMER=<plugin.command>`, no session, at most
+/// [`LIMIT`]
 fn fire(e: &Entry, m: &Manifest, t: &Timer) -> Res<Fed> {
     let a = m.actions.iter().find(|a| a.id == t.run).ok_or_else(|| tr!("{} 没有能力 {}", "{} has no command {}", e.id, t.run))?;
     let q = format!("{}.{}", e.id, t.run);
@@ -394,7 +407,8 @@ fn fire(e: &Entry, m: &Manifest, t: &Timer) -> Res<Fed> {
     run_fed(c, LIMIT, None).map_err(|err| tr!("{} {err}", "{} {err}", a.command[0]))
 }
 
-/// 跑完:记下这一次(重读一遍:跑的时候插件可能开关过它),再让 launchd 跟记的一样 —— 卸放最后:会把这一次一起收走
+/// After a run: record it (re-read first: the plugin may have switched it on or off while it ran), then make launchd
+/// match the record — unloading comes last: it takes this run down with it
 fn settle(q: &str, enabled: bool, started: u64, got: &Res<Fed>) {
     let Some(mut st) = load(q) else { return };
     st.last = started;
@@ -405,7 +419,7 @@ fn settle(q: &str, enabled: bool, started: u64, got: &Res<Fed>) {
     };
     let want = st.on && enabled;
     if !want {
-        // 卸的时候这一次连同 aca 一起被收走,后面的存不到:先记成没装
+        // Unloading takes this run down along with aca, so nothing after it gets saved: record it as not loaded first
         st.installed = 0;
     }
     let _ = save(&st);
@@ -414,8 +428,9 @@ fn settle(q: &str, enabled: bool, started: u64, got: &Res<Fed>) {
     }
 }
 
-/// launchd 到点跑的:`aca plugin timer tick <插件.能力>`。不该跑的(插件没了、停了、清单里没这个定时、关着)把自己卸掉。
-/// 输出进插件的日志;出了什么事记在 `aca plugin timer` 里
+/// What launchd runs when due: `aca plugin timer tick <plugin.command>`. When it shouldn't run (plugin gone or disabled,
+/// no such timer in the manifest, switched off) it unloads itself. Output goes to the plugin's log; what happened is
+/// recorded in `aca plugin timer`
 pub fn tick(q: &str) -> i32 {
     let found = declared(q);
     let st = load(q);
@@ -426,7 +441,7 @@ pub fn tick(q: &str) -> i32 {
     if !run {
         let Ok((pid, name)) = split_qualified(q) else { return 0 };
         let mut s = st.unwrap_or(State { plugin: pid.into(), run: name.into(), ..Default::default() });
-        // 插件、定时都在,只是停着 / 关着:开没开照记的;没了:不记了
+        // Plugin and timer are both there, just disabled / off: on / off stays as recorded; gone: forget it
         if found.is_ok() {
             s.installed = 0;
             let _ = save(&s);
@@ -462,7 +477,8 @@ pub fn tick(q: &str) -> i32 {
     0
 }
 
-/// `aca plugin timer run <插件.能力>`:现在跑一次,像到点了一样(输出打出来,关着也跑),返回它的退出码
+/// `aca plugin timer run <plugin.command>`: runs it once now, as if it were due (output printed, runs even when off),
+/// and returns its exit code
 pub fn run_now(q: &str) -> Res<i32> {
     let (e, m, t) = declared(q)?;
     if !e.enabled {
@@ -482,17 +498,17 @@ pub fn run_now(q: &str) -> Res<i32> {
     Ok(fed.code.unwrap_or(1))
 }
 
-/// `aca plugin timer` 列的一行
+/// A row listed by `aca plugin timer`
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Row {
     pub id: String,
     pub every: u64,
     pub manual: bool,
-    /// 要它开着(插件停着时也照记的说)
+    /// Wanted on (also as recorded while the plugin is disabled)
     pub on: bool,
-    /// 插件开着
+    /// The plugin is enabled
     pub enabled: bool,
-    /// launchd 那头装着
+    /// launchd has it loaded
     pub scheduled: bool,
     pub last: u64,
     pub secs: u64,
@@ -500,7 +516,7 @@ pub struct Row {
     pub why: String,
 }
 
-/// 全部插件的定时,登记的顺序
+/// Timers of all plugins, in registration order
 pub fn list() -> Vec<Row> {
     let mut out = vec![];
     for e in registry() {
@@ -526,7 +542,7 @@ pub fn list() -> Vec<Row> {
 }
 
 impl Row {
-    /// 一行字:● 开着 / ○ 关着,每隔多久,上次跑得怎么样
+    /// One line: ● on / ○ off, how often, how the last run went
     pub fn text(&self, now: u64) -> String {
         let mark = if self.on && self.enabled { "●" } else { "○" };
         let mut parts = vec![tr!("每 {}", "every {}", span(self.every))];
@@ -549,7 +565,7 @@ impl Row {
         format!("{mark} {}  {}", self.id, parts.join(" · "))
     }
 
-    /// 记的和 launchd 对不上:说一句怎么办
+    /// The record and launchd disagree: one sentence on what to do
     pub fn mismatch(&self) -> Option<String> {
         let want = self.on && self.enabled;
         match (want, self.scheduled) {

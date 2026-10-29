@@ -1,16 +1,20 @@
-//! 弹窗和设置页的接口:一个功能的界面写在它自己的文件里,不进 ui.rs。
+//! The traits for popups and the settings page: a feature's interface is written in its own file, not in ui.rs.
 //!
-//! - `Overlay`:一个弹窗 —— 它记着什么、按键怎么走、画哪些行。ui.rs 只管把它压进栈、把键转给最上面那层、
-//!   把它给的行画进弹窗的框(桌面居中、手机从底下升起,和别的弹窗一样)。
-//! - `Setting`:`^S` 设置页里的一行。
-//! - `Fx`:弹窗 / 设置行要界面做的事。它们碰不到 App,只把要做的写在这里交回去,所以不开界面也能测。
-//! - `kit`:画行用的零件。
+//! - `Overlay`: one popup: what it keeps, how keys go, which lines it draws. ui.rs only pushes it onto the stack, hands keys
+//!   to the top layer, and draws the lines it gives into the popup frame (centered on desktop, rising from the bottom on a
+//!   phone, like the other popups).
+//! - `Setting`: a row on the `^S` settings page.
+//! - `Fx`: what a popup / settings row wants the interface to do. They can't touch App; they write what to do here and hand it
+//!   back, so they can be tested without the interface.
+//! - `kit`: parts for drawing lines.
 //!
-//! 加一个带界面的功能:
-//! 1. 自己的文件里实现 `Overlay`(设置页要有一行,再实现 `Setting`),main.rs 加 `mod`
-//! 2. ui.rs 加一处入口 —— 列表上的键:`on_key` 里一行 `self.open(…)`;设置页的行:`run` 里一行 `with_setting(…)`
-//! 3. 要放到后台跑的活:ops.rs 的 `Job` 加一个变体,带功能自己的类型(`Job::Mcp`、`Job::Group`、`Job::Plugins`)
-//! 4. help.rs / README 写上键
+//! Adding a feature with its own interface:
+//! 1. implement `Overlay` in its own file (for a row on the settings page, also implement `Setting`); add the `mod` in main.rs
+//! 2. add one entry point in ui.rs: a key on the list: one `self.open(…)` line in `on_key`; a settings-page row: one
+//!    `with_setting(…)` line in `run`
+//! 3. work that runs in the background: add a variant to `Job` in ops.rs, carrying the feature's own type (`Job::Mcp`,
+//!    `Job::Group`, `Job::Plugins`)
+//! 4. document the keys in help.rs / docs/keys.md
 
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::text::{Line, Span};
@@ -18,70 +22,74 @@ use ratatui::text::{Line, Span};
 use crate::ops::Job;
 use crate::ui::{External, TermReq};
 
-/// 一个弹窗
+/// A popup
 pub trait Overlay {
-    /// 桌面上弹窗多宽(手机上占满)
+    /// How wide the popup is on desktop (full width on a phone)
     fn width(&self) -> u16;
-    /// 里面的行;w = 一行能写多宽
+    /// Its lines; w = how wide a line can be
     fn lines(&self, w: usize) -> Vec<Line<'static>>;
-    /// 大小固定的弹窗(插件页):桌面上高度占满屏幕(留点边),换了高亮框也不跟着变;行由 `lines_in` 给
+    /// A fixed-size popup (the plugins page): on desktop it takes the screen's full height (minus a margin), and the frame doesn't
+    /// change as the highlight moves; lines come from `lines_in`
     fn fill(&self) -> bool {
         false
     }
-    /// `fill` 的弹窗里面最多要几行(不算外框和底下那句话);None = 屏幕放得下多少占多少。
-    /// 内容不多的页(账号页)照内容定高,不留大片空白;要自己保证挪高亮时这个数不变
+    /// At most how many rows a `fill` popup needs inside (not counting the frame and the message under it); None = as many as
+    /// the screen fits. A page with little content (the accounts page) sizes its height to the content instead of leaving a
+    /// big blank; it must make sure this number doesn't change as the highlight moves
     fn fill_rows(&self) -> Option<u16> {
         None
     }
-    /// `fill` 的弹窗:正好 h 行(多了截掉,少了补空行)
+    /// A `fill` popup: exactly h lines (extra ones cut, missing ones padded with blank lines)
     fn lines_in(&self, w: usize, _h: usize) -> Vec<Line<'static>> {
         self.lines(w)
     }
-    /// 一个键。要界面做的事写进 fx;返回这层留不留
+    /// One key. What the interface should do goes into fx; returns whether this layer stays
     fn on_key(&mut self, k: KeyEvent, fx: &mut Fx) -> Flow;
-    /// 后台的活做完了、从编辑器回来了:显示的值重读
+    /// A background job finished, or back from the editor: reread the values shown
     fn reload(&mut self) {}
-    /// 从让出终端跑的程序(编辑器…)回来了,要接着做的写进 fx(插件页:plugins.toml 改了就同步)。只问最上面那层
+    /// Back from a program the terminal was handed to (editor…): what to do next goes into fx (plugins page: sync if plugins.toml
+    /// changed). Only the top layer is asked
     fn returned(&mut self, _fx: &mut Fx) {}
-    /// 正在打字(弹窗里自己的输入框):这时一下到好几个键是粘贴,不当成代敲的丢掉
+    /// Typing (in the popup's own input box): several keys arriving at once are then a paste, not dropped as auto-typed input
     fn typing(&self) -> bool {
         false
     }
-    /// 插件的列表视图:这个请求(重读它自己、它的键跑完了要重读)归不归它
+    /// A plugin's list view: whether this request (rereading itself, rereading after one of its keys finished) belongs to it
     fn takes(&self, _req: &crate::caps::Req) -> bool {
         false
     }
-    /// 它自己的命令又跑了一遍:换上新的输出
+    /// Its own command ran again: swap in the new output
     fn feed(&mut self, _ok: bool, _out: &str) {}
-    /// 它的一个键跑完了:跑出来的(写在列表下面)
+    /// One of its keys finished: what it output (shown under the list)
     fn said(&mut self, _ok: bool, _out: &str) {}
 }
 
-/// 按完键这层弹窗怎么办
+/// What this popup layer does after a key
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Flow {
     Stay,
     Close,
 }
 
-/// 要界面做的事,都可以不填
+/// What the interface should do; every field is optional
 #[derive(Default)]
 pub struct Fx {
-    /// 说一句:写在底栏;弹窗还开着的话也写在弹窗最下面(手机上弹窗盖着底栏)
+    /// A message: shown in the bottom bar; if the popup stays open, also at the popup's bottom (on a phone the popup covers the bottom bar)
     pub flash: Option<String>,
-    /// 放到后台做(别的活还没做完就不做,底栏说「还在忙」);做完底栏说结果,开着的弹窗 `reload`
+    /// Run in the background (not while another job is unfinished; the bottom bar says "still busy"); when done the bottom bar
+    /// says the result and the open popup gets `reload`
     pub job: Option<Job>,
-    /// 让出终端跑别的程序(编辑器…),回来接着显示
+    /// Hand the terminal to another program (editor…), then come back and keep showing
     pub external: Option<External>,
-    /// 下半屏开个终端
+    /// Open a terminal in the bottom half of the screen
     pub term: Option<TermReq>,
-    /// 再开一层,关了回到现在这层
+    /// Open another layer; closing it returns to this one
     pub open: Option<Box<dyn Overlay>>,
-    /// 复制这段字(手机上走 OSC 52 进手机的剪贴板),底栏说复制了什么
+    /// Copy this text (on a phone, via OSC 52 into the phone's clipboard); the bottom bar says what was copied
     pub copy: Option<String>,
-    /// 跑一个插件的能力 / 视图 / 窗格(见 caps.rs):在后台跑,不占 `job`
+    /// Run a plugin's command / view / pane (see caps.rs): runs in the background, doesn't take up `job`
     pub plugin: Option<crate::caps::Req>,
-    /// 这层关了之后,当作在主列表上按了这个键(`:` 面板里挑的 aca 动作)
+    /// After this layer closes, act as if this key was pressed on the main list (an aca action picked in the `:` panel)
     pub key: Option<KeyEvent>,
 }
 
@@ -91,34 +99,35 @@ impl Fx {
     }
 }
 
-/// `^S` 设置页里功能自己的一行:「键  名字  现在的值  ›」
+/// A feature's own row on the `^S` settings page: "key  name  current value  ›"
 pub trait Setting {
-    /// 行首的键(别和设置页已有的重了:t i a n g e,功能自己的:d Discord 桥、h 远端任务、m Claude 的 mod、f 自动信任目录)
+    /// The key at the start of the row (mustn't clash with the settings page's own: t i a n g e; features' own: d Discord bridge,
+    /// h remote tasks, m Claude mod, f auto-trust folders)
     fn key(&self) -> char;
     fn name(&self) -> &'static str;
-    /// 现在的值:设置页打开、重读时各问一次,不每帧问
+    /// The current value: asked once when the settings page opens and once per reread, not every frame
     fn value(&self) -> Vec<Span<'static>>;
-    /// 行尾的记号:› = 进去再挑,↗ = 用编辑器打开,空 = 当场切
+    /// The mark at the end of the row: › = go in and pick, ↗ = open in the editor, empty = toggles in place
     fn mark(&self) -> &'static str {
         "›"
     }
-    /// ⏎ / 按了它的键
+    /// ⏎ / its key was pressed
     fn enter(&self, fx: &mut Fx);
 }
 
-/// 画行用的零件(样子和别的弹窗一致)
+/// Parts for drawing lines (looking the same as the other popups)
 pub mod kit {
     use ratatui::style::Style;
     use ratatui::text::{Line, Span};
 
     pub use crate::ui::{button, clip, dim, esc_hint, key_style, keys_line, modal_title, spread};
 
-    /// 高亮的那行:补满一行宽,铺上选中的底色
+    /// The highlighted row: pad it to the full width with the selected background
     pub fn picked(line: Line<'static>, w: usize, on: bool) -> Line<'static> {
         shaded(line, w, on.then(|| crate::theme::pal().sel))
     }
 
-    /// 补满一行宽,铺上这个底色(None = 不铺)
+    /// Pad to the full width with this background (None = no background)
     pub fn shaded(mut line: Line<'static>, w: usize, bg: Option<ratatui::style::Color>) -> Line<'static> {
         if let Some(bg) = bg {
             let pad = w.saturating_sub(line.width());

@@ -1,24 +1,33 @@
-//! 收件箱:会话之间递话。每个会话一个 `inbox/<id>.jsonl`,一行一条,只往后加;哪几条送到了记在旁边的 `<id>.state`。
+//! The inbox: passing messages between sessions. Each session has an `inbox/<id>.jsonl`, one message per line, append
+//! only; which ones were delivered is recorded next to it in `<id>.state`.
 //!
-//! 谁往里放:`aca msg`(人、agent、脚本),和 worker 自己的 hook —— 它跑完一轮、出错、退出、在等确认时,
-//! 给派它的那个(`parent`)放一条通知([`notify`])。通知只往上发:派活关系是一棵树,不会两个 agent 互相叫醒停不下来。
+//! Who puts things in: `aca msg` (people, agents, scripts), and a worker's own hooks — when it finishes a turn, errors,
+//! exits or waits for a confirmation, it leaves a notice for the session that delegated it (`parent`) ([`notify`]).
+//! Notices only go up: delegation forms a tree, so two agents can't keep waking each other up forever.
 //!
-//! 怎么送进去看收信的那一家([`Delivery`]),前两种都不碰输入框:
-//! - **门铃**(Claude):改一下 `inbox/<id>.bell`。Claude 起来时 `aca inbox watch` 让它盯着这个文件,
-//!   一变它就在后台跑 `aca inbox take`:取出没送的,写到 stderr、退出码 2,Claude 当成系统提示给模型
-//!   (空着就开一轮,在跑就塞进这一轮,在等你就等你答完)。按了 10 秒还没人取,就当这次没接上,改用打字
-//! - **排队**(Codex):`codex queue --thread <对话> --message <那段话>`,Codex 窗口自己每 10 秒看一次队列,
-//!   空着就开一轮。它在跑、在等你确认、刚被你按 Esc 打断时先不排,等它自己这一轮跑完(Stop hook)再排
-//! - **打字**:前两样用不了时(没接上门铃的 Claude、还没说过话的 Codex、别的 agent)。对方空着、
-//!   你没在那一格打字、输入框里没有你没发的字,才粘进去按回车;不然 20 秒后再看一次,还不行等它下次的 hook
+//! How it's delivered depends on the receiving tool ([`Delivery`]); the first two never touch the input box:
+//! - **Doorbell** (Claude): touch `inbox/<id>.bell`. When Claude starts, `aca inbox watch` has it watch this file; on a
+//!   change it runs `aca inbox take` in the background, which takes the undelivered messages, writes them to stderr and
+//!   exits 2, and Claude hands that to the model as a system message (idle: starts a turn; running: added to this turn;
+//!   needs you: waits until you've answered). If nobody takes it 10 seconds after ringing, this one didn't connect, so
+//!   fall back to typing
+//! - **Queue** (Codex): `codex queue --thread <conversation> --message <text>`; the Codex window checks its queue every
+//!   10 seconds and starts a turn when idle. While it's running, waiting for your confirmation, or just interrupted with
+//!   Esc, don't queue yet: wait until its own turn finishes (Stop hook) and queue then
+//! - **Typing**: when the first two can't be used (a Claude with no doorbell connected, a Codex that hasn't been spoken
+//!   to yet, other agents). Only paste and press Enter when the other side is idle, you aren't typing in that pane, and
+//!   the input box has no unsent text of yours; otherwise look again after 20 seconds, and if it still can't, wait for
+//!   its next hook
 //!
-//! 没有常驻进程:发的那一刻送一次([`deliver`]);送不了的留着,等对方自己的 hook 下次跑(一轮跑完、重新起来)再送。
-//! 屏幕上像在跑、hook 却没说有一轮在跑的(刚起来在加载),20 秒后自己再看一次;`aca start` 起来后过几秒也送一次
-//! (Codex 的 SessionStart 要等第一句话才报)。
-//! 每放进一条、每送到一条,事件流里记一行(`message.sent` / `message.delivered`)。
+//! There's no resident process: delivery is tried once at the moment of sending ([`deliver`]); what can't be delivered
+//! waits for the other side's own hook to run next (a turn finishes, it restarts). If the screen looks like it's running
+//! but no hook said a turn is running (just started and loading), look again after 20 seconds by itself; after
+//! `aca start` it also tries once a few seconds later (Codex's SessionStart is only reported after the first prompt).
+//! Every message put in and every one delivered is a line in the event stream (`message.sent` / `message.delivered`).
 //!
-//! 不开口就不往 agent 里加东西:没人发话时,收信那一头的上下文里没有 aca 的任何字;worker 跑完要不要叫醒派它的那个,
-//! 派的时候说(`aca new --notify`),不说不叫。
+//! Nothing is added to an agent unless someone speaks: when nobody sends anything, the receiving side's context holds not
+//! a word from aca; whether a worker wakes the session that delegated it when it finishes is said at delegation time
+//! (`aca new --notify`), and without it, it doesn't.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -42,21 +51,24 @@ use crate::{event, t, tmux, tr};
 pub struct Msg {
     pub id: String,
     pub ts: u64,
-    /// 谁发的:会话 id;不是在会话里发的是 `you`
+    /// Who sent it: a session id; `you` when not sent from inside a session
     pub from: String,
-    /// 发的那个给人看的样子:`ab12「修登录」claude:sub`
+    /// How the sender is shown to people: `ab12「修登录」claude:sub`
     pub who: String,
     pub to: String,
-    /// msg = 有人发的话;notice = worker 的 hook 自动发的通知
+    /// msg = something someone said; notice = a notice sent automatically by a worker's hook
     pub kind: String,
-    /// 通知说的是哪件事:turn.done / turn.failed / agent.exited / agent.waiting
+    /// What the notice is about: turn.done / turn.failed / agent.exited / agent.waiting
     pub what: String,
-    /// 要不要为它叫醒对方;不叫醒的,等下次送别的时一起带上
+    /// Whether to wake the other side for it; if not, it's carried along next time something else is delivered
     pub wake: bool,
     pub text: String,
+    /// Scheduled (`aca msg --in`): delivered only at this moment; 0 = right away
+    pub at: u64,
 }
 
-/// 哪几条送到了:`got` 已经到了对方眼前;`queued` 排进了 Codex 的队列,还没看到它为这几条开一轮
+/// Which ones were delivered: `got` reached the other side; `queued` went into Codex's queue, but it hasn't been seen
+/// starting a turn for them yet
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 struct Ledger {
@@ -64,10 +76,12 @@ struct Ledger {
     queued: Vec<String>,
 }
 
-/// 一条消息走到哪了
+/// How far a message has got
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stage {
+    /// Scheduled, not due yet
+    Scheduled,
     Pending,
     Queued,
     Got,
@@ -76,6 +90,7 @@ pub enum Stage {
 impl Stage {
     pub fn said(self) -> &'static str {
         match self {
+            Stage::Scheduled => t!("定时", "scheduled"),
             Stage::Pending => t!("未送达", "not delivered"),
             Stage::Queued => t!("排队中", "queued"),
             Stage::Got => t!("已送达", "delivered"),
@@ -83,15 +98,17 @@ impl Stage {
     }
 }
 
-/// 送一次的结果
+/// The result of one delivery attempt
 #[derive(Clone, Debug, PartialEq)]
 pub enum Sent {
-    /// 没有要叫醒它的
+    /// Nothing to wake it for
     Nothing,
     Bell,
     Queued,
     Typed,
-    /// 先留着,为什么
+    /// Scheduled: delivered at this moment
+    Scheduled(u64),
+    /// Held for now, and why
     Held(String),
 }
 
@@ -102,22 +119,23 @@ impl Sent {
             Sent::Bell => t!("已按门铃", "rang the doorbell").into(),
             Sent::Queued => t!("已排入它的队列,空闲后会自动开始一轮", "queued; it starts a turn on its own once idle").into(),
             Sent::Typed => t!("已输入并发送", "typed in and sent").into(),
+            Sent::Scheduled(at) => tr!("{} 送达", "delivered at {}", crate::schedule::clock(*at, paths::now())),
             Sent::Held(why) => tr!("暂存:{why}", "kept: {why}"),
         }
     }
 }
 
-/// 同一对会话 10 分钟内到了这么多条,后面的只存不叫醒
+/// Once this many arrive between the same pair of sessions within 10 minutes, the rest are stored without waking
 const BRAKE: usize = 20;
 const BRAKE_SECS: u64 = 600;
-/// 文件到这么多条就收拾一次:没送的全留,送到了的只留最近这么多条
+/// At this many messages the file is tidied: undelivered ones are all kept, delivered ones only the most recent this many
 const TIDY_AT: usize = 500;
 const KEEP_DONE: usize = 100;
-/// 你在那一格最后一次按键在这么多秒以内,就当你在打字
+/// If your last key press in that pane was within this many seconds, you count as typing
 const TYPING_SECS: u64 = 15;
-/// 按了门铃这么久还没人取:这次起来的 Claude 没接上门铃
+/// Rang the doorbell this long ago and nobody took it: this run of Claude didn't connect the doorbell
 const BELL_CHECK_SECS: u64 = 10;
-/// 打字送不了(你在打字、有草稿)时,过这么久再看一次
+/// When typing can't deliver (you're typing, there's a draft), look again after this long
 const RETRY_SECS: u64 = 20;
 
 fn file(id: &str) -> PathBuf {
@@ -132,7 +150,8 @@ pub fn bell(id: &str) -> PathBuf {
     paths::inbox_dir().join(format!("{id}.bell"))
 }
 
-/// 这个收件箱的锁:放、取、记送到都在锁里,两个进程同时取,只有一个取得到
+/// This inbox's lock: putting, taking and marking delivered all happen under it, so of two processes taking at once only
+/// one gets the messages
 fn lock(id: &str) -> Option<std::fs::File> {
     let _ = std::fs::create_dir_all(paths::inbox_dir());
     let f = std::fs::OpenOptions::new().create(true).append(true).open(paths::inbox_dir().join(format!("{id}.lock"))).ok()?;
@@ -162,29 +181,40 @@ fn stage(l: &Ledger, m: &Msg) -> Stage {
     }
 }
 
-/// 全部消息,带着各自走到哪了(`aca inbox`)
+/// All messages, with how far each has got (`aca inbox`). Not delivered and not due yet = scheduled
 pub fn list(id: &str) -> Vec<(Msg, Stage)> {
-    let l = ledger(id);
+    let (l, now) = (ledger(id), paths::now());
     all(id)
         .into_iter()
         .map(|m| {
-            let st = stage(&l, &m);
+            let st = match stage(&l, &m) {
+                Stage::Pending if m.at > now => Stage::Scheduled,
+                st => st,
+            };
             (m, st)
         })
         .collect()
 }
 
-/// 还没送的:没到对方眼前,也没排进队列
+/// Not delivered yet: hasn't reached the other side and isn't queued; a scheduled one counts only once it's due
 pub fn pending(id: &str) -> Vec<Msg> {
     list(id).into_iter().filter(|(_, s)| *s == Stage::Pending).map(|(m, _)| m).collect()
 }
 
-/// 有没有该叫醒它的
+/// Scheduled and not due yet, the earliest first (marked ◷ in the list; a session that has any isn't stopped while idle)
+pub fn scheduled(id: &str) -> Vec<Msg> {
+    let mut v: Vec<Msg> = list(id).into_iter().filter(|(_, s)| *s == Stage::Scheduled).map(|(m, _)| m).collect();
+    v.sort_by_key(|m| m.at);
+    v
+}
+
+/// Whether there's anything to wake it for
 pub fn wants_wake(id: &str) -> bool {
     pending(id).iter().any(|m| m.wake)
 }
 
-/// 放一条进 `m.to` 的收件箱:补上 id 和时刻;同一个人 10 分钟里说了太多的,只存不叫醒。返回放进去的那条
+/// Puts a message into `m.to`'s inbox, filling in the id and time; if the same sender said too much within 10 minutes,
+/// it's stored without waking. Returns the message put in
 pub fn post(mut m: Msg) -> Msg {
     m.id = format!("m{}", paths::short_id());
     m.ts = paths::now();
@@ -206,19 +236,21 @@ pub fn post(mut m: Msg) -> Msg {
         braked && recent == BRAKE
     };
     let what = if m.what.is_empty() { Value::Null } else { json!(m.what) };
+    let at = if m.at == 0 { Value::Null } else { json!(m.at) };
     event::emit(
         "message.sent",
         &m.to,
-        json!({ "id": m.id, "from": m.from, "kind": m.kind, "what": what, "wake": m.wake, "text": clip(&m.text, 200) }),
+        json!({ "id": m.id, "from": m.from, "kind": m.kind, "what": what, "wake": m.wake, "text": clip(&m.text, 200), "at": at }),
     );
-    // 刚踩到刹车的那一条:告诉你一声(之后的不再说)
+    // The message that just hit the brake: tell you once (not again for the ones after)
     if braked {
         event::emit("message.throttled", &m.to, json!({ "from": m.from, "count": BRAKE, "secs": BRAKE_SECS }));
     }
     m
 }
 
-/// 收拾:没送的全留,送到了的只留最近的几条;记着的送到了的 id 也只留还在的(在锁里调)
+/// Tidy: keep every undelivered one and only the latest few delivered; the delivered ids on record are trimmed to the
+/// ones still there too (call under the lock)
 fn tidy(id: &str, msgs: Vec<Msg>) {
     let mut l = ledger(id);
     let done: Vec<usize> = msgs.iter().enumerate().filter(|(_, m)| stage(&l, m) != Stage::Pending).map(|(i, _)| i).collect();
@@ -231,7 +263,8 @@ fn tidy(id: &str, msgs: Vec<Msg>) {
     save(id, &l);
 }
 
-/// 记成送到了(在锁里调),每条发一个 `message.delivered`;已经记过的不再发
+/// Marks as delivered (call under the lock), emitting a `message.delivered` for each; already marked ones aren't emitted
+/// again
 fn mark_locked(id: &str, ids: &[String], how: &str) {
     let mut l = ledger(id);
     let fresh: Vec<&String> = ids.iter().filter(|x| !l.got.contains(x)).collect();
@@ -251,7 +284,8 @@ pub fn mark(id: &str, ids: &[String], how: &str) {
     mark_locked(id, ids, how);
 }
 
-/// 门铃响了:没送的全取出来,记成送到了。有该叫醒的才取;只有不叫醒的就留着,等下次一起带
+/// The doorbell rang: take every undelivered one out and mark them delivered. Only taken if there's one to wake for; if
+/// there are only non-waking ones, leave them to be carried along next time
 pub fn take(id: &str) -> Vec<Msg> {
     let _l = lock(id);
     let p = pending(id);
@@ -262,7 +296,8 @@ pub fn take(id: &str) -> Vec<Msg> {
     p
 }
 
-/// 排进了 Codex 的队列:还不算送到,等它为这几条开一轮(UserPromptSubmit 里看到原话)再算
+/// Queued in Codex's queue: doesn't count as delivered yet, only once it starts a turn for them (the original text shows up
+/// in UserPromptSubmit)
 fn mark_queued(id: &str, ids: &[String]) {
     let _l = lock(id);
     let mut l = ledger(id);
@@ -295,10 +330,12 @@ fn what_said(what: &str) -> &'static str {
     }
 }
 
-/// 门铃(Claude)取走的那一段,它当成系统提示看到:几条一起列出来,谁发的、多久前、怎么回。
-/// 通知只写发生了什么、去哪看,不写「你去做 X」:写成命令,模型可能当成可疑指令。
-/// 派它出去的那个(`parent`)发来的标明是交代的活:不标的话,要它跑命令时 Claude 会当成外人的指令不做(2.1.295 实测)。
-/// `hears_done` = 它这一轮跑完 parent 会收到通知:在原地回答就送回去了,不用再 `aca msg`
+/// The text the doorbell (Claude) takes, which it sees as a system message: lists the messages together, with who sent
+/// each, how long ago, and how to reply. Notices only say what happened and where to look, never "go do X": phrased as a
+/// command, the model may take it as a suspicious instruction. Messages from the session that delegated it (`parent`)
+/// are marked as assigned work: unmarked, Claude takes a request to run a command as an outsider's instruction and won't
+/// (tested on 2.1.295). `hears_done` = the parent gets a notice when this turn finishes: answering in place sends it
+/// back, no need for another `aca msg`
 pub fn render(msgs: &[Msg], now: u64, parent: &str, hears_done: bool) -> String {
     let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
     let mut out = format!("{} 条新消息({})· 全部:aca inbox", msgs.len(), ids.join(" "));
@@ -307,6 +344,8 @@ pub fn render(msgs: &[Msg], now: u64, parent: &str, hears_done: bool) -> String 
         let who = if m.from == "you" { "用户(在会话外面)".to_string() } else { m.who.clone() };
         if m.kind == "notice" {
             out += &format!("\n{}. {who} · {} · {when}\n   {}", i + 1, what_said(&m.what), m.text.replace('\n', "\n   "));
+        } else if m.from == m.to {
+            out += &format!("\n{}. 你自己 · 定时到点了 · {when}定的\n   「{}」", i + 1, m.text.replace('\n', "\n   "));
         } else {
             let back = match m.from.as_str() {
                 "you" => String::new(),
@@ -320,25 +359,28 @@ pub fn render(msgs: &[Msg], now: u64, parent: &str, hears_done: bool) -> String 
     out
 }
 
-/// 排队 / 打字送进去的那段:在它看来就是一条用户消息,所以只放话本身。你发的原样送;会话发的前面一行写是谁;
-/// 通知写发生了什么。不写「这是别的会话转来的、不是用户打的字」,也不教它怎么回:Codex 看到这些会当成注入、
-/// 不照做;只写一行「来自哪个会话」它照做(0.162 实测)。`parent` = 派收信这个会话出来的那个
+/// The text delivered by queueing / typing: to the agent it's just a user message, so only the message itself goes in.
+/// What you send goes as is; from a session, a line in front says who; a notice says what happened. It doesn't say "this
+/// was forwarded from another session, not typed by the user", and doesn't teach it how to reply: Codex takes those as
+/// injection and won't comply; with just one line saying which session it's from, it complies (tested on 0.162). `parent`
+/// = the session that delegated the receiving session
 fn render_as_input(msgs: &[Msg], now: u64, parent: &str) -> String {
     let one = |m: &Msg| match (m.kind.as_str(), m.from.as_str()) {
         ("notice", _) => format!("[aca] {} {} · {}\n{}", m.who, what_said(&m.what), ago(now.saturating_sub(m.ts)), m.text),
         (_, "you") => m.text.clone(),
+        (_, f) if f == m.to => format!("[aca] 定时到点了(你 {}定的):\n{}", ago(now.saturating_sub(m.ts)), m.text),
         (_, f) if f == parent => format!("[aca] 派你干活的会话 {} 说:\n{}", m.who, m.text),
         _ => format!("[aca] 来自会话 {}:\n{}", m.who, m.text),
     };
     msgs.iter().map(one).collect::<Vec<_>>().join("\n\n")
 }
 
-/// 它这一轮跑完,派它出去的那个会不会收到通知(见 [`render`])
+/// Whether the session that delegated it gets a notice when this turn finishes (see [`render`])
 fn hears_done(cfg: &Config, s: &Session) -> bool {
     !s.parent.is_empty() && wanted(&runtime::load(&s.id).notify, &cfg.inbox.notify, "done")
 }
 
-/// 排进了队列、这段用户消息里带着原话的那几条:Codex 为它们开了一轮
+/// The queued messages whose original text is in this user message: Codex started a turn for them
 fn queued_in(id: &str, prompt: &str) -> Vec<String> {
     let queued = ledger(id).queued;
     if queued.is_empty() {
@@ -351,8 +393,9 @@ fn queued_in(id: &str, prompt: &str) -> Vec<String> {
         .collect()
 }
 
-/// 输入框里有没有你没发的字:找最后一行以 `mark` 开头的(那是输入框),看记号后面有没有不是灰色(dim)的字。
-/// 两家的提示(`Try "…"`、`Ask Codex to do anything`)都是灰的(2026-10-08 实测)。None = 屏幕上没找到输入框
+/// Whether the input box has unsent text of yours: find the last line starting with `mark` (that's the input box) and look
+/// for non-gray (dim) text after the mark. Both tools' hints (`Try "…"`, `Ask Codex to do anything`) are gray (tested
+/// 2026-10-08). None = no input box found on the screen
 pub fn draft(mark: char, lines: &[String]) -> Option<bool> {
     let line = lines.iter().rev().find(|l| plain(l).trim_start().starts_with(mark))?;
     let mut dim = false;
@@ -386,7 +429,7 @@ pub fn draft(mark: char, lines: &[String]) -> Option<bool> {
     Some(false)
 }
 
-/// 去掉颜色
+/// Strips colors
 fn plain(line: &str) -> String {
     let mut out = String::new();
     let mut cs = line.chars().peekable();
@@ -405,7 +448,8 @@ fn plain(line: &str) -> String {
     out
 }
 
-/// 一段 SGR(`ESC[…m` 中间那串)之后还是不是灰的:2 是灰,0 / 22 / 空 是取消;38、48 后面跟着的是颜色,跳过
+/// Whether it's still gray after one SGR (the part inside `ESC[…m`): 2 is gray, 0 / 22 / empty cancel it; what follows 38
+/// or 48 is a color, skipped
 fn sgr_dim(seq: &str, mut dim: bool) -> bool {
     let ps: Vec<&str> = seq.split(';').collect();
     let mut i = 0;
@@ -421,21 +465,21 @@ fn sgr_dim(seq: &str, mut dim: bool) -> bool {
     dim
 }
 
-/// 发的那个给人看的样子:`ab12「修登录」claude:sub`
+/// How the sender is shown to people: `ab12「修登录」claude:sub`
 pub fn who(s: &Session, r: &Run) -> String {
     let acct = if s.account.is_empty() { s.tool.clone() } else { format!("{}:{}", s.tool, agent::account_label(&s.account)) };
     format!("{}「{}」{acct}", s.id, status::title(s, r))
 }
 
-/// 这件事要不要通知 parent:会话自己定了的(`aca new --notify`)听它的,没定的听配置的,配置也没写就都不通知
-/// (不开口就不叫醒谁)。`all` = 四样都要
+/// Whether to notify the parent of this: the session's own choice (`aca new --notify`) wins, otherwise the config's, and
+/// if the config says nothing, nothing is notified (nobody is woken unless asked). `all` = all four
 fn wanted(own: &str, default: &[String], short: &str) -> bool {
     let own: Vec<&str> = own.split(',').map(str::trim).filter(|x| !x.is_empty()).collect();
     let list: Vec<&str> = if own.is_empty() { default.iter().map(String::as_str).collect() } else { own };
     list.iter().any(|x| *x == short || *x == "all")
 }
 
-/// 通知里那一段:只写发生了什么、去哪看
+/// The text of a notice: only what happened and where to look
 fn notice_text(id: &str, ev: &str, r: &Run) -> String {
     let one_line = |s: &str, n: usize| clip(&s.split_whitespace().collect::<Vec<_>>().join(" "), n);
     match ev {
@@ -456,8 +500,8 @@ fn notice_text(id: &str, ev: &str, r: &Run) -> String {
     }
 }
 
-/// worker 这一头,在它自己的 hook 里:这件事要不要告诉派它的那个,要的话放一条进那边的收件箱,
-/// 再起一个不等的送信进程。返回放进去的那条
+/// The worker side, in its own hook: whether to tell the session that delegated it about this; if so, put a message in
+/// that session's inbox and start a detached delivery process. Returns the message put in
 pub fn notify(id: &str, ev: &str, cfg: &Config) -> Option<Msg> {
     let short = match ev {
         "turn.done" => "done",
@@ -487,9 +531,10 @@ pub fn notify(id: &str, ev: &str, cfg: &Config) -> Option<Msg> {
     Some(m)
 }
 
-/// 收信这一头,在它自己的 hook 里(不等任何东西):
-/// - 这一轮的那段话里有排进队列的那几条原话:记成送到了
-/// - 这一轮跑完了、刚起来:还有没送的,起一个不等的送信进程(门铃那一家刚起来时由 `aca inbox watch` 管)
+/// The receiving side, in its own hook (waits for nothing):
+/// - The prompt of this turn contains the original text of queued messages: mark them delivered
+/// - The turn finished, or it just started: if anything is undelivered, start a detached delivery process (for doorbell
+///   tools just starting, `aca inbox watch` handles it)
 pub fn on_hook(id: &str, ev: &str, prompt: &str, bell_agent: bool) {
     if ev == "UserPromptSubmit" {
         let ids = queued_in(id, prompt);
@@ -503,8 +548,9 @@ pub fn on_hook(id: &str, ev: &str, prompt: &str, bell_agent: bool) {
     }
 }
 
-/// `aca start` / `new` 刚把它起起来:有没送的,过几秒送一次。门铃那一家等它自己接上门铃时送(`aca inbox watch`);
-/// 别的不能等它的 SessionStart —— Codex 的要等第一句话才报
+/// `aca start` / `new` just started it: if anything is undelivered, deliver once a few seconds later. Doorbell tools get
+/// it once they connect the doorbell themselves (`aca inbox watch`); the rest can't wait for their SessionStart — Codex's
+/// is only reported after the first prompt
 pub fn launched(cfg: &Config, s: &Session) {
     let bell = agent::of(cfg, s).is_ok_and(|(a, _)| a.delivery() == Delivery::Bell);
     if !bell && wants_wake(&s.id) {
@@ -512,8 +558,9 @@ pub fn launched(cfg: &Config, s: &Session) {
     }
 }
 
-/// 在跑 / 在等确认先不送,一般等它自己这一轮跑完的 hook。屏幕上像在跑、hook 却没说有一轮在跑的
-/// (刚起来在加载、启动时的几道关),之后没有那个 hook:过一阵自己再看一次
+/// Running / waiting for a confirmation: don't deliver yet, usually wait for its own end-of-turn hook. If the screen looks
+/// like running but no hook said a turn is running (just started and loading, the startup gates), that hook never comes:
+/// look again by itself after a while
 fn wait_turn(id: &str, retry: bool, why: &str) -> Res<Sent> {
     if !retry && !matches!(runtime::load(id).status.as_str(), "running" | "waiting") {
         later(id, RETRY_SECS, &["--retry"]);
@@ -521,7 +568,13 @@ fn wait_turn(id: &str, retry: bool, why: &str) -> Res<Sent> {
     Ok(Sent::Held(why.into()))
 }
 
-/// 过 `secs` 秒在后台送一次(`aca inbox deliver`):不等它,hook 和命令马上返回
+/// Delivers a scheduled one once in the background when it's due
+fn later_at(id: &str, at: u64) {
+    later(id, 0, &["--at", &at.to_string()]);
+}
+
+/// Delivers once in the background after `secs` seconds (`aca inbox deliver`): not waited for, so hooks and commands
+/// return at once
 fn later(id: &str, secs: u64, more: &[&str]) {
     let _ = crate::proc::detach(
         Command::new(agent::self_exe())
@@ -535,14 +588,15 @@ fn later(id: &str, secs: u64, more: &[&str]) {
 
 fn ring(id: &str) {
     let _ = std::fs::create_dir_all(paths::inbox_dir());
-    // 原地改,不换文件:换了文件,盯着它的那一头可能就跟丢了
+    // Changed in place, not replaced: with a new file, the side watching it might lose track
     let _ = std::fs::write(bell(id), paths::now_ms().to_string());
 }
 
-/// 它没在跑:等它起来再送
+/// It isn't running: deliver once it starts
 const NOT_RUNNING: Tr = Tr::new("它未运行:启动后再送达", "it isn't running: delivered when it starts");
 
-/// 发的那一刻(和之后每次补送)送一次:看对方是哪一家、现在在干什么,挑一种送法。`retry` = 这已经是隔了一阵的再试
+/// One delivery attempt at the moment of sending (and each retry after): looks at which tool the other side is and what
+/// it's doing now, and picks a way to deliver. `retry` = this is already a retry after a while
 pub fn deliver(store: &Store, cfg: &Config, id: &str, retry: bool) -> Res<Sent> {
     let s = store.get(id)?;
     let msgs = pending(&s.id);
@@ -580,7 +634,8 @@ pub fn deliver(store: &Store, cfg: &Config, id: &str, retry: bool) -> Res<Sent> 
                             ),
                         );
                     }
-                    // 被打断的对话,Codex 自己也不开跑排着的(退出再 resume 起来也一样,0.162 实测),等下一轮正常跑完
+                    // In an interrupted conversation Codex doesn't start on queued messages by itself either (same after exiting and
+                    // resuming; tested on 0.162): wait for the next turn to finish normally
                     _ if r.event == "Interrupt" => {
                         return held(t!(
                             "你刚按 Esc 中断了它:下一轮结束后再送达",
@@ -610,13 +665,14 @@ pub fn deliver(store: &Store, cfg: &Config, id: &str, retry: bool) -> Res<Sent> 
     }
 }
 
-/// 排进 Codex 的队列:先带 `-c` 在自己进程里写(不拉起后台服务);这个账号已经有后台服务在跑时它会拒绝,就交给那个服务
+/// Queue for Codex: first write with `-c` in our own process (without bringing up the background service); if this
+/// account already has a background service running it refuses, so hand it to that service
 fn enqueue(cfg: &Config, s: &Session, agent: &dyn Agent, conv: &str, text: &str) -> Res<()> {
     let run = |shared: bool| -> Res<()> {
         let l = agent::tool_cmd(cfg, s, &agent.queue_args(conv, text, shared))?;
         let mut c = Command::new(&l.argv[0]);
         c.args(&l.argv[1..]).envs(l.env).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-        // 包了一层脚本的(按窗格改配色):别让它以为是在哪一格里起的
+        // Wrapped in a script (changing colors per pane): don't let it think it was started inside some pane
         c.env_remove("TMUX").env_remove("TMUX_PANE");
         if std::path::Path::new(&s.dir).is_dir() {
             c.current_dir(&s.dir);
@@ -646,7 +702,8 @@ fn enqueue(cfg: &Config, s: &Session, agent: &dyn Agent, conv: &str, text: &str)
     }
 }
 
-/// 打字送进去:它空着、你没在那一格打字、输入框里没有你没发的字才打;不然过一阵再看一次
+/// Delivers by typing: only types when it's idle, you aren't typing in that pane, and the input box has no unsent text of
+/// yours; otherwise look again after a while
 fn type_in(cfg: &Config, s: &Session, agent: &dyn Agent, pane: &tmux::Pane, msgs: &[Msg], retry: bool) -> Res<Sent> {
     let why = match status::one(cfg, s, true).state {
         State::Running => return wait_turn(&s.id, retry, t!("它正在运行:本轮结束后再送达", "it's running: delivered after this turn")),
@@ -665,7 +722,7 @@ fn type_in(cfg: &Config, s: &Session, agent: &dyn Agent, pane: &tmux::Pane, msgs
         },
     };
     if let Some(why) = why {
-        // 你在打字、有草稿的:过一阵再看一次;还不行就等它下次的 hook
+        // You're typing, or there's a draft: look again after a while; if it still can't, wait for its next hook
         if !retry {
             later(&s.id, RETRY_SECS, &["--retry"]);
         }
@@ -678,8 +735,10 @@ fn type_in(cfg: &Config, s: &Session, agent: &dyn Agent, pane: &tmux::Pane, msgs
     Ok(Sent::Typed)
 }
 
-/// `aca msg`:放一条进对方的收件箱,马上送一次。在会话里调的,发件人是那个会话;`parent` = 派它的那个
-pub fn send(store: &Store, cfg: &Config, to: &str, text: &str) -> Res<(Msg, Sent)> {
+/// `aca msg`: puts a message in the other side's inbox and tries delivering it at once. Called from inside a session, the
+/// sender is that session; `parent` = the session that delegated it. A nonzero `at` makes it scheduled: delivered at that
+/// moment, and it may be sent to yourself (to wake yourself up later)
+pub fn send(store: &Store, cfg: &Config, to: &str, text: &str, at: u64) -> Res<(Msg, Sent)> {
     let me = std::env::var("ACA_SESSION_ID").ok().filter(|x| !x.is_empty()).and_then(|x| store.get(&x).ok());
     let to = match to {
         "parent" => {
@@ -694,11 +753,18 @@ pub fn send(store: &Store, cfg: &Config, to: &str, text: &str) -> Res<(Msg, Sent
         key => store.get(key)?,
     };
     let (from, who) = match &me {
-        Some(m) if m.id == to.id => return Err(t!("不能发送给自己", "can't send to yourself").into()),
+        Some(m) if m.id == to.id && at == 0 => {
+            return Err(t!("不能发送给自己(定时的可以:--in)", "can't send to yourself (a scheduled one can: --in)").into());
+        }
         Some(m) => (m.id.clone(), who(m, &runtime::load(&m.id))),
         None => ("you".to_string(), "你".to_string()),
     };
-    let m = post(Msg { from, who, to: to.id.clone(), kind: "msg".into(), wake: true, text: clip(text.trim(), 4000), ..Default::default() });
+    let m =
+        post(Msg { from, who, to: to.id.clone(), kind: "msg".into(), wake: true, text: clip(text.trim(), 4000), at, ..Default::default() });
+    if m.wake && at > paths::now() {
+        later_at(&to.id, at);
+        return Ok((m, Sent::Scheduled(at)));
+    }
     if !m.wake {
         return Ok((
             m,
@@ -711,12 +777,13 @@ pub fn send(store: &Store, cfg: &Config, to: &str, text: &str) -> Res<(Msg, Sent
     Ok((m, sent))
 }
 
-/// `aca inbox take`:Claude 的门铃 hook(FileChanged,asyncRewake)。有该叫醒的就写到 stderr、退出码 2;没有退出 0
+/// `aca inbox take`: Claude's doorbell hook (FileChanged, asyncRewake). If there's something to wake for, writes it to
+/// stderr and exits 2; otherwise exits 0
 pub fn take_cmd() -> i32 {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let Some(id) = std::env::var("ACA_SESSION_ID").ok().filter(|s| !s.is_empty()) else { return 0 };
-    // Claude 的后台会话继承了原窗格的环境,不是这个会话本人
+    // Claude's background sessions inherit the original pane's environment; they aren't this session itself
     if std::env::var_os("CLAUDE_JOB_DIR").is_some() {
         return 0;
     }
@@ -729,7 +796,8 @@ pub fn take_cmd() -> i32 {
     2
 }
 
-/// `aca inbox watch`:Claude 的 SessionStart 多跑的那一条。回一个 `watchPaths` 让它盯着门铃;有没送的,过两秒(它盯上之后)按一次
+/// `aca inbox watch`: the extra one run on Claude's SessionStart. Replies with `watchPaths` so it watches the doorbell; if
+/// anything is undelivered, rings once two seconds later (after it starts watching)
 pub fn watch_cmd() -> i32 {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
@@ -749,11 +817,16 @@ pub fn watch_cmd() -> i32 {
     0
 }
 
-/// `aca inbox deliver <id> [--after 秒] [--retry] [--check 编号,…]`:hook 和命令留的后手,过一阵送一次。
-/// `--check`:门铃按过了,这几条还没被取走 = 这次起来的 Claude 没接上门铃,以后改用打字
-pub fn deliver_cmd(id: &str, after: u64, retry: bool, check: &[String]) -> i32 {
+/// `aca inbox deliver <id> [--after secs] [--at time] [--retry] [--check id,…]`: the follow-up hooks and commands leave,
+/// delivering once after a while. `--at`: a scheduled one is delivered at this moment. `--check`: the doorbell was rung and
+/// these still weren't taken = this run of Claude didn't connect the doorbell, so use typing from now on
+pub fn deliver_cmd(id: &str, after: u64, at: u64, retry: bool, check: &[String]) -> i32 {
     std::thread::sleep(Duration::from_secs(after));
-    // 等的这一阵会话删了:不去开登记表(开了会把整个目录重新建出来)
+    // The due moment goes by the wall clock: time asleep with the lid closed counts as passed, so it's delivered on waking
+    while paths::now() < at {
+        std::thread::sleep(Duration::from_secs(at.saturating_sub(paths::now()).min(30)));
+    }
+    // The session was deleted while waiting: don't open the registry (opening it would recreate the whole directory)
     if !paths::run_file(id).exists() {
         return 0;
     }
@@ -768,10 +841,10 @@ pub fn deliver_cmd(id: &str, after: u64, retry: bool, check: &[String]) -> i32 {
     0
 }
 
-/// `aca wait` 等到的结果
+/// What `aca wait` ended on
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Outcome {
-    /// 跑完一轮(或者空下来了)
+    /// Finished a turn (or went idle)
     Done,
     Asking,
     Failed,
@@ -791,15 +864,17 @@ impl Outcome {
     }
 }
 
-/// 一个会话现在算不算「等到了」。`since` = 开始等的时刻:刚开始那几秒,跑完的得是开始等之后跑完的
-/// (刚发进去的话还没变成「在跑」,它看起来还是上一轮的「跑完了」);手上还有没送到的消息的,算还没开始
+/// Whether a session counts as "done waiting" right now. `since` = when waiting started: in the first few seconds, a
+/// finish has to come after waiting started (a prompt just sent hasn't become "running" yet, so it still looks like the
+/// last turn's "finished"); with messages still undelivered, it hasn't started yet
 fn outcome(cfg: &Config, s: &Session, since: u64, now: u64) -> Option<Outcome> {
     let r = runtime::load(&s.id);
-    // 读屏幕:Claude 被 Esc 打断不发 hook,只看 hook 的话它一直「在跑」
+    // Read the screen: Claude sends no hook when interrupted with Esc, so going by hooks alone it would be "running" forever
     let state = status::one(cfg, s, true).state;
     match state {
         State::Running => None,
-        // 启动时问「信不信任这个目录」、开关开着:起它时留的后手正要替你答,还没到要你管的时候
+        // Asking at startup whether to trust the folder, with the setting on: the follow-up left when starting it is about to
+        // answer for you, so it doesn't need you yet
         State::Ask if crate::trust::answering(cfg, s) => None,
         State::Ask => Some(Outcome::Asking),
         State::Error => Some(Outcome::Failed),
@@ -813,8 +888,9 @@ fn outcome(cfg: &Config, s: &Session, since: u64, now: u64) -> Option<Outcome> {
     }
 }
 
-/// `aca wait`:等这几个会话跑完一轮 / 在等确认 / 出错 / 退出。`any` = 等到一个就回。
-/// 在某个会话里调的:等到的那几个发来的通知记成送到了,门铃就不会再为它们叫醒一次
+/// `aca wait`: waits for these sessions to finish a turn / wait for a confirmation / error / exit. `any` = return as soon
+/// as one does. Called from inside a session: notices from the ones waited for are marked delivered, so the doorbell
+/// won't wake it for them again
 pub fn wait(store: &Store, cfg: &Config, keys: &[String], any: bool, timeout: Option<Duration>) -> Res<Vec<(Session, Outcome)>> {
     let sessions: Vec<Session> = keys.iter().map(|k| store.get(k)).collect::<Res<_>>()?;
     if sessions.is_empty() {
@@ -844,7 +920,7 @@ pub fn wait(store: &Store, cfg: &Config, keys: &[String], any: bool, timeout: Op
     }
     let out: Vec<(Session, Outcome)> = sessions.into_iter().zip(done).filter_map(|(s, d)| d.map(|d| (s, d))).collect();
     if let Some(me) = std::env::var("ACA_SESSION_ID").ok().filter(|x| !x.is_empty()) {
-        // 那几个的 hook 正在往这边放通知:等它落下来,再记成送到了
+        // Those sessions' hooks are putting notices here right now: wait for them to land, then mark them delivered
         std::thread::sleep(Duration::from_millis(600));
         let from: Vec<&str> = out.iter().filter(|(_, d)| *d != Outcome::Timeout).map(|(s, _)| s.id.as_str()).collect();
         let ids: Vec<String> = pending(&me)
@@ -874,6 +950,7 @@ mod tests {
             what: if kind == "notice" { "turn.done".into() } else { String::new() },
             wake: true,
             text: text.into(),
+            at: 0,
         }
     }
 
@@ -885,15 +962,17 @@ mod tests {
         let text = render(&[a.clone(), b.clone(), c.clone()], 220, "", false);
         assert!(text.starts_with("3 条新消息(m0000000a m0000000b m0000000c)"), "{text}");
         assert!(text.contains("1. ef56「读文档」codex:labs · 跑完一轮 · 2 分钟前\n   最后一句:「整理好了」"), "{text}");
-        // 多行的话缩进对齐;用户在外面发的没有「回话」
+        // Multiple lines are indented to line up; messages from the user outside have no 「回话」 (reply)
         assert!(text.contains("2. 用户(在会话外面) · 发来一句话 · 2 分钟前\n   「先别动数据库\n   等我回来」\n"), "{text}");
         assert!(text.contains("「补一下测试」  回话:aca msg ef56"), "{text}");
-        // 派它干活的那个发来的:标明是交代的活;它听「跑完」的,原地回答就送回去了,不教它再 aca msg 一遍
+        // From the session that delegated it: marked as assigned work; it hears "finished", so answering in place gets back,
+        // and it isn't told to aca msg again
         let text = render(std::slice::from_ref(&c), 220, "ef56", true);
         assert!(text.contains("「补一下测试」  派你干活的会话交代的:直接在这里做、在这里回答") && !text.contains("aca msg"), "{text}");
         let text = render(std::slice::from_ref(&c), 220, "ef56", false);
         assert!(text.contains("「补一下测试」  派你干活的会话交代的:直接在这里做;要回它用 aca msg ef56"), "{text}");
-        // 排队 / 打字进去的:用户发的原样,会话发的只多一行是谁,不说「不是用户打的」、不教怎么回
+        // Queued / typed in: the user's go as is, a session's only gets one extra line saying who, without "not typed by the
+        // user" or how to reply
         let other = Msg { from: "zz99".into(), who: "zz99「别的」claude:sub".into(), ..c.clone() };
         let input = render_as_input(&[a, b, c, other], 220, "ef56");
         assert_eq!(
@@ -903,31 +982,37 @@ mod tests {
              [aca] 派你干活的会话 ef56「读文档」codex:labs 说:\n补一下测试\n\n\
              [aca] 来自会话 zz99「别的」claude:sub:\n补一下测试"
         );
+        // A message it scheduled for itself is due: say it scheduled it itself and how long ago, don't teach it to reply to itself
+        let me =
+            Msg { from: "ab12".into(), who: "ab12「主线」claude:sub".into(), at: 200, ..msg("m0000000d", "msg", "回来看看 CI") };
+        let text = render(std::slice::from_ref(&me), 220, "", false);
+        assert!(text.ends_with("\n1. 你自己 · 定时到点了 · 2 分钟前定的\n   「回来看看 CI」"), "{text}");
+        assert_eq!(render_as_input(&[me], 220, ""), "[aca] 定时到点了(你 2 分钟前定的):\n回来看看 CI");
     }
 
     #[test]
     fn a_draft_is_any_non_dim_character_after_the_prompt_mark() {
         let l = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        // 两家的提示都是灰的(SGR 2),2026-10-08 抓的样子
+        // Both tools' hints are gray (SGR 2), as captured 2026-10-08
         assert_eq!(draft('❯', &l(&["● 好了", "\x1b[0m❯ \x1b[2mTry \"fix typecheck errors\"\x1b[0m"])), Some(false));
         assert_eq!(draft('›', &l(&["\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[22m"])), Some(false));
         assert_eq!(draft('❯', &l(&["❯ "])), Some(false));
-        // 你打了字
+        // You typed something
         assert_eq!(draft('❯', &l(&["❯ 人打的草稿"])), Some(true));
         assert_eq!(draft('›', &l(&["\x1b[2m›\x1b[0m half"])), Some(true));
-        // 灰的后面接着正常颜色的字(取消了灰)
+        // Gray followed by normal-colored text (gray canceled)
         assert_eq!(draft('❯', &l(&["❯ \x1b[2mTry\x1b[22m x"])), Some(true));
-        // 颜色参数里的 2 不是灰
+        // A 2 among color parameters isn't gray
         assert_eq!(draft('❯', &l(&["❯ \x1b[38;2;2;2;2mx"])), Some(true));
-        // 对话里早先的那几行也以记号开头:看最后一个
+        // Earlier lines in the conversation also start with the mark: look at the last one
         assert_eq!(draft('›', &l(&["› 上一句我说的", "• 回复", "› \x1b[2mAsk Codex to do anything"])), Some(false));
-        // 没有输入框(在等你选、界面还没画出来)
+        // No input box (waiting for you to choose, interface not drawn yet)
         assert_eq!(draft('❯', &l(&["Loading…"])), None);
     }
 
     #[test]
     fn who_gets_told_follows_the_session_then_the_config_and_otherwise_nobody() {
-        // 谁都没说要:不通知
+        // Nobody asked for it: no notice
         assert!(!wanted("", &[], "done") && !wanted("", &[], "waiting"));
         let cfg = vec!["done".to_string(), "failed".to_string()];
         assert!(wanted("", &cfg, "done") && !wanted("", &cfg, "waiting"));

@@ -1,15 +1,19 @@
-//! aca:一屏管住所有 agent 会话。后端是 tmux,会话的登记、启动、状态、插件都自己做,不依赖 agent-deck。
+//! aca: one screen for all your agent sessions. The backend is tmux; registering, starting, state and plugins are all done
+//! here, with no dependency on agent-deck.
 //!
-//! 分层(下面的不知道上面的):
-//! - `paths` `tmux` `store` `config` `runtime`:存东西和调 tmux 的地方
-//! - `agent/`:各家 agent 的适配(怎么起、hook、屏幕、标题),一家一个文件
-//! - `screen` `hook` `status`:状态怎么来
-//! - `session`:对会话的操作,界面和命令行共用;`adopt`:接管不是 aca 起的会话;`proc`:读进程(认 agent、认账号)、放到后台不等的子进程
-//! - `event` `plugin`:事件流和插件宿主
-//! - `i18n`:说哪种话(`tr!`),命令行和界面共用
-//! - `inbox` `answer`:会话之间递话(收件箱、门铃、排队、自动通知、`aca wait`),替在等确认的会话回答
+//! Layers (lower ones don't know about the ones above):
+//! - `paths` `tmux` `store` `config` `runtime`: storage and calls into tmux
+//! - `agent/`: adapters for each agent (how to start it, hooks, screen, title), one file per tool
+//! - `screen` `hook` `status`: where the state comes from
+//! - `session`: operations on sessions, shared by the interface and the CLI; `adopt`: adopting sessions aca didn't start;
+//!   `proc`: reading processes (recognizing the agent and the account), and background child processes nobody waits for
+//! - `event` `plugin`: the event stream and the plugin host
+//! - `i18n`: which language to speak (`tr!`), shared by the CLI and the interface
+//! - `inbox` `answer`: passing messages between sessions (inbox, doorbell, queueing, automatic notices, `aca wait`), and
+//!   answering for sessions waiting for a confirmation
 //!
-//! 这个库不解析命令行、不画界面:那是 `aca`(命令行)和以后的界面那两个 crate 的事。
+//! This library doesn't parse the command line or draw the interface: that's the job of the `aca` (CLI) crate and the
+//! interface crate that comes later.
 
 pub mod adopt;
 pub mod agent;

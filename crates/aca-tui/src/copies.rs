@@ -1,7 +1,8 @@
-//! `C`:挑一样复制 —— aca id(`aca move <id>` 这类命令用的)、session id(Claude / Codex 自己的对话 id,
-//! `claude --resume` 用的)、path(会话的目录)。按行首的键直接复制,或者 ↑↓ 挑了回车。
-//! 没有的那样(普通 tmux 会话没有 aca id、还没说过话的没有对话 id)照样列着,写为什么没有。
-//! `B` 照旧:路径和对话 id 两行一起。
+//! `C`: pick one thing to copy: aca id (for commands like `aca move <id>`), session id (Claude's / Codex's own conversation id,
+//! for `claude --resume`), path (the session's directory). Press the key at the start of a row to copy it, or pick with ↑↓ and ⏎.
+//! One that's missing (a plain tmux session has no aca id; one that hasn't talked yet has no conversation id) is still listed,
+//! saying why it's missing.
+//! `B` as before: path and conversation id, two lines together.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::{Line, Span};
@@ -12,7 +13,7 @@ use aca_core::{t, tr};
 use crate::overlay::{Flow, Fx, Overlay, kit};
 use crate::theme;
 
-/// 一行:键、名字、值(空 = 没有)、没有时写的
+/// One row: key, name, value (empty = missing), what to show when missing
 struct Row {
     key: char,
     name: &'static str,
@@ -27,7 +28,7 @@ pub struct Menu {
 }
 
 impl Menu {
-    /// id:aca 的会话 id(没登记 = 空);info:列表里给 `B` 的那份(`Path: …`、`Session: …` 一行一个)
+    /// id: aca's session id (not registered = empty); info: what the list gives `B` (`Path: …`, `Session: …`, one per line)
     pub fn new(title: &str, id: &str, info: &str) -> Menu {
         let line = |k: &str| info.lines().find_map(|l| l.strip_prefix(k)).unwrap_or("").trim().to_string();
         let rows = vec![
@@ -49,7 +50,7 @@ impl Menu {
         Flow::Close
     }
 
-    /// 挪高亮,跳过没有的
+    /// Move the highlight, skipping missing ones
     fn step(&mut self, d: usize) {
         let n = self.rows.len();
         for k in 1..n {
@@ -71,7 +72,7 @@ impl Overlay for Menu {
         let title = kit::clip(&tr!("复制 · {}", "Copy · {}", self.title), w.saturating_sub(12)).trim_end().to_string();
         let mut out = vec![kit::modal_title(&title, theme::accent(), kit::esc_hint(t!("关闭", "close")), w), Line::raw("")];
         let name_w = self.rows.iter().map(|r| r.name.width()).max().unwrap_or(0);
-        // 「i  」+ 名字 +「  」
+        // "i  " + name + "  "
         let room = w.saturating_sub(3 + name_w + 2);
         for (i, r) in self.rows.iter().enumerate() {
             let (text, st) = if r.value.is_empty() { (r.none, kit::dim()) } else { (r.value.as_str(), ratatui::style::Style::new()) };
@@ -131,7 +132,7 @@ mod tests {
         }
         let (f, fx) = press(&mut m, KeyCode::Char('s'));
         assert_eq!((f, fx.copy.as_deref()), (Flow::Close, Some("5f0c-uuid")));
-        // ↓ 再回车:path
+        // ↓ then ⏎: path
         press(&mut m, KeyCode::Down);
         press(&mut m, KeyCode::Down);
         let (f, fx) = press(&mut m, KeyCode::Enter);
@@ -141,7 +142,7 @@ mod tests {
 
     #[test]
     fn missing_values_say_why_and_the_highlight_skips_them() {
-        // 普通 tmux 会话、还没说过话:只有目录
+        // Plain tmux session that hasn't talked yet: only the directory
         let mut m = Menu::new("裸", "", "Path: /w/x");
         assert_eq!(m.sel, 2);
         let rows = text(&m, 66);
@@ -150,7 +151,7 @@ mod tests {
         assert_eq!((f, fx.copy, fx.flash.as_deref()), (Flow::Stay, None, Some("没有 aca id:A 接管后可用")));
         press(&mut m, KeyCode::Up);
         assert_eq!(m.sel, 2);
-        // 手机宽度:一行不超宽
+        // Phone width: no line too wide
         assert!(text(&Menu::new(&"长".repeat(40), "id", &format!("Path: /{}", "a".repeat(90))), 40).iter().all(|r| r.width() <= 40));
     }
 }

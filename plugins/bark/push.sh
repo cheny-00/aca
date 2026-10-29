@@ -1,5 +1,6 @@
 #!/bin/sh
-# aca.bark:事件来了推一条。地址是设置 url(ACA_SETTING_URL);有人正连着这个会话就不推;派出去的 worker 看设置 workers。
+# aca.bark: push one notification per event. The address is the url setting (ACA_SETTING_URL); nothing is pushed while someone
+# is attached to the session; for workers that were sent out, see the workers setting.
 url="$ACA_SETTING_URL"
 [ -n "$url" ] || { echo "aca.bark: no url set (settings.url in plugins.toml)"; exit 0; }
 for c in curl jq; do

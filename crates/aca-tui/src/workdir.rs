@@ -1,14 +1,16 @@
-//! 会话真正在哪个目录干活(看改动、预览顶上的统计用)。
+//! Which directory a session is really working in (for the diff page and the stats atop the preview).
 //!
-//! 登记的路径是建会话时填的,Claude 的进程 cwd 也一直停在启动时那个;可 Claude 在里面 cd 过、
-//! 进了 worktree,或者登记的就是上一级(底下好几个仓库)时,真正在改的是别处。所以以 agent 自己的记录为准:
-//! - Claude:`$CLAUDE_CONFIG_DIR/sessions/<pid>.json` 给出它现在的会话 id → `projects/*/<id>.jsonl` 对话记录,
-//!   最后一条带 `cwd` 的就是它现在的目录(Bash 里 cd 了、进了 worktree 都会跟着变)
-//! - Codex:登记的对话 id(hook 报的)→ `$CODEX_HOME/sessions/**/rollout-*-<id>.jsonl`,最后一个 `cwd`
-//! - 那个目录不在 git 仓库里(比如停在上一级):用它最近改的文件(Edit / Write、apply_patch)所在的仓库
-//! - 都没有:agent 进程的 cwd,再没有就是登记的目录
+//! The registered path is the one given when the session was created, and Claude's process cwd stays where it started too; but
+//! when Claude has cd'd inside, entered a worktree, or the registered path is a level up (several repositories under it), what's
+//! really being changed is elsewhere. So the agent's own records win:
+//! - Claude: `$CLAUDE_CONFIG_DIR/sessions/<pid>.json` gives its current session id → the `projects/*/<id>.jsonl` conversation
+//!   record, where the last entry with a `cwd` is its current directory (it follows a cd in Bash or entering a worktree)
+//! - Codex: the registered conversation id (reported by the hook) → `$CODEX_HOME/sessions/**/rollout-*-<id>.jsonl`, the last `cwd`
+//! - If that directory isn't in a git repository (e.g. it stayed a level up): the repository of the file it changed most recently
+//!   (Edit / Write, apply_patch)
+//! - None of those: the agent process's cwd, failing that the registered directory
 //!
-//! 只读文件末尾一截,不解析整份记录;记录里的内容不留存,只取路径。
+//! Reads only the tail of the file, never parses a whole record; nothing from the record is kept but paths.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -20,15 +22,15 @@ use aca_core::t;
 
 use crate::data::Agent;
 
-/// 去哪儿找:会话的这几样(`Session` 里的)
+/// Where to look: these fields of a session (from `Session`)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Where {
-    /// 登记的目录(没登记的是窗格当前目录)
+    /// The registered directory (for an unregistered one, the pane's current directory)
     pub dir: String,
-    /// agent 进程,0 = 没在跑
+    /// The agent process, 0 = not running
     pub pid: u32,
     pub agent: Agent,
-    /// 登记的 Claude / Codex 对话 id(`B` 复制的那个)
+    /// The registered Claude / Codex conversation id (the one `B` copies)
     pub id: String,
 }
 
@@ -39,30 +41,30 @@ impl Where {
     }
 }
 
-/// 找到的目录,和是怎么找到的(和登记的不一样时写出来)
+/// The directory found, and how it was found (shown when it differs from the registered one)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Found {
     pub dir: String,
     pub how: &'static str,
 }
 
-/// 对话记录最多读末尾这么多
+/// Read at most this much of a conversation record's tail
 const TAIL: u64 = 2 << 20;
 
 static CWD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""cwd":"((?:[^"\\]|\\.)*)""#).unwrap());
-/// Claude 改文件:Edit / Write 的输入,和改完回来的 filePath
+/// Claude changing files: Edit / Write input, and the filePath returned afterwards
 static CLAUDE_EDIT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#""name":"(?:Edit|Write|MultiEdit|NotebookEdit)","input":\{[^{}]*?"(?:file_path|notebook_path)":"((?:[^"\\]|\\.)*)"|"filePath":"((?:[^"\\]|\\.)*)""#)
         .unwrap()
 });
-/// Codex 改文件:apply_patch 里的 `*** Update File: 路径`(在 JSON 字符串里,换行是 \n)
+/// Codex changing files: `*** Update File: PATH` in apply_patch (inside a JSON string, newlines are \n)
 static CODEX_EDIT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\*\*\* (?:Update|Add) File: ((?:[^"\\]|\\[^n])+)"#).unwrap());
 
 fn unescape(raw: &str) -> String {
     serde_json::from_str::<String>(&format!("\"{raw}\"")).unwrap_or_else(|_| raw.to_string())
 }
 
-/// 文件末尾一截(从一行开头起)
+/// The tail of a file (starting at a line start)
 fn tail(p: &Path) -> Option<String> {
     let mut f = std::fs::File::open(p).ok()?;
     let len = f.metadata().ok()?.len();
@@ -78,14 +80,15 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
 }
 
-/// Claude 把项目目录变成 projects 底下的文件夹名:不是字母数字的都换成 -
+/// How Claude turns a project directory into a folder name under projects: everything not alphanumeric becomes -
 fn project_key(dir: &str) -> String {
     dir.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
 static SID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""sessionId":"([^"]+)""#).unwrap());
 
-/// Claude 的对话记录:先按 sessions/<pid>.json 找现在的会话 id(/clear、resume 之后会变),没有就用登记的
+/// Claude's conversation record: first the current session id from sessions/<pid>.json (it changes after /clear, resume), else
+/// the registered one
 fn claude_log(conf: &Path, pid: u32, id: &str) -> Option<PathBuf> {
     let reg = std::fs::read_to_string(conf.join("sessions").join(format!("{pid}.json"))).unwrap_or_default();
     let sid = SID.captures(&reg).map(|c| c[1].to_string()).filter(|_| pid > 0).unwrap_or_else(|| id.to_string());
@@ -94,7 +97,8 @@ fn claude_log(conf: &Path, pid: u32, id: &str) -> Option<PathBuf> {
     }
     let file = format!("{sid}.jsonl");
     let projects = conf.join("projects");
-    // 通常就在启动目录对应的文件夹里;名字太长时 Claude 会截断加 hash,那就挨个找
+    // Usually in the folder for the start directory; when the name is too long Claude truncates it and adds a hash, so search
+    // them one by one
     let start = CWD.captures(&reg).map(|c| unescape(&c[1]));
     if let Some(p) = start.map(|d| projects.join(project_key(&d)).join(&file)).filter(|p| p.is_file()) {
         return Some(p);
@@ -102,7 +106,7 @@ fn claude_log(conf: &Path, pid: u32, id: &str) -> Option<PathBuf> {
     std::fs::read_dir(&projects).ok()?.flatten().map(|d| d.path().join(&file)).find(|p| p.is_file())
 }
 
-/// Codex 的 rollout:按会话 id 找,从最近的日期往前翻
+/// Codex's rollout: find it by session id, going back from the most recent date
 pub(crate) fn codex_log(conf: &Path, id: &str) -> Option<PathBuf> {
     if id.is_empty() || id.contains('/') {
         return None;
@@ -126,7 +130,8 @@ pub(crate) fn codex_log(conf: &Path, id: &str) -> Option<PathBuf> {
     None
 }
 
-/// 它现在这段对话的记录文件。conf = 配置目录(CLAUDE_CONFIG_DIR / CODEX_HOME),空 = 默认的 ~/.claude / ~/.codex
+/// The record file of its current conversation. conf = config directory (CLAUDE_CONFIG_DIR / CODEX_HOME), empty = the default
+/// ~/.claude / ~/.codex
 pub fn log_of(w: &Where, conf: &str) -> Option<PathBuf> {
     let dir = |d: &str| if conf.is_empty() { home().join(d) } else { PathBuf::from(conf) };
     match w.agent {
@@ -136,7 +141,7 @@ pub fn log_of(w: &Where, conf: &str) -> Option<PathBuf> {
     }
 }
 
-/// 所在 git 仓库的根(往上找 .git,不跑 git)
+/// The root of the containing git repository (looks up for .git, doesn't run git)
 fn repo_root(dir: &Path) -> Option<&Path> {
     dir.ancestors().find(|d| d.join(".git").exists())
 }
@@ -145,7 +150,7 @@ fn in_repo(dir: &Path) -> bool {
     repo_root(dir).is_some()
 }
 
-/// 从记录末尾读出:最后的 cwd、最近改的文件(绝对路径)
+/// Read from the record's tail: the last cwd, the most recently changed file (absolute path)
 fn read_log(log: &Path, agent: Agent) -> (Option<String>, Option<String>) {
     let Some(text) = tail(log) else { return (None, None) };
     let cwd = CWD.captures_iter(&text).last().map(|c| unescape(&c[1]));
@@ -153,7 +158,7 @@ fn read_log(log: &Path, agent: Agent) -> (Option<String>, Option<String>) {
         Agent::Codex => CODEX_EDIT.captures_iter(&text).last().map(|c| unescape(c[1].trim_end())),
         _ => CLAUDE_EDIT.captures_iter(&text).last().and_then(|c| c.get(1).or(c.get(2))).map(|m| unescape(m.as_str())),
     };
-    // apply_patch 里常是相对路径:接在 cwd 后面
+    // apply_patch paths are often relative: append them to cwd
     let edited = edited.map(|e| match &cwd {
         Some(c) if !e.starts_with('/') => format!("{}/{e}", c.trim_end_matches('/')),
         _ => e,
@@ -161,13 +166,14 @@ fn read_log(log: &Path, agent: Agent) -> (Option<String>, Option<String>) {
     (cwd, edited)
 }
 
-/// agent 进程的 cwd(lsof,只读得到自己的进程)
+/// The agent process's cwd (lsof; only readable for our own processes)
 fn proc_cwd(pid: u32) -> Option<String> {
     let out = std::process::Command::new("lsof").args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"]).output().ok()?;
     String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix('n')).map(String::from).filter(|d| d.starts_with('/'))
 }
 
-/// 找它真正干活的目录。conf = agent 的配置目录(CLAUDE_CONFIG_DIR / CODEX_HOME,None = 默认的 ~/.claude / ~/.codex)
+/// Find the directory it's really working in. conf = the agent's config directory (CLAUDE_CONFIG_DIR / CODEX_HOME, None = the
+/// default ~/.claude / ~/.codex)
 pub fn find_in(w: &Where, conf: Option<&str>) -> Found {
     let registered = || Found { dir: w.dir.clone(), how: "" };
     let log = match w.agent {
@@ -186,7 +192,7 @@ pub fn find_in(w: &Where, conf: Option<&str>) -> Found {
         if let Some(d) = cwd.as_ref().filter(|d| in_repo(Path::new(d))) {
             return Found { dir: d.clone(), how: here };
         }
-        // 停在不是仓库的地方(比如上一级):看它最近改的文件在哪个仓库
+        // Stayed somewhere that isn't a repository (e.g. a level up): see which repository its most recently changed file is in
         if let Some(root) = edited.as_deref().map(Path::new).and_then(Path::parent).filter(|d| d.is_dir()).and_then(repo_root) {
             return Found {
                 dir: root.to_string_lossy().into_owned(), how: t!("最近修改的文件所在仓库", "its recent edits are here")
@@ -196,7 +202,8 @@ pub fn find_in(w: &Where, conf: Option<&str>) -> Found {
             return Found { dir: d, how: here };
         }
     }
-    // 没有记录可读(手动起的 Codex 之类):登记的不是仓库而进程在仓库里,用进程的
+    // No record to read (a Codex started by hand and the like): if the registered one isn't a repository but the process is in
+    // one, use the process's
     let lost = !w.dir.is_empty() && !in_repo(Path::new(&w.dir));
     if w.pid > 0
         && lost
@@ -207,7 +214,7 @@ pub fn find_in(w: &Where, conf: Option<&str>) -> Found {
     registered()
 }
 
-/// 同 `find_in`,配置目录从 agent 进程的环境变量里读
+/// Same as `find_in`, with the config directory read from the agent process's environment
 pub fn find(w: &Where) -> Found {
     let conf = (w.pid > 0).then(|| crate::data::config_home(w.pid, w.agent)).flatten();
     find_in(w, conf.as_deref())
@@ -247,24 +254,24 @@ mod tests {
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir_all(repo.join("src")).unwrap();
         let top_s = top.to_str().unwrap();
-        // sessions/<pid>.json:现在的会话 id 和启动目录
+        // sessions/<pid>.json: the current session id and start directory
         std::fs::create_dir_all(conf.join("sessions")).unwrap();
         std::fs::write(conf.join("sessions/42.json"), format!(r#"{{"pid":42,"sessionId":"s-new","cwd":"{top_s}"}}"#)).unwrap();
         let proj = conf.join("projects").join(project_key(top_s));
         std::fs::create_dir_all(&proj).unwrap();
         let line = |cwd: &Path| format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display());
         let w = Where { dir: top_s.into(), pid: 42, agent: Agent::Claude, id: "s-old".into() };
-        // cd 进了仓库:跟着它
+        // cd'd into the repository: follow it
         std::fs::write(proj.join("s-new.jsonl"), line(&top) + &line(&repo)).unwrap();
         assert_eq!(find_in(&w, conf.to_str()), Found { dir: repo.to_str().unwrap().into(), how: "Claude 当前目录" });
-        // 停在上一级、用绝对路径改了仓库里的文件:看文件
+        // Stayed a level up and changed a file in the repository by absolute path: go by the file
         let edit = format!(
             "{{\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"name\":\"Edit\",\"input\":{{\"replace_all\":false,\"file_path\":\"{}\"}}}}]}},\"cwd\":\"{top_s}\"}}\n",
             repo.join("src/main.rs").display()
         );
         std::fs::write(proj.join("s-new.jsonl"), line(&repo) + &edit).unwrap();
         assert_eq!(find_in(&w, conf.to_str()), Found { dir: repo.to_str().unwrap().into(), how: "最近修改的文件所在仓库" });
-        // 记录找不到:登记的目录
+        // Record not found: the registered directory
         let w = Where { pid: 0, id: String::new(), ..w };
         assert_eq!(find_in(&w, conf.to_str()), Found { dir: top_s.into(), how: "" });
         let _ = std::fs::remove_dir_all(&root);

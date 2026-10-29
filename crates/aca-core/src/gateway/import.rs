@@ -1,11 +1,14 @@
-//! `aca plugin gateway import`:把各账号里散装的 MCP 收进 gateway。
+//! `aca plugin gateway import`: gather the loose MCP servers in each account into the gateway.
 //!
-//! 读的地方:Claude 账号目录里 `.claude.json` 顶层的 `mcpServers`(没登记目录的默认账号是 `~/.claude.json`),
-//! Codex 账号目录里 `config.toml` 的 `[mcp_servers.*]`(默认 `~/.codex`)。同名、写法一样的并成一个;写法不一样的、
-//! HTTP 的(gateway 现在只接 stdio)标出来不收。
+//! Where it reads: top-level `mcpServers` in `.claude.json` in Claude account directories (`~/.claude.json` for the default
+//! account with no registered directory), and `[mcp_servers.*]` in `config.toml` in Codex account directories (default
+//! `~/.codex`). Same name written the same way merges into one; ones written differently, or HTTP ones (the gateway only takes
+//! stdio for now), are marked and not taken.
 //!
-//! 不加 `--apply` 只列;加了才写:aca 自己的 config.toml 末尾追加 `[mcps.<名字>]`(已经有的不动),再收进 gateway。
-//! **账号里的那份原样留着**:gateway 开着时 agent 会两份都看到,确认没问题后你自己去账号里删(删不删、什么时候删你定)。
+//! Without `--apply` it only lists; with it, it writes: `[mcps.<name>]` is appended to the end of aca's own config.toml (ones
+//! already there are left alone), then taken into the gateway.
+//! **The copy in the account stays as it is**: while the gateway is on, agents see both; once you've confirmed it's fine, delete
+//! it from the account yourself (whether and when is up to you).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,22 +16,22 @@ use std::path::{Path, PathBuf};
 use crate::paths::{self, Res};
 use crate::{t, tr};
 
-/// 找到的一个
+/// One that was found
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Found {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
-    /// 在哪几个账号里(`claude`、`claude:work`、`codex:work`)
+    /// Which accounts it's in (`claude`, `claude:work`, `codex:work`)
     pub from: Vec<String>,
-    /// 收不了的原因(HTTP 的、几处写得不一样);None = 能收
+    /// Why it can't be taken (HTTP, written differently in different places); None = it can
     pub problem: Option<String>,
-    /// aca 的 `[mcps]` 里已经有这个名字(不再写,只收进 gateway)
+    /// aca's `[mcps]` already has this name (not written again, only taken into the gateway)
     pub known: bool,
 }
 
-/// 一个账号里读出来的:(名字, 定义)
+/// What's read from one account: (name, definition)
 fn claude_servers(file: &Path) -> Vec<(String, serde_json::Value)> {
     let Ok(text) = std::fs::read_to_string(file) else { return vec![] };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return vec![] };
@@ -43,16 +46,17 @@ fn codex_servers(file: &Path) -> Vec<(String, serde_json::Value)> {
         .unwrap_or_default()
 }
 
-/// 一个 stdio 服务怎么起:(命令, 参数, 环境)
+/// How to start a stdio server: (command, arguments, environment)
 type Stdio = (String, Vec<String>, BTreeMap<String, String>);
 
-/// 定义 → 怎么起;HTTP 的、没写命令的 Err
+/// Definition → how to start it; Err for HTTP ones and ones with no command
 fn stdio(def: &serde_json::Value) -> Result<Stdio, String> {
     if def.get("url").is_some() || matches!(def.get("type").and_then(|t| t.as_str()), Some("http" | "sse" | "streamable-http")) {
         return Err(t!("是 HTTP 服务,gateway 目前只支持 stdio", "an HTTP server; the gateway takes stdio ones only").into());
     }
     let command = def.get("command").and_then(|c| c.as_str()).ok_or(t!("缺少 command", "no command"))?.to_string();
-    // `./x`、`dir/x` 是相对那个账号自己的目录的(Codex 应用装的那种),gateway 里起不来;`npx` 这种按 PATH 找的没事
+    // `./x` and `dir/x` are relative to that account's own directory (the kind Codex apps install), so they can't start in the
+    // gateway; ones found via PATH like `npx` are fine
     if command.contains('/') && !command.starts_with('/') && !command.starts_with('~') {
         return Err(tr!(
             "命令是相对路径({command}),依赖该账号自己的目录,无法在 gateway 中启动",
@@ -72,7 +76,7 @@ fn stdio(def: &serde_json::Value) -> Result<Stdio, String> {
     Ok((command, args, env))
 }
 
-/// 要读的账号:(叫什么, 哪一家, 账号目录;None = 这一家的默认目录)
+/// Accounts to read: (what it's called, which tool, account directory; None = that tool's default directory)
 fn accounts(cfg: &crate::config::Config) -> Vec<(String, &'static str, Option<PathBuf>)> {
     let mut out = vec![("claude".to_string(), "claude", None), ("codex".to_string(), "codex", None)];
     for kind in ["claude", "codex"] {
@@ -85,7 +89,7 @@ fn accounts(cfg: &crate::config::Config) -> Vec<(String, &'static str, Option<Pa
     out
 }
 
-/// 各账号里的 MCP,并好、标好
+/// The MCP servers in each account, merged and marked
 pub fn scan() -> Vec<Found> {
     let cfg = crate::config::load();
     let known = super::mcps_names();
@@ -103,7 +107,7 @@ pub fn scan() -> Vec<Found> {
     merge(seen, &known)
 }
 
-/// 同名的并起来(分开写好测)。几处写得不一样的标出来
+/// Merge ones with the same name (separate, so it's easy to test). Mark those written differently in different places
 pub fn merge(seen: Vec<(String, Vec<(String, serde_json::Value)>)>, known: &[String]) -> Vec<Found> {
     let mut out: Vec<Found> = vec![];
     for (label, servers) in seen {
@@ -135,7 +139,7 @@ pub fn merge(seen: Vec<(String, Vec<(String, serde_json::Value)>)>, known: &[Str
     out
 }
 
-/// 一段 `[mcps.<名字>]`
+/// One `[mcps.<name>]` section
 fn block(f: &Found) -> String {
     let key =
         if f.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') { f.name.clone() } else { format!("\"{}\"", f.name) };
@@ -151,7 +155,7 @@ fn block(f: &Found) -> String {
     s
 }
 
-/// 收进来:没有的追加到 aca 的 config.toml,都收进 gateway。返回收了哪几个
+/// Take them in: append missing ones to aca's config.toml, take all into the gateway. Returns which were taken
 pub fn apply(found: &[Found], only: &[String]) -> Res<Vec<String>> {
     let picked: Vec<&Found> = found.iter().filter(|f| f.problem.is_none() && (only.is_empty() || only.contains(&f.name))).collect();
     if let Some(n) = only.iter().find(|n| !found.iter().any(|f| &f.name == *n)) {
@@ -164,7 +168,7 @@ pub fn apply(found: &[Found], only: &[String]) -> Res<Vec<String>> {
         text.push_str(&block(f));
     }
     if text != before {
-        // 写之前确认整份还读得懂,读不懂就不写
+        // Before writing, make sure the whole thing still parses; if not, don't write
         text.parse::<toml::Table>()
             .map_err(|e| tr!("生成的 config.toml 无法解析,未写入:{e}", "the new config.toml wouldn't parse; not written: {e}"))?;
         paths::write_atomic(&file, &text).map_err(|e| tr!("无法写入 {}:{e}", "can't write {}: {e}", file.display()))?;

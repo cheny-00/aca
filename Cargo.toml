@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 
-# 依赖的版本只在这里写一次,各 crate 里 `xxx.workspace = true`
+# Dependency versions are written only here, once; each crate says `xxx.workspace = true`
 [workspace.dependencies]
 aca-core = { path = "crates/aca-core" }
 aca-tui = { path = "crates/aca-tui" }
@@ -20,11 +20,12 @@ serde_json = { version = "1.0.151", features = ["preserve_order", "raw_value"] }
 toml = "1.1.6"
 
 [workspace.lints.clippy]
-# 这个项目里一行长、参数多的函数是有意的;别的照 clippy 默认
+# Long lines and functions with many parameters are deliberate in this project; everything else follows clippy's defaults
 too_many_arguments = "allow"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
-# 只去掉调试信息、留着函数名:崩溃报告(~/Library/Logs/DiagnosticReports/aca-*.ips)和 exit.log 里的调用栈直接看得出在哪个函数
+# Strip only the debug info and keep function names: stack traces in crash reports (~/Library/Logs/DiagnosticReports/aca-*.ips)
+# and in exit.log then show which function it happened in
 strip = "debuginfo"

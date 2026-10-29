@@ -1,11 +1,14 @@
 #!/bin/sh
-# aca.copy:这个会话最后一条回复里的命令 / 代码,挑一段复制。
-# 认回复的原文,不认屏幕:``` 围起来的代码块(整块,几行都在)、行内的 `…`(设置 inline,默认只要带空格的);
-# shell 的代码块里有几条命令的,每一条也单独列出来(设置 lines)。
-#   pick    挑(弹窗里,fzf):数字键直接复制那一条,↑↓ ⏎ 复制高亮的,Esc 不复制;只认出一条就不问
-#   list    打出来:认出了什么,一行一条
-# 回复是 aca 给的(清单里写了 input = "reply":窗格读 ACA_INPUT_FILE,命令读标准输入)。
-# 复制 = tmux 的缓冲区(前缀 ] 贴到别的格里)+ OSC 52 给外层终端(ssh 进来的也到)+ 本机的剪贴板。
+# aca.copy: pick a command / some code from the last reply of this session and copy it.
+# Reads the original text of the reply, not the screen: code blocks fenced with ``` (whole, every line), inline `…` (the inline
+# setting; by default only those with a space in them);
+# a shell code block holding several commands also lists each command on its own (the lines setting).
+#   pick    pick (in a popup, fzf): a number key copies that one right away, ↑↓ ⏎ copies the highlighted one, Esc copies
+#           nothing; with only one found, no question is asked
+#   list    print what was found, one per line
+# The reply comes from aca (the manifest says input = "reply": a pane reads ACA_INPUT_FILE, a command reads stdin).
+# Copy = the tmux buffer (prefix ] pastes it into another pane) + OSC 52 to the outer terminal (reaches it over ssh too) + the
+# local clipboard.
 
 zh() { [ "${ACA_LANG:-en}" = zh ]; }
 say() { if zh; then printf '%s\n' "$1"; else printf '%s\n' "$2"; fi; }
@@ -23,7 +26,8 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/aca-copy.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
 trap 'exit 130' INT TERM HUP
 
-# 一句话。弹窗一关,打在里面的字就没了:在 tmux 里写到状态栏;不在 tmux 里(手机直接 ssh 进来)停一下再回界面
+# One line of message. Once the popup closes, whatever was printed in it is gone: in tmux, write it to the status bar; outside
+# tmux (a phone that came in straight over ssh), pause a moment before going back to the UI
 tell() {
   if [ "$mode" != pick ]; then
     printf '%s\n' "$1"
@@ -46,9 +50,11 @@ if ! grep -q '[^[:space:]]' "$src"; then
   exit 1
 fi
 
-# 每认出一段:原文写进 $tmp/<编号>(结尾不带换行:贴进 shell 不会自己回车),打一行「种类 编号 行数 第一行」
-# (种类:b 代码块、l 上面那个代码块里的一条、i 行内的)。每一行都是 "$ " 开头的,去掉这个提示符;一样的只留一段。
-# 代码块没收尾(回复被截在里面)的不要,留个记号
+# For each piece found: write its original text to $tmp/<NUMBER> (no trailing newline: pasted into a shell, it does not press
+# Enter by itself), and print a line "KIND NUMBER LINES FIRST-LINE"
+# (KIND: b a code block, l one command from the code block above, i inline). When every line starts with "$ ", drop that
+# prompt; identical pieces are kept once.
+# A code block that never closes (the reply was cut off inside it) is dropped, leaving a marker
 awk -v dir="$tmp" -v mode="${ACA_SETTING_INLINE:-spaced}" -v split_lines="${ACA_SETTING_LINES:-true}" '
 function emit(text, kind,    n, i, lines, all, first) {
   gsub(/^\n+|\n+$/, "", text)
@@ -69,8 +75,9 @@ function emit(text, kind,    n, i, lines, all, first) {
   gsub(/\t/, " ", first)
   printf "%s\t%d\t%d\t%s\n", kind, id, n, first
 }
-# shell 的代码块里的每一条命令。行尾的 \ 接着下一行;有 "$ " 开头的行就只要这些(别的是输出);
-# 有缩进的(循环、条件)、有 << 的(一段文字喂给命令)拆开就不是一条了:不拆
+# Each command in a shell code block. A \ at the end of a line continues onto the next; if some lines start with "$ ", take only
+# those (the rest is output);
+# a block with indentation (loops, conditionals) or with << (text fed to a command) is no longer one command once split: not split
 function commands(text,    n, i, lines, cur, l, dollar, cont) {
   if (text ~ /<</) return
   n = split(text, lines, "\n")
@@ -78,7 +85,7 @@ function commands(text,    n, i, lines, cur, l, dollar, cont) {
   cont = 0
   for (i = 1; i <= n; i++) {
     if (lines[i] ~ /^\$ /) dollar = 1
-    # 接着上一行 \ 的那几行缩进不算
+    # Indentation on the lines that continue a \ from the line above does not count
     if (!cont && lines[i] ~ /^[ \t]+[^ \t]/) return
     cont = (lines[i] ~ /\\$/)
   }
@@ -99,7 +106,7 @@ function commands(text,    n, i, lines, cur, l, dollar, cont) {
   }
   if (cur != "") emit(cur, "l")
 }
-# 一行里的 `…`:开头几个反引号,收尾就得是几个
+# Inline `…` in a line: it must close with as many backticks as it opens with
 function inline(s,    n, body, found) {
   while (match(s, /`+/)) {
     n = RLENGTH
@@ -135,13 +142,13 @@ function inline(s,    n, body, found) {
       fence = ""
       next
     }
-    # 列表里的代码块跟着列表缩进:开头那一行缩了几格,里面每行去掉几格
+    # A code block in a list is indented along with the list: strip from each line inside as many spaces as the opening line has
     for (i = 0; i < ind && substr(line, 1, 1) == " "; i++) line = substr(line, 2)
     buf = buf line "\n"
     next
   }
   if (match(t, /^(```+|~~~+)/)) {
-    # 反引号开的头,后面那截(语言名)里不会再有反引号:有就是一行里的 ```…```
+    # A fence opened with backticks has no more backticks in the rest (the language name): if it does, it is a ```…``` on one line
     if (substr(t, 1, 1) == "~" || index(substr(t, RLENGTH + 1), "`") == 0) {
       fence = substr(t, 1, 1)
       flen = RLENGTH
@@ -157,7 +164,8 @@ function inline(s,    n, body, found) {
 END { if (fence != "") print "" > (dir "/open") }
 ' "$src" > "$tmp/found"
 
-# 代码块(和它里面的每一条)在前,行内的在后,各自照回复里的先后;这里的第几行就是给人看的编号
+# Code blocks (with each command inside them) first, inline ones after, each in the order of the reply; the line number here
+# is the number people see
 { grep '^[bl]' "$tmp/found"; grep '^i' "$tmp/found"; } > "$tmp/index"
 n=$(wc -l < "$tmp/index" | tr -d ' ')
 cut_note=""
@@ -168,7 +176,7 @@ if [ "$n" -eq 0 ]; then
   exit 1
 fi
 
-# 列表:$1 = 1 时带上给 fzf 的那一列(编号)和颜色
+# The list: with $1 = 1, include the column for fzf (the number) and colors
 rows() {
   awk -F'\t' -v fzf="$1" -v more="$(say "行" "more")" '{
     first = ($1 == "l" ? "  └ " : "") $4
@@ -185,7 +193,7 @@ if [ "$mode" = list ]; then
   exit 0
 fi
 
-# 挑第几条:打出编号;不挑了什么也不打
+# Pick one: print its number; print nothing when nothing is picked
 choose() {
   if [ "$n" -eq 1 ]; then
     echo 1
@@ -204,7 +212,7 @@ choose() {
     keys="$keys${keys:+,}$i:become(echo $i)"
     i=$((i + 1))
   done
-  # 你自己没配颜色的话用终端那 16 色:浅色深色的主题都看得清
+  # Unless you set colors yourself, use the 16 colors of the terminal: readable on both light and dark themes
   case "${FZF_DEFAULT_OPTS:-}" in *--color*) color="" ;; *) color="--color=16" ;; esac
   header=$(say "数字键 / ⏎ 复制 · Esc 取消" "digit / Enter copies · Esc cancels")
   rows 1 | fzf --ansi --delimiter='\t' --with-nth=2.. --layout=reverse --no-multi --cycle --info=hidden $color \
@@ -213,7 +221,7 @@ choose() {
     --bind="$keys" | cut -f1
 }
 
-# 交给谁复制;一处都没成才算没成
+# Hand it over for copying; it counts as failed only if every one of them failed
 copy() {
   if [ -n "${ACA_SETTING_COPY:-}" ]; then
     sh -c "$ACA_SETTING_COPY" < "$1"
@@ -221,7 +229,7 @@ copy() {
   fi
   done=1
   if [ -n "${TMUX:-}" ] && tmux load-buffer -w "$1" 2>/dev/null; then done=0; fi
-  # ssh 进来的:这台机器的剪贴板不是你手边那个,只走上面的 OSC 52
+  # Over ssh: the clipboard of this machine is not the one at your hand, so only the OSC 52 above is used
   if [ -z "${SSH_CONNECTION:-}${SSH_TTY:-}" ]; then
     for c in pbcopy wl-copy "xclip -selection clipboard" "xsel -ib"; do
       command -v "${c%% *}" >/dev/null 2>&1 || continue

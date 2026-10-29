@@ -1,12 +1,16 @@
-//! 已读 / 未读(`u`)。核心给的「跑完了没看」(◐)看的是跑完之后有没有人连进去过、在里面按过键、标过「看过」;
-//! 普通 tmux 会话没有这个,「标成未读」核心也没有 —— 所以界面在上面再叠一层自己记的:
-//!   已读:从 aca 进去过 / 按 u 标的,记下时刻。之后没有新输出就当已读(○);又跑了一轮、跑完了,照样 ◐。
-//!        登记的会话按 u 标已读时,同时记到核心那份上(同 `aca seen`):只靠这里的时刻的话,
-//!        「有没有新输出」看的是窗口最后有输出的时刻,屏幕一重画(电脑睡醒)就又算未读了。
-//!   未读:按 u 标的,进去之前一直 ◐。
-//! 存在 ~/.local/state/aca/ui/read,一行一个:`<键>\t<时刻>` 是已读,`<键>\t-` 是标成未读。
-//! 键同便签(`notes::key`):登记的会话按它的 id,改名、重启都跟着。
-//! 和置顶一样,每次刷新都重读,改之前先重读,手机和桌面各开一个 aca 不会互相覆盖。
+//! Seen / unread (`u`). The core's "finished, not seen" (◐) is about whether anyone attached after it finished, pressed
+//! keys in it, or marked it "seen"; plain tmux sessions don't have this, and the core has no "mark unread" either, so the
+//! interface layers its own record on top:
+//!   seen: entered from aca / marked with u, the time is recorded. With no new output after that it counts as seen (○);
+//!        if it ran another round and finished, it's ◐ again.
+//!        When u marks a registered session seen, it is also recorded on the core's copy (same as `aca seen`): with only
+//!        the time here, "is there new output" looks at the window's last output time, and a screen redraw (the computer
+//!        waking up) would make it unread again.
+//!   unread: marked with u, ◐ until you go in.
+//! Stored in ~/.local/state/aca/ui/read, one per line: `<key>\t<time>` is seen, `<key>\t-` is marked unread.
+//! Keys as for notes (`notes::key`): a registered session by its id, so renames and restarts follow it.
+//! Like pins, reread on every refresh and before every change, so an aca open on the phone and one on the desktop don't
+//! overwrite each other.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -15,14 +19,14 @@ use crate::state::{state_file, write_atomic};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mark {
-    /// 这个时刻看过
+    /// Seen at this time
     Read(u64),
     Unread,
 }
 
 #[derive(Default)]
 pub struct Reads {
-    /// None = 只在内存里(单元测试、--snapshot)
+    /// None = in memory only (unit tests, --snapshot)
     path: Option<PathBuf>,
     marks: BTreeMap<String, Mark>,
 }
@@ -38,13 +42,13 @@ impl Reads {
         r
     }
 
-    /// 读完就和文件断开,之后的改动只在内存里(--snapshot 喂按键时不能写真文件)
+    /// Cut off from the file once read; later changes stay in memory (--snapshot feeding keys must not write the real file)
     pub fn detached(mut self) -> Self {
         self.path = None;
         self
     }
 
-    /// 连着文件(不是单元测试、--snapshot 那种只在内存里的)
+    /// Backed by the file (not the in-memory kind used by unit tests and --snapshot)
     pub fn live(&self) -> bool {
         self.path.is_some()
     }
@@ -62,7 +66,7 @@ impl Reads {
             .collect();
     }
 
-    /// 什么时候看过的(标成未读的、没看过的 = None)
+    /// When it was seen (marked unread, or never seen = None)
     pub fn read_at(&self, key: &str) -> Option<u64> {
         match self.marks.get(key) {
             Some(&Mark::Read(t)) => Some(t),
@@ -74,7 +78,8 @@ impl Reads {
         self.marks.get(key) == Some(&Mark::Unread)
     }
 
-    /// 记成 at 时看过。keep:还在的会话,别的顺手清掉(删掉的会话不留在文件里)
+    /// Record it as seen at `at`. keep: sessions still around; the others are cleared along the way (deleted sessions don't
+    /// stay in the file)
     pub fn mark_read(&mut self, key: &str, at: u64, keep: &dyn Fn(&str) -> bool) -> std::io::Result<()> {
         self.set(key, Mark::Read(at), keep)
     }
@@ -83,7 +88,7 @@ impl Reads {
         self.set(key, Mark::Unread, keep)
     }
 
-    /// 文件里记的(没记 = None);`^Z` 撤销 u 时用 `put` 放回去
+    /// What the file records (nothing = None); undoing u with `^Z` puts it back with `put`
     pub fn mark(&self, key: &str) -> Option<Mark> {
         self.marks.get(key).copied()
     }
@@ -124,11 +129,11 @@ mod tests {
         let mut phone = Reads::open(Some(path.clone()));
         let mut desk = Reads::open(Some(path.clone()));
         phone.mark_read("a", 100, &all).unwrap();
-        desk.mark_unread("b", &all).unwrap(); // desk 内存里还没有 a,写之前重读所以 a 不丢
+        desk.mark_unread("b", &all).unwrap(); // desk has no a in memory yet; it rereads before writing, so a isn't lost
         let r = Reads::open(Some(path.clone()));
         assert_eq!((r.read_at("a"), r.unread("a")), (Some(100), false));
         assert_eq!((r.read_at("b"), r.unread("b")), (None, true));
-        phone.mark_unread("a", &|k| k != "b").unwrap(); // b 删掉了
+        phone.mark_unread("a", &|k| k != "b").unwrap(); // b was deleted
         let r = Reads::open(Some(path.clone()));
         assert!(r.unread("a") && !r.unread("b") && r.read_at("a").is_none());
         let _ = std::fs::remove_dir_all(&dir);

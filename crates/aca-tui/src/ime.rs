@@ -1,25 +1,31 @@
-//! 输入法:列表里的字母键是命令,拼音这类输入法开着时字母先进了它的候选框,终端根本不发给 aca。
-//! 桌面上在 aca 里就切到英文(ABC),要打字的地方(搜索、输入框、临时终端)和让出终端时(进会话、编辑器、fzf、退出)
-//! 切回原来的。本来就是英文的不动,也就不用切回。
+//! Input method: letter keys in the list are commands, but with an input method like Pinyin on, letters go into its candidate
+//! box first and the terminal never sends them to aca.
+//! On the desktop, switch to English (ABC) while in aca, and back to the original where you type (search, input boxes, the
+//! temporary terminal) and when handing over the terminal (entering a session, editor, fzf, quitting).
+//! If it was English already, nothing changes, so nothing needs switching back.
 //!
-//! - 只管本机的终端:手机隔着 Moshi,iPhone 的键盘管不了;从手机开的 aca 也不去动 Mac 的输入法
-//! - 系统设置里「自动切换到文稿的输入源」关着时输入法全系统就一份,所以离开时一定切回去
-//! - tmux 弹窗收不到焦点事件(窗格收得到):弹窗开着切到别的 App,那边也是英文,回来进会话 / 关掉时才切回
+//! - Only the local machine's terminal: the phone goes through Moshi and its iPhone keyboard is out of reach; an aca opened from
+//!   the phone doesn't touch the Mac's input method either
+//! - With "Automatically switch to a document's input source" off in System Settings there's one input method for the whole
+//!   system, so always switch back when leaving
+//! - tmux popups get no focus events (panes do): switching to another app with the popup open leaves English there too; it
+//!   switches back only when entering a session / closing
 
 use std::sync::Mutex;
 
 enum St {
-    /// 不管(手机、测试、不是 macOS)
+    /// Not managed (phone, tests, not macOS)
     Off,
-    /// 在让出去的地方(打字、进会话),没占着
+    /// Somewhere handed over (typing, inside a session), not holding it
     Out,
-    /// 在列表里:切到了英文就记着原来的,本来就是英文的是 None
+    /// In the list: if it switched to English, remembers the original; None if it was English already
     In(Option<tis::Source>),
 }
 
 static ST: Mutex<St> = Mutex::new(St::Off);
 
-/// 开 aca 时:本机的终端里才管,管就马上切(弹窗一出来就按的键不被拼音吃掉)
+/// When aca opens: manage only in a local terminal, and then switch right away (so keys pressed as soon as the popup appears
+/// aren't eaten by Pinyin)
 pub fn start() {
     if !local() {
         return;
@@ -30,7 +36,8 @@ pub fn start() {
     english(true);
 }
 
-/// true:切到英文,记下原来的;false:切回原来的。和上次一样就什么也不做(每一轮都会调)
+/// true: switch to English, remembering the original; false: switch back to the original. Same as last time = do nothing (it's
+/// called every round)
 pub fn english(on: bool) {
     let Ok(mut st) = ST.lock() else { return };
     match (&*st, on) {
@@ -48,8 +55,9 @@ pub fn english(on: bool) {
     }
 }
 
-/// 设置改了(设置页、config.toml 的 [ime] auto):按现在的设置重新决定管不管。
-/// 要管:先记成让出去了,主循环下一帧自己切;不管了:切回原来的再撒手
+/// The setting changed (settings page, config.toml's [ime] auto): decide again by the current setting whether to manage.
+/// Managing: first mark it as handed over, the main loop switches on its own next frame; no longer managing: switch back to
+/// the original, then let go
 pub fn reconfigure() {
     if cfg!(test) {
         return;
@@ -67,17 +75,17 @@ pub fn reconfigure() {
     }
 }
 
-/// 设了 ACA_IME:设置页标出来(这个终端里听它的)
+/// ACA_IME is set: the settings page marks it (this terminal follows it)
 pub fn forced() -> bool {
     std::env::var("ACA_IME").is_ok_and(|v| v == "0" || v == "1")
 }
 
-/// 在管输入法(桌面)
+/// Managing the input method (desktop)
 pub fn active() -> bool {
     ST.lock().is_ok_and(|st| !matches!(*st, St::Off))
 }
 
-/// 崩了也切回去(正常退出、`?` 带出来的错误走的是同一条路,重复调没关系)
+/// Switch back even on a crash (a normal exit and errors propagated by `?` take the same path; calling it twice is harmless)
 pub struct Guard;
 
 impl Drop for Guard {
@@ -86,10 +94,11 @@ impl Drop for Guard {
     }
 }
 
-/// 按键的是不是本机的终端:tmux 里看这台客户端的终端类型(弹窗 = `--client` 那台),
-/// 手机经 mosh 连进来的是 xterm-256color 之类;不在 tmux 里看 TERM,ssh 进来的不算。
-/// 测试(`ACA_TMUX_SOCKET` 指到假会话的服务)不动真的输入法。`ACA_IME=0` 不管,`=1` 不看这些一律管;
-/// 没设 ACA_IME 时 config.toml 的 `[ime] auto = false`(设置页里关掉)也是不管
+/// Whether the keys come from a local terminal: inside tmux, look at this client's terminal type (popup = the `--client` one);
+/// a phone connected over mosh is xterm-256color or the like; outside tmux, look at TERM; ssh sessions don't count.
+/// Tests (`ACA_TMUX_SOCKET` pointing at a server of fake sessions) don't touch the real input method. `ACA_IME=0` never
+/// manages, `=1` always manages regardless of all this;
+/// without ACA_IME, config.toml's `[ime] auto = false` (turned off on the settings page) also means not managing
 fn local() -> bool {
     if !cfg!(target_os = "macos") {
         return false;
@@ -112,7 +121,7 @@ fn local() -> bool {
     ["kitty", "ghostty", "wezterm"].iter().any(|t| term.contains(t))
 }
 
-/// macOS 的输入法接口(Carbon 的 TIS)
+/// macOS's input method API (Carbon's TIS)
 #[cfg(target_os = "macos")]
 mod tis {
     use std::ffi::c_void;
@@ -136,10 +145,10 @@ mod tis {
         static kCFRunLoopDefaultMode: Ref;
     }
 
-    /// 一个输入法,自己持有一份引用
+    /// An input method, holding its own reference
     pub struct Source(Ref);
 
-    // CF 对象的引用计数是线程安全的
+    // CF objects' reference counting is thread-safe
     unsafe impl Send for Source {}
 
     impl Drop for Source {
@@ -153,8 +162,9 @@ mod tis {
             (!r.is_null()).then_some(Source(r))
         }
 
-        /// 先让 run loop 转一圈:「现在是哪个」在进程里有缓存,靠系统通知更新,aca 不跑 run loop 就收不到,
-        /// 别处(菜单栏、快捷键、别的程序)切过之后读到的还是旧的(实测)
+        /// Spin the run loop once first: "which one is current" is cached in the process and updated by system notifications,
+        /// which aca doesn't receive without running a run loop, so after a switch elsewhere (menu bar, shortcut, another
+        /// program) it still reads the old one (tested)
         pub fn current() -> Option<Source> {
             unsafe {
                 CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 0);
@@ -162,12 +172,12 @@ mod tis {
             }
         }
 
-        /// 最近用过的英文键盘(一般是 ABC)
+        /// The most recently used English keyboard (usually ABC)
         pub fn english() -> Option<Source> {
             Source::own(unsafe { TISCopyCurrentASCIICapableKeyboardLayoutInputSource() })
         }
 
-        /// 打字母出字母(ABC、美式);拼音、注音、日文的假名模式都不是
+        /// Typing letters gives letters (ABC, U.S.); Pinyin, Zhuyin and Japanese kana modes don't
         pub fn ascii(&self) -> bool {
             let b = unsafe { TISGetInputSourceProperty(self.0, kTISPropertyInputSourceIsASCIICapable) };
             !b.is_null() && unsafe { CFBooleanGetValue(b) } != 0

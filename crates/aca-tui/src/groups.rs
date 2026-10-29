@@ -1,13 +1,19 @@
-//! 建分组:`^N` 起名回车就建(`Act::Create`),列表里马上有它的标题,接着挑目录开会话;中途 Esc 组也留着。
-//! 删分组:列表里停在分组上(标题 / 折叠行 / 空组)按 `d`,确认框说一起删掉什么,`y` 删(`Act::Delete`)。
-//! 改分组:停在分组上按 `r`,先改名(可以带上级:`fun/aca`),再改默认目录(`Act::Edit`,见 `rename_all`)。
+//! Creating a group: `^N`, type a name, ⏎ creates it (`Act::Create`); its title is in the list right away, then you pick a
+//! directory to open a session; Esc midway still keeps the group.
+//! Deleting a group: on a group in the list (title / fold row / empty group) press `d`; the confirm box says what goes with it;
+//! `y` deletes (`Act::Delete`).
+//! Editing a group: on a group press `r`: rename first (a parent may be included: `fun/aca`), then change the default directory
+//! (`Act::Edit`, see `rename_all`).
 //!
-//! 删分组 = 子分组和里面的会话(连子分组里的、归档着的)一起进回收站(见 trash.rs):
-//! - 会话归档(在跑的停掉,一起等它们退干净),分组的登记删掉、照原样(先后、默认目录)记进回收站的那一条
-//! - 1 天内 `^Z` / `b` 那一页 `⏎` 整条拿回来;过了 1 天会话才真删
-//! - 删之前就归档着的(连 `d` 删了还在回收站里的)记成归档着的,拿回来还归档着
+//! Deleting a group = its subgroups and the sessions in them (including those in subgroups, and archived ones) go to the trash
+//! together (see trash.rs):
+//! - sessions are archived (running ones stopped, all waited on together to exit cleanly); the group's registration is deleted
+//!   and recorded as it was (order, default directory) in that trash entry
+//! - within 1 day, `^Z` / `⏎` on the `b` page brings the whole entry back; only after 1 day are the sessions really deleted
+//! - sessions already archived before the delete (including ones `d` deleted that are still in the trash) are recorded as
+//!   archived and come back archived
 //!
-//! 组在工作区里的记录、折叠是界面那边记进回收站 / 清掉的(`ui::job_done`)。
+//! The group's workspace record and fold state are put in the trash / cleared by the interface (`ui::job_done`).
 
 use std::collections::HashMap;
 
@@ -18,33 +24,35 @@ use aca_core::{t, tr};
 use crate::ops::Outcome;
 use crate::trash::{Gone, GroupRec, Item};
 
-/// 登记表里的一个分组
+/// A group in the registry
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub profile: String,
-    /// 分组路径(`上级/名字`)
+    /// The group path (`parent/name`)
     pub path: String,
-    /// 直接在这个组里的会话:没归档的
+    /// Sessions directly in this group: not archived
     pub live: usize,
-    /// 归档着的(会话 id:回收站里的界面不算)
+    /// Archived ones (session ids; the interface doesn't count the ones in the trash)
     pub archived: Vec<String>,
 }
 
-/// g 是 top 自己或者它下面的
+/// g is top itself or under it
 pub fn within(g: &str, top: &str) -> bool {
     g == top || g.strip_prefix(top).is_some_and(|r| r.starts_with('/'))
 }
 
-/// 分组 g 改名(from → to)以后叫什么:是 from 自己或者它下面的才改,别的 None
+/// What group g is called after a rename (from → to): changed only if it's from itself or under it; otherwise None
 pub fn renamed(g: &str, from: &str, to: &str) -> Option<String> {
     within(g, from).then(|| format!("{to}{}", &g[from.len()..]))
 }
 
-/// 改分组的路径(`aca group rename`、分组上 `r`):登记表里的组和会话,连界面记着组名的
-/// (工作区里记的组、视图里在看的组和折起来的、便签)一起改。返回挪了几个会话
+/// Change a group's path (`aca group rename`, `r` on a group): the groups and sessions in the registry, along with the places
+/// the interface remembers group names (groups recorded in workspaces, the group being viewed and the folded ones in the view,
+/// notes). Returns how many sessions moved
 pub fn rename_all(store: &Store, from: &str, to: &str) -> Res<usize> {
     let n = store.group_rename(from, to)?;
-    // 界面记的没改上不算失败:最多是这个组回到默认的工作区、折着的展开、便签留在原来的名字下
+    // The interface's records not updating isn't a failure: at worst this group goes back to the default workspace, folded ones
+    // unfold, notes stay under the old name
     let _ = crate::spaces::Spaces::open(crate::spaces::Spaces::default_path()).rename_group(crate::data::REGISTERED, from, to);
     let _ = crate::notes::Notes::open(crate::notes::Notes::default_path()).rename_group(from, to);
     if let Some(p) = crate::state::state_file("view") {
@@ -56,19 +64,19 @@ pub fn rename_all(store: &Store, from: &str, to: &str) -> Res<usize> {
     Ok(n)
 }
 
-/// 要做的
+/// What to do
 #[derive(Clone, Debug, PartialEq)]
 pub enum Act {
-    /// `^N` 起的名字:建这个分组(已经有了不动)
+    /// The name typed at `^N`: create this group (left alone if it exists)
     Create { group: String },
-    /// 删掉这个分组:子分组、里面的会话一起进回收站
+    /// Delete this group: its subgroups and the sessions in them go to the trash together
     Delete { profile: String, group: String },
-    /// 分组上 `r`:group 改成 to(一样 = 不改名);dir:默认目录 (原来的, 改成的),空 = 不记;None = 不改
+    /// `r` on a group: group becomes to (the same = no rename); dir: the default directory (old, new), empty = none; None = unchanged
     Edit { profile: String, group: String, to: String, dir: Option<(String, String)> },
 }
 
 impl Act {
-    /// 跑的时候底栏显示的
+    /// Shown in the bottom bar while running
     pub fn doing(&self) -> String {
         match self {
             Act::Create { group } => tr!("正在创建分组 {group}…", "creating group {group}…"),
@@ -77,7 +85,7 @@ impl Act {
         }
     }
 
-    /// 这个分组会不会被删掉(它自己和子分组)
+    /// Whether this group gets deleted (itself and its subgroups)
     pub fn covers(&self, profile: &str, group: &str) -> bool {
         match self {
             Act::Delete { profile: p, group: top, .. } => p == profile && within(group, top),
@@ -85,7 +93,7 @@ impl Act {
         }
     }
 
-    /// 改分组的反过来做(^Z)
+    /// An edit to a group, done in reverse (^Z)
     pub fn undo(&self) -> Option<Act> {
         match self {
             Act::Create { .. } | Act::Delete { .. } => None,
@@ -99,12 +107,12 @@ impl Act {
     }
 }
 
-/// run 循环放进后台跑的(`Job::Group`)
+/// What the run loop runs in the background (`Job::Group`)
 pub fn job(a: &Act) -> Outcome {
     match a {
         Act::Delete { profile, group } => delete(profile, group),
         Act::Edit { group, to, dir, .. } => edit(group, to, dir.as_ref().map(|d| d.1.as_str())),
-        // 建好了不另说(新建会话的框正开着);没建成照实说
+        // Created: nothing more to say (the new-session box is open); not created: say so plainly
         Act::Create { group } => match Store::open().and_then(|s| s.group_create(group, "")) {
             Ok(()) => Outcome::Done(String::new()),
             Err(e) => Outcome::Failed(tr!("创建分组失败:{e}", "creating the group failed: {e}")),
@@ -112,8 +120,9 @@ pub fn job(a: &Act) -> Outcome {
     }
 }
 
-/// 删分组:先把要删的照原样记成回收站的一条,再归档会话(各等各的进程退干净,一起等),都停下了才删分组的登记。
-/// 有没停下的:分组留着,那几个不算进这一条(它们还在组里列着),照实说
+/// Delete a group: first record what goes, as it is, as one trash entry; then archive the sessions (each waits for its own
+/// process to exit cleanly, all waited on together); only when all have stopped is the group's registration deleted.
+/// Any that didn't stop: the group stays, those aren't in this entry (they're still listed in the group); say so plainly
 fn delete(profile: &str, group: &str) -> Outcome {
     let failed = |e: String| Outcome::Failed(tr!("删除分组失败:{e}", "deleting the group failed: {e}"));
     let store = match Store::open() {
@@ -178,7 +187,8 @@ fn delete(profile: &str, group: &str) -> Outcome {
     Outcome::Binned { msg, item: Box::new(item) }
 }
 
-/// 改名、改默认目录。目录先查(撞了别的组的就都不改),再改名,再记目录
+/// Rename, change the default directory. The directory is checked first (if it clashes with another group's, nothing changes),
+/// then the rename, then the directory is recorded
 fn edit(group: &str, to: &str, dir: Option<&str>) -> Outcome {
     let store = match Store::open() {
         Ok(s) => s,
@@ -222,7 +232,8 @@ fn edit(group: &str, to: &str, dir: Option<&str>) -> Outcome {
     Outcome::Done(said.join(" · "))
 }
 
-/// 登记表里的分组,按它的树排(父组紧跟着子组,同级按 sort_order 再按名字),带上组里有几个会话
+/// The registry's groups in tree order (each parent followed by its subgroups, siblings by sort_order then name), with how many
+/// sessions each has
 pub fn load() -> Vec<Row> {
     let Ok(store) = Store::open() else { return vec![] };
     rows_of(&store)
@@ -257,7 +268,7 @@ mod tests {
         assert!(a.covers("default", "fun/app") && a.covers("default", "fun/app/old"));
         assert!(!a.covers("default", "fun") && !a.covers("default", "fun/apple") && !a.covers("firm", "fun/app"));
         assert_eq!(a.doing(), "正在删除分组 fun/app…");
-        // 撤销走回收站(见 trash.rs),不是反过来做一遍
+        // Undo goes through the trash (see trash.rs), not by doing it in reverse
         assert_eq!(a.undo(), None);
     }
 
@@ -267,7 +278,7 @@ mod tests {
         assert_eq!(renamed("fun/app/old", "fun/app", "deck").as_deref(), Some("deck/old"));
         assert_eq!(renamed("fun/apple", "fun/app", "deck"), None);
         assert_eq!(renamed("fun", "fun/app", "deck"), None);
-        // 撤销:名字、目录都反过来
+        // Undo: both name and directory reversed
         let a = Act::Edit { profile: "default".into(), group: "a".into(), to: "b/a".into(), dir: Some(("/x".into(), String::new())) };
         let back = Act::Edit { profile: "default".into(), group: "b/a".into(), to: "a".into(), dir: Some((String::new(), "/x".into())) };
         assert_eq!(a.undo(), Some(back));

@@ -1,6 +1,8 @@
 #!/bin/sh
-# aca.core 的工具:一个工具一条 aca 命令。参数在 ACA_ARG_<名字>,调用的会话是 ACA_SESSION_ID、它的目录是 ACA_SESSION_DIR。
-# 退出码原样交回(不是 0 的,agent 那边看到的是出错);wait 例外:它的退出码是结果,打出来、自己退 0。
+# The tools of aca.core: one aca command per tool. Arguments are in ACA_ARG_<NAME>; the calling session is ACA_SESSION_ID, and
+# its directory ACA_SESSION_DIR.
+# Exit codes are passed back as they are (a nonzero one shows up as an error on the agent side); wait is the exception: its exit
+# code is the result, so it is printed and the script itself exits 0.
 a="$ACA_BIN"
 case "$1" in
   sessions)
@@ -19,7 +21,7 @@ case "$1" in
     exec "$a" msg "$ACA_ARG_TO" "$ACA_ARG_TEXT"
     ;;
   wait)
-    # shellcheck disable=SC2086 # ids 是空格隔开的几个
+    # shellcheck disable=SC2086 # ids is several, separated by spaces
     if [ "$ACA_ARG_ANY" = "true" ]; then
       "$a" wait $ACA_ARG_IDS --any --timeout 240
     else
@@ -35,6 +37,13 @@ case "$1" in
     ;;
   interrupt)
     exec "$a" interrupt "$ACA_ARG_ID"
+    ;;
+  wakeup)
+    if [ -z "$ACA_SESSION_ID" ]; then
+      echo "aca.core: not inside an aca session" >&2
+      exit 2
+    fi
+    exec "$a" msg --in "$ACA_ARG_AFTER" "$ACA_SESSION_ID" "$ACA_ARG_TEXT"
     ;;
   *)
     echo "aca.core: no tool $1" >&2

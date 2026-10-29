@@ -1,10 +1,11 @@
-//! aca 的东西放哪,和几样到处要用的小工具(时刻、随机 id、原子写)。
+//! Where aca keeps its things, and a few small tools used everywhere (time, random ids, atomic writes).
 //!
-//! - 配置:`~/.config/aca/`(config.toml、plugins.json)
-//! - 登记表:`~/.local/share/aca/aca.db`
-//! - 运行时状态:`~/.local/state/aca/`(run/<id>.json、events.jsonl、inbox/、hooks/、plugin-logs/)
+//! - Configuration: `~/.config/aca/` (config.toml, plugins.json)
+//! - Registry: `~/.local/share/aca/aca.db`
+//! - Runtime state: `~/.local/state/aca/` (run/<id>.json, events.jsonl, inbox/, hooks/, plugin-logs/)
 //!
-//! 设了 `ACA_HOME` 就全收进那一个目录(config / data / state 三个子目录):测试和基准用,动不到真的。
+//! With `ACA_HOME` set, everything goes into that one directory (config / data / state subdirectories): for tests and benchmarks,
+//! so the real ones can't be touched.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -40,7 +41,7 @@ pub fn db() -> PathBuf {
     data_dir().join("aca.db")
 }
 
-/// 一个会话的运行时状态(hook 写、列表读)
+/// A session's runtime state (hooks write it, the list reads it)
 pub fn run_file(id: &str) -> PathBuf {
     state_dir().join("run").join(format!("{id}.json"))
 }
@@ -49,12 +50,12 @@ pub fn events_log() -> PathBuf {
     state_dir().join("events.jsonl")
 }
 
-/// 收件箱:`inbox/<id>.jsonl`(消息)、`.state`(哪几条送到了)、`.bell`(门铃)
+/// Inbox: `inbox/<id>.jsonl` (messages), `.state` (which ones were delivered), `.bell` (the doorbell)
 pub fn inbox_dir() -> PathBuf {
     state_dir().join("inbox")
 }
 
-/// 配置里的路径可能带 ~
+/// Paths in the configuration may contain ~
 pub fn expand(p: &str) -> String {
     match p.strip_prefix("~/") {
         Some(rest) => home().join(rest).to_string_lossy().into_owned(),
@@ -63,7 +64,8 @@ pub fn expand(p: &str) -> String {
     }
 }
 
-/// 比较两个目录是不是同一个用的:展开 ~、能解析就解析成真实路径(/tmp → /private/tmp)、去掉结尾的 /
+/// For comparing whether two directories are the same: expand ~, resolve to the real path when possible (/tmp → /private/tmp),
+/// drop a trailing /
 pub fn real(p: &str) -> String {
     let p = expand(p);
     let p = Path::new(&p).canonicalize().map(|x| x.to_string_lossy().into_owned()).unwrap_or(p);
@@ -80,20 +82,20 @@ pub fn now_ms() -> u64 {
 
 fn random(buf: &mut [u8]) {
     if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)).is_err() {
-        // 读不到就拿时刻和 pid 凑:只用来起 id,不是口令
+        // If it can't be read, make do with the time and pid: only used to make ids, not passwords
         let seed = now_ms() as u128 * 6364136223846793005 + std::process::id() as u128;
         buf.iter_mut().enumerate().for_each(|(i, b)| *b = (seed >> (i % 16 * 8)) as u8);
     }
 }
 
-/// 会话 id:8 位十六进制
+/// Session id: 8 hex digits
 pub fn short_id() -> String {
     let mut b = [0u8; 4];
     random(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Claude 的 `--session-id` 要一个 v4 UUID
+/// Claude's `--session-id` wants a v4 UUID
 pub fn uuid4() -> String {
     let mut b = [0u8; 16];
     random(&mut b);
@@ -103,13 +105,14 @@ pub fn uuid4() -> String {
     format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
 }
 
-/// 先写临时文件再改名:几个进程(hook、界面、命令行)同时读写,读到的不会是半截。
-/// 原来那个文件的权限照旧:你收成只有自己能读的,不因为重写变回默认的
+/// Write a temporary file first, then rename: several processes (hooks, the interface, the CLI) read and write at once, and none
+/// reads half a file. The original file's permissions are kept: if you made it readable only by you, a rewrite doesn't reset it
+/// to the default
 pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     write_as(path, text, std::fs::metadata(path).ok().map(|m| m.permissions()))
 }
 
-/// 同上,但总是只有自己能读写(0600):里面有口令的(plugins.toml 里插件的设置)
+/// Same as above, but always readable and writable only by you (0600): for files with secrets (plugin settings in plugins.toml)
 pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     write_as(path, text, Some(std::fs::Permissions::from_mode(0o600)))
 }
@@ -121,7 +124,8 @@ fn write_as(path: &Path, text: &str, perm: Option<std::fs::Permissions>) -> std:
     match perm {
         None => std::fs::write(&tmp, text)?,
         Some(perm) => {
-            // 临时文件一建出来就只有自己能读,写完再换成要的权限:里面可能有口令,不留谁都能读的那一下
+            // The temporary file is readable only by you from the moment it's created, and gets the wanted permissions after writing:
+            // it may hold secrets, so there's no moment when anyone can read it
             let _ = std::fs::remove_file(&tmp);
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
             f.write_all(text.as_bytes())?;
@@ -157,13 +161,13 @@ mod tests {
     fn rewriting_keeps_a_files_mode_and_private_files_are_only_yours() {
         let dir = std::env::temp_dir().join(format!("aca-paths-{}", short_id()));
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        // 你收紧过的:重写不放开
+        // One you tightened: a rewrite doesn't loosen it
         let kept = dir.join("kept.toml");
         write_atomic(&kept, "a = 1\n").unwrap();
         std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o600)).unwrap();
         write_atomic(&kept, "a = 2\n").unwrap();
         assert_eq!((std::fs::read_to_string(&kept).unwrap().as_str(), mode(&kept)), ("a = 2\n", 0o600));
-        // 有口令的:新建的、原来谁都能读的,写完都只有自己能读
+        // With secrets: new ones, and ones anyone could read before, are readable only by you after writing
         let secret = dir.join("secret.toml");
         write_private(&secret, "t = 1\n").unwrap();
         assert_eq!(mode(&secret), 0o600);

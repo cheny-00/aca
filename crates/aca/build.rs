@@ -1,7 +1,9 @@
-//! 编的是哪一个提交:`aca --version` 打成 `aca 0.1.0 (ceaf172 2026-10-19)`。同一个版本号底下隔了一百多个提交,
-//! 光看 0.1.0 分不出装的是哪一份。没有 git(从源码包编的)就只有版本号。
+//! Which commit this was built from: `aca --version` prints `aca 0.1.0 (ceaf172 2026-10-19)`. Over a hundred commits sit under
+//! one version number, so 0.1.0 alone can't tell which build is installed. Without git (built from a source tarball) it's just
+//! the version number.
 //!
-//! 提交变了(新提交、换分支)才重跑:盯着 HEAD 和它指的那个分支。worktree 里 HEAD 在它自己的目录,分支在共用的那个
+//! Reruns only when the commit changes (a new commit, a branch switch): watches HEAD and the branch it points to. In a worktree,
+//! HEAD is in the worktree's own directory and the branch in the shared one
 
 use std::path::Path;
 use std::process::Command;
@@ -13,7 +15,8 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    // 源码包解在别的 git 仓库里(比如管家目录的那个)时,往上找到的是人家的提交:这份 Cargo.toml 得是这个仓库管着的
+    // When the source tarball is unpacked inside some other git repo (say, one tracking the home directory), looking upward finds
+    // that repo's commit: this Cargo.toml has to be tracked by this repo
     if git(&["ls-files", "--full-name", "Cargo.toml"]).is_none() {
         return;
     }
@@ -24,8 +27,11 @@ fn main() {
         println!("cargo:rerun-if-changed={dir}/HEAD");
     }
     let common = git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    // Watch the directory the branch file sits in: when the ref is packed into packed-refs the file is gone, and it reappears on
+    // the next commit (watching only the file misses that, and the version stays on the old commit)
     if let (Some(common), Some(branch)) = (common, git(&["symbolic-ref", "-q", "HEAD"])) {
-        for f in [format!("{common}/{branch}"), format!("{common}/packed-refs")] {
+        let dir = Path::new(&branch).parent().map(|p| format!("{common}/{}", p.display()));
+        for f in dir.into_iter().chain([format!("{common}/packed-refs")]) {
             if Path::new(&f).exists() {
                 println!("cargo:rerun-if-changed={f}");
             }

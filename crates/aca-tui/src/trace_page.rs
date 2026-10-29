@@ -1,6 +1,7 @@
-//! 会话记录排成字:左边对话里的一轮、右边一轮的过程、整屏的详情、e 用编辑器看的那份。
-//! 两家(`trace_claude` / `trace_codex`)把一个节点的内容读回来整理成一样的 —— 提问(`asked`)、想的和说的(`said`)、
-//! 工具的 `Io`(命令、改动、读到的文件、输入、输出)—— 这里只管怎么排。
+//! The session record laid out as text: a turn in the conversation on the left, a turn's steps on the right, the
+//! full-screen detail, and the copy e opens in the editor.
+//! Both tools (`trace_claude` / `trace_codex`) read a node's content back into the same shape: the prompt (`asked`), what
+//! was thought and said (`said`), a tool's `Io` (commands, changes, files read, input, output); this only handles layout.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -19,19 +20,21 @@ use crate::trace::{
 };
 use crate::ui::dim;
 
-/// 收着的时候改动最多露几行、输出最多露几行
+/// When folded, at most this many lines of changes and of output show
 const PEEK_DIFF: usize = 8;
 const PEEK_OUT: usize = 3;
-/// 收着的思考最多几行:本机的摘要桌面右栏(57 格)八成六放得下,手机(39 格)放得下三成,其余露前 5 行
+/// At most this many lines of folded thinking: 86% of this machine's summaries fit in the desktop right pane (57 columns),
+/// 30% on the phone (39 columns); the rest show their first 5 lines
 const PEEK_THOUGHT: usize = 5;
 
-/// 改动排成段落:行号淡,删的、加的那行铺淡红 / 淡绿底、记号红 / 绿,代码按文件的语言上色
-/// (认不出语言的:删的字红、加的绿、上下文淡);两处改动中间一行点线;折下去的行跟内容对齐
+/// Changes laid out as paragraphs: line numbers dim, removed / added lines on a pale red / pale green background with red /
+/// green marks, code colored by the file's language (language not recognized: removed text red, added green, context dim);
+/// a dotted line between two hunks; wrapped lines align with the content
 fn change_paras(ch: &[&Change], pre: &Styled, path: &str) -> Vec<Para> {
     let p = theme::pal();
     let nw = ch.iter().filter_map(|c| c.no).max().map_or(0, |n| n.to_string().len());
     let gutter = if nw == 0 { 0 } else { nw + 1 };
-    // 改之前、改之后各是一段连着的代码,分开上色(上下文两边都喂)
+    // Before and after are each one contiguous piece of code, colored separately (context is fed to both)
     let first_line = ch.iter().find(|c| c.c != '~').map(|c| c.text.as_str());
     let (mut old, mut new) = (crate::hl::Hl::for_path(path, first_line), crate::hl::Hl::for_path(path, first_line));
     ch.iter()
@@ -72,8 +75,8 @@ fn more(pre: &Styled, k: usize) -> Para {
     Para::under(pre.clone(), vec![seg(tr!("… 还有 {} 行", "… {} more lines", thousands(k as u64)), theme::faint())])
 }
 
-/// 几个文件的改动:改了不止一个文件时,每个文件先写一行路径。open = 带上下文全露(最多 200 行),
-/// 收着只露改动的行(最多 8 行)。第二个值:还有没露的
+/// Changes to several files: when more than one file changed, each file gets a path line first. open = show everything with
+/// context (up to 200 lines), folded shows only the changed lines (up to 8). Second value: something is still hidden
 fn edit_paras(t: &Trace, edits: &[(String, Vec<Change>)], open: bool, pre: &Styled) -> (Vec<Para>, bool) {
     let cap = if open { crate::trace::OUT_LINES } else { PEEK_DIFF };
     let (mut out, mut used, mut left, mut hidden) = (vec![], 0, 0, false);
@@ -95,7 +98,7 @@ fn edit_paras(t: &Trace, edits: &[(String, Vec<Change>)], open: bool, pre: &Styl
     (out, hidden)
 }
 
-/// 读到的文件内容排成段落:行号淡,代码按文件的语言上色
+/// File content that was read, laid out as paragraphs: line numbers dim, code colored by the file's language
 fn file_paras(rows: &[(u64, String)], path: &str, pre: &Styled) -> Vec<Para> {
     let nw = rows.last().map_or(1, |r| r.0.to_string().len());
     let mut hl = crate::hl::Hl::for_path(path, rows.first().map(|r| r.1.as_str()));
@@ -115,7 +118,7 @@ fn file_paras(rows: &[(u64, String)], path: &str, pre: &Styled) -> Vec<Para> {
         .collect()
 }
 
-/// 命令排成段落:第一行前面写 $,按 shell 上色
+/// Commands laid out as paragraphs: $ before the first line, colored as shell
 fn cmd_paras(cmds: &[String], pre: &Styled) -> Vec<Para> {
     let mut out = vec![];
     for cmd in cmds {
@@ -133,8 +136,10 @@ fn cmd_paras(cmds: &[String], pre: &Styled) -> Vec<Para> {
     out
 }
 
-/// 工具那一行:▸ Edit  src/bill.rs ……… 靠右 +3 -1 · 12.3s(在跑 / 被拒 / 被打断 / 出错也写在靠右那截)。
-/// mark:▸ 收着还有没露的、▾ 展开了、· 全露了;extra:靠右先写的(改了几行、读了几行、几条命令)
+/// The tool row: ▸ Edit  src/bill.rs ……… right-aligned +3 -1 · 12.3s (running / denied / interrupted / error also go in
+/// the right-aligned part).
+/// mark: ▸ folded with more hidden, ▾ unfolded, · everything shown; extra: written first on the right (lines changed, lines
+/// read, number of commands)
 fn tool_head(t: &Trace, i: usize, live: bool, now: i64, mark: &str, extra: Styled) -> Para {
     let n = &t.nodes[i];
     let running = t.running(i, live);
@@ -173,8 +178,9 @@ fn tool_head(t: &Trace, i: usize, live: bool, now: i64, mark: &str, extra: Style
     Para { first, body, right, ..Para::default() }
 }
 
-/// 右边的一个工具:一行头 + 底下的内容。收着露一点(改动的行、输出开头;读到的文件内容不露),
-/// open 了看全(改动带上下文、文件内容带行号、整条命令、输出前 200 行)。第二个值:能不能 o
+/// One tool on the right: a heading row + the content below. Folded shows a little (changed lines, the start of the output;
+/// file content read is not shown), open shows it all (changes with context, file content with line numbers, the whole
+/// command, the first 200 lines of output). Second value: whether o works
 pub(crate) fn tool_item(t: &Trace, i: usize, live: bool, now: i64, open: bool) -> (Vec<Para>, bool) {
     if t.sub_of(i).is_some() {
         return sub_item(t, i, live, now, open);
@@ -197,7 +203,7 @@ pub(crate) fn tool_item(t: &Trace, i: usize, live: bool, now: i64, open: bool) -
             let (ps, h) = edit_paras(t, &io.edits, open, &pre);
             out.extend(ps);
             hidden = h;
-            // 改好了:输出只是「改好了」,不露
+            // Edit succeeded: the output just says "done", not shown
             if n.state == St::Ok && io.cmds.is_empty() {
                 break 'body;
             }
@@ -229,7 +235,7 @@ pub(crate) fn tool_item(t: &Trace, i: usize, live: bool, now: i64, open: bool) -
             let (k, w) = (io.cmds.len(), noun(io.cmds.len() as u64, "command", "commands"));
             extra.push(seg(tr!("{k} 条命令", "{k} {w}"), dim()));
         }
-        // 命令:头一行只写了第一条的第一行,展开了先写全部命令
+        // Commands: the heading row only has the first line of the first one, so unfolded writes all the commands first
         hidden |= io.cmds.len() > 1 || io.cmds.iter().any(|c| c.trim().lines().count() > 1);
         if open {
             out.extend(cmd_paras(&io.cmds, &pre));
@@ -257,12 +263,13 @@ pub(crate) fn tool_item(t: &Trace, i: usize, live: bool, now: i64, open: bool) -
     (ps, open || hidden)
 }
 
-/// 子代理最后说的(它交回来的结果)
+/// What the subagent said last (the result it reported back)
 fn sub_reply(t: &Trace) -> String {
     t.last_turn().and_then(|r| last_said(t, r)).map(|c| said(t, c).1.join("\n\n")).unwrap_or_default()
 }
 
-/// 子代理的数字:在跑 / 出错 / 被打断、几次调用、钱、从头到尾多久(后台跑的 Agent 工具早就返回了,真正的耗时在这)
+/// The subagent's numbers: running / error / interrupted, number of calls, cost, how long from start to end (an Agent tool
+/// running in the background returned long ago; the real duration is here)
 fn sub_numbers(t: &Trace, i: usize, live: bool, now: i64) -> Styled {
     let Some(s) = t.sub_of(i) else { return vec![] };
     let p = theme::pal();
@@ -293,8 +300,9 @@ fn sub_numbers(t: &Trace, i: usize, live: bool, now: i64) -> Styled {
     out
 }
 
-/// 起了子代理的那一步:头一行照工具写,靠右换成子代理的数字;底下是它最后说的(收着前 3 行,展开全文)。
-/// ⏎ 进去看它自己的过程(界面管)
+/// The step that started a subagent: the heading row is written like a tool's, with the subagent's numbers on the right;
+/// below is what it said last (first 3 lines when folded, all of it unfolded).
+/// ⏎ goes in to see its own steps (handled by the interface)
 fn sub_item(t: &Trace, i: usize, live: bool, now: i64, open: bool) -> (Vec<Para>, bool) {
     let n = &t.nodes[i];
     let pre = vec![seg("  ", Style::new())];
@@ -330,7 +338,8 @@ fn sub_item(t: &Trace, i: usize, live: bool, now: i64, open: bool) -> (Vec<Para>
     (ps, open || hidden)
 }
 
-/// 一次调用开头一条分隔线,线上写数字:── 4.5s · 1.1k · $0.01 ───(模型换了写上模型)
+/// A separator line at the start of each call, with the numbers on it: ── 4.5s · 1.1k · $0.01 ─── (plus the model when it
+/// changed)
 fn call_rule(t: &Trace, i: usize) -> Para {
     Para {
         body: vec![seg("── ", theme::faint()), seg(call_numbers(t, i), dim()), seg(" ", Style::new())],
@@ -339,8 +348,8 @@ fn call_rule(t: &Trace, i: usize) -> Para {
     }
 }
 
-/// 一次调用的数字:多久 · 上下文 · 钱,4.5s · 1.1k · $0.01。模型和上一次调用的不一样时写上模型
-/// (头一次调用跟出现最多的那个比)
+/// A call's numbers: duration · context · cost, 4.5s · 1.1k · $0.01. The model is added when it differs from the previous
+/// call's (the first call is compared with the most common one)
 fn call_numbers(t: &Trace, i: usize) -> String {
     let n = &t.nodes[i];
     let cost = if n.copied { t!("不计入", "not counted").to_string() } else { t.cost(i).map_or("–".into(), fmt_cost) };
@@ -352,13 +361,15 @@ fn call_numbers(t: &Trace, i: usize) -> String {
     s
 }
 
-/// 这一轮最后说了话的那次调用(它说的就是这一轮的回复,左边写它)
+/// The last call in this turn that said something (what it said is the turn's reply, shown on the left)
 pub(crate) fn last_said(t: &Trace, turn: usize) -> Option<usize> {
     t.nodes[turn].kids.iter().rev().copied().find(|&k| t.nodes[k].kind == Kind::Call && !t.nodes[k].label.is_empty())
 }
 
-/// 右边的一次调用:分隔线、想的(收着摊成一段,最多 PEEK_THOUGHT 行)、说的(全文;brief = 这是回复,左边有全文,收着只写第一句)。
-/// 第二个值:能不能 o(想的截没截到,要折好才知道,见 `wrap_clipped`)
+/// One call on the right: the separator, what was thought (folded: flattened into one paragraph, at most PEEK_THOUGHT
+/// lines), what was said (in full; brief = this is the reply, the left has it in full, so folded writes only the first
+/// sentence).
+/// Second value: whether o works (whether the thinking got cut is only known after wrapping, see `wrap_clipped`)
 fn call_item(t: &Trace, i: usize, brief: bool, open: bool) -> (Vec<Para>, bool) {
     let n = &t.nodes[i];
     let mut out = vec![call_rule(t, i)];
@@ -366,7 +377,7 @@ fn call_item(t: &Trace, i: usize, brief: bool, open: bool) -> (Vec<Para>, bool) 
     let label = |s: &str| vec![seg(s.to_string(), theme::faint())];
     let pad = vec![seg("     ", Style::new())];
     let mut hidden = false;
-    // 收着的一句:第一行,后面还有就写 …
+    // The folded sentence: the first line, with … if there's more
     let mut one = |all: &str, limit: usize| {
         let mut line = first_line(&unmark(all), limit);
         if all.lines().filter(|l| !l.trim().is_empty()).count() > 1 || unmark(all).trim().chars().count() > line.chars().count() {
@@ -398,7 +409,7 @@ fn call_item(t: &Trace, i: usize, brief: bool, open: bool) -> (Vec<Para>, bool) 
     (out, open || hidden)
 }
 
-/// 一轮的对话里有哪几块:这一轮自己(提问)、每次调用、它调的每个工具、出错
+/// The blocks in a turn's conversation: the turn itself (the prompt), each call, each tool it called, errors
 pub(crate) fn flow_nodes(t: &Trace, turn: usize) -> Vec<usize> {
     let mut out = vec![turn];
     for &k in &t.nodes[turn].kids {
@@ -414,13 +425,15 @@ pub(crate) fn flow_nodes(t: &Trace, turn: usize) -> Vec<usize> {
     out
 }
 
-/// 一轮的对话,一块一个节点(见 flow_nodes)。brief = 最后那句回复只留第一句;open:哪些块展开了
+/// A turn's conversation, one block per node (see flow_nodes). brief = keep only the first sentence of the final reply;
+/// open: which blocks are unfolded
 pub(crate) fn flow(t: &Trace, turn: usize, live: bool, now: i64, brief: bool, open: &dyn Fn(usize) -> bool) -> Vec<Step> {
     let list = flow_nodes(t, turn);
     (0..list.len()).map(|k| flow_item(t, turn, &list, k, live, now, brief, open)).collect()
 }
 
-/// 第 k 块(单独排得出来:右边只给看得见的块上色,要一块块重排)。下一块是调用 / 出错的,这块末尾空一行;最后一块末尾写在跑 / 被打断
+/// Block k (can be laid out on its own: the right side only colors visible blocks, so it relays out block by block). If
+/// the next block is a call / error, this one ends with a blank line; the last block ends with running / interrupted
 #[allow(clippy::too_many_arguments)]
 fn flow_item(t: &Trace, turn: usize, list: &[usize], k: usize, live: bool, now: i64, brief: bool, open: &dyn Fn(usize) -> bool) -> Step {
     let n = &t.nodes[turn];
@@ -471,7 +484,8 @@ fn flow_item(t: &Trace, turn: usize, list: &[usize], k: usize, live: bool, now: 
     Step { node: i, paras, fold }
 }
 
-/// 一轮的头(整屏看一轮、e 写的那份):几点到几点、多久、出错 / 被打断;几次调用、几个工具、上下文最多多少、输出、钱
+/// A turn's heading (a turn seen full screen, and the copy e writes): from when to when, how long, error / interrupted;
+/// number of calls, number of tools, peak context, output, cost
 fn turn_head(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
     let n = &t.nodes[i];
     let mut out = vec![minor(turn_span(t, i, live, now))];
@@ -492,7 +506,8 @@ fn turn_head(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
     out
 }
 
-/// 右栏顶上一轮的头:时刻、时长、钱、出错 / 被打断左栏那一轮底下写了,这里只写几次调用、几个工具、上下文最多多少
+/// The turn's heading at the top of the right pane: time, duration, cost, error / interrupted are already under the turn
+/// in the left pane, so this only has number of calls, number of tools, peak context
 fn side_head(t: &Trace, i: usize) -> Vec<Para> {
     let s = t.sum(i);
     let mut out = vec![];
@@ -509,7 +524,7 @@ fn side_head(t: &Trace, i: usize) -> Vec<Para> {
     out
 }
 
-/// 2 调用 · 1 工具 · 3 子代理 · 上下文最多 309k
+/// 2 calls · 1 tool · 3 subagents · context up to 309k
 fn turn_counts(s: &crate::trace::Sum) -> String {
     let (k, w) = (s.calls, noun(s.calls as u64, "call", "calls"));
     let mut parts = vec![tr!("{k} 调用", "{k} {w}")];
@@ -525,12 +540,12 @@ fn turn_counts(s: &crate::trace::Sum) -> String {
     parts.join(" · ")
 }
 
-/// 几点到几点、多久、出错 / 被打断 / 回退掉了
+/// From when to when, how long, error / interrupted / rolled back
 fn turn_span(t: &Trace, i: usize, live: bool, now: i64) -> String {
     let n = &t.nodes[i];
     let running = t.running(i, live);
     let dur = t.dur(i, running, now);
-    // 记录里没写一轮到哪结束的(子代理、记录断在半截的):到最后一次有动静
+    // The record doesn't say where the turn ended (subagents, records cut off halfway): up to the last activity
     let end = if running {
         t!("运行中", "running").to_string()
     } else if n.t1 > 0 {
@@ -551,7 +566,8 @@ fn turn_span(t: &Trace, i: usize, live: bool, now: i64) -> String {
     first
 }
 
-/// 左边对话里的一轮:你说的(全文)、Claude / Codex 最后说的(全文;在跑的还没有)、一行数字
+/// One turn in the conversation on the left: what you said (in full), what Claude / Codex said last (in full; none yet
+/// while running), a line of numbers
 pub(crate) fn chat(t: &Trace, i: usize, live: bool, now: i64) -> Chat {
     let n = &t.nodes[i];
     let running = t.running(i, live);
@@ -581,7 +597,7 @@ pub(crate) fn chat(t: &Trace, i: usize, live: bool, now: i64) -> Chat {
         }
         None => vec![],
     };
-    // 时刻 · 时长 · 钱;几次调用、几个工具在右栏
+    // Time · duration · cost; number of calls and tools are in the right pane
     let s = t.sum(i);
     let mut parts = vec![clock(n.t0, t.tz, false), fmt_dur(t.dur(i, running, now))];
     parts.push(if n.copied {
@@ -593,7 +609,7 @@ pub(crate) fn chat(t: &Trace, i: usize, live: bool, now: i64) -> Chat {
     });
     parts.retain(|x| !x.is_empty());
     let mut foot = vec![];
-    // 这一轮起的后台子代理还在干活
+    // A background subagent started in this turn is still working
     let busy = !running && t.subs_in(i).iter().any(|&k| t.sub_live(k, live, now));
     match (running, n.state) {
         _ if n.rolled => foot.push(seg(t!("↶ 已回退 · ", "↶ rolled back · "), dim())),
@@ -607,15 +623,17 @@ pub(crate) fn chat(t: &Trace, i: usize, live: bool, now: i64) -> Chat {
     Chat { asked, reply, foot: Para::new(foot) }
 }
 
-/// 右边:一轮的中间过程。第一块是这一轮的头(节点是这一轮),后面每次调用、每个工具、出错一块;最后那句回复只留第一句
+/// The right side: a turn's steps. The first block is the turn's heading (its node is the turn), then one block per call,
+/// tool and error; the final reply keeps only its first sentence
 #[cfg(test)]
 pub(crate) fn steps(t: &Trace, turn: usize, live: bool, now: i64, open: &dyn Fn(usize) -> bool) -> Vec<Step> {
     let list = flow_nodes(t, turn);
     (0..list.len()).map(|k| steps_item(t, turn, &list, k, live, now, open)).collect()
 }
 
-/// 右边第 k 块(list = flow_nodes)排出来的样子取决于的东西:都没变的块不用重排。
-/// 在跑的会话每读到新的一截整轮都要重排,一轮几百次调用时大半的块是老样子
+/// What the layout of block k on the right (list = flow_nodes) depends on: a block where none of it changed needn't be
+/// relaid out. A running session relays out the whole turn on every newly read chunk, and in a turn with hundreds of calls
+/// most blocks are unchanged
 pub(crate) fn step_sig(t: &Trace, turn: usize, list: &[usize], k: usize, live: bool, now: i64, open: &dyn Fn(usize) -> bool) -> u64 {
     let i = list[k];
     let n = &t.nodes[i];
@@ -623,20 +641,21 @@ pub(crate) fn step_sig(t: &Trace, turn: usize, list: &[usize], k: usize, live: b
     (i, open(i), n.t0, n.t1, n.state as u8, n.src.len(), n.kids.len(), n.tok[4], n.label.len()).hash(&mut h);
     let running = t.running(turn, live);
     let last = k + 1 == list.len();
-    // 最后一块末尾写在跑 / 被打断;下一块是调用的空一行;是这一轮的回复的只留一句
+    // The last block ends with running / interrupted; a blank line if the next block is a call; the turn's reply keeps only
+    // one sentence
     (last, last && running, last.then_some(t.nodes[turn].state as u8)).hash(&mut h);
     list.get(k + 1).map(|&x| matches!(t.nodes[x].kind, Kind::Call | Kind::Fail)).hash(&mut h);
     (n.kind == Kind::Call && !running && last_said(t, turn) == Some(i)).hash(&mut h);
-    // 子代理:它的记录长了、干完了
+    // Subagent: its record grew, it finished
     t.sub_of(i).map(|s| (s.t.grown(), t.sub_live(i, live, now), t.sub_state(i) as u8)).hash(&mut h);
-    // 在跑的写着跑了多久;头是整轮的合计,每次都排
+    // A running one shows how long it has run; the heading is the whole turn's total, laid out every time
     if t.running(i, live) || t.sub_live(i, live, now) || k == 0 {
         (now, t.off).hash(&mut h);
     }
     h.finish()
 }
 
-/// 右边的第 k 块:第一块换成这一轮的头
+/// Block k on the right: the first block is replaced with the turn's heading
 pub(crate) fn step(t: &Trace, turn: usize, k: usize, live: bool, now: i64, open: &dyn Fn(usize) -> bool) -> Option<Step> {
     let list = flow_nodes(t, turn);
     (k < list.len()).then(|| steps_item(t, turn, &list, k, live, now, open))
@@ -651,7 +670,7 @@ fn steps_item(t: &Trace, turn: usize, list: &[usize], k: usize, live: bool, now:
     Step { node: turn, paras: head, fold: false }
 }
 
-/// 改动的标题下面:改了不止一个文件时每个文件前面一行路径
+/// Under the changes heading: when more than one file changed, a path line before each file
 fn edits_detail(t: &Trace, out: &mut Vec<Para>, edits: &[(String, Vec<Change>)]) {
     for (path, ch) in edits {
         if edits.len() > 1 {
@@ -661,7 +680,8 @@ fn edits_detail(t: &Trace, out: &mut Vec<Para>, edits: &[(String, Vec<Change>)])
     }
 }
 
-/// 一次调用为什么停:正常的(要调工具、说完了)不写,别的说成话;不认得的照写
+/// Why a call stopped: normal ones (calling a tool, done talking) aren't written, others are put into words; unknown ones
+/// are written as is
 fn stop_why(stop: &str) -> Option<String> {
     Some(match stop {
         "" | "tool_use" | "end_turn" | "stop_sequence" | "pause_turn" => return None,
@@ -814,7 +834,7 @@ pub(crate) fn detail(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
                 out.push(blank());
                 let st = if n.state == St::Ok { Style::new() } else { Style::new().fg(theme::pal().red) };
                 match &io.read {
-                    // 读到的文件内容:带行号、上色,后面跟的提示不要
+                    // File content read: with line numbers, colored, without the hint that follows it
                     Some((path, rows)) => {
                         let cap = crate::trace::OUT_LINES;
                         out.push(heading(&if rows.len() > cap {
@@ -838,9 +858,9 @@ pub(crate) fn detail(t: &Trace, i: usize, live: bool, now: i64) -> Vec<Para> {
     out
 }
 
-// ---------- e:用编辑器看 ----------
+// ---------- e: view in the editor ----------
 
-/// 围住一段的反引号:比里面最长的一串多一个(至少 3 个)
+/// The backticks fencing a block: one more than the longest run inside (at least 3)
 pub(crate) fn fenced(lang: &str, body: &str) -> String {
     let (mut run, mut longest) = (0, 0);
     for c in body.chars() {
@@ -851,7 +871,8 @@ pub(crate) fn fenced(lang: &str, body: &str) -> String {
     format!("{f}{lang}\n{}\n{f}\n\n", body.trim_end_matches('\n'))
 }
 
-/// 改动写成 diff(编辑器按 diff 上色),每处开头写从第几行起;几个文件的,每个文件前面写 --- 路径
+/// Changes written as a diff (the editor colors it as diff), each hunk starting with the line it starts at; with several
+/// files, --- path before each file
 fn diff_text(t: &Trace, edits: &[(String, Vec<Change>)]) -> String {
     let mut out = String::new();
     for (path, ch) in edits {
@@ -877,7 +898,8 @@ fn diff_text(t: &Trace, edits: &[(String, Vec<Change>)]) -> String {
     out
 }
 
-/// 一个工具写成 Markdown:标题(名字 · 摘要 · 耗时 · 状态)、命令 / 输入、改动、输出(全部,不截)
+/// One tool written as Markdown: heading (name · summary · duration · state), command / input, changes, output (all of
+/// it, not cut)
 fn tool_md(t: &Trace, i: usize, level: &str, live: bool, now: i64) -> String {
     let n = &t.nodes[i];
     let running = t.running(i, live);
@@ -918,7 +940,7 @@ fn tool_md(t: &Trace, i: usize, level: &str, live: bool, now: i64) -> String {
     }
     if let Some(sub) = t.sub_of(i) {
         let turns: Vec<usize> = sub.t.roots.iter().copied().filter(|&r| sub.t.nodes[r].kind == Kind::Turn).collect();
-        // 子代理的每一轮,标题降一级
+        // Each of the subagent's turns, headings one level down
         for r in turns {
             s += &format!("\n{}", turn_md(&sub.t, r, t.sub_live(i, live, now), now)).replace("\n#", &format!("\n{level}#"));
         }
@@ -926,7 +948,7 @@ fn tool_md(t: &Trace, i: usize, level: &str, live: bool, now: i64) -> String {
     s
 }
 
-/// 一次调用写成 Markdown:数字、想的(引用)、说的、调的工具
+/// One call written as Markdown: numbers, what was thought (quoted), what was said, the tools called
 fn call_md(t: &Trace, i: usize, level: &str, live: bool, now: i64) -> String {
     let n = &t.nodes[i];
     let mut s = format!("{level} {} · {}\n\n", crate::trace::where_of(t, i), call_numbers(t, i));
@@ -945,7 +967,7 @@ fn call_md(t: &Trace, i: usize, level: &str, live: bool, now: i64) -> String {
     s
 }
 
-/// 一轮写成 Markdown:头、你说的、每次调用(想的、说的、工具)、出错
+/// One turn written as Markdown: heading, what you said, each call (thought, said, tools), errors
 fn turn_md(t: &Trace, i: usize, live: bool, now: i64) -> String {
     let n = &t.nodes[i];
     let head: Vec<String> = turn_head(t, i, live, now).iter().map(|p| crate::ansi::plain(&p.body)).collect();
@@ -967,8 +989,8 @@ fn turn_md(t: &Trace, i: usize, live: bool, now: i64) -> String {
     s
 }
 
-/// e 看什么:读 / 改文件的工具看那个文件本身(停在读的 / 改的那一行;文件不在了才看记录里的);
-/// 别的写成一份 Markdown(一轮、一次调用、一个工具的全部,输出不截)
+/// What e shows: for a tool that reads / changes a file, the file itself (at the line read / changed; what the record has
+/// only if the file is gone); everything else is written as Markdown (all of a turn, a call, a tool, output not cut)
 pub(crate) fn view(t: &Trace, i: usize, live: bool, now: i64) -> Option<View> {
     let n = &t.nodes[i];
     let text = |text: String| Some(View::Text { text, ext: "md".into(), line: 1 });

@@ -5,7 +5,7 @@ api = 1
 description = "每轮结束后,在会话行上显示改动统计;在弹窗中查看 diff"
 description_en = "After each turn, put a summary of the changes on the session's row; see the diff in a popup."
 
-# 一轮跑完:数一下工作区的改动,挂到会话行上(列表里的 [git …])
+# A turn finished: count the changes in the working tree and attach them to the session row ([git …] in the list)
 [[events]]
 on = "turn.done"
 command = ["sh", "stat.sh"]

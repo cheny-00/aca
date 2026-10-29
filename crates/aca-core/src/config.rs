@@ -1,61 +1,73 @@
-//! `~/.config/aca/config.toml`:账号和工具。都是可选的,一个字不写也能用(claude / codex 用各自默认的配置目录)。
+//! `~/.config/aca/config.toml`: accounts and tools. All optional; it works with nothing written at all (claude / codex use their
+//! own default configuration directories).
 //!
 //! ```toml
-//! [accounts.claude]            # 账号 = 起它时多带的那几样,用它自己的词写。只换配置目录的写一个字符串就行
+//! [accounts.claude]            # account = the extra things added when starting it, in the tool's own terms.
+//!                              # A string just changes the configuration directory
 //! work = "~/.claude-work"
 //! personal = "~/.claude-personal"
 //! bedrock = { env = { CLAUDE_CODE_USE_BEDROCK = "1", AWS_PROFILE = "work" } }
 //!
 //! [accounts.codex]
 //! work = "~/.codex-work"
-//! team = { home = "~/.codex2", args = ["--profile", "team"] } # 目录之外还要带参数
-//! api = { env_file = "~/.secrets/openai.env" }                # 不换目录,只换 key
+//! team = { home = "~/.codex2", args = ["--profile", "team"] } # arguments on top of the directory
+//! api = { env_file = "~/.secrets/openai.env" }                # same directory, different key
 //!
-//! [tools.claude]               # 内置工具的默认值
-//! account = "work"             # 没指定账号时用哪个
+//! [tools.claude]               # defaults for a built-in tool
+//! account = "work"             # the account used when none is named
 //! args = ["--dangerously-skip-permissions"]
-//! mod = true                   # 起它时带上 aca 的 mod:订阅额度不靠状态栏(不写就不带;接口还早,见 agent/claude_mod.rs)
+//! mod = true                   # start it with aca's mod: limits without the status bar
+//!                              # (off when unset; the API is early, see agent/claude_mod.rs)
 //!
-//! [tools.ccx]                  # 自己起名字的工具:`aca new ccx`
-//! kind = "claude"              # 按内置的哪一家起、接 hook(claude / codex / pi / opencode / shell)
-//! cmd = ["claude"]             # 不写就是那一家的命令
+//! [tools.ccx]                  # a tool you name yourself: `aca new ccx`
+//! kind = "claude"              # which built-in tool it starts as and takes hooks from (claude / codex / pi / opencode / shell)
+//! cmd = ["claude"]             # unset = that tool's command
 //! args = ["--model", "opus"]
 //! account = "personal"
-//! env = { ANTHROPIC_BASE_URL = "https://…" }   # 起的时候加的环境变量,哪种工具都能写
+//! env = { ANTHROPIC_BASE_URL = "https://…" }   # environment variables added at start; any kind of tool can have them
 //!
 //! [tools.codex]
-//! hook_trust = "bypass"        # 不写:Codex 每个账号问一次「Hooks need review」,点「Trust all」之后不再问
+//! hook_trust = "bypass"        # unset: Codex asks "Hooks need review" once per account, and stops asking after "Trust all"
 //!
-//! [inbox]                      # 会话之间递话
-//! notify = ["done", "failed"]  # worker 在哪些事上通知派它的那个;all = 都要,不写 = 都不通知
+//! [inbox]                      # passing messages between sessions
+//! notify = ["done", "failed"]  # which events a worker tells the session that delegated it about; all = every one, unset = none
 //!
 //! [trust]
-//! folder = true                # 起会话时替你答「信不信任这个目录」(Claude、Codex 头一回进一个目录都问);不写 = 不替你答
+//! folder = true                # answer "do you trust this folder?" for you when a session starts (Claude and Codex both ask the
+//!                              # first time in a folder); unset = don't answer for you
 //!
-//! [idle]                       # 闲着的会话
-//! stop_after = "3h"            # 空闲这么久就停掉(agent 退出,窗格留着,列表里标 ☾;⏎ / aca start 接着原来的对话再起)。
-//!                              # 写成 30m、3h、1d、1h30m;never 或不写 = 不自动停。aca 界面开着时每 5 分钟看一次;
-//!                              # 这一轮没跑完的、有人连着的、有后台任务的等等不停(见 session::stop_idle)
-//! remove_after = "30d"         # 停着(■ ☾,连归档的)这么久没动就删掉,和 d 一样进回收站,1 天内 b 拿回来。
-//!                              # never 或不写 = 不删。置顶的、有便签的不删(见 aca-tui 的 `App::stale`)
+//! [idle]                       # idle sessions
+//! stop_after = "3h"            # stop after idle this long (the agent exits, the pane stays, marked ☾ in the list;
+//!                              # ⏎ / aca start resumes). Write 30m, 3h, 1d, 1h30m; never or unset = no auto-stop.
+//!                              # Checked every 5 minutes while the aca interface is open; not stopped: mid-turn,
+//!                              # someone attached, background tasks running, etc. (see session::stop_idle)
+//! remove_after = "30d"         # delete after stopped (■ ☾, archived ones too) and untouched this long; into the trash
+//!                              # like d, b brings it back within a day. never or unset = keep. Pinned ones and ones
+//!                              # with a note are kept (see aca-tui's `App::stale`)
 //!
-//! [keys]                       # aca 自己绑在 tmux 上的键(不用前缀,只在 aca 的会话里拦;不写进你的 tmux.conf)
-//! next = "C-M-n"               # 进下一个在等你的会话(`aca next`)。不写就是它;"" = 不绑
+//! [keys]                       # keys aca binds in tmux itself (no prefix, only caught in aca's sessions;
+//!                              # nothing written to your tmux.conf)
+//! next = "C-M-n"               # go to the next session that needs you (`aca next`). This is the default; "" = unbound
 //!
-//! [login]                      # aca 起的登录(账号页的 ⏎、aca run … login):不替你开默认浏览器,链接弹出来挑
+//! [login]                      # logins aca starts (⏎ on the accounts page, aca run … login): no default browser
+//!                              # opened for you, the link pops up to pick from
 //! browsers = ["Firefox", { name = "Chrome 工作", cmd = ["google-chrome", "--profile-directory=Profile 1"] }]
-//!                              # 不写:自动找(Mac 看 .app,Linux 看 .desktop)。字符串:Mac 上是 App 的名字,Linux 上是命令;
-//!                              # 表:名字 + 命令,链接接在最后(参数里写 {url} 就换在那)
-//! remote = "auto"              # 当不当远程(远程:不列浏览器,换成在别的设备上登得完的):auto 看 SSH、Linux 有没有图形界面;yes / no 定死
+//!                              # unset: found automatically (.app on Mac, .desktop on Linux). A string: the App's
+//!                              # name on Mac, a command on Linux; a table: name + command, the link goes last
+//!                              # (or wherever {url} is in the arguments)
+//! remote = "auto"              # whether to act as remote (no browsers listed, a login finishable on another device):
+//!                              # auto looks at SSH and whether Linux has a GUI; yes / no fixes it
 //!
-//! [tools.aider]                # 不写 kind、名字也不是内置的:声明式工具,下面几项告诉 aca 怎么对待它(见 agent/declared.rs)
-//! cmd = ["aider"]              # 不写就是工具名
-//! home_var = "AIDER_HOME"      # 账号的 home 交给哪个环境变量;不写的话账号里只能用 env / args
-//! resume = ["--session", "{conv}"]   # 接着对话怎么起;{conv} 换成对话 id(id 由 hook 报上来)
+//! [tools.aider]                # no kind and not a built-in name: a declared tool; the keys below tell aca
+//!                              # how to treat it (see agent/declared.rs)
+//! cmd = ["aider"]              # unset = the tool name
+//! home_var = "AIDER_HOME"      # which environment variable gets the account's home; unset = accounts can only use env / args
+//! resume = ["--session", "{conv}"]   # how to start it resuming a conversation; {conv} becomes the conversation id
+//!                                    # (the hook reports the id)
 //! fork = ["--fork", "{conv}"]
-//! busy = ['Working\.\.\.']     # 屏幕上出现就算在跑(正则)
-//! ask = ['\(y/n\)']            # 屏幕上出现就算在等你(正则)
-//! title = "pane"               # 标题取窗格标题;不写就只用 hook 报的
+//! busy = ['Working\.\.\.']     # running when this shows on the screen (regex)
+//! ask = ['\(y/n\)']            # needs you when this shows on the screen (regex)
+//! title = "pane"               # the title comes from the pane title; unset = only what the hook reports
 //! ```
 
 use std::collections::BTreeMap;
@@ -67,53 +79,56 @@ use crate::{agent, paths};
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Tool {
-    /// 内置的哪一家;空 = 声明式工具
+    /// Which built-in tool; empty = a declared tool
     pub kind: String,
     pub cmd: Vec<String>,
     pub args: Vec<String>,
     pub account: String,
     pub env: BTreeMap<String, String>,
-    /// Codex:`"bypass"` = 启动时加 `--dangerously-bypass-hook-trust`,不让它问「Hooks need review」
+    /// Codex: `"bypass"` = add `--dangerously-bypass-hook-trust` at start, so it doesn't ask "Hooks need review"
     pub hook_trust: String,
-    /// Claude:`true` = 起它时带上 aca 的 mod(`--plugin-dir`),订阅额度从它那来、不靠状态栏。见 agent/claude_mod.rs
+    /// Claude: `true` = start it with aca's mod (`--plugin-dir`); limits come from the mod, not the status bar. See agent/claude_mod.rs
     #[serde(rename = "mod")]
     pub mods: bool,
-    // 下面几项只给声明式工具用;内置的几家各有各的办法,写了也不看
+    // The keys below are only for declared tools; the built-in tools each have their own way and ignore them
     pub home_var: String,
     pub resume: Vec<String>,
     pub fork: Vec<String>,
     pub busy: Vec<String>,
     pub ask: Vec<String>,
     pub title: String,
-    /// 这一次启动要带上的、开着的 aca 插件给这一家的插件目录(见 [`crate::plugin::agent_dirs`])。启动时填,配置文件里不写
+    /// The plugin directories for this tool from the enabled aca plugins, passed at this start (see [`crate::plugin::agent_dirs`]). Filled
+    /// at start, not written in the config file
     #[serde(skip)]
     pub plugin_dirs: Vec<String>,
-    /// 这一次启动要直接挂的 MCP 服务(见 [`crate::plugin::mount`]):(名字, 交给 aca 的参数)。启动时填
+    /// MCP servers mounted directly for this start (see [`crate::plugin::mount`]): (name, arguments handed to aca). Filled at start
     #[serde(skip)]
     pub mcp: Vec<(String, Vec<String>)>,
-    /// Codex:这一次要打开的 aca 插件(`-c plugins.<名字>@aca.enabled=true`)。启动时填
+    /// Codex: aca plugins to enable this time (`-c plugins.<name>@aca.enabled=true`). Filled at start
     #[serde(skip)]
     pub codex_plugins: Vec<String>,
 }
 
-/// 账号:起 agent 时在工具上面再叠的一层。认证是 harness 自己的事(它的配置目录、它的 login、它的 key),
-/// aca 只负责每次都把这几样原样带上,不知道也不管里面是订阅、API key 还是 Codex 的 profile
+/// Account: one more layer on top of the tool when starting an agent. Authentication is the harness's own business (its config
+/// directory, its login, its key); aca just passes these along as they are every time, without knowing or caring whether it's a
+/// subscription, an API key or a Codex profile
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(from = "AccountDef")]
 pub struct Account {
-    /// 配置目录(完整路径):交给这一家认的那个环境变量(`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / 声明式工具的 `home_var`)
+    /// Configuration directory (full path): passed in the environment variable this tool reads (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` /
+    /// a declared tool's `home_var`)
     pub home: String,
     pub env: BTreeMap<String, String>,
-    /// 一行一个 `KEY=值` 的文件,每次启动时现读(放 key 的地方;aca 不存里面的东西)
+    /// A file with one `KEY=value` per line, read fresh at each start (where the key lives; aca doesn't store its contents)
     pub env_file: String,
-    /// 每次都带的参数,比如 Codex 的 `--profile team`
+    /// Arguments added every time, such as Codex's `--profile team`
     pub args: Vec<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum AccountDef {
-    /// 简写:只换配置目录
+    /// Shorthand: only changes the configuration directory
     Dir(String),
     Layer(Layer),
 }
@@ -136,7 +151,7 @@ impl From<AccountDef> for Account {
     }
 }
 
-/// 配置里写的目录:展开 ~,末尾的 / 去掉
+/// A directory written in the config: ~ expanded, trailing / removed
 pub(crate) fn dir(p: &str) -> String {
     let d = paths::expand(p.trim());
     if d.len() > 1 { d.trim_end_matches('/').to_string() } else { d }
@@ -145,7 +160,7 @@ pub(crate) fn dir(p: &str) -> String {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
-    /// 哪一家 → 账号名 → 那一层
+    /// tool → account name → that layer
     pub accounts: BTreeMap<String, BTreeMap<String, Account>>,
     pub tools: BTreeMap<String, Tool>,
     pub inbox: Inbox,
@@ -157,34 +172,34 @@ pub struct Config {
     pub idle: Idle,
 }
 
-/// `[idle]`:闲着的会话(见 [`crate::session::stop_idle`])
+/// `[idle]`: idle sessions (see [`crate::session::stop_idle`])
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Idle {
-    /// 空闲这么久就停掉;原样留着,用的时候由 [`Idle::stop_after`] 认
+    /// Stop after idle this long; kept as written, read by [`Idle::stop_after`] when used
     pub stop_after: Option<toml::Value>,
-    /// 停着这么久没动就删掉(进回收站);原样留着,用的时候由 [`Idle::remove_after`] 认
+    /// Delete after stopped and untouched this long (into the trash); kept as written, read by [`Idle::remove_after`] when used
     pub remove_after: Option<toml::Value>,
 }
 
 impl Idle {
-    /// 空闲几秒就停;不自动停 = `Ok(None)`,写得认不出来 = Err 说为什么(这时也不停)
+    /// Seconds idle before stopping; no auto-stop = `Ok(None)`, unreadable = Err saying why (nothing is stopped then either)
     pub fn stop_after(&self) -> Result<Option<u64>, String> {
         after("stop_after", "3h", &self.stop_after)
     }
 
-    /// 停着几秒没动就删;不删 = `Ok(None)`,写得认不出来 = Err 说为什么(这时也不删)
+    /// Seconds stopped and untouched before deleting; never = `Ok(None)`, unreadable = Err saying why (nothing is deleted then either)
     pub fn remove_after(&self) -> Result<Option<u64>, String> {
         after("remove_after", "30d", &self.remove_after)
     }
 
-    /// 两样里第一处写错的
+    /// The first of the two that's written wrong
     fn problem(&self) -> Option<String> {
         self.stop_after().err().or_else(|| self.remove_after().err())
     }
 }
 
-/// `[idle]` 里的一个时长:never、空的、0、不写 = 不做(None);eg 是错了时举的例子
+/// One duration in `[idle]`: never, empty, 0 or unset = don't (None); eg is the example given when it's wrong
 fn after(name: &str, eg: &str, v: &Option<toml::Value>) -> Result<Option<u64>, String> {
     match v {
         None => Ok(None),
@@ -202,7 +217,7 @@ fn after(name: &str, eg: &str, v: &Option<toml::Value>) -> Result<Option<u64>, S
     }
 }
 
-/// 时长:一个或几个「数 + 单位」连着写,单位 s / m / h / d(`90m`、`1h30m`)。空的 = 0;认不出来 = None
+/// Duration: one or more "number + unit" written together, units s / m / h / d (`90m`, `1h30m`). Empty = 0; unreadable = None
 pub fn span(text: &str) -> Option<u64> {
     let (mut total, mut num) = (0u64, None::<u64>);
     for c in text.trim().to_ascii_lowercase().chars() {
@@ -220,20 +235,21 @@ pub fn span(text: &str) -> Option<u64> {
             _ => return None,
         }
     }
-    // 最后一个数没写单位
+    // The last number has no unit
     num.is_none().then_some(total)
 }
 
-/// `[login]`:aca 起的登录,链接怎么交给你(见 `agent::quiet_login`、界面的 browser.rs)
+/// `[login]`: logins aca starts, and how the link reaches you (see `agent::quiet_login` and the interface's browser.rs)
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Login {
-    /// 链接弹出来时列哪些浏览器;不写 = 自动找,写了就只列这些
+    /// Which browsers to list when the link pops up; unset = found automatically, set = only these
     pub browsers: Vec<Browser>,
     pub remote: Remote,
 }
 
-/// 一个浏览器:表上写的名字,和开链接的命令(链接接在最后;参数里写了 `{url}` 就换在那)
+/// One browser: the name shown in the table, and the command that opens the link (the link goes last; or wherever `{url}` is in
+/// the arguments)
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(from = "BrowserDef")]
 pub struct Browser {
@@ -244,7 +260,7 @@ pub struct Browser {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum BrowserDef {
-    /// 简写:Mac 上是 App 的名字(`open -a`),别处是命令
+    /// Shorthand: the App's name on Mac (`open -a`), a command elsewhere
     Short(String),
     Full {
         #[serde(default)]
@@ -255,7 +271,7 @@ enum BrowserDef {
 
 impl From<BrowserDef> for Browser {
     fn from(d: BrowserDef) -> Browser {
-        // 写的是路径时,表上只写文件名(`/opt/x/firefox` → firefox,`/Applications/Arc.app` → Arc)
+        // When it's a path, the table only shows the file name (`/opt/x/firefox` → firefox, `/Applications/Arc.app` → Arc)
         let base = |s: &str| s.trim_end_matches('/').rsplit('/').next().unwrap_or(s).trim_end_matches(".app").to_string();
         match d {
             BrowserDef::Short(s) if cfg!(target_os = "macos") => Browser { name: base(&s), cmd: vec!["open".into(), "-a".into(), s] },
@@ -271,7 +287,7 @@ impl From<BrowserDef> for Browser {
     }
 }
 
-/// `[login] remote`:当不当远程(见 `agent::remote`)。`"auto"`(不写)/ `"yes"` / `"no"`,也认 true / false
+/// `[login] remote`: whether to act as remote (see `agent::remote`). `"auto"` (unset) / `"yes"` / `"no"`; true / false work too
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
 #[serde(try_from = "toml::Value")]
 pub enum Remote {
@@ -298,24 +314,25 @@ impl TryFrom<toml::Value> for Remote {
     }
 }
 
-/// `[login]`、`[idle]` 写错了只当它没写,不连累别的(整个文件写坏才当空的);错在哪由 [`login_problem`]、[`idle_problem_in`] 说
+/// A wrong `[login]` or `[idle]` counts as unset without dragging the rest down (only a broken file as a whole counts as empty);
+/// [`login_problem`] and [`idle_problem_in`] say what's wrong
 fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned + Default>(d: D) -> Result<T, D::Error> {
     Ok(toml::Value::deserialize(d)?.try_into().unwrap_or_default())
 }
 
-/// 不写 `[keys] next` 时的键:Ctrl+Alt+N
+/// The key when `[keys] next` is unset: Ctrl+Alt+N
 pub const NEXT_KEY: &str = "C-M-n";
 
-/// `[keys]`:aca 自己绑在 tmux 上的键,和 Ctrl+Q、插件的热键一个办法(见 [`crate::tmux::bind_hotkeys`])
+/// `[keys]`: keys aca binds in tmux itself, the same way as Ctrl+Q and plugin hotkeys (see [`crate::tmux::bind_hotkeys`])
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Keys {
-    /// 进下一个在等你的会话(`aca next`):tmux 的键名。不写 = [`NEXT_KEY`],`""` = 不绑
+    /// Go to the next session that needs you (`aca next`): a tmux key name. Unset = [`NEXT_KEY`], `""` = unbound
     pub next: Option<String>,
 }
 
 impl Keys {
-    /// 绑哪个键;不要 = `Ok(None)`。写得不能当热键的不绑,Err 说为什么
+    /// Which key to bind; none = `Ok(None)`. One that can't be a hotkey isn't bound, and Err says why
     pub fn next_key(&self) -> Result<Option<String>, String> {
         let k = self.next.as_deref().unwrap_or(NEXT_KEY).trim();
         if k.is_empty() {
@@ -325,21 +342,21 @@ impl Keys {
     }
 }
 
-/// `[trust]`:agent 启动时问的那几道「信不信任」
+/// `[trust]`: the "do you trust …" questions agents ask when they start
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Trust {
-    /// `true` = 起会话之后屏幕上出现「信不信任这个目录」就替你选信任(见 [`crate::trust`])。
-    /// 那个目录自己带的配置(hook、MCP 服务)从此不再问就能跑:只在你自己挑目录的机器上开
+    /// `true` = after a session starts, when "do you trust this folder?" shows on the screen, choose trust for you (see [`crate::trust`]).
+    /// The folder's own configuration (hooks, MCP servers) then runs without asking: only turn it on where you pick the folders yourself
     pub folder: bool,
 }
 
-/// `[inbox]`:会话之间递话
+/// `[inbox]`: passing messages between sessions
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Inbox {
-    /// worker 在哪些事上通知派它的那个:done(跑完一轮)/ failed(出错)/ exited(退出)/ waiting(在等确认)。
-    /// `all` = 四样都要;不写 = 都不通知(不开口就不叫醒谁);`aca new --notify` 给一个会话单独定
+    /// Which events a worker tells the session that delegated it about: done (finished a turn) / failed (error) / exited / waiting
+    /// (waiting for a confirmation). `all` = all four; unset = none (no word, nobody woken); `aca new --notify` sets it per session
     pub notify: Vec<String>,
 }
 
@@ -347,13 +364,13 @@ pub fn load() -> Config {
     std::fs::read_to_string(paths::config_dir().join("config.toml")).map(|t| parse(&t)).unwrap_or_default()
 }
 
-/// config.toml 写坏了的话,坏在哪。[`load`] 不吭声(hook 不能因为它出错),命令行拿这个提醒一句
+/// If config.toml is broken, where. [`load`] stays quiet (hooks mustn't fail because of it); the CLI uses this to mention it
 pub fn problem() -> Option<String> {
     let text = std::fs::read_to_string(paths::config_dir().join("config.toml")).ok()?;
     toml::from_str::<Config>(&text).err().map(|e| e.to_string())
 }
 
-/// `[login]` 写错了的话错在哪:那一节是单独当成没写的(见 [`lenient`]),别的照用
+/// If `[login]` is wrong, what's wrong: that section alone counts as unset (see [`lenient`]), the rest is used as usual
 pub fn login_problem() -> Option<String> {
     login_problem_in(&std::fs::read_to_string(paths::config_dir().join("config.toml")).ok()?)
 }
@@ -363,7 +380,7 @@ pub fn login_problem_in(text: &str) -> Option<String> {
     login.try_into::<Login>().err().map(|e| e.to_string().trim().to_string())
 }
 
-/// `[idle]` 写错了的话错在哪(这时不自动停)
+/// If `[idle]` is wrong, what's wrong (no auto-stop then)
 pub fn idle_problem() -> Option<String> {
     idle_problem_in(&std::fs::read_to_string(paths::config_dir().join("config.toml")).ok()?)
 }
@@ -376,14 +393,14 @@ pub fn idle_problem_in(text: &str) -> Option<String> {
     }
 }
 
-/// 写坏了的配置当成没写:建会话、hook 都不该因为它起不来
+/// A broken config counts as empty: neither creating sessions nor hooks should fail because of it
 pub fn parse(text: &str) -> Config {
     toml::from_str(text).unwrap_or_default()
 }
 
 impl Config {
-    /// 工具名对应的定义;内置的几家没写也有。名字就是内置的那家、又没写 kind 的,kind 就是它;
-    /// 别的名字没写 kind 的是声明式工具,kind 留空
+    /// The definition for a tool name; the built-in tools have one even when unset. A built-in name with no kind gets itself as kind;
+    /// other names with no kind are declared tools, and kind stays empty
     pub fn tool(&self, name: &str) -> Option<Tool> {
         let builtin = agent::builtin(name).is_some();
         let mut t = self.tools.get(name).cloned().or_else(|| builtin.then(Tool::default))?;
@@ -393,12 +410,12 @@ impl Config {
         Some(t)
     }
 
-    /// 登记过的账号;没有 = None
+    /// A registered account; none = None
     pub fn account(&self, kind: &str, name: &str) -> Option<&Account> {
         self.accounts.get(kind)?.get(name)
     }
 
-    /// `n` 的菜单 / `aca new` 认的名字:工具,和「工具:账号」
+    /// The names the `n` menu / `aca new` accept: tools, and "tool:account"
     pub fn names(&self) -> Vec<String> {
         let mut v: Vec<String> = agent::kinds().map(String::from).collect();
         v.extend(self.tools.keys().filter(|k| agent::builtin(k).is_none()).cloned());
@@ -430,7 +447,7 @@ mod tests {
         assert!(c.account("claude", "sub").unwrap().home.ends_with("/.claude-subscription"));
         assert!(c.account("claude", "nope").is_none());
         assert_eq!(c.names(), ["claude", "codex", "pi", "opencode", "shell", "ccx", "claude:sub"]);
-        // 写坏了不炸
+        // A broken file doesn't blow up
         assert_eq!(parse("[accounts\nx"), Config::default());
     }
 
@@ -451,7 +468,7 @@ mod tests {
         );
         let t = c.tool("aider").unwrap();
         assert_eq!((t.kind.as_str(), t.resume.len(), t.busy[0].as_str(), t.env["A"].as_str()), ("", 2, r"Working\.\.\.", "1"));
-        // 内置的那几家写了别的项,kind 还是它自己
+        // A built-in tool with other keys set still has itself as kind
         assert_eq!((c.tool("claude").unwrap().kind.as_str(), c.tool("claude").unwrap().env["B"].as_str()), ("claude", "2"));
         assert_eq!(c.names(), ["claude", "codex", "pi", "opencode", "shell", "aider"]);
     }
@@ -469,7 +486,7 @@ mod tests {
             (labs.home.as_str(), labs.args.as_slice()),
             (format!("{home}/.labs").as_str(), ["--profile".to_string(), "labs".to_string()].as_slice())
         );
-        // 不换目录的账号:home 是空的
+        // An account that keeps the directory: home is empty
         let api = c.account("codex", "api").unwrap();
         assert_eq!(
             (api.home.as_str(), api.env_file.as_str(), api.env["OPENAI_BASE_URL"].as_str()),
@@ -487,19 +504,19 @@ mod tests {
         );
         assert_eq!(c.login.remote, Remote::No);
         let b = &c.login.browsers;
-        // 字符串:Mac 上是 App 的名字,别处是命令
+        // A string: the App's name on Mac, a command elsewhere
         let firefox = if cfg!(target_os = "macos") { vec!["open", "-a", "Firefox"] } else { vec!["Firefox"] };
         assert_eq!((b[0].name.as_str(), b[0].cmd.iter().map(String::as_str).collect::<Vec<_>>()), ("Firefox", firefox));
         assert_eq!(b[1], Browser { name: "Chrome 工作".into(), cmd: vec!["google-chrome".into(), "--profile-directory=Profile 1".into()] });
-        // 不写名字:命令的文件名;~ 展开
+        // No name: the command's file name; ~ expanded
         assert_eq!(b[2].name, "zen");
         assert!(b[2].cmd[0].ends_with("/bin/zen") && !b[2].cmd[0].starts_with('~'));
-        // 简写成路径:表上也只写文件名
+        // Shorthand as a path: the table also shows only the file name
         let b = parse("[login]\nbrowsers = [\"/opt/x/work-chrome\", \"/Applications/Arc.app\"]\n").login.browsers;
         assert_eq!((b[0].name.as_str(), b[1].name.as_str()), ("work-chrome", "Arc"));
         assert_eq!(parse("[login]\nremote = true\n").login.remote, Remote::Yes);
         assert_eq!(parse("[login]\nremote = \"auto\"\n").login.remote, Remote::Auto);
-        // 写错了:只有 [login] 当没写,账号照用;错在哪说得出来
+        // Written wrong: only [login] counts as unset, accounts are used as usual; it can say what's wrong
         let c = parse("[accounts.claude]\nsub = \"~/.cs\"\n[login]\nremote = \"maybe\"\nbrowsers = [\"Firefox\"]\n");
         assert!(c.account("claude", "sub").is_some() && c.login == Login::default());
         assert!(login_problem_in("[login]\nremote = \"maybe\"\n").is_some_and(|e| e.contains("auto / yes / no")));
@@ -516,9 +533,9 @@ mod tests {
         assert_eq!(parse("[idle]\nstop_after = \"\"\n").idle.stop_after(), Ok(None));
         assert_eq!(parse("[idle]\nstop_after = \"0m\"\n").idle.stop_after(), Ok(None));
         assert_eq!((span("2d"), span("45s"), span("90m")), (Some(172800), Some(45), Some(5400)));
-        // 最后一个数没单位、别的字、单位前没数:都不认
+        // Not accepted: a last number with no unit, other words, a unit with no number before it
         assert_eq!((span("3"), span("3h20"), span("3 小时"), span("h"), span("99999999999999999999d")), (None, None, None, None, None));
-        // 写错了:不自动停,说得出错在哪;别的照用
+        // Written wrong: no auto-stop, it can say what's wrong; the rest is used as usual
         let c = parse("[accounts.claude]\nsub = \"~/.cs\"\n[idle]\nstop_after = 180\n");
         assert!(c.account("claude", "sub").is_some() && c.idle.stop_after().is_err());
         assert!(idle_problem_in("[idle]\nstop_after = 180\n").is_some_and(|e| e.contains("\"3h\"")));
@@ -537,7 +554,7 @@ mod tests {
         assert_eq!(idle("").remove_after(), Ok(None));
         assert_eq!(idle("remove_after = \"30d\"").remove_after(), Ok(Some(30 * 86400)));
         assert_eq!(idle_problem_in("[idle]\nstop_after = \"never\"\nremove_after = \"never\"\n"), None);
-        // 写错的那一样说得出是哪个;另一样照用
+        // It can say which of the two is wrong; the other is used as usual
         let i = idle("stop_after = \"1d\"\nremove_after = \"一个月\"");
         assert_eq!(i.stop_after(), Ok(Some(86400)));
         assert!(i.remove_after().is_err());

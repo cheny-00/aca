@@ -1,17 +1,23 @@
-//! 账号页:`^S` → `a`;`n` 菜单里按 `+` 也到这(直接进加账号)。
+//! Accounts page: `^S` → `a`; `+` in the `n` menu also lands here (straight into adding an account).
 //!
-//! 和插件页一样是大小固定的大弹窗:左边一栏是登记的账号,分成 Claude Code、Codex 两段,一行「名字  登录着没有」
-//! (问的是工具自己,见 accounts.rs 的 `login`);右边一栏是高亮那个账号的整页 —— 配置目录、登录的是谁、额度(同 `n` 菜单)、
-//! 状态栏现在用谁的、启动参数;有会话在用、是默认账号、`n` 菜单里不显示的才写;目录不在、目录其实是另一家的在这说怎么办。
-//! 段头(Claude Code、Codex)也能高亮:右边是这一家每个账号都带的启动参数(`[tools.<家>] args`);
-//! 这一家没登记账号的,还有不登记时用的那个目录登录着没有。没登记账号、装着的那家也列段头。
-//! 窄屏(手机)上两栏上下叠。加账号的表单、删之前的确认也在右边那一栏,框不跟着变。
+//! Like the plugins page it's a big fixed-size popup: the left column lists the registered accounts in two sections, Claude Code
+//! and Codex, one row each: "name  logged in or not" (asked of the tool itself, see `login` in accounts.rs); the right column is
+//! the highlighted account's whole page — config directory, who's logged in, quota (same as the `n` menu), whose status bar is in
+//! use now, launch args; sessions using it, being the default account, or being hidden from the `n` menu are written only when
+//! so; a missing directory, or one that actually belongs to the other tool, gets told what to do here.
+//! Section headers (Claude Code, Codex) can be highlighted too: the right side shows the launch args every account of that tool
+//! gets (`[tools.<tool>] args`); for a tool with no registered accounts, also whether the directory used without one is logged
+//! in. A tool that's installed but has no registered accounts still gets a section header.
+//! On a narrow screen (phone) the two columns stack. The add-account form and the confirm-before-remove also sit in the right
+//! column; the frame doesn't change.
 //!
-//! ⏎ 登录(下半屏开终端跑工具自己的登录)· `+` 加 · `d` 删(先说清动什么、谁在用,y 才删;只去掉登记那一行,目录不动)·
-//! ⇧↑ ⇧↓ 挪顺序(就是 `n` 菜单的顺序,记在 `[ui] menu`)· `p` 改启动参数(就在右边那一栏里改):账号上改它自己的,
-//! 存进它在 config.toml 的那一行;段头上改这一家每个账号都带的 · `s` 各账号的状态栏(setup.rs 的表)· `r` 重新问一遍登录、额度。
+//! ⏎ log in (opens a terminal in the bottom half running the tool's own login) · `+` add · `d` remove (first says what it
+//! touches and who uses it; only y removes; it drops just the registry line, the directory stays) ·
+//! ⇧↑ ⇧↓ reorder (that's the `n` menu order, kept in `[ui] menu`) · `p` edit launch args (right in the right column): on an
+//! account, its own, saved to its line in config.toml; on a section header, those every account of the tool gets ·
+//! `s` each account's status bar (the table in setup.rs) · `r` ask again for logins and quotas.
 //!
-//! [`Form`] 是加账号填的三步(哪个工具 → 名字 → 配置目录),`aca setup` 的表也用它。
+//! [`Form`] is the three steps of adding an account (which tool → name → config directory); the `aca setup` table uses it too.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +38,7 @@ use crate::theme;
 use crate::ui::{TermReq, agent_style};
 use crate::usage::Quota;
 
-/// 表头、表单里写哪一家:它的颜色、粗体(一眼分得出是 Claude Code 还是 Codex)
+/// Which tool, in headers and forms: its color, bold (Claude Code vs Codex at a glance)
 pub(crate) fn who_span(a: Agent) -> Span<'static> {
     Span::styled(accounts::who(a), agent_style(a).add_modifier(Modifier::BOLD))
 }
@@ -44,26 +50,27 @@ enum Step {
     Dir,
 }
 
-/// 加账号填的三步。哪个工具单独一步、摆成两行来挑:原来是名字那一步按 Tab 换、只差标题上一个词,
-/// 容易把 Codex 的目录登记成 Claude 的账号
+/// The three steps of adding an account. Which tool is its own step, picked from two rows: it used to be a Tab on the name
+/// step, differing by just one word in the title, which made it easy to register a Codex directory as a Claude account
 #[derive(Clone, Debug)]
 pub(crate) struct Form {
     step: Step,
     pub agent: Agent,
-    /// 名字那一步过了才有
+    /// Set once the name step is done
     pub name: String,
-    /// 输入框里的字:名字那一步是名字,目录那一步是目录
+    /// Text in the input box: the name on the name step, the directory on the directory step
     pub text: String,
     pub hint: String,
 }
 
-/// 表单按完一个键
+/// What one key did to the form
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Went {
     Stay,
-    /// 第一步上按了 Esc:不加了
+    /// Esc on the first step: not adding after all
     Left,
-    /// 目录填完按了回车:`agent` / `name` / `text` 交给开它的那一页核对、去办;不行就写 `hint`,表单留着
+    /// Enter after the directory: `agent` / `name` / `text` go to the page that opened the form to check and carry out; if that
+    /// fails it writes `hint` and the form stays
     Filled,
 }
 
@@ -72,12 +79,12 @@ impl Form {
         Form { step: Step::Tool, agent: Agent::Claude, name: String::new(), text: String::new(), hint: String::new() }
     }
 
-    /// 在打字(挑工具那一步不算:那时 j / k 是挑)
+    /// Typing (not on the tool step: there j / k pick)
     pub fn typing(&self) -> bool {
         self.step != Step::Tool
     }
 
-    /// `taken`:这一家里已经有这个名字了
+    /// `taken`: this tool already has an account by that name
     pub fn key(&mut self, k: KeyEvent, taken: impl Fn(Agent, &str) -> bool) -> Went {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if self.step == Step::Tool {
@@ -91,7 +98,7 @@ impl Form {
             return Went::Stay;
         }
         match k.code {
-            // 退一步:目录 → 名字 → 哪个工具
+            // Back one step: directory → name → which tool
             KeyCode::Esc => {
                 if self.step == Step::Dir {
                     (self.step, self.text) = (Step::Name, std::mem::take(&mut self.name));
@@ -132,7 +139,7 @@ impl Form {
         self.agent = if self.agent == Agent::Codex { Agent::Claude } else { Agent::Codex };
     }
 
-    /// `done`:目录那一步回车写的是什么(「加上」/「列进表里」)
+    /// `done`: what Enter on the directory step is labeled ("add" / "add to the table")
     pub fn lines(&self, w: usize, done: &str) -> Vec<Line<'static>> {
         let bold = theme::accent().add_modifier(Modifier::BOLD);
         if self.step == Step::Tool {
@@ -182,54 +189,55 @@ impl Form {
     }
 }
 
-/// 读写的那几处(测试里换成临时目录、假的登录)
+/// Where it reads and writes (tests swap in temp directories and fake logins)
 #[derive(Clone)]
 pub struct Env {
     pub config: PathBuf,
     pub home: String,
-    /// 问工具这个账号登录着没有
+    /// Ask the tool whether this account is logged in
     pub ask: fn(Agent, &str) -> Login,
-    /// 放到后台问、问到了下一帧就显示(界面里);测试里当场问
+    /// Ask in the background and show the answer on the next frame (in the UI); tests ask on the spot
     pub background: bool,
-    /// 登录链接交到这个目录里的文件(见 `aca_core::agent::LOGIN_LINK`)
+    /// Login links are handed over through files in this directory (see `aca_core::agent::LOGIN_LINK`)
     pub links: PathBuf,
-    /// 人不在这台机器跟前(`aca_core::agent::remote`):Claude 也不交链接,从屏幕上认
+    /// The user isn't at this machine (`aca_core::agent::remote`): Claude doesn't hand over a link either; it's read off the screen
     pub remote: bool,
-    /// 这个程序装了没有(一个都没登记时,列装着的那家自己的)
+    /// Whether this program is installed (with no accounts registered, the installed tool's own one is listed)
     pub installed: fn(&str) -> bool,
-    /// 各账号的订阅额度(Claude 的是状态栏 / mod 记下的,Codex 的读它最近的对话记录);和登录一样放到后台拿
+    /// Each account's subscription quota (Claude's as recorded by the status bar / mod, Codex's read from its latest transcript);
+    /// fetched in the background, like logins
     pub quotas: fn() -> Vec<Quota>,
 }
 
-/// 登记着的一个会话:哪一家、用的账号、标题
+/// A registered session: which tool, the account it uses, its title
 pub(crate) type Use = (Agent, String, String);
 
 struct Row {
     a: Account,
-    /// 配置目录在(不换目录的也算在)
+    /// The config directory exists (an account that doesn't switch directories counts as existing)
     there: bool,
-    /// 目录是另一家的:哪一家、凭什么这么说
+    /// The directory belongs to the other tool: which one, and why we think so
     foreign: Option<(Agent, String)>,
-    /// 在用它的会话的标题
+    /// Titles of the sessions using it
     used: Vec<String>,
-    /// 哪些工具不写账号时用它
+    /// Tools that use it when no account is given
     default_of: Vec<String>,
-    /// `n` 菜单里列着(藏着的 `[ui] hide` 不算)
+    /// Listed in the `n` menu (hidden ones in `[ui] hide` don't count)
     in_menu: bool,
-    /// Claude 的、目录没毛病的:状态栏现在用谁的,aca 记不记得到额度
+    /// Claude accounts with a sound directory: whose status bar is in use now, and whether aca gets to record the quota
     bar: Option<(&'static str, bool)>,
-    /// 账号自己的启动参数(`[accounts.<家>] 名 = { args = […] }`)
+    /// The account's own launch args (`[accounts.<tool>] <name> = { args = […] }`)
     args: Vec<String>,
 }
 
-/// 列着段头的一家
+/// A tool listed with a section header
 struct Fam {
     agent: Agent,
-    /// 这一家每个账号都带的启动参数(`[tools.<家>] args`),起的时候排在账号自己的前面
+    /// Launch args every account of this tool gets (`[tools.<tool>] args`); at launch they go before the account's own
     args: Vec<String>,
 }
 
-/// 左边那一栏里能高亮的一项:一家的段头,或一个账号(`rows` 里第几个)
+/// Something in the left column that can be highlighted: a tool's section header, or an account (index into `rows`)
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Item {
     Head(Agent),
@@ -241,28 +249,29 @@ impl Row {
         format!("{}:{}", accounts::fam(self.a.agent).unwrap_or("claude"), self.a.name)
     }
 
-    /// 问得了登录:目录在、是它自己这一家的(不在的目录一问会被建出来,另一家的目录里不该跑它)
+    /// Login can be asked: the directory exists and belongs to its own tool (asking about a missing directory would create it; it
+    /// shouldn't run in the other tool's directory)
     fn askable(&self) -> bool {
         self.there && self.foreign.is_none()
     }
 }
 
-/// 右边那一栏在问的事,等 y
+/// What the right column is asking, waiting for y
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Asking {
-    /// 按过 d:删这条登记
+    /// Pressed d: remove this registration
     Remove,
-    /// 在登录着的账号上按了 ⏎:重新登录。工具的登录一开始,原来那份就没了(Codex 0.162 实测:`codex login` 一启动就删
-    /// auth.json,浏览器里没登完就是没登录),所以先问
+    /// ⏎ on a logged-in account: log in again. Once the tool's login starts, the old login is gone (tested on Codex 0.162:
+    /// `codex login` deletes auth.json as soon as it starts, so not finishing in the browser means logged out), hence asking first
     Relogin,
 }
 
-/// 不登记时那一家自己的,登录记在这个名下(`aca run claude` 不带账号)
+/// The tool's own one, used when unregistered; its login is kept under this name (`aca run claude` with no account)
 fn own_spec(a: Agent) -> String {
     accounts::fam(a).unwrap_or("claude").to_string()
 }
 
-/// 问到的登录怎么写:记号、一句话、颜色。None = 还在问
+/// How a login answer is shown: mark, a phrase, color. None = still asking
 fn login_said(l: Option<Login>) -> (&'static str, String, Style) {
     match l {
         None => ("…", t!("查询中", "asking").into(), kit::dim()),
@@ -273,14 +282,14 @@ fn login_said(l: Option<Login>) -> (&'static str, String, Style) {
     }
 }
 
-/// 右边那一栏最多列几个会话的标题
+/// At most this many session titles in the right column
 const TITLES: usize = 5;
-/// 加账号的表单最多几行(提示折成两行时)
+/// Max rows of the add-account form (when the hint wraps to two lines)
 const FORM_ROWS: usize = 7;
-/// 启动参数一行最多输这么长
+/// Max length of the launch args line
 const ARGS_MAX: usize = 2000;
 
-/// 右边那一栏里各项的名字
+/// Labels of the fields in the right column
 fn labels() -> [&'static str; 7] {
     [
         t!("目录", "directory"),
@@ -293,12 +302,13 @@ fn labels() -> [&'static str; 7] {
     ]
 }
 
-/// 名字那一列多宽
+/// Width of the label column
 fn label_w() -> usize {
     labels().iter().map(|l| l.width()).max().unwrap_or(0) + 2
 }
 
-/// 右边那一栏里的一项:「名字  值」,值太长折到下面、和值对齐;lead 是值前面的记号(● ○ ⚠)
+/// One field in the right column: "label  value"; a long value wraps below, aligned with the value; lead is the mark before
+/// the value (● ○ ⚠)
 fn field(out: &mut Vec<Line<'static>>, w: usize, lw: usize, label: &str, lead: Option<(&str, Style)>, text: &str, st: Style) {
     let lead_w = lead.map_or(0, |(m, _)| m.width() + 1);
     for (i, part) in fold(text, w.saturating_sub(lw + lead_w)).into_iter().enumerate() {
@@ -313,12 +323,12 @@ fn field(out: &mut Vec<Line<'static>>, w: usize, lw: usize, label: &str, lead: O
     }
 }
 
-/// 启动参数改的时候是一行字,照 shell 的写法分:空格隔开,带空格的用引号包上(`'…'` 原样,`"…"` 里 `\"` `\\` 转义)。
-/// 引号没配上 = Err
+/// While edited, launch args are one line of text, split the shell way: separated by spaces, ones with spaces quoted (`'…'`
+/// verbatim, `\"` `\\` escaped inside `"…"`). An unmatched quote = Err
 fn split(s: &str) -> Result<Vec<String>, String> {
     let unclosed = || t!("引号不成对", "a quote isn't closed").to_string();
     let mut out = vec![];
-    // None = 不在一个词里(连着的引号、字算同一个词:`--x='a b'`)
+    // None = not inside a word (adjacent quotes and characters form one word: `--x='a b'`)
     let mut cur: Option<String> = None;
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -355,7 +365,7 @@ fn split(s: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// 参数拼回一行:空的、带空格引号的用单引号包上,`split` 分回来还是这几个
+/// Join args back into one line: empty ones and ones with spaces or quotes go in single quotes, so `split` gives back the same
 fn join(args: &[String]) -> String {
     let quote = |a: &String| {
         if !a.is_empty() && a.chars().all(|c| !c.is_whitespace() && !matches!(c, '\'' | '"' | '\\')) {
@@ -370,32 +380,34 @@ fn join(args: &[String]) -> String {
 pub struct Page {
     env: Env,
     rows: Vec<Row>,
-    /// 列着段头的那几家:有账号的、装着的、写了启动参数的
+    /// Tools listed with a section header: those with accounts, installed, or with launch args set
     fams: Vec<Fam>,
-    /// 不登记时各家用的那个(`accounts::defaults`):这一家没登记账号时,段头那页说它登录着没有
+    /// What each tool uses when unregistered (`accounts::defaults`): for a tool with no registered accounts, its section header
+    /// page says whether this is logged in
     own: Vec<Account>,
-    /// 高亮的是 `items()` 里第几项
+    /// Index of the highlighted item in `items()`
     sel: usize,
     uses: Vec<Use>,
-    /// 问到的登录,按「工具:账号」记;没有 = 还在问
+    /// Login answers, keyed by "tool:account"; missing = still asking
     logins: Arc<Mutex<HashMap<String, Login>>>,
     form: Option<Form>,
     asking: Option<Asking>,
-    /// 拿到的额度;还在拿 = None
+    /// Fetched quotas; still fetching = None
     quotas: Arc<Mutex<Option<Vec<Quota>>>>,
-    /// 拿额度的时刻(算重置、「几小时前的数」)和本地时区偏移
+    /// When the quotas were fetched (for resets and "N hours old") and the local UTC offset
     at: i64,
     off: i64,
-    /// 开了 Claude mod:额度不靠状态栏
+    /// Claude mod is on: quotas don't depend on the status bar
     mods: bool,
-    /// 按了 p,在改高亮那个账号(段头:那一家每个账号都带)的启动参数:输入框里的字
+    /// After p, editing the launch args of the highlighted account (on a section header: those every account of that tool gets):
+    /// the input box text
     editing: Option<String>,
-    /// 参数没存成:为什么
+    /// Why the args weren't saved
     args_err: String,
 }
 
 impl Page {
-    /// `adding`:一开就进加账号(`n` 菜单里按 `+`)
+    /// `adding`: open straight into adding an account (`+` in the `n` menu)
     pub fn real(adding: bool) -> Page {
         let env = Env {
             config: crate::config::path(),
@@ -410,7 +422,7 @@ impl Page {
         Page::load(env, crate::setup::session_accounts(), adding)
     }
 
-    /// `uses`:登记着的会话各用的(哪一家, 账号名, 标题)
+    /// `uses`: what each registered session uses (tool, account name, title)
     pub fn load(env: Env, uses: Vec<Use>, adding: bool) -> Page {
         let mut p = Page {
             env,
@@ -430,13 +442,13 @@ impl Page {
             args_err: String::new(),
         };
         p.read();
-        // 一开高亮第一个账号(没有账号的是第一个段头)
+        // On open, highlight the first account (with no accounts, the first section header)
         p.sel = p.items().iter().position(|i| matches!(i, Item::Acct(_))).unwrap_or(0);
         p.fetch_quotas();
         p
     }
 
-    /// 左边那一栏从上到下能高亮的:每一家先是段头,再是它的账号
+    /// What can be highlighted in the left column, top to bottom: each tool's section header, then its accounts
     fn items(&self) -> Vec<Item> {
         let mut out = vec![];
         for f in &self.fams {
@@ -450,7 +462,7 @@ impl Page {
         self.items().get(self.sel).copied()
     }
 
-    /// 高亮的那个账号;高亮的是段头 = None
+    /// The highlighted account; a section header highlighted = None
     fn cur(&self) -> Option<&Row> {
         match self.item()? {
             Item::Acct(i) => self.rows.get(i),
@@ -458,12 +470,12 @@ impl Page {
         }
     }
 
-    /// 这一家每个账号都带的启动参数
+    /// Launch args every account of this tool gets
     fn common(&self, a: Agent) -> &[String] {
         self.fams.iter().find(|f| f.agent == a).map_or(&[], |f| &f.args)
     }
 
-    /// 照 config.toml 现在写的重列;高亮跟着原来那一项
+    /// Relist from what config.toml says now; the highlight stays on the same item
     fn read(&mut self) {
         let keep = self.item().map(|i| match i {
             Item::Head(a) => (a, None),
@@ -517,7 +529,7 @@ impl Page {
         self.ask(false);
     }
 
-    /// 两栏各多宽(里面一共 w 宽):左边照最长的名字,右边是剩下的
+    /// Width of each column (w inside in all): the left fits the longest name, the right gets the rest
     fn split(&self, w: usize) -> (usize, usize) {
         let names = self.rows.iter().map(|r| r.a.name.width()).max().unwrap_or(0).min(14);
         let lw = (2 + names + 2 + 2 + 16).clamp(26, 38);
@@ -531,7 +543,7 @@ impl Page {
         }
     }
 
-    /// 问还没问过的账号登录着没有;`again` = 都重问
+    /// Ask whether accounts not asked about yet are logged in; `again` = ask all again
     fn ask(&self, again: bool) {
         let mut known = self.logins.lock().unwrap_or_else(|e| e.into_inner());
         if again {
@@ -543,7 +555,7 @@ impl Page {
             .filter(|r| r.askable() && !known.contains_key(&r.spec()))
             .map(|r| (r.spec(), r.a.agent, r.a.name.clone()))
             .collect();
-        // 这一家一个都没登记:问它自己的那个(段头那页要说)
+        // No accounts registered for this tool: ask about its own one (the section header page says it)
         let bare = self.own.iter().filter(|o| !self.rows.iter().any(|r| r.a.agent == o.agent));
         todo.extend(bare.map(|a| (own_spec(a.agent), a.agent, String::new())).filter(|(s, ..)| !known.contains_key(s)));
         drop(known);
@@ -561,7 +573,7 @@ impl Page {
         }
     }
 
-    /// 重新拿各账号的额度
+    /// Refetch every account's quota
     fn fetch_quotas(&mut self) {
         self.at = crate::limits::now();
         let (slot, get) = (self.quotas.clone(), self.env.quotas);
@@ -585,7 +597,7 @@ impl Page {
         self.logins.lock().unwrap_or_else(|e| e.into_inner()).get(&r.spec()).cloned()
     }
 
-    /// 这个账号现在怎么样:记号、一句话、颜色。左边列表只写这句话的头一段
+    /// This account's state now: mark, a phrase, color. The left list shows only the phrase's first part
     fn state(&self, r: &Row) -> (&'static str, String, Style) {
         if let Some((other, _)) = &r.foreign {
             return ("⚠", tr!("是 {} 的目录", "a {} directory", accounts::who(*other)), theme::warn());
@@ -596,7 +608,8 @@ impl Page {
         login_said(self.login_of(r))
     }
 
-    /// 左边那一栏:两段(Claude Code、Codex),段头单独一行,一行一个账号「名字  记号 头一段」。连同高亮在第几行
+    /// Left column: two sections (Claude Code, Codex), each header on its own line, one account per line "name  mark first-part".
+    /// Plus which line the highlight is on
     fn list(&self, w: usize) -> (Vec<Line<'static>>, Option<usize>) {
         let name_w = self.rows.iter().map(|r| r.a.name.width()).max().unwrap_or(0).min(14);
         let (mut out, mut at) = (vec![], None);
@@ -641,13 +654,14 @@ impl Page {
         (out, at)
     }
 
-    /// 右边那一栏:在加账号就是那张表单,按过 d 是要删什么,高亮的是段头就是那一家的,不然是高亮那个账号的整页
+    /// Right column: the form while adding an account, what's being removed after d, the tool's page when a section header is
+    /// highlighted, otherwise the highlighted account's whole page
     fn right(&self, w: usize) -> Vec<Line<'static>> {
         if let Some(f) = &self.form {
             return f.lines(w, t!("添加", "add"));
         }
         match self.item() {
-            // 哪一家都没装、没登记(键栏有 +)
+            // No tool installed or registered (the key bar has +)
             None => {
                 let none = t!(
                     "默认使用 ~/.claude、~/.codex · + 添加账号",
@@ -667,8 +681,8 @@ impl Page {
         }
     }
 
-    /// 段头那一页:这一家每个账号都带的启动参数。这一家没登记账号的,先说不登记时用的那个目录登录着没有、怎么登
-    /// (没登录的新用户在这看得出来)
+    /// The section header page: launch args every account of this tool gets. For a tool with no registered accounts, it first says
+    /// whether the directory used without one is logged in, and how to log in (a new user who hasn't logged in can tell here)
     fn head(&self, a: Agent, w: usize) -> Vec<Line<'static>> {
         let (labels, lw) = (labels(), label_w());
         let mut out = vec![Line::from(who_span(a)), Line::raw("")];
@@ -698,7 +712,7 @@ impl Page {
         out
     }
 
-    /// 启动参数那一项(`now` 是现在的,空的不写);在改时是输入框
+    /// The launch args field (`now` is the current value, omitted when empty); an input box while editing
     fn args_field(&self, out: &mut Vec<Line<'static>>, w: usize, now: &str) {
         let (label, lw) = (labels()[4], label_w());
         match &self.editing {
@@ -708,7 +722,7 @@ impl Page {
         }
     }
 
-    /// 在改启动参数时输入框下面的:没存成的为什么、键
+    /// Below the input box while editing launch args: why it didn't save, and the keys
     fn args_keys(&self, out: &mut Vec<Line<'static>>, w: usize) {
         if !self.args_err.is_empty() {
             field(out, w, label_w(), "", None, &self.args_err, theme::warn());
@@ -717,7 +731,8 @@ impl Page {
         out.push(kit::keys_line(&[("⏎", t!("保存", "save")), ("^U", t!("清空", "clear"))], vec![], w));
     }
 
-    /// 名字后面那个「默认」:哪些工具不写账号时用它。只有它自己那一家的就不写是哪个
+    /// The 「默认」 ("default") tag after the name: tools that use it when no account is given. If it's only its own tool, it
+    /// doesn't say which
     fn default_tag(&self, r: &Row) -> Option<String> {
         let fam = accounts::fam(r.a.agent).unwrap_or_default();
         match r.default_of.as_slice() {
@@ -727,8 +742,9 @@ impl Page {
         }
     }
 
-    /// 高亮那个账号的整页:是哪个工具的、是不是默认、目录、登录的是谁、额度、状态栏、启动参数;
-    /// 有会话在用、n 菜单里不显示的才写。在改启动参数时,输入框和键写在启动参数那一项下面,后面的不写
+    /// The highlighted account's whole page: which tool, whether default, directory, who's logged in, quota, status bar, launch args;
+    /// sessions using it and being hidden from the n menu only when so. While editing launch args, the input box and keys go under
+    /// the launch args field, and nothing after it is shown
     fn detail(&self, r: &Row, w: usize) -> Vec<Line<'static>> {
         let (labels, lw) = (labels(), label_w());
         let put = |out: &mut Vec<Line<'static>>, label: &str, lead: Option<(&str, Style)>, text: &str, st: Style| {
@@ -761,7 +777,8 @@ impl Page {
             };
             put(&mut out, labels[1], Some((mark, st)), &said, if mark == "●" { plain } else { st });
         }
-        // 额度记到了才写;Claude 的状态栏没接(也没开 mod)记不到,写在状态栏那一项
+        // Quota only once recorded; a Claude account with no status bar wired up (and no mod) can't record it, which the status bar
+        // field says
         if let Some(q) = self.quota_of(r) {
             let mut spans = vec![Span::styled(kit::clip(labels[2], lw), kit::dim())];
             spans.extend(crate::rehome::quota_spans(Some(&q), self.at, self.off));
@@ -774,7 +791,7 @@ impl Page {
             let said = if feeds || self.mods { bar.to_string() } else { tr!("{bar} · 无额度信息", "{bar} · no quotas") };
             put(&mut out, labels[3], None, &said, plain);
         }
-        // 启动参数:账号自己的,和这一家每个账号都带的(排在前面,在段头上改)
+        // Launch args: the account's own, and those every account of this tool gets (they go first; edited on the section header)
         let own = join(&r.args);
         self.args_field(&mut out, w, &own);
         let common = self.common(r.a.agent);
@@ -787,7 +804,7 @@ impl Page {
             self.args_keys(&mut out, w);
             return out;
         }
-        // 有内容才写的几项,和上面空一行
+        // Fields shown only when non-empty, a blank line above them
         let (mut more, n) = (vec![], r.used.len());
         if n > 0 {
             put(&mut more, labels[5], None, &tr!("{n} 个正在使用", "{n} using it"), plain);
@@ -810,7 +827,7 @@ impl Page {
         out
     }
 
-    /// 按过 d:会动什么、谁在用
+    /// After d: what it touches and who uses it
     fn confirm(&self, r: &Row, w: usize) -> Vec<Line<'static>> {
         let me = accounts::who(r.a.agent);
         let kept = if r.a.dir.is_empty() || !r.there {
@@ -840,15 +857,16 @@ impl Page {
         out
     }
 
-    /// 工具说了它没登录(目录不在的也算:里面没有登录可丢)。登录着的、还没问到的、问不出的都不算
+    /// The tool said it isn't logged in (a missing directory counts too: there's no login in it to lose). Logged in, not asked yet
+    /// and can't tell don't count
     fn logged_out(&self, r: &Row) -> bool {
         !r.there || self.login_of(r) == Some(Login::Out)
     }
 
-    /// 在登录着的账号上按了 ⏎:重新登录会丢掉什么,y 才去
+    /// ⏎ on a logged-in account: what logging in again loses; only y goes ahead
     fn relogin(&self, r: &Row, w: usize) -> Vec<Line<'static>> {
         let me = accounts::who(r.a.agent);
-        // 还没问到的不写:当它登录着问一句
+        // Not asked yet: say nothing about it; ask as if it's logged in
         let now = match self.login_of(r) {
             Some(Login::In(who)) if !who.is_empty() => tr!("当前已登录:{who}。", "It is logged in now: {who}."),
             Some(Login::In(_)) => t!("当前已登录。", "It is logged in now.").to_string(),
@@ -875,7 +893,7 @@ impl Page {
         out
     }
 
-    /// 高亮那一行上的 ⏎:没登录的直接去登录;登录着的先问(见 [`Asking::Relogin`])
+    /// ⏎ on the highlighted row: logged out goes straight to login; logged in asks first (see [`Asking::Relogin`])
     fn login(&mut self, fx: &mut Fx) {
         let Some(r) = self.cur() else { return };
         if let Some((other, _)) = &r.foreign {
@@ -884,14 +902,15 @@ impl Page {
         if self.logged_out(r) { self.open_login(fx) } else { self.asking = Some(Asking::Relogin) }
     }
 
-    /// 在下半屏开个终端,带着高亮那个账号跑工具自己的登录
+    /// Open a terminal in the bottom half running the tool's own login for the highlighted account
     fn open_login(&self, fx: &mut Fx) {
         let Some(r) = self.cur() else { return };
         fx.term = Some(self.term(&r.a.name, r.a.agent, accounts::relogin_cmd(r.a.agent, &r.a.name)));
     }
 
-    /// 登录不让工具自己开默认浏览器:链接交给界面(文件),弹出来挑用哪个开(见 browser.rs)。
-    /// Codex 不交、远程时 Claude 也不交(给的是要贴码的那条),界面从屏幕上认;上次留下的文件先删掉,免得一开就弹旧的
+    /// Login doesn't let the tool open the default browser itself: the link goes to the UI (a file), which pops up a choice of what
+    /// to open it with (see browser.rs). Codex doesn't hand it over, nor does Claude when remote (it gives the paste-a-code one), so
+    /// the UI reads it off the screen; a file left from last time is deleted first so the old link doesn't pop up right away
     fn term(&self, name: &str, a: Agent, run: String) -> TermReq {
         let tool = if a == Agent::Codex { "codex" } else { "claude" };
         let file = self.env.links.join(format!("login-{tool}-{name}.url"));
@@ -908,7 +927,7 @@ impl Page {
         }
     }
 
-    /// 表单的目录填完了:记进 config.toml;目录是新建的就开终端登录
+    /// The form's directory is filled in: record it in config.toml; if the directory was just created, open a terminal to log in
     fn add(&mut self, fx: &mut Fx) {
         let Some(f) = self.form.as_mut() else { return };
         let (a, name) = (f.agent, f.name.clone());
@@ -918,7 +937,7 @@ impl Page {
                 self.form = None;
                 self.read();
                 self.at(a, &name);
-                // Claude 的额度靠状态栏:接不接在 s 里挑,不替人接(键栏写着 s)
+                // Claude's quota depends on the status bar: wiring it up is chosen under s, not done for the user (the key bar shows s)
                 fx.say(tr!("已添加 {} 账号 {name}", "added the {} account {name}", accounts::who(a)));
                 if added.created {
                     fx.term = Some(self.term(&name, a, accounts::login_cmd(a, &name)));
@@ -927,7 +946,8 @@ impl Page {
         }
     }
 
-    /// 存高亮那个账号的启动参数(段头:那一家每个账号都带的);没存成的为什么写在输入框下面,接着改
+    /// Save the highlighted account's launch args (section header: those every account of the tool gets); if that fails, why goes
+    /// under the input box and editing continues
     fn save_args(&mut self, fx: &mut Fx) {
         let (Some(text), Some(item)) = (&self.editing, self.item()) else { return };
         let args = match split(text) {
@@ -944,11 +964,11 @@ impl Page {
         match saved {
             Ok(changed) => {
                 (self.editing, self.args_err) = (None, String::new());
-                // 和原来一样:不写、不说
+                // Unchanged: don't write, don't say
                 if changed {
-                    // 高亮跟着原来那一项
+                    // The highlight stays on the same item
                     self.read();
-                    // 开着的会话不动,新起、重启的才用这份
+                    // Open sessions are left alone; only new or restarted ones use this
                     fx.say(t!("已保存,新会话生效", "saved; new sessions use it"));
                 }
             }
@@ -960,7 +980,7 @@ impl Page {
         let Some(r) = self.cur() else { return };
         let (a, name) = (r.a.agent, r.a.name.clone());
         match accounts::remove_in(&self.env.config, &self.env.home, a, &name) {
-            // 目录留着:删之前的确认里说过了
+            // The directory stays: the confirm before removing said so
             Ok(_) => {
                 fx.say(tr!("已删除 {} 账号 {name}", "removed the {} account {name}", accounts::who(a)));
                 self.read();
@@ -969,7 +989,7 @@ impl Page {
         }
     }
 
-    /// 挪一格:列表当场换了顺序,不另外说(记在 `[ui] menu`,`n` 菜单同一个顺序)
+    /// Move one step: the list reorders on the spot, no separate message (kept in `[ui] menu`, the same order as the `n` menu)
     fn shift(&mut self, up: bool, fx: &mut Fx) {
         let Some(r) = self.cur() else { return };
         let (a, name) = (r.a.agent, r.a.name.clone());
@@ -989,13 +1009,15 @@ impl Overlay for Page {
         120
     }
 
-    /// 和插件页一样大小固定:挪高亮、进表单、问删不删,框都不跟着变
+    /// Fixed size like the plugins page: moving the highlight, entering the form, asking whether to remove don't change the frame
     fn fill(&self) -> bool {
         true
     }
 
-    /// 高度照内容定(不像插件页占满屏幕:账号就那么几个,占满了下半截全是空的):标题、两栏里长的那一栏、细线和键。
-    /// 右边按最长的那个账号、段头算(连同删它之前的确认),所以挪高亮不变,加了 / 删了账号才变
+    /// Height follows the content (unlike the plugins page filling the screen: there are only a few accounts, so the bottom half
+    /// would be empty): title, the longer of the two columns, the rule and keys. The right column is sized for the longest account
+    /// or section header page (including its remove confirm), so moving the highlight doesn't change it; only adding / removing an
+    /// account does
     fn fill_rows(&self) -> Option<u16> {
         let (lw, rw) = self.split(self.width() as usize - 6);
         let ask = |r: &Row| self.confirm(r, rw).len().max(self.relogin(r, rw).len());
@@ -1008,12 +1030,13 @@ impl Overlay for Page {
         self.lines_in(w, 32)
     }
 
-    /// 标题、两栏(窄屏上下叠)、细线、键;正好 h 行
+    /// Title, two columns (stacked on narrow screens), rule, keys; exactly h lines
     fn lines_in(&self, w: usize, h: usize) -> Vec<Line<'static>> {
         let busy = self.form.is_some() || self.asking.is_some() || self.editing.is_some();
         let esc = kit::esc_hint(if busy { t!("返回", "back") } else { t!("关闭", "close") });
         let mut out = vec![kit::modal_title(t!("账号", "Accounts"), theme::accent(), esc, w), Line::raw("")];
-        // 放不下时后面的键先不写:最要紧的排前面。在填表单、在问删不删时键写在右边那一栏里
+        // When they don't fit, later keys are dropped first: the most important go first. While filling the form or asking whether to
+        // remove, the keys go in the right column
         let out_now = self.cur().is_none_or(|r| r.foreign.is_some() || self.logged_out(r));
         let all = [
             ("⏎", if out_now { t!("登录", "log in") } else { t!("重新登录", "log in again") }),
@@ -1024,7 +1047,7 @@ impl Overlay for Page {
             ("s", t!("状态栏", "status bar")),
             ("r", t!("刷新", "recheck")),
         ];
-        // 段头上没有只对一个账号的那几个;状态栏那张表一个账号都没有时是空的
+        // A section header lacks the keys that act on one account; the status bar table is empty when there are no accounts
         let on_head = |k: &str| ["+", "p", "r"].contains(&k) || (k == "s" && !self.rows.is_empty());
         let keys: Vec<(&str, &str)> = match self.item() {
             _ if busy => vec![],
@@ -1046,7 +1069,7 @@ impl Overlay for Page {
                 out.push(Line::from(spans));
             }
         } else {
-            // 手机:列表在上(最多占一半),高亮那个的整页在下
+            // Phone: list on top (at most half), the highlighted one's page below
             let (left, at) = self.list(w);
             let lh = left.len().min((bh / 2).max(4)).min(bh);
             let lo = scroll(at, left.len(), lh);
@@ -1109,7 +1132,7 @@ impl Overlay for Page {
             KeyCode::Enter => self.login(fx),
             KeyCode::Char('+') => self.form = Some(Form::new()),
             KeyCode::Char('d') | KeyCode::Delete if self.cur().is_some() => self.asking = Some(Asking::Remove),
-            // 账号上改它自己的,段头上改这一家每个账号都带的
+            // On an account, edit its own; on a section header, those every account of the tool gets
             KeyCode::Char('p') => {
                 self.editing = match self.item() {
                     Some(Item::Head(a)) => Some(join(self.common(a))),
@@ -1117,7 +1140,8 @@ impl Overlay for Page {
                     None => None,
                 }
             }
-            // 各账号的状态栏接不接(`aca setup` 开的也是这张表;加账号在这一页,表里不给加)
+            // Whether each account's status bar is wired up (`aca setup` opens the same table; accounts are added on this page, not in
+            // the table)
             KeyCode::Char('s') => fx.open = Some(Box::new(crate::setup::Page::real(false))),
             KeyCode::Char('r') => {
                 self.read();
@@ -1129,7 +1153,7 @@ impl Overlay for Page {
         Flow::Stay
     }
 
-    /// config.toml 在编辑器里改了、状态栏那张表办完了:重列
+    /// config.toml edited in the editor, or the status bar table done: relist
     fn reload(&mut self) {
         self.read();
     }
@@ -1159,7 +1183,7 @@ mod tests {
             background: false,
             links: root.join("state"),
             remote: false,
-            // 这个家里只装了 Claude
+            // Only Claude is installed in this home
             installed: |prog| prog == "claude",
             quotas: Vec::new,
         };
@@ -1206,7 +1230,7 @@ mod tests {
         p.rows.iter().map(|r| r.a.name.as_str()).collect()
     }
 
-    /// 高亮的那一项:账号是它的名字,段头是那一家
+    /// The highlighted item: an account's name, or a section header's tool
     fn on(p: &Page) -> &str {
         match p.item() {
             Some(Item::Acct(i)) => &p.rows[i].a.name,
@@ -1215,7 +1239,7 @@ mod tests {
         }
     }
 
-    /// 左边那一栏里这个账号的那一行(高亮的前面是 ›)
+    /// This account's row in the left column (the highlighted one starts with ›)
     fn row<'a>(text: &'a [String], name: &str) -> &'a str {
         let found = text.iter().find(|l| l.starts_with(&format!("  {name} ")) || l.starts_with(&format!("› {name} ")));
         found.unwrap_or_else(|| panic!("左边没有 {name}:{text:#?}"))
@@ -1231,7 +1255,7 @@ mod tests {
         let (root, env) = home(name, config);
         dir(&root, ".claude-sub", &[".claude.json", "settings.json"]);
         dir(&root, ".claude-firm", &[".claude.json"]);
-        // Codex 的目录,被登记成 Claude 的起过一次:多了个 .claude.json
+        // A Codex directory registered as Claude's and launched once: it gained a .claude.json
         dir(&root, ".codex", &["auth.json", "config.toml", "version.json", ".claude.json"]);
         dir(&root, ".codex-cx", &["auth.json"]);
         let used = |a, account: &str, title: &str| (a, account.to_string(), title.to_string());
@@ -1260,11 +1284,11 @@ mod tests {
             ]
         };
         p.fetch_quotas();
-        // sub:额度;启动参数只有每个 Claude 账号都带的那份
+        // sub: quota; the only launch args are those every Claude account gets
         press(&mut p, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
         assert_eq!(on(&p), "sub");
         shows(&shown(&p, 110), &["额度      5h 12% · 7d 61%", "启动参数  所有 Claude Code 账号都附带:--x"]);
-        // p:改它自己的,存进 config.toml 那一行
+        // p: edit its own, saved to its line in config.toml
         press(&mut p, &[KeyCode::Char('p')]);
         assert!(p.typing());
         type_in(&mut p, "--model 'big one'");
@@ -1274,19 +1298,19 @@ mod tests {
         let saved = std::fs::read_to_string(&p.env.config).unwrap();
         assert!(saved.contains("sub = { home = \"~/.claude-sub\", args = [\"--model\", \"big one\"] }\n"), "{saved}");
         shows(&shown(&p, 110), &["启动参数  --model 'big one'", "          所有 Claude Code 账号都附带:--x"]);
-        // 引号没配上:说为什么,接着改;Esc 不改
+        // Unmatched quote: say why, keep editing; Esc leaves it unchanged
         press(&mut p, &[KeyCode::Char('p')]);
         type_in(&mut p, " \"oops");
         press(&mut p, &[KeyCode::Enter]);
         assert!(p.editing.is_some() && !p.args_err.is_empty());
         press(&mut p, &[KeyCode::Esc]);
         assert!(p.editing.is_none() && std::fs::read_to_string(&p.env.config).unwrap() == saved);
-        // 清空:写回一行目录
+        // Clear: written back as the bare directory line
         press(&mut p, &[KeyCode::Char('p')]);
         p.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), &mut Fx::default());
         press(&mut p, &[KeyCode::Enter]);
         assert_eq!(std::fs::read_to_string(&p.env.config).unwrap(), config);
-        // Codex 的额度不用接状态栏;余额写在后面
+        // Codex's quota needs no status bar wiring; the balance follows it
         press(&mut p, &[KeyCode::Down, KeyCode::Down]);
         assert_eq!(on(&p), "cx");
         shows(&shown(&p, 110), &["额度      5h 95%  余额 5"]);
@@ -1297,18 +1321,18 @@ mod tests {
     fn p_on_a_tools_heading_changes_what_every_account_of_it_gets() {
         let config = CONFIG.replace("account = \"sub\"\n", "account = \"sub\"\nargs = [\"--x\"]\n");
         let (root, mut p) = page_with("common", &config);
-        // 段头也能高亮:在第一个账号上往上一格
+        // Section headers can be highlighted too: one up from the first account
         press(&mut p, &[KeyCode::Up]);
         assert_eq!(on(&p), "Claude Code");
         let text = shown(&p, 110);
         assert!(text.iter().any(|l| l.starts_with("Claude Code") && l.contains("│  Claude Code")), "{text:#?}");
         shows(&text, &["启动参数  --x"]);
-        // 段头上没有只对一个账号的键
+        // A section header has no keys that act on one account
         assert_eq!(text.last().unwrap(), "+ 添加账号 • p 启动参数 • s 状态栏 • r 刷新");
         assert!(press(&mut p, &[KeyCode::Enter]).term.is_none() && p.asking.is_none());
         press(&mut p, &[KeyCode::Char('d')]);
         assert!(p.asking.is_none());
-        // p:改这一家每个账号都带的,存进 [tools.claude] 那一段,别的一个字不动
+        // p: edit those every account of this tool gets, saved to the [tools.claude] section, nothing else touched
         press(&mut p, &[KeyCode::Char('p')]);
         assert!(p.typing());
         type_in(&mut p, " --effort high");
@@ -1317,13 +1341,13 @@ mod tests {
         assert_eq!((fx.flash.as_deref(), p.editing.is_none(), on(&p)), (Some("已保存,新会话生效"), true, "Claude Code"));
         let saved = std::fs::read_to_string(&p.env.config).unwrap();
         assert_eq!(saved, config.replace("args = [\"--x\"]", "args = [\"--x\", \"--effort\", \"high\"]"));
-        // 账号那页写着每个账号都带的
+        // The account page shows those every account gets
         press(&mut p, &[KeyCode::Up]);
         assert_eq!(on(&p), "cx");
         press(&mut p, &[KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down]);
         assert_eq!(on(&p), "sub");
         shows(&shown(&p, 110), &["启动参数  所有 Claude Code 账号都附带:--x --effort high"]);
-        // Codex 那一段:原来没有这一段,加在最后
+        // The Codex section: there wasn't one, so it's appended at the end
         press(&mut p, &[KeyCode::Down]);
         assert_eq!(on(&p), "Codex");
         assert!(!shown(&p, 110).iter().any(|l| l.contains("启动参数  ")));
@@ -1333,7 +1357,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&p.env.config).unwrap(), format!("{saved}\n[tools.codex]\nargs = [\"--search\"]\n"));
         press(&mut p, &[KeyCode::Down]);
         shows(&shown(&p, 110), &["启动参数  所有 Codex 账号都附带:--search"]);
-        // 没改就回车:不写、不说;引号没配上:说为什么,接着改
+        // Enter with no change: don't write, don't say; unmatched quote: say why, keep editing
         press(&mut p, &[KeyCode::Up, KeyCode::Char('p')]);
         let before = std::fs::read_to_string(&p.env.config).unwrap();
         assert!(press(&mut p, &[KeyCode::Enter]).flash.is_none() && std::fs::read_to_string(&p.env.config).unwrap() == before);
@@ -1368,21 +1392,22 @@ mod tests {
     fn the_list_is_on_the_left_and_the_highlighted_account_in_full_on_the_right() {
         let (root, mut p) = page("list");
         let text = shown(&p, 110);
-        // 左边:两段各有表头(单独一行写哪个工具),账号在自己那一段里,各带登录着没有
+        // Left: two sections, each with a header (its own line naming the tool), accounts in their own section, each showing whether
+        // it's logged in
         let at = |want: &str| text.iter().position(|l| l.starts_with(want)).unwrap_or_else(|| panic!("没有「{want}」开头的行:{text:#?}"));
         assert!(at("Claude Code") < at("  sub ") && at("  gone ") < at("Codex") && at("Codex") < at("  cx "), "{text:#?}");
         assert!(row(&text, "sub").contains("● max") && !row(&text, "sub").contains("me@example.com"), "{text:#?}");
         assert!(row(&text, "firm").contains("○ 未登录") && row(&text, "cx").contains("● ChatGPT"), "{text:#?}");
-        // 另一家的目录、不在的目录:标出来,不去问它登录(问了会在里面写东西)
+        // The other tool's directory, a missing directory: marked, and not asked about login (asking would write into them)
         assert!(row(&text, "codex").contains("⚠ 是 Codex 的目录") && row(&text, "gone").contains("⚠ 目录不存在"), "{text:#?}");
         assert!(!p.logins.lock().unwrap().keys().any(|k| k == "claude:codex" || k == "claude:gone"));
-        // 右边:高亮那个(加错的)—— 是谁的目录、怎么办;没有登录那一项
+        // Right: the highlighted one (added wrongly) — whose directory it is and what to do; no login field
         assert_eq!(on(&p), "codex");
         shows(&text, &["⚠ 这是 Codex 的目录(其中包含 auth.json、config.toml…)", "d 删除 · + 添加为 Codex 账号", "目录      ~/.codex"]);
         assert!(!text.iter().any(|l| l.contains(" 登录    ")), "{text:#?}");
         press(&mut p, &[KeyCode::Down, KeyCode::Down]);
         shows(&shown(&p, 110), &["登录      ⚠ 目录不存在 · d 删除"]);
-        // 登录着的:是谁、是默认、状态栏、哪些会话在用;n 菜单里列着就不写
+        // Logged in: who, default, status bar, which sessions use it; listed in the n menu, so not mentioned
         press(&mut p, &[KeyCode::Down]);
         let text = shown(&p, 110);
         shows(
@@ -1398,16 +1423,16 @@ mod tests {
             ],
         );
         assert!(!text.iter().any(|l| l.contains("n 菜单") || l.contains("aca ")), "{text:#?}");
-        // 没会话在用、不是默认的不写;n 菜单里藏着的写一句
+        // No sessions using it and not default: not mentioned; hidden from the n menu: one line says so
         press(&mut p, &[KeyCode::Up, KeyCode::Up]);
         let text = shown(&p, 110);
         shows(&text, &["登录      ○ 未登录 · ⏎ 登录", "n 菜单    不显示"]);
         assert!(!text.iter().any(|l| l.contains(" 会话    ") || l.contains("默认")), "{text:#?}");
-        // 往上绕过段头到最后一个
+        // Up wraps past the section header to the last one
         press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Up]);
         assert_eq!(on(&p), "cx");
         shows(&shown(&p, 110), &["cx", "登录      ● ChatGPT"]);
-        // Codex 的额度不靠状态栏:没有那一项
+        // Codex's quota doesn't depend on the status bar: no such field
         assert!(!shown(&p, 110).iter().any(|l| l.contains(" 状态栏  ")));
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1431,17 +1456,17 @@ mod tests {
         press(&mut p, &[KeyCode::Char('d')]);
         shows(&shown(&p, 110), &["删除 Claude Code 账号 codex?", "仅从 aca 中移除,目录和登录信息保留。", "y 删除 • 其他键 取消"]);
         assert!(!shown(&p, 110).iter().any(|l| l.contains("config.toml")));
-        // 别的键:不删,键也不往下走(j 不挪高亮)
+        // Any other key: no removal, and the key isn't passed on (j doesn't move the highlight)
         press(&mut p, &[KeyCode::Char('j')]);
         assert_eq!((on(&p), std::fs::read_to_string(&p.env.config).unwrap()), ("codex", before.clone()));
         let fx = press(&mut p, &[KeyCode::Char('d'), KeyCode::Char('y')]);
         assert_eq!(fx.flash.as_deref(), Some("已删除 Claude Code 账号 codex"));
         assert_eq!(names(&p), ["firm", "gone", "sub", "cx"]);
-        // 只少了那一行;目录和里面的东西都在;删之前的那份留着
+        // Only that line is gone; the directory and its contents remain; the pre-removal copy is kept
         assert_eq!(std::fs::read_to_string(&p.env.config).unwrap(), before.replace("codex = \"~/.codex\"\n", ""));
         assert!(root.join(".codex/auth.json").exists() && root.join(".codex/.claude.json").exists());
         assert_eq!(std::fs::read_to_string(root.join("aca/config.toml.bak-aca")).unwrap(), before);
-        // 有会话在用的、是默认账号的:删之前说清楚
+        // In use by sessions, or the default account: spelled out before removing
         press(&mut p, &[KeyCode::Down, KeyCode::Down, KeyCode::Char('d')]);
         shows(&shown(&p, 110), &["删除 Claude Code 账号 sub?", "2 个会话正在使用它,删除后这些会话将无法重启。", "它是 claude 的默认账号"]);
         press(&mut p, &[KeyCode::Esc]);
@@ -1459,19 +1484,19 @@ mod tests {
         };
         press(&mut p, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
         assert_eq!(on(&p), "sub");
-        // 已经在这一家的最后:不动,什么都不写
+        // Already last for this tool: no move, nothing said
         let before = std::fs::read_to_string(&p.env.config).unwrap();
         assert!(shift(&mut p, KeyCode::Down).flash.is_none());
         assert_eq!(std::fs::read_to_string(&p.env.config).unwrap(), before);
-        // 挪了:列表当场换顺序,底栏不另外说
+        // Moved: the list reorders on the spot, no extra message in the bottom bar
         let fx = shift(&mut p, KeyCode::Up);
         assert!(fx.flash.is_none() && names(&p)[2] == "sub");
         press(&mut p, &[KeyCode::Char('K'), KeyCode::Char('K')]);
-        // 高亮跟着它;Codex 的不受影响
+        // The highlight follows it; Codex's are unaffected
         assert_eq!((names(&p), on(&p)), (vec!["sub", "codex", "firm", "gone", "cx"], "sub"));
         press(&mut p, &[KeyCode::Char('K')]);
         assert_eq!(names(&p)[0], "sub");
-        // 记在 [ui] menu,别的行(注释、hide)原样;n 菜单读到的就是这个顺序
+        // Kept in [ui] menu, other lines (comments, hide) untouched; the n menu reads this same order
         let text = std::fs::read_to_string(&p.env.config).unwrap();
         assert_eq!(text, before.replace("[ui]\n", "[ui]\nmenu = [\"sub\", \"codex\", \"firm\", \"gone\", \"cx\"]\n"));
         let menu = crate::tools::menu(
@@ -1487,7 +1512,8 @@ mod tests {
         let (root, mut p) = page_with("add", &CONFIG.replace("codex = \"~/.codex\"\n", ""));
         let before = std::fs::read_to_string(&p.env.config).unwrap();
         press(&mut p, &[KeyCode::Char('+')]);
-        // 第一步:两个工具摆出来挑,不是在打字(j / k 是挑);表单在右边那一栏,左边的列表还在
+        // Step one: the two tools laid out to pick from, not typing (j / k pick); the form is in the right column, the left list
+        // still there
         assert!(!p.typing());
         let text = shown(&p, 110);
         shows(&text, &["添加账号 · 选择工具", "› Claude Code  默认目录 ~/.claude-<名字>", "  Codex        默认目录 ~/.codex-<名字>"]);
@@ -1495,7 +1521,7 @@ mod tests {
         press(&mut p, &[KeyCode::Enter]);
         assert!(p.typing());
         shows(&shown(&p, 110), &["添加 Claude Code 账号 · 名字", "字母、数字、- 和 _"]);
-        // 名字:空的、写得不对的、这一家里重了的,当场说
+        // Name: empty, malformed, or already taken for this tool is reported on the spot
         press(&mut p, &[KeyCode::Enter]);
         assert_eq!(p.form.as_ref().unwrap().hint, "账号名不能为空");
         type_in(&mut p, "a b");
@@ -1504,7 +1530,7 @@ mod tests {
         retype(&mut p, "sub");
         press(&mut p, &[KeyCode::Enter]);
         assert_eq!(p.form.as_ref().unwrap().hint, "账号已存在:sub");
-        // 把 Codex 默认的目录登记成 Claude 的账号:不给,说它是谁的
+        // Registering Codex's default directory as a Claude account: refused, saying whose it is
         retype(&mut p, "mine");
         press(&mut p, &[KeyCode::Enter]);
         assert_eq!(p.form.as_ref().unwrap().text, "~/.claude-mine");
@@ -1517,7 +1543,7 @@ mod tests {
         press(&mut p, &[KeyCode::Enter]);
         assert!(p.form.as_ref().unwrap().hint.starts_with("~/.elsewhere 是 Codex 的目录(其中包含 auth.json、config.toml…)"));
         assert_eq!(std::fs::read_to_string(&p.env.config).unwrap(), before);
-        // Esc 一步步退回第一步,换成 Codex:同一个目录就能加了;目录本来就在,不用登录
+        // Esc back step by step to step one, switch to Codex: the same directory can be added; it already exists, so no login
         press(&mut p, &[KeyCode::Esc, KeyCode::Esc, KeyCode::Down, KeyCode::Enter]);
         shows(&shown(&p, 110), &["加 Codex 账号 · 名字"]);
         press(&mut p, &[KeyCode::Enter]);
@@ -1527,7 +1553,7 @@ mod tests {
         assert_eq!(fx.flash.as_deref(), Some("已添加 Codex 账号 mine"));
         assert_eq!((names(&p), on(&p)), (vec!["firm", "gone", "sub", "cx", "mine"], "mine"));
         shows(&shown(&p, 110), &["目录      ~/.elsewhere", "登录      ● ChatGPT"]);
-        // 新建的目录:加完在下半屏开终端,带着这个账号跑它自己的登录
+        // A newly created directory: once added, a terminal opens in the bottom half running the tool's own login for this account
         press(&mut p, &[KeyCode::Char('+'), KeyCode::Enter]);
         type_in(&mut p, "work");
         press(&mut p, &[KeyCode::Enter]);
@@ -1540,7 +1566,7 @@ mod tests {
             "{:?}",
             term.run
         );
-        // 第一步上 Esc:不加了,回到表
+        // Esc on step one: not adding, back to the page
         assert_eq!(key(&mut p, KeyCode::Char('+')).0, Flow::Stay);
         assert_eq!(key(&mut p, KeyCode::Esc).0, Flow::Stay);
         assert!(p.form.is_none());
@@ -1551,24 +1577,26 @@ mod tests {
     #[test]
     fn enter_logs_in_with_the_tools_own_command_and_r_asks_again() {
         let (root, mut p) = page("login");
-        // 另一家的目录:不在里面登录
+        // The other tool's directory: no login in it
         let fx = press(&mut p, &[KeyCode::Enter]);
         assert_eq!((fx.term.is_none(), fx.flash.as_deref()), (true, Some("是 Codex 的目录,不能在此登录")));
         let fx = press(&mut p, &[KeyCode::Down, KeyCode::Enter]);
         let term = fx.term.unwrap();
         assert_eq!(term.title, "登录 Claude Code · firm");
         assert!(term.run.as_deref().is_some_and(|c| c.ends_with("' run claude:firm -- auth login")));
-        // 不让 Claude 自己开浏览器:链接交到这个文件,界面弹出来挑(Codex 的从屏幕上认)
+        // Claude isn't allowed to open the browser itself: the link goes to this file and the UI pops up a choice (Codex's is read off
+        // the screen)
         let file = root.join("state/login-claude-firm.url");
         assert_eq!(term.env, [("ACA_LOGIN_LINK".to_string(), file.to_string_lossy().into_owned())]);
         assert_eq!(term.link, Some(crate::term::Catch { file, screen: false }));
-        // 登录着的(往上绕过段头到最后一行,Codex 的):⏎ 不直接去登录 —— Codex 的登录一开始就把原来那份删了,先问
+        // Logged in (up wraps past the section header to the last row, Codex's): ⏎ doesn't go straight to login — Codex's login
+        // deletes the old one the moment it starts, so ask first
         let fx = press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Up, KeyCode::Enter]);
         assert!(fx.term.is_none() && p.asking == Some(Asking::Relogin));
         let text = shown(&p, 110);
         shows(&text, &["重新登录 Codex 账号 cx?", "当前已登录:ChatGPT。", "Codex 开始登录时会清除当前登录", "y 重新登录 • 其他键 取消"]);
         assert!(text.last().unwrap().is_empty(), "在问的时候底下不写其他键:{text:#?}");
-        // 别的键:不登录,回到那一页,键也不往下走
+        // Any other key: no login, back to the page, and the key isn't passed on
         let fx = press(&mut p, &[KeyCode::Enter]);
         assert!(fx.term.is_none() && p.asking.is_none() && on(&p) == "cx");
         shows(&shown(&p, 110), &["登录      ● ChatGPT"]);
@@ -1577,7 +1605,8 @@ mod tests {
         let term = fx.term.unwrap();
         assert!(term.run.as_deref().is_some_and(|c| c.ends_with("' run codex:cx -- login")));
         assert!(term.link.is_some_and(|c| c.screen && c.file.ends_with("login-codex-cx.url")));
-        // Claude 登录着的也先问;还没问到的、问不出的当它登录着(还没问到的不写现在登录着没有)
+        // A logged-in Claude account asks first too; not asked yet or can't tell is treated as logged in (not asked yet doesn't say
+        // whether it's logged in now)
         let fx = press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Enter]);
         assert!(fx.term.is_none() && on(&p) == "sub");
         shows(&shown(&p, 110), &["重新登录 Claude Code 账号 sub?", "当前已登录:max · me@example.com。", "重新登录将替换当前登录。"]);
@@ -1589,12 +1618,12 @@ mod tests {
         shows(&text, &["重新登录 Claude Code 账号 sub?", "重新登录将替换当前登录。"]);
         assert!(!text.iter().any(|l| l.contains("已登录")), "{text:#?}");
         press(&mut p, &[KeyCode::Esc]);
-        // 没登录的那一行写的是「登录」,⏎ 直接去
+        // The logged-out row says 「登录」 (log in); ⏎ goes straight there
         press(&mut p, &[KeyCode::Up, KeyCode::Up]);
         assert_eq!(on(&p), "firm");
         shows(&shown(&p, 110), &["登录      ○ 未登录 · ⏎ 登录"]);
         assert!(shown(&p, 110).last().unwrap().starts_with("⏎ 登录 • + 添加账号"));
-        // r:问到的都丢掉重问(登录完回来按一下)
+        // r: drop every answer and ask again (press it after coming back from logging in)
         p.logins.lock().unwrap().insert("claude:firm".into(), Login::Unknown("旧的".into()));
         press(&mut p, &[KeyCode::Char('r')]);
         assert_eq!(p.logins.lock().unwrap().get("claude:firm"), Some(&Login::Out));
@@ -1612,26 +1641,27 @@ mod tests {
                     let lines: Vec<String> =
                         p.lines_in(w, h).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
                     let over: Vec<&String> = lines.iter().filter(|l| l.width() > w).collect();
-                    // 正好 h 行、不超宽:挪高亮、问删不删、填表单,框都不变
+                    // Exactly h lines, none too wide: moving the highlight, asking whether to remove, filling the form
+                    // leave the frame alone
                     assert!(lines.len() == h && over.is_empty(), "{w}x{h}:{} 行,超宽的 {over:#?}", lines.len());
                 }
             }
             press(&mut p, &[KeyCode::Esc, KeyCode::Esc]);
             assert!(p.form.is_none() && p.asking.is_none());
         }
-        // 框多高照内容定,挪高亮、问删不删都不变
+        // Frame height follows the content; moving the highlight or asking whether to remove doesn't change it
         let tall = p.fill_rows();
         let downs = [KeyCode::Down; 4];
         for keys in [&[KeyCode::Down][..], &downs[..], &[KeyCode::Char('d')][..]] {
             press(&mut p, keys);
             assert_eq!(p.fill_rows(), tall);
         }
-        // 停在 cx(登录着)上按 ⏎:在问要不要重新登录,框还是那么高
+        // ⏎ on cx (logged in): asking whether to log in again, the frame is just as tall
         press(&mut p, &[KeyCode::Esc, KeyCode::Enter]);
         assert_eq!((on(&p), p.asking, p.fill_rows()), ("cx", Some(Asking::Relogin), tall));
         press(&mut p, &[KeyCode::Esc, KeyCode::Down, KeyCode::Down]);
         assert_eq!((on(&p), tall), ("codex", Some(22)));
-        // 宽的:最下面是细线和键;在填表单时键写在右边那一栏里,底下那行空着
+        // Wide: rule and keys at the bottom; while filling the form the keys go in the right column and the bottom line is empty
         let wide = shown(&p, 116);
         assert_eq!(wide[wide.len() - 1], "⏎ 登录 • + 添加账号 • d 删除 • ⇧↑↓ 移动 • p 启动参数 • s 状态栏 • r 刷新");
         assert!(wide[wide.len() - 2].starts_with("────"), "{wide:#?}");
@@ -1639,7 +1669,7 @@ mod tests {
         let form = shown(&p, 116);
         assert!(form.last().unwrap().is_empty() && form.iter().any(|l| l.ends_with("⏎ 下一步 • ↑↓ 切换 • Esc 返回")), "{form:#?}");
         press(&mut p, &[KeyCode::Esc]);
-        // 手机那么宽:上下叠,列表在上、高亮那个的整页在下
+        // Phone width: stacked, list on top, the highlighted one's page below
         press(&mut p, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
         let narrow = shown(&p, 42);
         let list = narrow.iter().position(|l| l.starts_with("› sub ") && l.contains("● max")).unwrap_or_else(|| panic!("{narrow:#?}"));
@@ -1649,15 +1679,15 @@ mod tests {
         let (root2, env) = home("empty", "");
         let none = Page::load(env, vec![], false);
         let text = shown(&none, 110);
-        // 装着的那家(这里只装了 Claude)列段头,高亮着:不加账号时用的那个登录着没有、怎么登,段头上能改启动参数;
-        // 没装的 Codex 不提
+        // The installed tool (only Claude here) gets a section header, highlighted: whether the one used without an account is logged
+        // in and how to log in; launch args can be edited on the header; Codex, not installed, isn't mentioned
         assert_eq!(on(&none), "Claude Code");
         assert!(text.iter().any(|l| l.starts_with("Claude Code") && l.contains("│  Claude Code")), "{text:#?}");
         shows(&text, &["  暂无账号", "默认使用 ~/.claude · + 添加账号", "登录      ○ 未登录"]);
         shows(&text, &["          登录:aca run claude -- auth login"]);
         assert!(!text.iter().any(|l| l.contains("Codex") || l.contains("aca run codex")), "{text:#?}");
         assert_eq!(text.last().unwrap(), "+ 添加账号 • p 启动参数 • r 刷新");
-        // 哪一家都没装:只能加
+        // No tool installed: only adding is possible
         let (root3, mut env) = home("bare", "");
         env.installed = |_| false;
         let bare = Page::load(env, vec![], false);

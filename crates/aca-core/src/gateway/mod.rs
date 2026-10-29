@@ -1,21 +1,26 @@
-//! MCP gateway(第一方插件 `aca.gateway`):MCP 的注册中心。可装可不装、可开可关。
+//! MCP gateway (the first-party plugin `aca.gateway`): a registry for MCP. Optional to install, and can be switched on and off.
 //!
-//! 开着时,aca 给每个 agent 只挂一个 MCP 服务 `aca`,它是一个很薄的转接(`aca plugin gateway connect`,见 [`connect`]):
-//! stdio 进,本机 Unix socket 出,连到 gateway。gateway 是一个进程,下面挂着各个 MCP 服务:
-//! - 插件的 MCP(`[agent.mcp]`,`via` 不是 direct 的)
-//! - 插件露给 agent 的能力(`aca plugin tools`)
-//! - config.toml 里 `[mcps.<名字>]` 写的、在 gateway 的设置 `servers` 里点了名的
+//! When on, aca mounts only one MCP server, `aca`, on each agent; it's a very thin relay (`aca plugin gateway connect`, see
+//! [`connect`]): stdio in, a local Unix socket out, connected to the gateway. The gateway is one process with the MCP servers
+//! under it:
+//! - plugins' MCP servers (`[agent.mcp]` whose `via` isn't direct)
+//! - commands plugins expose to agents (`aca plugin tools`)
+//! - `[mcps.<name>]` in config.toml that are named in the gateway's `servers` setting
 //!
-//! 每个服务按 `scope` 起:shared(默认)只起一份,所有会话共用 —— 请求编号改写了再转,不会撞;
-//! session 每个会话一份(有状态的,比如一个浏览器),这个会话最后一个连接断了就收掉。都是第一次有人要时才起。
+//! Each server starts according to its `scope`: shared (the default) starts once, shared by all sessions — request ids are
+//! rewritten before forwarding, so they don't collide; session gives each session its own (stateful ones, such as a browser),
+//! cleaned up when that session's last connection closes. All start only when first asked for.
 //!
-//! 谁在调:转接连上先报「我是哪个会话」;gateway 转调用时在请求的 `_meta` 里加 `dev.aca/session`(规范没有标准的调用者字段,
-//! 第二段是 mcp / modelcontextprotocol 的前缀是保留的,所以用 dev.aca)。共用的插件 MCP 从这读调用者;每会话一份的
-//! 环境里还有 `ACA_SESSION_ID`。每个会话看到的工具按 plugins.toml 的 agents 算(插件够不着这个会话的,它的工具不给)。
+//! Who's calling: the relay says "which session I am" first when it connects; when forwarding a call, the gateway adds
+//! `dev.aca/session` to the request's `_meta` (the spec has no standard caller field, and prefixes whose second label is mcp /
+//! modelcontextprotocol are reserved, hence dev.aca). Shared plugin MCP servers read the caller from there; per-session ones also
+//! have `ACA_SESSION_ID` in their environment. The tools each session sees follow the agents setting in plugins.toml (a plugin
+//! that can't reach this session doesn't get its tools offered).
 //!
-//! 不违背「核心没有常驻进程」:第一个转接发现 gateway 没在跑就把它拉起来(加锁,两个同时来只起一个),
-//! 没人连着过了设置的分钟数自己退出;插件停了就不再挂,它也就没人连了。socket、pid、日志都在 `state/gateway/`,
-//! 任何一个 aca 命令都能查(`aca plugin gateway status`)、能停。
+//! This doesn't break "the core has no resident process": the first relay that finds the gateway not running starts it (under a
+//! lock, so two arriving at once start only one), and it exits by itself after the set number of minutes with nobody connected;
+//! once a plugin is stopped it's no longer mounted, so nobody connects to it. The socket, pid and logs are all in
+//! `state/gateway/`, and any aca command can check it (`aca plugin gateway status`) and stop it.
 
 pub mod connect;
 mod down;
@@ -36,13 +41,14 @@ use crate::{t, tr};
 
 pub use serve::serve;
 
-/// gateway 这个插件的 id
+/// The gateway plugin's id
 pub const PLUGIN: &str = "aca.gateway";
 
-/// 挂到 agent 上的那个服务的名字(和不开 gateway 时能力的那个服务同名:agent 那头看到的工具名前缀一样,都是 mcp__aca__)
+/// The name of the server mounted on agents (the same name as the plugin-commands server without the gateway: the tool name prefix
+/// the agent sees is the same, mcp__aca__)
 pub const SERVER: &str = "aca";
 
-/// gateway 开没开:装了 `aca.gateway` 这个插件、开着
+/// Whether the gateway is on: the `aca.gateway` plugin is installed and enabled
 pub fn enabled() -> bool {
     plugin::registry().iter().any(|e| e.enabled && e.id == PLUGIN)
 }
@@ -51,7 +57,8 @@ pub fn dir() -> PathBuf {
     paths::state_dir().join("gateway")
 }
 
-/// socket 的路径。Unix socket 的路径最长一百来个字节:状态目录太深(测试、换了 ACA_HOME)时改放 /tmp,名字按状态目录算
+/// The socket's path. A Unix socket path is at most a hundred-odd bytes: when the state directory is too deep (tests, a different
+/// ACA_HOME), put it in /tmp instead, named after the state directory
 pub fn sock_path() -> PathBuf {
     let p = dir().join("gw.sock");
     if p.as_os_str().len() < 100 {
@@ -74,7 +81,7 @@ pub fn log_dir() -> PathBuf {
     dir().join("logs")
 }
 
-/// 一个服务的日志(它的 stderr、它发来的日志通知)
+/// A server's log (its stderr, and the log notifications it sends)
 pub fn log_of(server: &str) -> PathBuf {
     log_dir().join(format!("{}.log", mount::safe(server)))
 }
@@ -83,28 +90,29 @@ fn calls_log() -> PathBuf {
     dir().join("calls.jsonl")
 }
 
-/// 一个下游 MCP 服务怎么起
+/// How to start a downstream MCP server
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Spec {
-    /// 名字:工具名的前缀(`<名字>__<工具>`)
+    /// Name: the prefix of the tool names (`<name>__<tool>`)
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
-    /// 每个会话一份
+    /// One per session
     pub per_session: bool,
-    /// 哪个插件的(按 plugins.toml 的 agents 决定给谁);None = 谁都给
+    /// Which plugin it belongs to (the agents setting in plugins.toml decides who gets it); None = everyone
     pub plugin: Option<String>,
-    /// aca 自己的能力服务:工具名本来就带着插件名,不再加前缀,按工具名里的插件决定给谁
+    /// aca's own plugin-commands server: the tool names already carry the plugin name, so no prefix is added, and the plugin in the tool
+    /// name decides who gets it
     pub tools: bool,
 }
 
-/// gateway 的设置(plugins.toml 里 `[plugins."aca.gateway"] settings`,清单里有默认值)
+/// The gateway's settings (`[plugins."aca.gateway"] settings` in plugins.toml; the manifest has the defaults)
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
-    /// 要经 gateway 给 agent 的 `[mcps.<名字>]`
+    /// The `[mcps.<name>]` to offer agents through the gateway
     pub servers: Vec<String>,
-    /// 没人连着多久退出
+    /// How long with nobody connected before exiting
     pub idle: Duration,
 }
 
@@ -123,7 +131,8 @@ pub fn settings() -> Settings {
     Settings { servers, idle: Duration::from_secs(mins * 60) }
 }
 
-/// 现在 gateway 下面该挂哪些服务(每次有人来列工具时重算,改了 config.toml / plugins.toml 不用重启 gateway)
+/// Which servers should be under the gateway now (recomputed every time someone lists tools, so changes to config.toml /
+/// plugins.toml need no gateway restart)
 pub fn catalog() -> Vec<Spec> {
     let aca = crate::agent::self_exe();
     let mut out = vec![];
@@ -182,7 +191,7 @@ pub fn catalog() -> Vec<Spec> {
     out
 }
 
-/// gateway 有没有东西给这个会话:有,才给它挂转接(默认什么都不进 agent)
+/// Whether the gateway has anything for this session: only then is the relay mounted on it (by default nothing goes into the agent)
 pub fn offers(kind: &str, tool: &str, account: &str) -> bool {
     let wants = decl::wants().unwrap_or_default();
     let reaches = |id: &str| wants.get(id).is_none_or(|w| w.reaches(tool, kind, account));
@@ -199,7 +208,7 @@ fn off_file(session: &str) -> PathBuf {
     dir().join("off").join(format!("{session}.json"))
 }
 
-/// 这个会话在 M 页里关掉的服务(名字)
+/// Servers switched off for this session on the M page (names)
 pub fn off_for(session: &str) -> Vec<String> {
     if session.is_empty() {
         return vec![];
@@ -207,7 +216,8 @@ pub fn off_for(session: &str) -> Vec<String> {
     std::fs::read_to_string(off_file(session)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
-/// 改这个会话关掉的服务;在跑的 gateway 通知连着的 agent 重新拉工具列表(Claude 当场换,Codex 重启才换)
+/// Change the servers switched off for this session; a running gateway tells connected agents to fetch the tool list again (Claude
+/// switches on the spot, Codex after a restart)
 pub fn set_off(session: &str, names: &[String]) -> Res<()> {
     let f = off_file(session);
     if names.is_empty() {
@@ -220,7 +230,8 @@ pub fn set_off(session: &str, names: &[String]) -> Res<()> {
     Ok(())
 }
 
-/// 这个会话从 gateway 能看到的服务(按插件给谁筛过,M 页里关掉的也在):(服务, 关没关)
+/// Servers this session can see through the gateway (filtered by who each plugin is for; ones switched off on the M page are
+/// included): (server, switched off)
 pub fn seen_by(session: &str) -> Vec<(Spec, bool)> {
     let (tool, kind, account) = serve::facts(session);
     let wants = decl::wants().unwrap_or_default();
@@ -242,7 +253,7 @@ pub fn seen_by(session: &str) -> Vec<(Spec, bool)> {
         .collect()
 }
 
-/// 每个服务最近一天被调了几次、哪几个会话在用(从调用记录里数)
+/// How many times each server was called in the last day, and which sessions use it (counted from the call log)
 pub fn usage() -> std::collections::HashMap<String, (usize, Vec<String>)> {
     let since = paths::now().saturating_sub(86_400);
     let mut out: std::collections::HashMap<String, (usize, Vec<String>)> = Default::default();
@@ -261,7 +272,8 @@ pub fn usage() -> std::collections::HashMap<String, (usize, Vec<String>)> {
     out
 }
 
-/// 把 `[mcps.<名字>]` 收进 / 移出 gateway(改 plugins.toml 里 gateway 的设置 servers)。下次有人来列工具时就是新的
+/// Put `[mcps.<name>]` into / take it out of the gateway (changes the gateway's servers setting in plugins.toml). The next one to
+/// list tools gets the new set
 pub fn set_served(name: &str, on: bool) -> Res<()> {
     if on && !mcps_names().iter().any(|n| n == name) {
         return Err(tr!("config.toml 中没有 [mcps.{name}]", "no [mcps.{name}] in config.toml"));
@@ -278,19 +290,19 @@ pub fn set_served(name: &str, on: bool) -> Res<()> {
     Ok(())
 }
 
-/// config.toml 里 `[mcps.*]` 的名字
+/// Names of `[mcps.*]` in config.toml
 pub fn mcps_names() -> Vec<String> {
     let cfg: toml::Table =
         std::fs::read_to_string(paths::config_dir().join("config.toml")).ok().and_then(|t| t.parse().ok()).unwrap_or_default();
     cfg.get("mcps").and_then(|m| m.as_table()).map(|t| t.keys().cloned().collect()).unwrap_or_default()
 }
 
-/// 发一条控制命令给在跑的 gateway,读它回的一行
+/// Send a control command to the running gateway and read the line it replies
 pub fn ctl(cmd: Value) -> Res<Value> {
     ctl_within(cmd, Duration::from_secs(10))
 }
 
-/// 同 [`ctl`],最多等 `wait`(状态栏这种每隔几秒问一次的,不能被它拖住)
+/// Same as [`ctl`], waiting at most `wait` (things like the status bar asking every few seconds mustn't get held up by it)
 pub fn ctl_within(cmd: Value, wait: Duration) -> Res<Value> {
     let s = UnixStream::connect(sock_path()).map_err(|_| t!("gateway 未运行", "the gateway isn't running").to_string())?;
     s.set_read_timeout(Some(wait)).ok();
@@ -306,7 +318,7 @@ pub fn ctl_within(cmd: Value, wait: Duration) -> Res<Value> {
     serde_json::from_str(&line).map_err(|_| t!("无法解析 gateway 的响应", "can't read the gateway's answer").to_string())
 }
 
-/// `aca plugin gateway status`:在不在跑、谁连着、下面每个服务的样子、最近几次调用
+/// `aca plugin gateway status`: whether it's running, who's connected, how each server under it is doing, the last few calls
 pub fn status_text() -> String {
     let mut out = vec![];
     if !enabled() {

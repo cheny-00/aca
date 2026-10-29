@@ -1,17 +1,24 @@
-//! `aca tmux-status`:tmux 状态栏上的一段 —— 有几个会话在等你,哪个插件出错了(`⚠ bark`,见 `plugin::health`)。
-//! `aca next`:进下一个在等你的(那两个数指的就是它们)。绑在一个键上,和 Ctrl+Q 一个办法(config.toml 的 `[keys] next`,
-//! 见 `plugin::bind_hotkeys`):看到数、按键、到了。
+//! `aca tmux-status`: one segment of the tmux status bar: how many sessions need you, which plugin has errors (`⚠ bark`,
+//! see `plugin::health`).
+//! `aca next`: go into the next one that needs you (the ones those two numbers count). Bound to a key the same way as Ctrl+Q
+//! (config.toml's `[keys] next`, see `plugin::bind_hotkeys`): see the number, press the key, you're there.
 //!
-//! 状态栏是余光扫的地方,所以只打种类和个数、用颜色分轻重,不打名字:名字截到十几格认不出来,看到了也点不了。
-//! 是谁、在问什么,列表里写得全。
+//! The status bar is caught out of the corner of your eye, so it shows only kinds and counts, with color for urgency, and no
+//! names: a name cut to a dozen-odd cells can't be recognized, and seeing it you still can't click it.
+//! Who it is and what it's asking, the list spells out in full.
 //!
-//! 状态栏 tmux 每隔 `status-interval` 秒跑一次,所以只读:登记表、一条 `tmux list-panes`、每个会话一个小状态文件、界面记的已读。
-//! 不读屏幕、不替没报 hook 的那一轮补事件、不跟改名(这些留给列表刷新),所以偶尔比列表慢一拍
-//! (比如 Codex 漏了 Stop hook 的那一轮,列表刷新时才补上)。
-//! `aca next` 是按一下才跑一次:和列表一样读屏幕,只在屏幕上看得出在等你的(没信任 hook 的 Codex、启动时的确认框)也去得了。
+//! tmux runs the status bar every `status-interval` seconds, so it only reads: the registry, one `tmux list-panes`, one small
+//! status file per session, the seen marks the interface keeps.
+//! It doesn't read screens, doesn't fill in events for a turn whose hook didn't report, doesn't follow renames (those are left
+//! to the list refresh), so now and then it's a beat behind the list
+//! (e.g. a turn where Codex missed the Stop hook is filled in only when the list refreshes).
+//! `aca next` runs once per press: it reads screens like the list, so it also reaches ones only the screen shows need you
+//! (Codex without trusted hooks, a confirmation prompt at startup).
 //!
-//! `aca tmux install` 替你接上(见 tmuxconf.rs);自己接:`set -ag status-right "#($HOME/.local/bin/aca tmux-status #{@aca_id})"`。
-//! 后面那个是你正看着的会话,不算它;没有在等你的、插件也都好好的,就什么都不打,这一段就没了。
+//! `aca tmux install` hooks it up for you (see tmuxconf.rs); by hand:
+//! `set -ag status-right "#($HOME/.local/bin/aca tmux-status #{@aca_id})"`.
+//! The argument at the end is the session you're looking at, which isn't counted; with nothing needing you and every plugin
+//! fine, it prints nothing and the segment is gone.
 
 use aca_core::plugin::health::{self, Problem};
 use aca_core::status::{self, Row, State};
@@ -21,17 +28,17 @@ use unicode_width::UnicodeWidthChar;
 use crate::reads::Reads;
 use crate::ui::SEEN_SLACK;
 
-/// 出错的插件列几个名字,多的写 +N
+/// How many names of failing plugins to list; the rest as +N
 const NAMES: usize = 2;
-/// 一个名字最多几格宽
+/// Max width of one name, in cells
 const NAME_W: usize = 14;
-/// 在等你的两种:要你确认 / 选择,跑完了还没看
+/// The two kinds that need you: wants you to confirm / choose; finished and not seen yet
 const ASK: u8 = 0;
 const DONE: u8 = 1;
 
 pub fn run(args: &[String]) -> i32 {
     let here = args.first().map(String::as_str).unwrap_or("");
-    // 出什么错都只是这一段没了:状态栏上不打错误
+    // Whatever goes wrong, this segment just isn't there: no errors on the status bar
     let Ok(rows) = aca_core::store::Store::open().and_then(|s| status::peek(&s)) else { return 0 };
     let parts = [text(&rows, &Reads::open(Reads::default_path()), here), alerts(&health::problems())];
     let line = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("  ");
@@ -41,7 +48,8 @@ pub fn run(args: &[String]) -> i32 {
     0
 }
 
-/// `⚠ bark remote`:出错了的插件(aca 自带的去掉 `aca.`),最多列两个,多的写 +N。细节在插件页、`aca plugin ls`
+/// `⚠ bark remote`: plugins with errors (aca's own without `aca.`), at most two listed, the rest as +N.
+/// Details on the plugins page, `aca plugin ls`
 fn alerts(problems: &[Problem]) -> String {
     let mut names: Vec<&str> = vec![];
     for p in problems {
@@ -57,14 +65,15 @@ fn alerts(problems: &[Problem]) -> String {
     if names.len() > NAMES {
         out.push_str(&format!(" +{}", names.len() - NAMES));
     }
-    // tmux 拿 # 起头的当格式:名字里的 # 写两个
+    // tmux reads anything starting with # as a format: double any # in names
     out.replace('#', "##")
 }
 
-/// 在等你的,先要你确认的,同一种里最近有动静的在前。`!` 要你确认 / 选择(派出去的 worker 也算),
-/// `●` 跑完了还没看(只算你自己开的:worker 跑完是派它的那个收)。你正看着的那个不算
+/// The ones that need you: those wanting your confirmation first, within a kind the most recently active first. `!` wants you
+/// to confirm / choose (delegated workers count too), `●` finished and not seen yet (only ones you started yourself: a finished
+/// worker is collected by the one that delegated it). The one you're looking at doesn't count
 fn waiting<'a>(rows: &'a [Row], reads: &Reads, here: &str) -> Vec<(u8, &'a Row)> {
-    // 叠上界面记的已读 / 未读,跟列表里看到的一样(见 reads.rs)
+    // Layer on the seen / unread marks the interface keeps, so it matches what the list shows (see reads.rs)
     let state = |r: &Row| match r.state {
         State::Unread if reads.read_at(&r.id).is_some_and(|t| r.active <= t + SEEN_SLACK) => State::Idle,
         State::Idle if reads.unread(&r.id) => State::Unread,
@@ -83,8 +92,9 @@ fn waiting<'a>(rows: &'a [Row], reads: &Reads, here: &str) -> Vec<(u8, &'a Row)>
     waiting
 }
 
-/// ` ◆ 2  ◐ 3`:各有几个,符号同列表。`◆` 要你答:agent 停着等你,红底的一块;`◐` 没看:放着也不丢,次要的字色。没有的那一样不打。
-/// 颜色用终端调色板里的名字:底色是你的 tmux 主题定的,跟着它走
+/// ` ◆ 2  ◐ 3`: how many of each, symbols as in the list. `◆` needs your answer: the agent is stopped waiting for you, a red block;
+/// `◐` unread: nothing's lost if left, secondary text color. A kind with none isn't shown.
+/// Colors are named from the terminal palette: the background is set by your tmux theme, so they follow it
 fn text(rows: &[Row], reads: &Reads, here: &str) -> String {
     let w = waiting(rows, reads, here);
     let asks = w.iter().filter(|(kind, _)| *kind == ASK).count();
@@ -99,29 +109,31 @@ fn text(rows: &[Row], reads: &Reads, here: &str) -> String {
     parts.join(" ")
 }
 
-/// 下一个进哪个:先没看过的(次序同 [`waiting`]);都看过了、还有在等你确认的,挑最久没去的那个,一圈圈轮。
-/// 看过 = 进去过、之后没有新动静(同界面里的 `i`)。没在跑的进不去,不算
+/// Which one to go into next: unseen ones first (order as in [`waiting`]); once all are seen and some still wait for your
+/// confirmation, the one longest unvisited, round and round.
+/// Seen = gone into, with no new activity since (same as `i` in the interface). Ones not running can't be gone into, so don't count
 fn pick<'a>(rows: &'a [Row], reads: &Reads, here: &str) -> Option<&'a Row> {
     let w: Vec<(u8, &Row)> = waiting(rows, reads, here).into_iter().filter(|(_, r)| !r.pane.is_empty()).collect();
     let fresh = |r: &Row| reads.read_at(&r.id).is_none_or(|t| r.active > t + SEEN_SLACK);
     w.iter().find(|(_, r)| fresh(r)).or_else(|| w.iter().min_by_key(|(_, r)| reads.read_at(&r.id))).map(|(_, r)| *r)
 }
 
-/// `aca next [--session <你正在的那个>] [--client <tmux 的客户端>]`:进下一个在等你的。键按下去跑的就是它
-/// (`--session '#{@aca_id}' --client '#{client_name}'`,tmux 换成按键的那个会话、那台终端);自己敲的话两样都不用写。
-/// 离开的这个、进去的那个都算看过了,所以再按一次是下一个
+/// `aca next [--session <the one you're in>] [--client <tmux client>]`: go into the next one that needs you. It's what the key runs
+/// (`--session '#{@aca_id}' --client '#{client_name}'`, tmux fills in the session and terminal the key was pressed in); typing it
+/// yourself, neither is needed.
+/// Both the one left and the one entered count as seen, so pressing again goes to the next one
 pub fn next(args: &[String]) -> i32 {
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).filter(|v| !v.is_empty()).cloned();
     let client = opt("--client");
     let in_tmux = client.is_some() || std::env::var_os("TMUX").is_some();
     let tmux = |args: &[&str]| aca_core::tmux::run(args);
-    // 键是在 tmux 里按的,没有终端可打字:话说在状态栏上
+    // The key was pressed in tmux, with no terminal to print to: messages go on the status bar
     let say = |m: &str| match (&client, in_tmux) {
         (Some(c), _) => drop(tmux(&["display-message", "-c", c, m])),
         (None, true) => drop(tmux(&["display-message", m])),
         (None, false) => println!("{m}"),
     };
-    // 读屏幕(同列表):只靠 peek 的话,列表里 ◐ 的、hook 没报的那些按了去不了
+    // Read screens (as the list does): with peek alone, ones the list shows as ◐ but whose hook didn't report couldn't be reached
     let cfg = aca_core::config::load();
     let rows = match aca_core::store::Store::open().and_then(|s| Ok((status::collect(&s, &cfg, true)?, s))) {
         Ok(v) => v,
@@ -143,7 +155,7 @@ pub fn next(args: &[String]) -> i32 {
         say(t!("暂无待处理会话", "nothing waits for you"));
         return 0;
     };
-    // Ctrl+Q、热键的绑定服务重启就没了:进会话前补一遍(同 `aca attach`)
+    // The Ctrl+Q and hotkey bindings are gone after a server restart: redo them before going into a session (as `aca attach` does)
     aca_core::tmux::bind_detach();
     let went = if in_tmux {
         let mut a = vec!["switch-client"];
@@ -153,7 +165,7 @@ pub fn next(args: &[String]) -> i32 {
         a.extend(["-t", r.pane.as_str()]);
         tmux(&a).map(|_| ())
     } else {
-        // 不在 tmux 里:连上去,detach 才回来
+        // Not in tmux: attach, and come back only on detach
         let sid = aca_core::tmux::find(&r.id).map(|p| p.sid).unwrap_or_default();
         match aca_core::tmux::cmd().args(["attach-session", "-t", &sid]).status() {
             Ok(st) if st.success() => Ok(()),
@@ -174,7 +186,7 @@ pub fn next(args: &[String]) -> i32 {
     }
 }
 
-/// 截到 NAME_W 格宽(中文一个字两格),截了的末尾放 …
+/// Cut to NAME_W cells wide (a Chinese character is two cells); a cut one ends with …
 fn clip(s: &str) -> String {
     let w = |c: char| c.width().unwrap_or(0);
     if s.chars().map(w).sum::<usize>() <= NAME_W {
@@ -236,7 +248,7 @@ mod tests {
             row("e", "在跑", State::Running, "", 40),
             row("f", "我正看着", State::Ask, "", 50),
         ];
-        // worker 跑完的不算(派它的那个收),worker 在问的算;名字不上状态栏
+        // A finished worker doesn't count (the one that delegated it collects it), an asking worker does; names stay off the status bar
         assert_eq!(text(&rows, &reads, "f"), format!("{ASKS}2 #[default] {DONES}1#[default]"));
         assert_eq!(text(&rows, &reads, ""), format!("{ASKS}3 #[default] {DONES}1#[default]"));
         assert_eq!(text(&rows[..1], &reads, ""), format!("{DONES}1#[default]"));
@@ -266,23 +278,23 @@ mod tests {
             row("ask-new", "", State::Ask, "", 8),
             row("busy", "", State::Running, "", 99),
         ];
-        // 先要你确认的,最近有动静的在前;你正在的那个跳过
+        // Ones wanting your confirmation first, most recently active first; the one you're in is skipped
         assert_eq!(id(pick(&rows, &reads, "")), Some("ask-new".into()));
         assert_eq!(id(pick(&rows, &reads, "ask-new")), Some("ask-old".into()));
-        // 进去看过、没再动的往后排:两个在问的都看过了,轮到跑完没看的
+        // Ones gone into and quiet since move back: both asking ones seen, so it's the finished unseen one's turn
         reads.mark_read("ask-new", 100, &|_| true).unwrap();
         reads.mark_read("ask-old", 101, &|_| true).unwrap();
         assert_eq!(id(pick(&rows, &reads, "ask-old")), Some("done-new".into()));
-        // 跑完的看过就不算在等你了;剩下两个还在问:从一个按,去另一个,来回轮
+        // A finished one, once seen, no longer needs you; two still asking remain: press from one, go to the other, back and forth
         reads.mark_read("done-new", 102, &|_| true).unwrap();
         reads.mark_read("done-old", 103, &|_| true).unwrap();
         assert_eq!(id(pick(&rows, &reads, "done-old")), Some("ask-new".into()));
         reads.mark_read("ask-new", 104, &|_| true).unwrap();
         assert_eq!(id(pick(&rows, &reads, "ask-new")), Some("ask-old".into()));
-        // 看过之后又有动静的(换了一个问题):又排到前面
+        // One active again after being seen (a new question): back to the front
         rows[3].active = 200;
         assert_eq!(id(pick(&rows, &reads, "")), Some("ask-new".into()));
-        // 没在跑的进不去;一个在等的都没有 = None
+        // Ones not running can't be gone into; none waiting at all = None
         rows[2].pane.clear();
         rows[3].pane.clear();
         assert_eq!(id(pick(&rows, &reads, "")), None);

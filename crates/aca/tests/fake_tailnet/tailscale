@@ -1,6 +1,7 @@
 #!/bin/sh
-# 假的 tailscale:挂载记在 $FAKE/serve.json(off、--bg 真的改它),状态在 $FAKE/status.json;
-# 改挂载的命令记在 $FAKE/log。$FAKE/down 在 = 没在跑;off_ignored = off 报成功但不撤;off_wipes = off 清掉整份
+# Fake tailscale: mounts are kept in $FAKE/serve.json (off and --bg really change it), the status in $FAKE/status.json;
+# commands that change mounts are logged in $FAKE/log. $FAKE/down exists = not running; off_ignored = off reports success but
+# takes nothing down; off_wipes = off clears the whole file
 F=${FAKE:?}
 case "$1 ${2:-}" in
   "status --json")

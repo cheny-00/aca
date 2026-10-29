@@ -1,14 +1,18 @@
-//! `H` 交接:这个会话跑了一阵(上下文快满了、想换个账号接着跑),另开一个会话接着干。
-//! 先从 `n` 的工具菜单里挑新会话用哪个工具 / 账号(没有 shell),在原会话的目录、分组里建好启动,
-//! 再把一段交接说明发进它的输入框:原会话在哪、对话 id、对话记录在哪,让它自己读完接着做。
+//! `H` hand off: this session has run a while (context nearly full, or you want to carry on under another account), so open
+//! another session to carry on its work. First pick the new session's tool / account from `n`'s tool menu (no shell), create
+//! and start it in the original session's directory and group, then send a handoff note into its input box: where the
+//! original session is, the conversation id, where the conversation record is, so it reads it all itself and carries on.
 //!
-//! 对话记录动辄几十 MB(大半是工具输出),新会话直接读不动,所以先抽一份文字版:双方说的话、子代理交回来的报告,
-//! 最后附它改过的文件(`~/.local/state/aca/ui/handoff/<对话 id>.md`,30 天前的顺手删),说明里两份的路径都给。
+//! A conversation record easily runs to tens of MB (mostly tool output), too much for the new session to read directly, so a
+//! text version is extracted first: what both sides said, reports handed back by subagents, and at the end the files it
+//! changed (`~/.local/state/aca/ui/handoff/<conversation id>.md`; ones older than 30 days are deleted along the way). The
+//! handoff note gives the paths of both.
 //!
-//! 发送是 `session::send_fresh`:等新会话把界面画出来、空下来再发,最多等一分钟。新账号头一回进这个目录
-//! 会先问「信任这个文件夹吗」(Codex 还有「Hooks need review」),那算「在等你」,一分钟里进去选了它才发。
+//! Sending is `session::send_fresh`: wait until the new session has drawn its screen and gone idle, at most a minute. A new
+//! account entering this directory for the first time first asks "trust this folder?" (Codex also "Hooks need review"); that
+//! counts as needs you, and the note is sent only if you go in and answer it within the minute.
 //!
-//! 发不出去就把说明留在新会话的便签里,`s` 再发。
+//! If it can't be sent, the handoff note is left in the new session's note; `s` sends it.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -25,33 +29,34 @@ use crate::data::{Agent, Session};
 use crate::ops::Outcome;
 use crate::workdir::{Found, Where};
 
-/// 文字版留多久
+/// How long text versions are kept
 const KEEP: Duration = Duration::from_secs(30 * 86400);
 
-/// 要交接出去的那个会话
+/// The session being handed off
 #[derive(Clone, Debug, PartialEq)]
 pub struct Source {
     pub title: String,
-    /// 「Claude·work」
+    /// "Claude·work"
     pub label: String,
     pub agent: Agent,
-    /// 登记的目录
+    /// The registered directory
     pub dir: String,
-    /// `B` 复制的那几行:Path / Repo / Branch / Session
+    /// The lines `B` copies: Path / Repo / Branch / Session
     pub info: String,
-    /// 对话 id、对话记录
+    /// Conversation id, conversation record
     pub sid: String,
     pub log: PathBuf,
-    /// 在跑:它的窗格(新会话想看它的屏幕用);没在跑 = 空
+    /// Running: its pane (for the new session to look at its screen); not running = empty
     pub pane: String,
-    /// 它的便签:另外交代的话,一起带过去
+    /// Its note: extra instructions, carried over too
     pub note: Option<String>,
-    /// 找它最后在哪个目录干活用(见 `workdir`)
+    /// For finding which directory it last worked in (see `workdir`)
     pub w: Where,
     pub conf: String,
 }
 
-/// 认出高亮会话现在这段对话:在跑的 Claude 看它进程自己记的对话 id(/clear、resume 之后会变),其余用登记的
+/// Identify the highlighted session's current conversation: for a running Claude, the conversation id its process records
+/// itself (it changes after /clear, resume); otherwise the registered one
 pub fn source(s: &Session) -> Result<Source, String> {
     let w = Where::of(s);
     let conf = crate::mcp::home_of(s);
@@ -76,7 +81,8 @@ pub fn source(s: &Session) -> Result<Source, String> {
     })
 }
 
-/// 后台跑:先抽文字版、写好说明(读不了就不建),再建新会话,最后发过去
+/// Runs in the background: first extract the text version and write the note (nothing is created if the record can't be
+/// read), then create the new session, finally send it over
 pub fn run(from: &Source, req: &NewReq, _to: Agent) -> Outcome {
     let d = match dialog(&from.log, from.agent) {
         Ok(d) => d,
@@ -104,7 +110,7 @@ pub fn run(from: &Source, req: &NewReq, _to: Agent) -> Outcome {
     }
 }
 
-/// 新会话起来要一会儿:等它画出界面、空下来再发
+/// A new session takes a while to start: wait until it has drawn its screen and gone idle before sending
 const SEND_WAIT: Duration = Duration::from_secs(60);
 
 fn send(id: &str, text: &str) -> Result<(), String> {
@@ -112,7 +118,7 @@ fn send(id: &str, text: &str) -> Result<(), String> {
     aca_core::session::send_fresh(&store, &aca_core::config::load(), id, text, SEND_WAIT)
 }
 
-/// 写给新会话的交接说明
+/// The handoff note written for the new session
 pub fn prompt(from: &Source, digest: &Path, lines: usize, now: &Found) -> String {
     let mut p = String::new();
     let _ = writeln!(
@@ -198,13 +204,13 @@ pub fn prompt(from: &Source, digest: &Path, lines: usize, now: &Found) -> String
 enum Who {
     User,
     Agent,
-    /// 压缩上下文时写的摘要(之前的对话被压成了这一段)
+    /// The summary written when compacting the context (the earlier conversation compressed into it)
     Summary,
-    /// 子代理交回来的报告,后面是派它时写的说明
+    /// A report handed back by a subagent; the field is the description written when sending it out
     Sub(String),
 }
 
-/// 一段话:谁说的、什么时候(秒,0 = 不知道)、说了什么
+/// One passage: who said it, when (seconds, 0 = unknown), what was said
 #[derive(Debug, PartialEq)]
 struct Said {
     who: Who,
@@ -212,7 +218,7 @@ struct Said {
     text: String,
 }
 
-/// 它改过的文件:路径、最后一次改的时刻、是不是删掉了(挪走也算删)
+/// A file it changed: path, time of the last change, whether it was deleted (moved away counts as deleted)
 #[derive(Debug, PartialEq)]
 struct Touched {
     path: String,
@@ -220,7 +226,7 @@ struct Touched {
     gone: bool,
 }
 
-/// 从对话记录里抽出来的
+/// What's extracted from the conversation record
 #[derive(Debug, Default, PartialEq)]
 struct Dialog {
     said: Vec<Said>,
@@ -228,7 +234,8 @@ struct Dialog {
 }
 
 impl Dialog {
-    /// 同一方连着说的并成一段(Claude 一条回复按内容块拆成好几行记);摘要、子代理报告各是各的
+    /// Consecutive passages from the same side merge into one (Claude records one reply as several lines, one per content
+    /// block); summaries and subagent reports stay separate
     fn say(&mut self, s: Option<Said>) {
         let Some(s) = s else { return };
         match self.said.last_mut() {
@@ -240,7 +247,7 @@ impl Dialog {
         }
     }
 
-    /// 同一个文件只留最后一次
+    /// Keep only the last change of each file
     fn touch(&mut self, path: &str, at: i64, gone: bool) {
         if path.is_empty() {
             return;
@@ -250,7 +257,7 @@ impl Dialog {
     }
 }
 
-/// 对话记录 → 说的话(按顺序)和改过的文件(按最后一次改的时刻)
+/// Conversation record → what was said (in order) and the files changed (by time of last change)
 fn dialog(log: &Path, agent: Agent) -> Result<Dialog, String> {
     let mut d = Dialog::default();
     if agent == Agent::Codex {
@@ -258,7 +265,7 @@ fn dialog(log: &Path, agent: Agent) -> Result<Dialog, String> {
     } else {
         let mut agents = HashMap::new();
         each_line(log, |v| claude_line(v, &mut d, &mut agents))?;
-        // 子代理自己的记录在 <对话 id>/subagents/ 下,只看它们改了哪些文件
+        // Subagents' own records are under <conversation id>/subagents/; only look at which files they changed
         let subs = log.with_extension("").join("subagents");
         for f in std::fs::read_dir(subs)
             .into_iter()
@@ -297,7 +304,7 @@ fn said(who: Who, v: &Value, text: &str) -> Option<Said> {
     (!text.is_empty()).then(|| Said { who, at: at(v), text: text.to_string() })
 }
 
-/// 内容里的文字:字符串原样,数组只取 `text` 块(思考、工具调用、工具结果、图片都不要)
+/// The text in content: a string as is; from an array only `text` blocks (no thinking, tool calls, tool results, images)
 fn texts(c: &Value) -> String {
     match c {
         Value::String(s) => s.clone(),
@@ -306,8 +313,8 @@ fn texts(c: &Value) -> String {
     }
 }
 
-/// Claude 改过的文件:编辑工具(Edit / Write)做成了,结果里有 `filePath`(没改成的没有);
-/// 新版 Claude Code 的 Bash 结果里还有 `bashEditDiff`,命令行改了哪些文件
+/// Files Claude changed: when an edit tool (Edit / Write) succeeded, its result has `filePath` (failed ones don't);
+/// newer Claude Code's Bash results also have `bashEditDiff`: which files the command line changed
 fn claude_edits(v: &Value, d: &mut Dialog) {
     let r = &v["toolUseResult"];
     if let Some(p) = r["filePath"].as_str() {
@@ -318,8 +325,9 @@ fn claude_edits(v: &Value, d: &mut Dialog) {
     }
 }
 
-/// Claude:`user` / `assistant` 的文字块,加上子代理的报告;子代理自己的(isSidechain)、Claude Code 塞的(isMeta)不要。
-/// agents:派子代理的调用 id → 说明,等它的报告回来时用
+/// Claude: text blocks of `user` / `assistant`, plus subagent reports; not subagents' own (isSidechain) or what Claude Code
+/// injects (isMeta).
+/// agents: id of the call that sent out a subagent → its description, used when its report comes back
 fn claude_line(v: &Value, d: &mut Dialog, agents: &mut HashMap<String, String>) {
     claude_edits(v, d);
     if v["isSidechain"] == true || v["isMeta"] == true {
@@ -339,7 +347,8 @@ fn claude_line(v: &Value, d: &mut Dialog, agents: &mut HashMap<String, String>) 
             d.say(said(Who::Agent, v, &texts(content)));
         }
         Some("user") => {
-            // 前台跑的子代理,报告就是工具结果;后台跑的(新版默认)这里只回一句「已在后台启动」,报告在之后的通知里
+            // For a foreground subagent the report is the tool result; for a background one (newer versions' default) this is
+            // just a line saying it launched in the background, and the report comes in a later notification
             for b in content.as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
                 if let Some(desc) = b["tool_use_id"].as_str().and_then(|id| agents.get(id))
                     && v["toolUseResult"]["status"] != "async_launched"
@@ -362,8 +371,8 @@ fn claude_line(v: &Value, d: &mut Dialog, agents: &mut HashMap<String, String>) 
     }
 }
 
-/// 后台子代理跑完的通知:`<summary>Agent "说明" completed</summary>` 和 `<result>报告</result>`。
-/// 别的后台任务(命令、MCP)的通知不算
+/// The notification that a background subagent finished: `<summary>Agent "DESCRIPTION" completed</summary>` and
+/// `<result>REPORT</result>`. Notifications of other background tasks (commands, MCP) don't count
 fn sub_report(t: &str) -> Option<(String, String)> {
     let s = t.trim_start();
     if !s.starts_with("<task-notification>") {
@@ -373,7 +382,8 @@ fn sub_report(t: &str) -> Option<(String, String)> {
     Some((desc, tag(s, "result")?.to_string()))
 }
 
-/// 用户那边混着 Claude Code 自己塞的:斜杠命令写成一行「/命令 参数」,命令输出、后台任务的通知不要
+/// The user's side is mixed with what Claude Code injects itself: a slash command becomes one line "/command args"; command
+/// output and background task notifications are dropped
 fn claude_user_text(t: &str) -> Option<String> {
     let s = t.trim_start();
     if ["<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>", "<task-notification>"]
@@ -388,7 +398,7 @@ fn claude_user_text(t: &str) -> Option<String> {
     Some(t.to_string())
 }
 
-/// `<name>里面</name>` 的里面
+/// What's inside `<name>…</name>`
 fn tag<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     let open = format!("<{name}>");
     let i = s.find(&open)? + open.len();
@@ -396,7 +406,7 @@ fn tag<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     Some(s[i..j].trim())
 }
 
-/// Codex 每轮开头替你塞进去的(AGENTS.md、环境、技能说明…),不是人说的
+/// What Codex injects for you at the start of each turn (AGENTS.md, environment, skill instructions...), not said by a person
 const CODEX_INJECTED: [&str; 7] = [
     "<environment_context>",
     "# AGENTS.md",
@@ -407,8 +417,9 @@ const CODEX_INJECTED: [&str; 7] = [
     "<turn_aborted>",
 ];
 
-/// Codex:`response_item` 里 user / assistant 的 message(developer 的是系统说明,不要),压缩时的 `compacted`;
-/// 改过的文件看 apply_patch 做成了的 `patch_apply_end`,新版另记一份 `FileChange`(同样的路径,并掉)
+/// Codex: user / assistant messages in `response_item` (developer ones are system instructions, dropped), `compacted` from
+/// compaction; changed files come from a successful apply_patch's `patch_apply_end`, newer versions also record a
+/// `FileChange` (same paths, merged)
 fn codex_line(v: &Value, d: &mut Dialog) {
     let p = &v["payload"];
     match (v["type"].as_str().unwrap_or(""), p["type"].as_str().unwrap_or("")) {
@@ -436,7 +447,7 @@ fn codex_line(v: &Value, d: &mut Dialog) {
     }
 }
 
-/// `changes`:路径 → {type: add / update / delete, move_path}
+/// `changes`: path → {type: add / update / delete, move_path}
 fn codex_changes(c: &Value, at: i64, d: &mut Dialog) {
     for (path, ch) in c.as_object().into_iter().flatten() {
         match ch["move_path"].as_str() {
@@ -449,7 +460,8 @@ fn codex_changes(c: &Value, at: i64, d: &mut Dialog) {
     }
 }
 
-/// 文字版:开头写原始记录在哪、省了什么,之后一段一段「=== 谁 · 月-日 时:分 ===」,最后是改过的文件
+/// The text version: first where the raw record is and what was left out, then passage by passage
+/// "=== who · MM-DD HH:MM ===", finally the changed files
 fn render(from: &Source, d: &Dialog, now: i64, off: i64) -> String {
     let codex = from.agent == Agent::Codex;
     let mut o = tr!("# 「{}」的对话(文字版)\n\n", "# Conversation of “{}” (text version)\n\n", from.title);
@@ -486,7 +498,7 @@ fn render(from: &Source, d: &Dialog, now: i64, off: i64) -> String {
     o
 }
 
-/// 本地时间「09-30 14:05」
+/// Local time "09-30 14:05"
 fn stamp(ts: i64, off: i64) -> String {
     if ts == 0 {
         return "?".into();
@@ -496,7 +508,8 @@ fn stamp(ts: i64, off: i64) -> String {
     format!("{m:02}-{d:02} {:02}:{:02}", t.rem_euclid(86400) / 3600, t.rem_euclid(3600) / 60)
 }
 
-/// 写进 ~/.local/state/aca/ui/handoff/<对话 id>.md(同一段对话再交接一次就覆盖成新的),顺手删 30 天前的
+/// Write to ~/.local/state/aca/ui/handoff/<conversation id>.md (handing off the same conversation again overwrites it),
+/// deleting ones older than 30 days along the way
 fn save(sid: &str, text: &str) -> std::io::Result<PathBuf> {
     let dir = crate::state::state_file("handoff").ok_or_else(|| std::io::Error::other(t!("未设置 HOME", "no HOME")))?;
     let name = if sid.is_empty() || sid.contains(['/', '\\']) || sid.starts_with('.') { "dialog".to_string() } else { sid.to_string() };
@@ -563,10 +576,10 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"先看看"}]},"timestamp":"2026-09-30T01:00:05Z"}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"一大堆输出"}]}}"#,
-            // 前台子代理:报告就是工具结果
+            // Foreground subagent: the report is the tool result
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"description":"查登录","prompt":"…"}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a1","content":[{"type":"text","text":"cookie 过期了"}]}]},"toolUseResult":{"status":"completed"}}"#,
-            // 后台子代理:先回一句已启动(不要),报告在通知里
+            // Background subagent: first a line saying it launched (dropped), the report is in the notification
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a2","name":"Agent","input":{"description":"跑测试"}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a2","content":"Async agent launched"}]},"toolUseResult":{"status":"async_launched"}}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"修好了"}]}}"#,
@@ -605,7 +618,7 @@ mod tests {
         let lines = [
             r#"{"type":"user","message":{"content":"改一下"},"timestamp":"2026-09-30T01:00:00Z"}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result"}]},"toolUseResult":{"filePath":"/r/a.rs","oldString":"x"},"timestamp":"2026-09-30T01:01:00Z"}"#,
-            // 没改成的 Edit 没有 filePath;Read 的在 file 里面
+            // A failed Edit has no filePath; a Read's is inside file
             r#"{"type":"user","message":{"content":[{"type":"tool_result"}]},"toolUseResult":"Error: String to replace not found"}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result"}]},"toolUseResult":{"type":"text","file":{"filePath":"/r/read.rs"}}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result"}]},"toolUseResult":{"stdout":"","bashEditDiff":{"changedFiles":["/r/b.txt"]}},"timestamp":"2026-09-30T01:03:00Z"}"#,
@@ -621,7 +634,7 @@ mod tests {
         .unwrap();
         std::fs::write(subs.join("agent-x.meta.json"), r#"{"toolUseResult":{"filePath":"/r/no.rs"}}"#).unwrap();
         let d = dialog(&log, Agent::Claude).unwrap();
-        // 按最后一次改的时间排,同一个文件只留一次
+        // Ordered by time of last change, each file only once
         assert_eq!(files_of(&d), vec![("/r/sub.rs", false), ("/r/b.txt", false), ("/r/a.rs", false)]);
         let _ = std::fs::remove_dir_all(&root);
     }

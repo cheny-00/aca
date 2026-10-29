@@ -59,7 +59,8 @@ Going in, or just looking
   y         open yazi in the directory it's really working in (a stopped session uses the directory it recorded);
             q inside quits back to aca; in a tmux popup it runs in a split next to that pane, zoomed, and switches
             there; q closes that split
-  c / B     copy the last reply / copy the path and conversation id (on a phone via OSC 52 into the phone's clipboard)
+  c / B     copy the last reply / copy the dir it really works in, the conversation id and the config dir (on a
+            phone via OSC 52 into the phone's clipboard)
   C         pick one to copy: i aca id (for commands like aca move <id>) · s session id (Claude / Codex's conversation
             id, for claude --resume) · p path; ↑↓ to pick then Enter works too; missing ones say why
 
@@ -124,7 +125,7 @@ On sessions
             One aca stopped for idling shows ☾ and "auto-stopped" on its row; ⏎ resumes it the same way. Put
             [idle] stop_after = "3h" in config.toml and while the interface is open, every 5 minutes it stops the
             sessions idle that long; never one mid-turn, attached, with background tasks, with unsent text in its
-            input box or with a schedule of its own not yet due (CronCreate, /loop) (see aca help stop).
+            input box or with something scheduled not yet due (CronCreate, /loop, aca msg --in) (see aca help stop).
             [idle] remove_after = "30d": ones stopped that long are deleted into the trash like d while the
             interface is open, as one entry that ^Z / b brings back; not pinned ones or ones with a note
             D on a window / pane opened inside a session, or on an ordinary tmux session: stops only that pane (the
@@ -380,9 +381,10 @@ Reading the list
   State     ● running (the last column is how long)  ◆ needs you (a choice / confirmation)  ◐ unread (finished, not seen yet)
             ○ idle  ✕ error  ■ stopped (the agent exited / stopped with D / gone from tmux)  ☾ auto-stopped (by aca, for idling)
             ✎ has a note  ★ pinned  ⇄ open elsewhere too
-            ◷ 08:57 after a title: it scheduled something of its own not yet due (Claude's CronCreate, /loop's next
-            wakeup), with when the first one runs and +N for more; the preview lists them. They live only in its
-            process: stopping or restarting drops them, and it isn't auto-stopped while idle
+            ◷ 08:57 after a title: something scheduled not yet due, with when the first one runs and +N for more;
+            the preview lists them. Claude's CronCreate and /loop's next wakeup live only in its process: stopping
+            or restarting drops them. A scheduled message (aca msg --in) waits in the inbox and, if the session
+            isn't running when it's due, comes once it starts. With any of these it isn't auto-stopped while idle
             Registered sessions: what the screen shows (asking, running) wins, what it can't show (unread,
             error) comes from the hooks; other sessions go by the screen only.
             Open = ● ◆ ◐ ○ ✕ (everything but stopped)

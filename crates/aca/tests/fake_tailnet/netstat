@@ -1,4 +1,4 @@
 #!/bin/sh
-# 假的 netstat:打出 $FAKE/netstat.txt;没有这个文件 = 问不出来
+# Fake netstat: prints $FAKE/netstat.txt; no such file = the query fails
 [ -e "${FAKE:?}/netstat.txt" ] || exit 1
 cat "$FAKE/netstat.txt"

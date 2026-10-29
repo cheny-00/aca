@@ -1,20 +1,22 @@
-//! 界面自己记的东西,都在 ~/.local/state/aca/ui/ 下:置顶(pins.rs)和上次的视图(这里)。
+//! What the interface remembers on its own, all under ~/.local/state/aca/ui/: pins (pins.rs) and the last view (here).
 //!
-//! 视图 = 分组 / 范围(和「近几天」)/ 只看开着的 / 预览开关 / 高亮的会话,下次打开恢复。一行一个 key=value,**一变就写**:
-//! 手机断线时 aca 是被直接杀掉的,等不到正常退出。过滤词不记 —— 本来就是临时的,
-//! 而且 Moshi 代敲的命令正是落进了过滤框。
+//! View = group / range (and "recent days") / open ones only / preview on-off / the highlighted session, restored next time.
+//! One key=value per line, **written on every change**: when the phone disconnects aca is killed outright and never gets to
+//! exit normally. The filter text isn't remembered: it's temporary by nature,
+//! and the commands Moshi auto-types land exactly in the filter box.
 
 use std::path::{Path, PathBuf};
 
 use crate::ui::{DAYS, Preview, Scope};
 
-/// ~/.local/state/aca/ui/<name>(`ACA_HOME` 换地方:测试动不到真的)
+/// ~/.local/state/aca/ui/<name> (`ACA_HOME` moves it: tests can't touch the real one)
 pub fn state_file(name: &str) -> Option<PathBuf> {
     Some(aca_core::paths::state_dir().join("ui").join(name))
 }
 
-/// 先写临时文件再改名:手机和桌面各开一个 aca 同时写,读到的也不会是半截。
-/// 原来那个文件的权限照旧:收成只有自己能读的(里面有口令),不因为重写变回默认的
+/// Write a temporary file, then rename: when the aca on the phone and the one on the desktop write at once, a reader never sees
+/// half a file. The original file's permissions are kept: one tightened to owner-only (it holds secrets) doesn't go back to the
+/// default on a rewrite
 pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     let tmp = path.with_file_name(format!(".{}.tmp", path.file_name().unwrap().to_string_lossy()));
@@ -27,26 +29,27 @@ pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct View {
-    /// None = 全部分组
+    /// None = all groups
     pub group: Option<String>,
     pub scope: Scope,
-    /// w:只看开着的
+    /// w: open ones only
     pub open: bool,
-    /// 按 w 之前的范围,再按 w 回到这里(在开着的里按过 * / a 是 None)
+    /// The range before w was pressed; w again returns here (None if * / a was pressed among the open ones)
     pub back: Option<Scope>,
-    /// 「近几天」的几天(`*` 轮换)
+    /// How many days "recent days" means (`*` cycles)
     pub days: u64,
-    /// 宽屏(桌面)的布局
+    /// The layout on a wide screen (desktop)
     pub preview: Preview,
-    /// 窄屏(手机)的布局。两边各记各的:手机上只看列表,桌面照样右侧预览
+    /// The layout on a narrow screen (phone). Each is kept separately: the phone shows only the list, the desktop still has the
+    /// preview on the right
     pub preview_narrow: Preview,
-    /// 高亮的会话(tmux 会话名)
+    /// The highlighted session (tmux session name)
     pub selected: Option<String>,
-    /// 折起来的分组
+    /// Folded groups
     pub folded: Vec<String>,
-    /// 在看哪个工作区(手机和桌面共用这一份)
+    /// Which workspace is being viewed (shared by phone and desktop)
     pub space: char,
-    /// 切到现在这个之前待的工作区:` 回那
+    /// The workspace you were in before switching to this one: ` goes back there
     pub last_space: Option<char>,
 }
 
@@ -77,7 +80,7 @@ fn scope(val: &str) -> Option<Scope> {
 }
 
 impl View {
-    /// 文件不在 / 读不了 / 某行认不出,就用默认值
+    /// File missing / unreadable / a line unrecognized: use the defaults
     pub fn load(path: &Path) -> View {
         let mut v = View::default();
         for line in std::fs::read_to_string(path).unwrap_or_default().lines() {
@@ -85,13 +88,13 @@ impl View {
             let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
             match k {
                 "group" => v.group = some(val),
-                // 旧版「开着的」是一种范围(scope=working,更早叫 pending):就是全部里开着的
+                // In old versions "open" was a range (scope=working, earlier pending): that's the open ones among all
                 "scope" if matches!(val, "working" | "pending") => (v.scope, v.open) = (Scope::All, true),
                 "scope" => v.scope = scope(val).unwrap_or(Scope::Recent),
                 "open" => v.open = val == "1",
                 "back" => v.back = scope(val),
                 "days" => v.days = val.parse().ok().filter(|d| DAYS.contains(d)).unwrap_or(1),
-                // 旧版写的是 1 / 0,再后来有过 right(现在就是宽屏的默认)
+                // Old versions wrote 1 / 0; later there was right (now simply the wide-screen default)
                 "preview" => {
                     v.preview = match val {
                         "below" => Preview::Below,
@@ -107,7 +110,7 @@ impl View {
                     }
                 }
                 "selected" => v.selected = some(val),
-                // 分组名里不会有 tab
+                // Group names never contain a tab
                 "folded" => v.folded = val.split('\t').filter(|g| !g.is_empty()).map(String::from).collect(),
                 "space" => {
                     v.space =
@@ -120,7 +123,7 @@ impl View {
         v
     }
 
-    /// 分组改了名(连子分组):在看的组、折起来的跟过去。返回有没有变
+    /// A group was renamed (with its subgroups): the group being viewed and the folded ones follow. Returns whether anything changed
     pub fn rename_group(&mut self, from: &str, to: &str) -> bool {
         let was = self.clone();
         if let Some(g) = self.group.as_mut().and_then(|g| crate::groups::renamed(g, from, to)) {
@@ -169,7 +172,7 @@ mod tests {
     fn view_round_trips_and_tolerates_junk() {
         let dir = std::env::temp_dir().join(format!("aca-view-test-{}", std::process::id()));
         let path = dir.join("view");
-        assert_eq!(View::load(&path), View::default()); // 还没有文件
+        assert_eq!(View::load(&path), View::default()); // no file yet
         let v = View {
             group: Some("work/sub".into()),
             scope: Scope::Recent,
@@ -185,19 +188,19 @@ mod tests {
         };
         v.save(&path).unwrap();
         assert_eq!(View::load(&path), v);
-        std::fs::write(&path, "scope=all\ngarbage\nnew_key=1\n").unwrap(); // 旧版 / 新版写的也能读
+        std::fs::write(&path, "scope=all\ngarbage\nnew_key=1\n").unwrap(); // what old / new versions wrote still reads
         assert_eq!(View::load(&path), View { scope: Scope::All, ..View::default() });
-        std::fs::write(&path, "scope=working\nback=working\n").unwrap(); // 旧版的「开着的」是一种范围
+        std::fs::write(&path, "scope=working\nback=working\n").unwrap(); // in old versions "open" was a range
         assert_eq!(View::load(&path), View { scope: Scope::All, open: true, back: None, ..View::default() });
-        std::fs::write(&path, "space=q\n").unwrap(); // q 不能当工作区
+        std::fs::write(&path, "space=q\n").unwrap(); // q can't be a workspace
         assert_eq!(View::load(&path).space, '1');
         std::fs::write(&path, "space=ab\n").unwrap();
         assert_eq!(View::load(&path).space, '1');
         std::fs::write(&path, "last_space=q\n").unwrap();
         assert_eq!(View::load(&path).last_space, None);
-        std::fs::write(&path, "days=5\n").unwrap(); // 不是 * 轮换得到的天数
+        std::fs::write(&path, "days=5\n").unwrap(); // not a day count * cycles through
         assert_eq!(View::load(&path).days, 1);
-        std::fs::write(&path, "preview=0\n").unwrap(); // 旧版的开关
+        std::fs::write(&path, "preview=0\n").unwrap(); // the old on/off switch
         assert_eq!(View::load(&path).preview, Preview::Off);
         std::fs::write(&path, "preview=1\n").unwrap();
         assert_eq!(View::load(&path).preview, Preview::Auto);
@@ -213,7 +216,7 @@ mod tests {
         write_atomic(&path, "a = 1\n").unwrap();
         let fresh = mode(&path);
         assert_ne!(fresh, 0o600, "新建的文件照 umask 来");
-        // 收紧过的(里面有口令):重写之后还是只有自己能读
+        // Tightened (it holds secrets): still owner-only after a rewrite
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         write_atomic(&path, "a = 2\n").unwrap();
         assert_eq!((mode(&path), std::fs::read_to_string(&path).unwrap().as_str()), (0o600, "a = 2\n"));

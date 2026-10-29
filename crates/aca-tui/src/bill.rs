@@ -1,10 +1,14 @@
-//! `$` 计费面板画什么。从上往下:订阅额度;四个时段各花了多少(按 API 价折美元,带环比和走势,选中的那个底下写日均);
-//! 按小时 / 天 / 月的走势;按账号 / 模型 / 会话分。
-//! 看了也不会改变用法的(调用次数、token、缓存这些概况和钱花在哪几项,星期 × 钟点,按目录)平常收着,`m` 摆出来(`more`)。
-//! 窄屏一栏往下排(手机);宽屏(≥ TWO_COL 格)分两栏:上面「额度 | 时段」,下面「走势 | 各种分法」。
-//! 数据见 `usage`;标题、底栏、翻页是 ui 画的。
-//! 颜色只有两家:账号各有各的颜色(theme 的 series),其余的条、色阶都是主题强调色那一家的深浅(total / parts / heat);
-//! 灰的只有没颜色的账号(other)和额度条没用掉的那截(track)。次要的字 `dim()`,分隔线 `theme::faint()`
+//! What the `$` billing panel draws. Top to bottom: subscription quotas; what each of the four periods cost (in USD at API prices,
+//! with the change vs. the previous period and the trend; the selected one gets its daily average underneath);
+//! the trend by hour / day / month; split by account / model / session.
+//! Things that wouldn't change how you use it (the overview of calls, tokens and cache, where the money went, weekday × hour,
+//! by directory) are hidden by default; `m` shows them (`more`).
+//! Narrow screens get one column running down (phones); wide ones (≥ TWO_COL cells) get two: "quota | periods" on top,
+//! "trend | breakdowns" below.
+//! Data comes from `usage`; the title, footer and paging are drawn by ui.
+//! Only two color families: each account has its own color (theme's series); every other bar and scale is a shade of the theme's
+//! accent (total / parts / heat). The only grays are accounts without a color (other) and the unused part of a quota bar (track).
+//! Secondary text is `dim()`, separator lines `theme::faint()`
 
 use std::collections::HashMap;
 
@@ -20,24 +24,25 @@ use crate::theme;
 use crate::ui::{clip, dim};
 use crate::usage::{Quota, RANGES, Range, Report, Row, WEEK, civil_from_days, weekday};
 
-/// 一栏最宽
+/// Widest a column gets
 const MAX_W: usize = 96;
-/// 这么宽起分两栏,每栏最宽 COL_W,两栏中间空 GAP
+/// From this width on, two columns, each at most COL_W wide, GAP apart
 const TWO_COL: usize = 108;
 const COL_W: usize = 78;
 const GAP: usize = 3;
-/// 金额那一列
+/// The money column
 const MONEY_W: usize = 9;
-/// 按会话 / 目录最多列几个,其余合成一行
+/// At most this many rows by session / directory; the rest merge into one row
 const TOP_SESSIONS: usize = 15;
 const TOP_DIRS: usize = 8;
-/// 八分之一格的竖条
+/// Vertical bars in eighths of a cell
 const TICKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-/// 横条是半格高的细条(上下两行之间露着底色,不连成一片),长短细到半格:整格、收尾的左半格、接在后面的右半格
+/// Horizontal bars are thin, half a cell high (the background shows between rows, so they don't merge into a block), and their
+/// length goes down to half a cell: a full cell, the closing left half, the right half that continues after it
 const BAR: &str = "▄";
 const BAR_END: char = '▖';
 const BAR_START: char = '▗';
-/// 花在哪的几项
+/// The parts the money goes to
 const PARTS: [Tr; 5] = [
     Tr::new("输入", "input"),
     Tr::new("缓存写", "cache write"),
@@ -70,7 +75,7 @@ fn count(n: u64) -> String {
     out
 }
 
-/// 980 / 1.2 万 / 3.4 亿;英文是 980 / 1.2K / 3.4M / 5.6B
+/// 980 / 1.2 万 / 3.4 亿 (Chinese units of 10^4 / 10^8); in English 980 / 1.2K / 3.4M / 5.6B
 pub fn tokens(n: u64) -> String {
     let short = |v: f64, unit: &str| format!("{} {unit}", format!("{v:.1}").trim_end_matches(".0"));
     if lang() == Lang::En {
@@ -89,7 +94,7 @@ pub fn tokens(n: u64) -> String {
     }
 }
 
-/// 占比:53% / <1%
+/// Share: 53% / <1%
 fn pct(v: f64, total: f64) -> String {
     match if total > 0.0 { v / total * 100.0 } else { 0.0 } {
         p if p > 0.0 && p < 0.5 => "<1%".into(),
@@ -97,7 +102,7 @@ fn pct(v: f64, total: f64) -> String {
     }
 }
 
-/// 小标题,后面一道细线拉到 w,线尾可以带一句灰字
+/// A subheading followed by a thin line out to w; the line can end with a gray note
 fn head(t: &str, note: &str, w: usize) -> Line<'static> {
     let mut spans = vec![Span::raw(" "), Span::styled(t.to_string(), theme::accent().add_modifier(Modifier::BOLD))];
     let used = 1 + t.width();
@@ -112,17 +117,17 @@ fn head(t: &str, note: &str, w: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// 右对齐到 n 格
+/// Right-align to n cells
 fn rpad(s: &str, n: usize) -> String {
     format!("{}{s}", " ".repeat(n.saturating_sub(s.width())))
 }
 
-/// 左对齐到 n 格
+/// Left-align to n cells
 fn lpad(s: &str, n: usize) -> String {
     format!("{s}{}", " ".repeat(n.saturating_sub(s.width())))
 }
 
-/// 从左边截:…/fun/app(目录看的是尾巴),补空格到 w
+/// Clip from the left: …/fun/app (what you look at in a directory is its tail), pad with spaces to w
 fn clip_left(s: &str, w: usize) -> String {
     if s.width() <= w {
         return lpad(s, w);
@@ -140,7 +145,8 @@ fn clip_left(s: &str, w: usize) -> String {
     lpad(&format!("…{}", tail.into_iter().rev().collect::<String>()), w)
 }
 
-/// 没登记的对话叫「目录 · 9/24」:放不下时截目录,留着日子(不然一排都是一样的前缀)。补空格到 w
+/// Unregistered conversations are named "<dir> · 9/24": when it doesn't fit, cut the directory and keep the date (otherwise every
+/// row shows the same prefix). Pad with spaces to w
 fn clip_name(s: &str, w: usize) -> String {
     match s.rsplit_once(" · ") {
         Some((dir, day)) if s.width() > w && w >= day.width() + 3 + 4 => {
@@ -150,7 +156,7 @@ fn clip_name(s: &str, w: usize) -> String {
     }
 }
 
-/// 横条有多少个半格:v 占 max 的几成就画满 w 的几成;有数的至少半格
+/// How many half cells a bar gets: v's fraction of max fills that fraction of w; anything nonzero gets at least half a cell
 fn halves(v: f64, max: f64, w: usize) -> usize {
     if max <= 0.0 || v <= 0.0 || w == 0 {
         return 0;
@@ -158,7 +164,7 @@ fn halves(v: f64, max: f64, w: usize) -> usize {
     ((v / max).min(1.0) * (w * 2) as f64).round().max(1.0) as usize
 }
 
-/// e 个半格的横条
+/// A bar of e half cells
 fn bar(e: usize) -> String {
     let mut s = BAR.repeat(e / 2);
     if e % 2 == 1 {
@@ -171,7 +177,7 @@ fn hbar(v: f64, max: f64, w: usize) -> String {
     bar(halves(v, max, w))
 }
 
-/// 额度条:用掉的一截、没用掉的一截(各自上色),中间总隔着半格,加起来 w 格
+/// Quota meter: the used part and the unused part (each in its own color), always half a cell apart, w cells in all
 fn meter(used: f64, w: usize) -> (String, String) {
     let e = if used > 0.0 { halves(used, 100.0, w) } else { 0 };
     let rest = w - e.div_ceil(2);
@@ -184,13 +190,13 @@ fn meter(used: f64, w: usize) -> (String, String) {
     (bar(e), track)
 }
 
-/// 一行小竖条,一个数一格;0 是空格
+/// A row of small vertical bars, one cell per value; 0 is a space
 fn spark(vals: &[f64]) -> String {
     let max = vals.iter().copied().fold(0.0, f64::max);
     vals.iter().map(|&v| if v <= 0.0 || max <= 0.0 { ' ' } else { TICKS[((v / max * 8.0).ceil() as usize).clamp(1, 8) - 1] }).collect()
 }
 
-/// 压成 n 格:挨着的几个数取平均(放不下时看的还是整段的走势)
+/// Squeeze into n cells: average neighboring values (when it doesn't fit you still see the trend of the whole span)
 fn squeeze(vals: &[f64], n: usize) -> Vec<f64> {
     if vals.len() <= n || n == 0 {
         return vals.to_vec();
@@ -203,7 +209,7 @@ fn squeeze(vals: &[f64], n: usize) -> Vec<f64> {
         .collect()
 }
 
-/// 把 w 格按比例分给各项:有数的至少一格,零头给余数大的
+/// Share w cells out in proportion: anything nonzero gets at least one cell, leftovers go to the largest remainders
 fn split(parts: &[f64], w: usize) -> Vec<usize> {
     let total: f64 = parts.iter().sum();
     if total <= 0.0 || w == 0 {
@@ -219,7 +225,7 @@ fn split(parts: &[f64], w: usize) -> Vec<usize> {
         let pick = if sum < w {
             (0..n.len()).filter(|&i| parts[i] > 0.0).max_by(|&a, &b| (exact[a] - n[a] as f64).total_cmp(&(exact[b] - n[b] as f64)))
         } else {
-            // 多出来的从分多了的扣;格子比项还少,就扣掉最小的
+            // Take the excess from the ones that got too much; with fewer cells than items, take from the smallest
             (0..n.len())
                 .filter(|&i| n[i] > 1)
                 .max_by(|&a, &b| (n[a] as f64 - exact[a]).total_cmp(&(n[b] as f64 - exact[b])))
@@ -230,7 +236,7 @@ fn split(parts: &[f64], w: usize) -> Vec<usize> {
     }
 }
 
-/// 一串小段按宽度折行,段间用 sep 隔开,每行缩进 2
+/// Wrap a run of small segments to the width, sep between segments, each line indented 2
 fn flow(out: &mut Vec<Line<'static>>, items: Vec<Vec<Span<'static>>>, sep: &str, w: usize) {
     let mut line = vec![Span::raw("  ")];
     let mut used = 2;
@@ -252,7 +258,7 @@ fn flow(out: &mut Vec<Line<'static>>, items: Vec<Vec<Span<'static>>>, sep: &str,
     }
 }
 
-/// 灰字 + 数 + 灰字
+/// Gray text + number + gray text
 fn fact(pre: &str, val: String, post: &str) -> Vec<Span<'static>> {
     [Span::styled(pre.to_string(), dim()), Span::raw(val), Span::styled(post.to_string(), dim())]
         .into_iter()
@@ -260,13 +266,13 @@ fn fact(pre: &str, val: String, post: &str) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// 本地时间的 (第几天, 时, 分)
+/// (day number, hour, minute) in local time
 fn local(ts: i64, off: i64) -> (i64, i64, i64) {
     let t = ts + off;
     (t.div_euclid(86400), t.rem_euclid(86400) / 3600, t.rem_euclid(3600) / 60)
 }
 
-/// 几点:今天 14:30 / 明天 09:00 / 周五 09:00 / 10/12 09:00
+/// Time of day: today 14:30 / tomorrow 09:00 / Fri 09:00 / 10/12 09:00
 pub(crate) fn when(ts: i64, now: i64, off: i64) -> String {
     let (d, h, m) = local(ts, off);
     let today = local(now, off).0;
@@ -282,10 +288,10 @@ pub(crate) fn when(ts: i64, now: i64, off: i64) -> String {
     format!("{day} {h:02}:{m:02}")
 }
 
-/// 额度的数旧过这么久(秒)才写是几时的(同换账号的框)
+/// Only once quota numbers are this old (seconds) do we say when they're from (same as the switch-account box)
 const STALE: i64 = 3600;
 
-/// 刚刚 / 3 分钟前
+/// just now / 3m ago
 pub(crate) fn ago(ts: i64, now: i64) -> String {
     match (now - ts).max(0) as u64 {
         0..=59 => t!("刚刚", "just now").into(),
@@ -293,19 +299,19 @@ pub(crate) fn ago(ts: i64, now: i64) -> String {
     }
 }
 
-// ---------- 订阅额度 ----------
+// ---------- Subscription quotas ----------
 
-/// 额度窗口多长:5h / 7d / 300m → 秒
+/// How long a quota window is: 5h / 7d / 300m → seconds
 fn window_secs(label: &str) -> Option<i64> {
     let (n, unit) = label.split_at(label.len().checked_sub(1)?);
     let n: i64 = n.parse().ok()?;
     Some(n * [("m", 60), ("h", 3600), ("d", 86400)].iter().find(|x| x.0 == unit)?.1)
 }
 
-/// 照 at 那会儿为止的速度用下去,重置之前会在什么时候用完(不会就是 None)
+/// Going on at the pace up to `at`, when it runs out before the reset (None if it won't)
 fn runs_out(used: f64, resets: i64, len: i64, at: i64) -> Option<i64> {
     let elapsed = len - (resets - at);
-    // 窗口刚开头速度还看不准;已经用完的不用猜
+    // Early in the window the pace can't be told yet; one that's already used up needs no guess
     if !(0.0..100.0).contains(&used) || used == 0.0 || elapsed < len / 10 || elapsed > len {
         return None;
     }
@@ -313,8 +319,9 @@ fn runs_out(used: f64, resets: i64, len: i64, at: i64) -> Option<i64> {
     (t < resets).then_some(t)
 }
 
-/// 账号的全名(「Claude sub」)拆成两段写:哪家用那家的颜色(同列表里的账号名),名字用 rest 的样式。
-/// 账号在计费页里有自己的一块颜色(走势、横条),和列表里橙 = Claude、蓝 = Codex 不是一套:家名上色,两套就对得上了
+/// Write an account's full name ("Claude sub") in two parts: the agent in its color (as account names in the list), the name in
+/// the `rest` style. On the billing page an account has its own color (trend, bars), a different scheme from the list's
+/// orange = Claude, blue = Codex: coloring the agent name ties the two together
 fn family_spans(name: &str, agent: Option<Agent>, rest: Style) -> Vec<Span<'static>> {
     let (fam, tail) = name.split_once(' ').map_or((name, ""), |(f, t)| (f, t));
     let agent = agent.unwrap_or(if fam == "Codex" { Agent::Codex } else { Agent::Claude });
@@ -325,7 +332,7 @@ fn family_spans(name: &str, agent: Option<Agent>, rest: Style) -> Vec<Span<'stat
     v
 }
 
-/// 额度那块的账号全名(找颜色用的那个)
+/// The account's full name in the quota block (the one colors are looked up by)
 fn quota_name(q: &Quota) -> String {
     match q.agent {
         Agent::Claude | Agent::Codex => crate::usage::account_name(q.agent, &q.who),
@@ -333,8 +340,9 @@ fn quota_name(q: &Quota) -> String {
     }
 }
 
-/// swatch:这个账号在走势、横条里的颜色,名字前面画一块,对得上是哪条;名字本身是正文色。
-/// label_w:窗口名对齐到几格(整块里最长的那个,见 `label_width`)
+/// swatch: this account's color in the trend and bars, drawn as a block before the name so you can tell which series is whose;
+/// the name itself is in the body text color.
+/// label_w: cells to align window names to (the longest in the whole block, see `label_width`)
 fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, (now, off): (i64, i64), w: usize, label_w: usize) {
     let name = crate::usage::account_shown(&quota_name(q)).to_string();
     let mut left = vec![Span::raw(" "), Span::styled("■ ", Style::new().fg(swatch))];
@@ -344,7 +352,7 @@ fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, (now, off
         left.push(Span::styled(format!(" · {extra}"), dim()));
         used_w += 3 + extra.width();
     }
-    // 数旧了才写是几时的
+    // Say when it's from only once it's stale
     let right = if q.updated > 0 && now - q.updated > STALE { tr!("{}更新", "updated {}", ago(q.updated, now)) } else { String::new() };
     if !right.is_empty() && used_w + 2 + right.width() <= w {
         left.push(Span::raw(" ".repeat(w - used_w - right.width())));
@@ -359,7 +367,7 @@ fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, (now, off
     let p = theme::pal();
     for win in &q.wins {
         let label = format!("   {} ", rpad(&win.label, label_w));
-        // 过了重置时间还没有新数:不知道现在用了多少,照实说
+        // Past the reset time and no new numbers: we don't know current usage, so say just that
         if win.resets.is_some_and(|r| r <= now) {
             out.push(Line::from(vec![
                 Span::raw(label),
@@ -368,7 +376,8 @@ fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, (now, off
             ]));
             continue;
         }
-        // 状态色只在该注意的时候出现(过七成黄、过九成红),平常是不分账号的那个颜色:绿色在色盘里是账号的颜色
+        // Status colors only when it needs attention (yellow over 70%, red over 90%); otherwise the color that belongs to no account:
+        // green is an account color in the palette
         let status = match win.used {
             u if u >= 90.0 => Some(p.red),
             u if u >= 70.0 => Some(p.amber),
@@ -395,9 +404,9 @@ fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, (now, off
             }
         }
         out.push(Line::from(spans));
-        // 照这速度重置前就会用完:提前说
+        // At this pace it runs out before the reset: say so ahead of time
         let base = if q.updated > 0 { q.updated } else { now };
-        // Claude 按模型分的(Fable)都是周额度
+        // Claude's per-model ones (Fable) are all weekly quotas
         let len = window_secs(&win.label).or((q.agent == Agent::Claude).then_some(7 * 86400));
         if let (Some(r), Some(len)) = (win.resets, len)
             && let Some(t) = runs_out(win.used, r, len, base).filter(|&t| t > now)
@@ -410,7 +419,8 @@ fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, (now, off
     }
 }
 
-/// 额度那块窗口名的宽度:所有账号里最长的那个,横条才从同一列开始(Claude 按模型分的那几个是模型名,Fable)
+/// Width of window names in the quota block: the longest across all accounts, so the bars start in the same column (Claude's
+/// per-model ones are model names, Fable)
 fn label_width(qs: &[Quota]) -> usize {
     qs.iter().flat_map(|q| &q.wins).map(|w| w.label.width()).max().unwrap_or(0).max(3)
 }
@@ -430,9 +440,10 @@ fn quota_block(r: &Report, w: usize) -> Vec<Line<'static>> {
     out
 }
 
-// ---------- 四个时段 ----------
+// ---------- The four periods ----------
 
-/// 跟前一段比:昨天多少 / 比前 7 天涨跌几成 / 全部的日均。long = 带上「比前 7 天」
+/// Compared with the span before: yesterday's amount / up or down how much vs. the previous 7 days / All's daily average.
+/// long = add 「比前 7 天」 ("vs prev 7 days")
 fn compare(g: &Range, i: usize, long: bool) -> String {
     match i {
         0 if g.prev > 0.0 => tr!("昨天 {}", "yesterday {}", money(g.prev)),
@@ -450,12 +461,13 @@ fn compare(g: &Range, i: usize, long: bool) -> String {
     }
 }
 
-/// 走势:老的在前
+/// Trend: oldest first
 fn oldest_first(g: &Range) -> Vec<f64> {
     g.series.iter().rev().map(|x| x.1).collect()
 }
 
-/// 选中的时段底下那行:近 7 / 30 天的日均(全部的日均在它那行上,今天没有),全部从哪天起
+/// The line under the selected period: daily average over the last 7 / 30 days (All has its daily average on its own row, Today
+/// has none), and the day All starts from
 fn picked_note(r: &Report, g: &Range, sel: usize) -> String {
     match (sel, r.first) {
         (1 | 2, _) if g.days > 0 && g.cost > 0.0 => tr!("日均 {}", "{}/day", money(g.cost / g.days as f64)),
@@ -496,7 +508,7 @@ fn totals_block(r: &Report, sel: usize, w: usize) -> Vec<Line<'static>> {
         out.push(Line::from(spans));
         let note = if on { picked_note(r, g, i) } else { String::new() };
         if !note.is_empty() {
-            // 对着环比那一列;放不下就往左挪
+            // Line up with the comparison column; shift left if it doesn't fit
             let at = (fixed + 2).min(w.saturating_sub(note.width())).max(3);
             out.push(Line::styled(format!("{}{note}", " ".repeat(at)), dim()));
         }
@@ -504,9 +516,10 @@ fn totals_block(r: &Report, sel: usize, w: usize) -> Vec<Line<'static>> {
     out
 }
 
-// ---------- 选中的时段 ----------
+// ---------- The selected period ----------
 
-/// m 摆出来的:选中时段的调用、token、缓存这些概况,钱花在哪几项(日均写在时段那块里了)
+/// What `m` shows: the selected period's calls, tokens, cache and so on, and where the money went (the daily average is in the
+/// periods block)
 fn usage_block(g: &Range, sel: usize, w: usize) -> Vec<Line<'static>> {
     let mut out = vec![head(t!("用量", "Usage"), "", w)];
     let mut facts = vec![fact(t!("调用 ", ""), count(g.calls), t!(" 次", " calls")), fact("", tokens(g.tokens), t!(" token", " tokens"))];
@@ -527,7 +540,7 @@ fn usage_block(g: &Range, sel: usize, w: usize) -> Vec<Line<'static>> {
     if g.parts.iter().sum::<f64>() <= 0.0 {
         return out;
     }
-    // 钱花在哪:一根分段的条 + 图例。缓存读往往占大头
+    // Where the money went: one segmented bar + legend. Cache reads are often the biggest part
     let p = theme::pal();
     let colors = p.parts;
     let cells = split(&g.parts, w.saturating_sub(3));
@@ -535,7 +548,7 @@ fn usage_block(g: &Range, sel: usize, w: usize) -> Vec<Line<'static>> {
     let last = cells.iter().rposition(|n| *n > 0);
     for (i, (n, c)) in cells.iter().zip(colors).enumerate() {
         if *n > 0 {
-            // 段和段之间留一丝底色
+            // Leave a sliver of background between segments
             let end = if Some(i) == last { "█" } else { "▉" };
             bar.push(Span::styled(format!("{}{end}", "█".repeat(*n - 1)), Style::new().fg(c)));
         }
@@ -556,12 +569,12 @@ fn usage_block(g: &Range, sel: usize, w: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// 刻度上写的字:"10:00" → "10","9/30 周三" → "9/30"
+/// The text on a tick: "10:00" → "10", "9/30 Wed" → "9/30"
 fn short_label(l: &str) -> &str {
     l.split([' ', ':']).next().unwrap_or(l)
 }
 
-/// 时间刻度上写什么:按小时每 3 / 6 点一个;7 天每天一个,30 天每个周一一个
+/// What goes on the time axis: by hour, one every 3 / 6 hours; 7 days, one a day; 30 days, one each Monday
 fn tick(label: &str, sel: usize, dense: bool) -> Option<String> {
     match sel {
         0 => {
@@ -569,21 +582,24 @@ fn tick(label: &str, sel: usize, dense: bool) -> Option<String> {
             h.is_multiple_of(if dense { 3 } else { 6 }).then(|| h.to_string())
         }
         1 => Some(short_label(label).to_string()),
-        // 和打标签的用同一张表比:星期几的写法翻成别的话也对得上
+        // Compare against the same table the labels came from, so the weekday spelling matches in any language
         _ => label.ends_with(WEEK[1].get()).then(|| short_label(label).to_string()),
     }
 }
 
-/// 走势按账号分段:有颜色的账号里、这个时段占 3% 以上的单列,按颜色的位子叠(叠在一起挨着的就是色盘里挨着的,
-/// 那几对是验证过分得清的),其余并成灰色的「其他」;分不出两段就只有一段(不分账号的颜色)。
-/// vals[格][段],老的在前,每格各段加起来就是那格的合计
+/// Trend split by account: accounts with a color and at least 3% of this period each get their own segment, stacked by color slot
+/// (neighbors in the stack are neighbors in the palette, pairs verified to be told apart); the rest merge into a gray 「其他」 ("other").
+/// If there can't be two segments, there's just one (the color that belongs to no account).
+/// vals[bucket][segment], oldest first; each bucket's segments add up to that bucket's total
 struct Stacks {
     names: Vec<(String, Color)>,
     vals: Vec<Vec<f64>>,
 }
 
-/// 账号的颜色:按 slots 记的位子取色盘(theme 的 series),按位子排好。没位子的账号不在里面,画灰色。
-/// 走势的分段、额度、「按账号」「按会话」的横条都用这一套,一个账号到哪都是同一种颜色
+/// Account colors: palette entries (theme's series) by the slot recorded in slots, sorted by slot. Accounts without a slot
+/// aren't in it and are drawn gray.
+/// The trend segments, quotas and the 「按账号」 ("By account") / 「按会话」 ("By session") bars all use this one set, so an
+/// account has the same color everywhere
 fn account_palette(r: &Report) -> Vec<(String, Color)> {
     let p = theme::pal();
     let mut v: Vec<&(String, usize)> = r.colors.iter().filter(|x| x.1 < p.series.len()).collect();
@@ -595,7 +611,7 @@ fn color_of(pal: &[(String, Color)], name: &str) -> Color {
     pal.iter().find(|x| x.0 == name).map_or(theme::pal().other, |x| x.1)
 }
 
-/// n = 画几格(今天画满 24 小时,没到的钟点是 0)
+/// n = how many buckets to draw (Today fills all 24 hours; hours not reached yet are 0)
 fn stacks(g: &Range, n: usize, pal: &[(String, Color)]) -> Stacks {
     let pad = |v: Vec<f64>| -> Vec<f64> { (0..n).map(|i| v.get(i).copied().unwrap_or(0.0)).collect() };
     let total = pad(g.series.iter().rev().map(|x| x.1).collect());
@@ -617,7 +633,7 @@ fn stacks(g: &Range, n: usize, pal: &[(String, Color)]) -> Stacks {
         names.push((t!("其他", "other").into(), p.other));
         cols.push(other);
     }
-    // 只有一段:就一个账号(比如只看它)用它的颜色
+    // Only one segment: a single account (say, when only it is shown) uses its own color
     if names.len() < 2 {
         let c = names.first().map_or(p.total, |x| x.1);
         return Stacks { names: vec![(String::new(), c)], vals: total.into_iter().map(|t| vec![t]).collect() };
@@ -625,12 +641,13 @@ fn stacks(g: &Range, n: usize, pal: &[(String, Color)]) -> Stacks {
     Stacks { vals: (0..n).map(|i| cols.iter().map(|c| c[i]).collect()).collect(), names }
 }
 
-/// 竖着往上长的「下面一截」:1/8 … 7/8 格
+/// The "lower part" of a cell growing upward: 1/8 … 7/8 of a cell
 const LOWER: [char; 8] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇'];
 
-/// 一根分段的竖条从下往上画成一串格子:vals 是各段的数,整根高 e 个 1/8 格。
-/// 一格里有两段的分界就用「下面一截」的字,前景是下面那段的颜色、背景是上面那段的 —— 分界也细到 1/8 格;
-/// 条的最后一格不满时,用这格里占得最多的那段的颜色
+/// Draw one segmented vertical bar bottom-up as a run of cells: vals are the segment values, the whole bar is e eighths high.
+/// A cell holding a boundary between two segments uses a "lower part" glyph, foreground the lower segment's color, background
+/// the upper one's, so boundaries are also precise to 1/8 cell;
+/// when the bar's last cell isn't full, it takes the color of the segment that fills most of that cell
 fn cells(vals: &[f64], e: usize, colors: &[Color]) -> Vec<(char, Style)> {
     let total: f64 = vals.iter().sum();
     if e == 0 || total <= 0.0 {
@@ -665,7 +682,8 @@ fn cells(vals: &[f64], e: usize, colors: &[Color]) -> Vec<(char, Style)> {
         .collect()
 }
 
-/// 一根分段的横条:整根长 e 个半格,每格是盖住它左半格的那段的颜色(细条没法在一格里换色,分界落在整格上)
+/// One segmented horizontal bar, e half cells long; each cell takes the color of the segment covering its left half (a thin bar
+/// can't change color within a cell, so boundaries fall on whole cells)
 fn hcells(vals: &[f64], e: usize, colors: &[Color]) -> Vec<(char, Style)> {
     let total: f64 = vals.iter().sum();
     if e == 0 || total <= 0.0 {
@@ -683,7 +701,7 @@ fn hcells(vals: &[f64], e: usize, colors: &[Color]) -> Vec<(char, Style)> {
     bar(e).chars().enumerate().map(|(c, ch)| (ch, Style::new().fg(colors[seg(c * 2)]))).collect()
 }
 
-/// 一串 (字, 样式) 并成几段 Span
+/// Merge a run of (char, style) into a few Spans
 fn spans_of(cs: impl IntoIterator<Item = (char, Style)>) -> Vec<Span<'static>> {
     let mut out: Vec<Span<'static>> = vec![];
     for (ch, st) in cs {
@@ -695,7 +713,7 @@ fn spans_of(cs: impl IntoIterator<Item = (char, Style)>) -> Vec<Span<'static>> {
     out
 }
 
-/// 横条图:一行一格(新的在前),条按账号分段,行尾是这格的合计
+/// Horizontal bar chart: one row per bucket (newest first), bars split by account, the bucket's total at the end of the row
 fn hbars(out: &mut Vec<Line<'static>>, labels: &[String], st: &Stacks, w: usize) {
     let label_w = labels.iter().map(|l| l.width()).max().unwrap_or(0);
     let bar_w = w.saturating_sub(2 + label_w + 2 + 1 + MONEY_W);
@@ -714,7 +732,8 @@ fn hbars(out: &mut Vec<Line<'static>>, labels: &[String], st: &Stacks, w: usize)
     }
 }
 
-/// 竖条图:一格一根(老的在前),往上按账号分段;底下一道线和刻度;太多放不下就只留新的
+/// Vertical bar chart: one bar per bucket (oldest first), stacked upward by account; a baseline and ticks below; when too many to
+/// fit, keep only the newest
 fn columns(out: &mut Vec<Line<'static>>, labels: &[String], st: &Stacks, sel: usize, w: usize) {
     let rows = if w >= 60 { 8 } else { 6 };
     let avail = w.saturating_sub(3);
@@ -730,7 +749,7 @@ fn columns(out: &mut Vec<Line<'static>>, labels: &[String], st: &Stacks, sel: us
     let sums: Vec<f64> = vals.iter().map(|v| v.iter().sum()).collect();
     let max = sums.iter().copied().fold(0.0, f64::max);
     let colors: Vec<Color> = st.names.iter().map(|x| x.1).collect();
-    // 每根从下往上的格子
+    // Each bar's cells, bottom up
     let bars: Vec<Vec<(char, Style)>> = vals
         .iter()
         .zip(&sums)
@@ -772,7 +791,7 @@ fn trend_block(g: &Range, sel: usize, pal: &[(String, Color)], w: usize) -> Vec<
         return vec![];
     }
     let mut labels: Vec<String> = g.series.iter().rev().map(|x| x.0.clone()).collect();
-    // 今天按小时画满 24 格,没到的钟点空着
+    // Today is drawn as all 24 hours; hours not reached yet stay blank
     if sel == 0 {
         labels.extend((labels.len()..24).map(|h| format!("{h:02}:00")));
     }
@@ -782,7 +801,8 @@ fn trend_block(g: &Range, sel: usize, pal: &[(String, Color)], w: usize) -> Vec<
         None => String::new(),
     };
     let mut out = vec![head([t!("按小时", "By hour"), t!("按天", "By day"), t!("按天", "By day"), t!("按月", "By month")][sel], &note, w)];
-    // 7 天、全部(格子少)画横条,行尾写金额;今天、30 天(格子多)画竖条
+    // 7 days and All (few buckets) are horizontal bars with the amount at the end of the row; Today and 30 days (many buckets) are
+    // vertical bars
     let st = stacks(g, labels.len(), pal);
     if sel == 1 || sel == 3 {
         hbars(&mut out, &labels, &st, w);
@@ -804,7 +824,8 @@ fn trend_block(g: &Range, sel: usize, pal: &[(String, Color)], w: usize) -> Vec<
     out
 }
 
-/// 星期 × 钟点:一个钟点一格实心的,花得越多颜色越深(theme 的 heat 四档;开平方拉开差距,不然只有高峰那几格看得见)
+/// Weekday × hour: one solid cell per hour, darker the more was spent (theme's four heat levels; the square root spreads them
+/// out, or only the few peak cells would show)
 fn heat_block(g: &Range, sel: usize, w: usize) -> Vec<Line<'static>> {
     let max = g.heat.iter().flatten().copied().fold(0.0, f64::max);
     if sel == 0 || max <= 0.0 {
@@ -824,7 +845,8 @@ fn heat_block(g: &Range, sel: usize, w: usize) -> Vec<Line<'static>> {
     for d in [1, 2, 3, 4, 5, 6, 0] {
         let mut spans = vec![Span::styled(format!("  {} ", WEEK[d]), dim())];
         for v in g.heat[d] {
-            // 没花钱的钟点也是一格(底色),七行排成整齐的一块;格子矮一丝,行和行之间露着底
+            // Hours with no spend are a cell too (background color), so the seven rows form a neat block; cells are a hair short, so the
+            // background shows between rows
             let lv = if v > 0.0 { (((v / max).sqrt() * 4.0).ceil() as usize).clamp(1, 4) } else { 0 };
             let c = if lv == 0 { theme::pal().track } else { ramp[lv - 1] };
             spans.push(Span::styled("▇".repeat(cell), Style::new().fg(c)));
@@ -834,7 +856,7 @@ fn heat_block(g: &Range, sel: usize, w: usize) -> Vec<Line<'static>> {
     out
 }
 
-// ---------- 按账号 / 模型 / 会话 / 目录 ----------
+// ---------- By account / model / session / directory ----------
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -844,22 +866,24 @@ enum Kind {
     Dir,
 }
 
-/// 名字(+ 灰字)、按最大那行比例的横条、金额、占比
-/// 按账号、按会话的横条用账号的颜色(palette,没位子的是灰的);按模型、按目录不分账号,用 theme 的 total。
-/// 名字都是正文的颜色:颜色只在横条上,名字不跟着涂
-/// 只有一行的不画(就一个账号、一个模型:全是它的)
+/// Name (+ gray note), a bar scaled to the largest row, amount, share
+/// By account and By session bars use the account colors (palette; accounts without a slot are gray); By model and By
+/// directory aren't split by account and use theme's total.
+/// Names are all in the body text color: color is only on the bars, names aren't painted to match
+/// Not drawn when there's only one row (a single account or model: it's all theirs)
 fn rows_block(title: &str, rows: &[Row], total: f64, top: usize, kind: Kind, palette: &[(String, Color)], w: usize) -> Vec<Line<'static>> {
     if rows.len() < 2 {
         return vec![];
     }
-    // 一共几个不写:多出来的末行写「其余 N 个」
+    // The count isn't written: the extra last row says 「其余 N 个」 ("N more")
     let mut out = vec![head(title, "", w)];
     let shown = &rows[..rows.len().min(top)];
     let rest = &rows[shown.len()..];
-    // 灰字(会话的账号)每行都一样(就一个账号)就不写
+    // If the gray note (a session's account) is the same on every row (only one account), leave it out
     let same_note = shown.iter().all(|r| r.note == shown[0].note);
     let tail = 1 + MONEY_W + 5;
-    // 名字、灰字(会话的账号,单独一列)、横条分剩下的地方。先保名字(至少 NAME_MIN),再保灰字,横条最后
+    // Name, gray note (a session's account, its own column) and bar share the remaining space. Name first (at least NAME_MIN),
+    // then the note, the bar last
     const NAME_MIN: usize = 14;
     const BAR_MIN: usize = 6;
     let base = w.saturating_sub(2 + tail);
@@ -898,7 +922,7 @@ fn rows_block(title: &str, rows: &[Row], total: f64, top: usize, kind: Kind, pal
             let bar = if faint { String::new() } else { hbar(r.cost, max, bar_w) };
             let bar_style = match kind {
                 Kind::Src | Kind::Session => {
-                    // 会话的灰字就是账号名,拼回「Claude 名字」去找
+                    // A session's gray note is its account name; join it back into "Claude <name>" to look it up
                     let who = if kind == Kind::Src {
                         r.name.clone()
                     } else {
@@ -938,9 +962,9 @@ fn unpriced_block(g: &Range, w: usize) -> Vec<Line<'static>> {
     out
 }
 
-// ---------- 排版 ----------
+// ---------- Layout ----------
 
-/// 几块往下排,块间空一行
+/// Stack blocks downward, a blank line between blocks
 fn stack(blocks: Vec<Vec<Line<'static>>>) -> Vec<Line<'static>> {
     let mut out = vec![];
     for b in blocks.into_iter().filter(|b| !b.is_empty()) {
@@ -952,7 +976,7 @@ fn stack(blocks: Vec<Vec<Line<'static>>>) -> Vec<Line<'static>> {
     out
 }
 
-/// 两栏并排:左栏补空格到 cw
+/// Two columns side by side: pad the left one with spaces to cw
 fn side_by_side(left: Vec<Line<'static>>, right: Vec<Line<'static>>, cw: usize) -> Vec<Line<'static>> {
     let n = left.len().max(right.len());
     let mut l = left.into_iter();
@@ -970,7 +994,8 @@ fn side_by_side(left: Vec<Line<'static>>, right: Vec<Line<'static>>, cw: usize) 
         .collect()
 }
 
-/// 整个面板的内容(不含标题、底栏)。sel = 选中的时段(RANGES 的下标);more = m 摆出收着的那几块
+/// The whole panel's content (without title and footer). sel = the selected period (index into RANGES); more = `m` shows the
+/// hidden blocks
 pub fn lines(r: &Report, sel: usize, more: bool, w: usize) -> Vec<Line<'static>> {
     if r.ranges.is_empty() {
         let w = w.min(MAX_W);
@@ -990,7 +1015,8 @@ pub fn lines(r: &Report, sel: usize, more: bool, w: usize) -> Vec<Line<'static>>
         } else {
             (quota, stack(vec![totals_block(r, sel, cw), usage(cw)]))
         };
-        // 左边走势下面接「按模型」(不分账号的那块,和按目录一类),右边是分账号上色的两块:两栏差不多一样长
+        // Left: the trend with 「按模型」 ("By model") below it (not split by account, same kind as By directory); right: the two
+        // account-colored blocks. The two columns come out about as long
         let left = stack(vec![
             trend_block(g, sel, &pal, cw),
             rows_block(t!("按模型", "By model"), &g.by_model, g.cost, usize::MAX, Kind::Model, &[], cw),
@@ -1054,7 +1080,7 @@ mod tests {
         assert_eq!(hbar(0.01, 100.0, 4), "▖");
         assert_eq!(hbar(0.0, 100.0, 4), "");
         assert_eq!(hbar(200.0, 100.0, 4), "▄▄▄▄");
-        // 额度条:用掉的和没用掉的之间总隔着半格,两截加起来正好那么宽
+        // Quota meter: always half a cell between used and unused, the two parts adding up to exactly that width
         let m = |u| meter(u, 4);
         assert_eq!(m(0.0), ("".into(), "▄▄▄▄".into()));
         assert_eq!(m(1.0), ("▖".into(), "▄▄▄".into()));
@@ -1085,11 +1111,11 @@ mod tests {
         assert_eq!(window_secs("300m"), Some(300 * 60));
         assert_eq!(window_secs("?"), None);
         let day = 86400;
-        // 7 天的窗口过了一半用了 60%:照这速度 5.83 天用完,重置前
+        // 7-day window half gone with 60% used: at this pace it runs out in 5.83 days, before the reset
         assert_eq!(runs_out(60.0, 1000 + 7 * day / 2, 7 * day, 1000), Some(1000 + (40.0 / 60.0 * (7 * day / 2) as f64) as i64));
-        // 过了一半用了 30%:够用
+        // Half gone with 30% used: enough
         assert_eq!(runs_out(30.0, 1000 + 7 * day / 2, 7 * day, 1000), None);
-        // 刚开头看不准、已经用完不猜
+        // Too early to tell, or already used up: no guess
         assert_eq!(runs_out(5.0, 1000 + 7 * day - 60, 7 * day, 1000), None);
         assert_eq!(runs_out(100.0, 1000 + day, 7 * day, 1000), None);
     }
@@ -1103,7 +1129,7 @@ mod tests {
         let mut out = vec![];
         quota_lines(&mut out, &q, Color::Reset, (now, 0), 80, label_width(std::slice::from_ref(&q)));
         let t = text(&out);
-        // 横条从同一列开始;Fable 过了四天用了八成,重置前用完
+        // Bars start in the same column; Fable is 80% used four days in, runs out before the reset
         assert_eq!(t.len(), 5, "{t:#?}");
         assert!(t[1].starts_with("      5h ") && t[2].starts_with("      7d ") && t[3].starts_with("   Fable "), "{t:#?}");
         assert!(t[4].contains("按当前速度"), "{t:#?}");
@@ -1209,15 +1235,15 @@ mod tests {
         let at = |s: &str| find(&t, s).0;
         assert!(at("订阅额度") < at("按 API 价") && at("按 API 价") < at("按小时") && at("按小时") < at("按账号"));
         assert!(at("按账号") < at("按模型") && at("按模型") < at("按会话"));
-        // 刚更新的额度不写几时更新,旧了才写
+        // A freshly updated quota doesn't say when it was updated; only a stale one does
         assert_eq!(find(&t, "Claude work").1, " ■ Claude work");
         assert!(find(&t, "   5h").1.contains("12%") && find(&t, "   5h").1.contains("今天 13:00 重置"));
         let (i7, l7) = find(&t, "   7d ▄▄");
         assert!(l7.contains("74%") && l7.contains("周五 10:00 重置"));
-        // 7 天用了 74%、还剩两天:照这速度会提前用完
+        // 7 days, 74% used, two days left: at this pace it runs out early
         assert!(t[i7 + 1].contains("按当前速度") && t[i7 + 1].contains("用完"), "{}", t[i7 + 1]);
         assert!(!t[find(&t, "   5h").0 + 1].contains("按当前速度"));
-        // 过了重置时间的不瞎报
+        // Past the reset time: don't make things up
         assert!(find(&t, "已重置").1.ends_with("      已重置"));
         assert!(find(&t, "Codex cx · plus").1.ends_with("1 天前更新"));
         assert!(find(&t, " ▸ 今天").1.contains("$210.00") && find(&t, " ▸ 今天").1.contains("昨天 $323.30"));
@@ -1225,17 +1251,17 @@ mod tests {
         assert!(find(&t, "   近 30 天").1.contains("比前 30 天 ↑30%"));
         assert!(find(&t, "   全部").1.contains("$42,000") && find(&t, "   全部").1.contains("日均 $201.92"));
         assert!(find(&t, "按小时").1.contains("最高 10 点 $200.00"));
-        // 一共几个只在末行说一次;会话的账号每行都一样,不写
+        // The count is said only once, in the last row; the session's account is the same on every row, so it's left out
         assert!(find(&t, "其余 5 个").1.contains("$15.00"));
         assert!(find(&t, "按会话").1.trim_end().ends_with('─'));
         assert!(!find(&t, "会话3").1.contains("work"));
         assert!(find(&t, "未计价的模型").0 < find(&t, "gpt-5.5-codex").0);
         assert!(find(&t, "gpt-5.5-codex").1.contains("1.2 万 token"));
-        // 收着的:用量、钱花在哪几项、按目录;今天本来就不画星期 × 钟点
+        // Hidden: usage, where the money went, By directory; Today never draws weekday × hour anyway
         for gone in ["调用 1,234 次", "缓存命中", "■ 缓存读", "按目录", "其余 2 个", "按星期和钟点"] {
             assert!(!t.iter().any(|l| l.contains(gone)), "{gone}");
         }
-        // m 摆出来
+        // `m` shows them
         let t = text(&lines(&report(), 0, true, 60));
         let at = |s: &str| find(&t, s).0;
         assert!(at("按 API 价") < at("用量") && at("用量") < at("按小时") && at("按会话") < at("按目录"));
@@ -1252,7 +1278,7 @@ mod tests {
         let t = text(&lines(&report(), 1, false, 60));
         let (i, _) = find(&t, " ▸ 近 7 天");
         assert_eq!(t[i + 1].trim(), "日均 $214.29");
-        // 全部的日均在它那行上,底下写从哪天起;今天不写
+        // All has its daily average on its own row and the start day below it; Today doesn't
         let t = text(&lines(&report(), 3, false, 60));
         assert_eq!(t[find(&t, " ▸ 全部").0 + 1].trim(), "2026/3/6 起");
         let t = text(&lines(&report(), 0, false, 60));
@@ -1278,14 +1304,15 @@ mod tests {
         let t = text(&lines(&report(), 0, false, 80));
         let ls = lines(&report(), 0, false, 80);
         let (i, _) = find(&t, "按小时");
-        // 8 行竖条 + 底线 + 刻度 + 图例
+        // 8 rows of vertical bars + baseline + ticks + legend
         assert!(t[i + 9].trim().chars().all(|c| c == '─'));
         let ticks = &t[i + 10];
         for h in ["0", "3", "9", "12", "21"] {
             assert!(ticks.split_whitespace().any(|x| x == h), "刻度没有 {h}:「{ticks}」");
         }
         assert!(t[i + 11].contains("■ Claude work") && t[i + 11].contains("■ Codex cx") && !t[i + 11].contains("其他"));
-        // 从下往上按颜色的位子叠:最下面一行全是 Claude(位子 0)的;10 点那根顶到头,顶上那格下半 Claude、上半 Codex
+        // Stacked bottom-up by color slot: the bottom row is all Claude (slot 0); the 10 o'clock bar reaches the top, its top cell
+        // half Claude below, half Codex above
         let p = theme::pal();
         let bars = |row: usize| ls[i + row].spans.iter().filter(|s| !s.content.trim().is_empty()).map(|s| s.style).collect::<Vec<_>>();
         assert!(bars(8).iter().all(|st| st.fg == Some(p.series[0]) && st.bg.is_none()), "{:?}", bars(8));
@@ -1295,12 +1322,12 @@ mod tests {
     #[test]
     fn a_stacked_bar_splits_at_an_eighth_of_a_cell() {
         let (a, b) = (Color::Red, Color::Blue);
-        // 竖条 12 个 1/8 格:下面一段 4、上面一段 8 → 第一格下半 a 上半 b,第二格是 b 的半格
+        // A vertical bar 12 eighths high: lower segment 4, upper 8 → first cell lower half a, upper half b; second cell half a cell of b
         let c = cells(&[1.0, 2.0], 12, &[a, b]);
         assert_eq!(c, vec![('▄', Style::new().fg(a).bg(b)), ('▄', Style::new().fg(b))]);
         assert_eq!(cells(&[3.0], 16, &[a]), vec![('█', Style::new().fg(a)); 2]);
         assert_eq!(cells(&[0.0], 16, &[a]), vec![]);
-        // 横条 7 个半格:前一段 2 个、后一段 5 个 → 一格 a、两格 b、收尾半格 b
+        // A horizontal bar of 7 half cells: first segment 2, second 5 → one cell a, two cells b, a closing half cell b
         let st = |c| Style::new().fg(c);
         assert_eq!(hcells(&[2.0, 5.0], 7, &[a, b]), vec![('▄', st(a)), ('▄', st(b)), ('▄', st(b)), ('▖', st(b))]);
         assert_eq!(hcells(&[0.0], 4, &[a]), vec![]);
@@ -1323,7 +1350,8 @@ mod tests {
             ..Default::default()
         };
         let p = theme::pal();
-        // b 先拿到位子 0:颜色跟着账号、不跟花得多少;d 没位子(色盘满了),e 不到 3%,都进「其他」
+        // b gets slot 0 first: the color follows the account, not how much it spent; d has no slot (palette full), e is under
+        // 3%, both go into 「其他」 ("other")
         let r = Report {
             colors: vec![("Claude a".into(), 1), ("Codex b".into(), 0), ("Claude c".into(), 2), ("Codex e".into(), 3)],
             ..Default::default()
@@ -1340,11 +1368,11 @@ mod tests {
                 ("其他".into(), p.other)
             ]
         );
-        // 老的在前:a 那格全是 0,b 那格 30 / 50 / 10 / 其他 8 + 2
+        // Oldest first: bucket a is all 0, bucket b is 30 / 50 / 10 / other 8 + 2
         assert_eq!(st.vals, vec![vec![0.0; 4], vec![30.0, 50.0, 10.0, 10.0]]);
-        // 按账号的横条用同一套颜色,没位子的灰
+        // The By account bars use the same colors; no slot means gray
         assert_eq!((color_of(&pal, "Claude a"), color_of(&pal, "Codex d")), (p.series[1], p.other));
-        // 只有一个账号:一段,不画图例
+        // Only one account: one segment, no legend
         let one = Range {
             cost: 5.0,
             series: vec![("a".into(), 5.0)],
@@ -1360,24 +1388,24 @@ mod tests {
         let ls = lines(&report(), 1, true, 60);
         let t = text(&ls);
         let fgs = |i: usize, ch: char| ls[i].spans.iter().filter(|s| s.content.contains(ch)).filter_map(|s| s.style.fg).collect::<Vec<_>>();
-        // 额度条:没到七成是不分账号的颜色,没用掉的那截是 track;过了七成才上状态色
+        // Quota meter: under 70% it's the color that belongs to no account, the unused part is track; status colors only past 70%
         let (i, _) = find(&t, "   5h");
         assert_eq!((fgs(i, '▖'), fgs(i, '▄')), (vec![p.total], vec![p.total, p.track]));
         assert_eq!(fgs(find(&t, "   7d ▄▄").0, '▄')[0], p.amber);
-        // 星期 × 钟点:没花钱的钟点是 track,最多的那格是最深一档
+        // Weekday × hour: hours with no spend are track, the busiest cell is the darkest level
         let (h, _) = find(&t, "按星期和钟点");
         let tue = fgs(h + 3, '▇');
         assert!(tue.contains(&p.track) && tue.contains(&p.heat[3]) && tue.contains(&p.heat[0]), "{tue:?}");
-        // 按账号:各是各的颜色;走势小图不分账号
+        // By account: each its own color; the small trend chart isn't split by account
         assert_eq!(fgs(find(&t, "  Claude work").0, '▄'), vec![p.series[0]]);
         assert_eq!(fgs(find(&t, "  Codex cx").0, '▄'), vec![p.series[1]]);
         assert_eq!(fgs(find(&t, " ▸ 近 7 天").0, '█'), vec![p.total]);
-        // 按模型不分账号;钱花在哪是 parts 的几段
+        // By model isn't split by account; where the money went is the parts segments
         let ls = lines(&report(), 0, true, 60);
         let t = text(&ls);
         let fgs = |i: usize, ch: char| ls[i].spans.iter().filter(|s| s.content.contains(ch)).filter_map(|s| s.style.fg).collect::<Vec<_>>();
         assert_eq!(fgs(find(&t, "  claude-opus-5-5").0, '▄'), vec![p.total]);
-        // 一段一个颜色,段尾留一丝底色(最后一段不留)
+        // One color per segment, a sliver of background at the end of each (not the last)
         let bar = &ls[find(&t, "■ 输入").0 - 1].spans[1..];
         assert_eq!(bar.iter().filter_map(|s| s.style.fg).collect::<Vec<_>>(), p.parts[..4].to_vec());
         assert_eq!(bar.iter().map(|s| s.content.chars().last()).collect::<Vec<_>>(), [Some('▉'), Some('▉'), Some('▉'), Some('█')]);
@@ -1390,7 +1418,8 @@ mod tests {
         assert!(head.contains("最高"));
         let ticks = &t[i + t[i..].iter().position(|l| !l.trim().is_empty() && l.trim().chars().all(|c| c == '─')).unwrap() + 1];
         assert!(ticks.contains("9/28"), "30 天的刻度写周一:{ticks}");
-        // 月里只有合计(没有分账号的数),走势不画图例(额度那边名字前的色块不算)
+        // Months only have totals (no per-account numbers), so the trend has no legend (the swatches before names in the quota block
+        // don't count)
         assert!(!t.iter().any(|l| l.contains("按星期和钟点")), "星期 × 钟点收着");
         let t = text(&lines(&report(), 2, true, 60));
         let (h, hl) = find(&t, "按星期和钟点");
@@ -1400,7 +1429,7 @@ mod tests {
         assert!(t[h + 3].starts_with("  周二") && t[h + 3].contains('▇'));
         assert!(t[h + 8].starts_with("  周日"));
         assert!(find(&t, "30 天里用了 26 天").0 > find(&t, "日均 $433.33").0);
-        // 7 天、全部是横条,新的在前,行尾是金额
+        // 7 days and All are horizontal bars, newest first, amount at the end of the row
         let t = text(&lines(&report(), 1, false, 60));
         assert!(find(&t, "  9/30 周三").1.ends_with("$0.00") && find(&t, "  9/29 周二").1.contains('▄'));
         let t = text(&lines(&report(), 3, false, 60));
@@ -1426,7 +1455,7 @@ mod tests {
         assert!(t[0].starts_with(" 订阅额度") && t[0].contains("按 API 价"));
         let (_, l) = find(&t, "按天");
         assert!(l.contains("按账号"), "走势和按账号并排:{l}");
-        // 窄了就一栏
+        // Narrow means one column
         assert!(!text(&lines(&report(), 1, false, 100))[0].contains("按 API 价"));
     }
 
@@ -1435,7 +1464,8 @@ mod tests {
     fn show() {
         let w: usize = std::env::var("W").ok().and_then(|x| x.parse().ok()).unwrap_or(60);
         let sel: usize = std::env::var("SEL").ok().and_then(|x| x.parse().ok()).unwrap_or(0);
-        // REPORT=<aca ui --cost-json 存下的文件> 看真数据;THEME=mocha 看深色(THEMES=<目录> 里的主题文件也行);ANSI=1 带颜色(转成图看配色);MORE=1 同按了 m
+        // REPORT=<file saved by aca ui --cost-json> to see real data; THEME=mocha for a dark theme (a theme file in THEMES=<dir> works
+        // too); ANSI=1 for colors (render it to an image to check the palette); MORE=1 is like pressing m
         let r = std::env::var("REPORT").ok().map_or_else(report, |f| serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap());
         if let Ok(t) = std::env::var("THEME") {
             let dir = std::env::var("THEMES").unwrap_or_default();

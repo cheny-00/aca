@@ -1,29 +1,36 @@
 #!/bin/sh
-# aca.tailnet:tailscale serve 把本机的什么挂在 tailnet 上。整个功能就是这个脚本 —— aca 里没有挂载的代码,
-# 用的只是插件接口(ACA_ARG_<名字>、ACA_LANG、标准输出 / 退出码)和外面的 tailscale、netstat、tpub、jq。
-# 写插件可以照着它来。
+# aca.tailnet: what tailscale serve mounts from this machine on the tailnet. The whole feature is this script — aca has no
+# mount code; it only uses the plugin interface (ACA_ARG_<NAME>, ACA_LANG, stdout / exit code) and tailscale, netstat, tpub
+# and jq from outside.
+# A model to follow when writing a plugin.
 #
-#   rows      列表视图要的 JSON(docs/plugins.md「列表视图的输出」)
-#   list      给人、给 agent 看的几行字;tailscale 没在跑时退出码是 1
-#   add       把本机端口 ACA_ARG_PORT 原样挂到 tailnet(https,tailnet 里也是这个端口号,好记)
-#   drop      撤掉 ACA_ARG_TARGET(rows 里的 id,或者地址)
-#   publish   ACA_ARG_TO = on / off:开关发布(外面的脚本 tpub,PATH 里有才算装了)
+#   rows      the JSON a list view wants (docs/plugins.md "Output of a list view")
+#   list      a few lines of text for people and agents; exit code 1 when tailscale is not running
+#   add       mount the local port ACA_ARG_PORT on the tailnet as is (https, with the same port number on the tailnet, easy
+#             to remember)
+#   drop      remove ACA_ARG_TARGET (an id from rows, or an address)
+#   publish   ACA_ARG_TO = on / off: turn publishing on or off (the outside script tpub; counts as installed only if on PATH)
 #
-# 谁挂的都列:手敲的 tailscale serve、脚本、skill。
-# - 撤的时候每条都带上端口和路径(--https=443 --set-path=/x off),不用 reset:那会把别处挂的一起清掉
-# - tailscale 说成了不算:撤完、挂完都重读一遍,要动的那条对了、别的一条没少才算成
-# - 前台挂的(没带 --bg 的 tailscale serve)撤不了:那条命令停了它自己就没了
-# - 只管 tailnet 里的:不开 funnel(已经开到公网的只标出来,撤照样能撤)
-# - 挂的时候目标写 localhost:只听 ::1 的 dev server(新一点的 Node 默认这样)写 127.0.0.1 转不过去
-# - 目标在没在听,问系统(netstat)而不是自己去连:装了 LuLu 这类防火墙的机器上去连本机端口会弹窗问、一直卡着
-# - 读的几样(tailscale 的状态、挂载、tpub、netstat)一起问,不一个等一个:列一次的时间是最慢那一样
+# Lists every mount, whoever made it: a tailscale serve typed by hand, a script, a skill.
+# - Removing one always passes its port and path (--https=443 --set-path=/x off), never reset: that would also clear mounts
+#   made elsewhere
+# - tailscale saying it worked is not enough: reread after every remove and mount; it worked only if the one meant to change
+#   is right and not a single other one is missing
+# - A foreground mount (tailscale serve without --bg) cannot be removed: it goes away by itself when that command stops
+# - Only the tailnet: no funnel (ones already open to the internet are only marked, and can still be removed)
+# - When mounting, the target is written as localhost: a dev server that listens only on ::1 (newer Node does so by default)
+#   cannot be reached through 127.0.0.1
+# - Whether a target is listening is asked of the system (netstat), not tested by connecting: on a machine with a firewall
+#   like LuLu, connecting to a local port pops up a prompt and hangs
+# - The few things read (tailscale status, mounts, tpub, netstat) are asked all at once, not one after another: a listing
+#   takes as long as the slowest of them
 set -u
 
-# 带界面的 macOS 版自带的命令行(没往 PATH 里装 tailscale 的机器)
+# The command line bundled with the macOS app with a GUI (for machines that have not put tailscale on PATH)
 APP=/Applications/Tailscale.app/Contents/MacOS/Tailscale
 case "${ACA_LANG:-}" in zh*) L=zh ;; *) L=en ;; esac
 
-# 说一句:t 中文 English
+# Say something: t CHINESE ENGLISH
 t() { if [ "$L" = zh ]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
 die() {
   printf '%s\n' "$1" >&2
@@ -38,7 +45,8 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/aca-tailnet.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
 trap 'exit 1' INT TERM
 
-# 跑一条命令,最多等 $2 秒:输出进 $TMP/$1.out,报错进 $TMP/$1.err,退出码进 $TMP/$1.rc(等超了是 124)
+# Run a command, waiting at most $2 seconds: output goes to $TMP/$1.out, errors to $TMP/$1.err, the exit code to $TMP/$1.rc
+# (124 on timeout)
 run() {
   name=$1 secs=$2
   shift 2
@@ -62,7 +70,8 @@ run() {
 
 ok() { [ "$(cat "$TMP/$1.rc" 2>/dev/null)" = 0 ]; }
 
-# 没成的那一条为什么:等超了说等了多久;不然是它报错里有用的那一行(第一行不空、不教人看 --help 的,去掉「error: 」)
+# Why the failed one failed: on timeout, say how long it waited; otherwise the useful line of its error (the first one that
+# is not empty and does not point people at --help, with "error: " removed)
 why() {
   name=$1 prog=$2 secs=$3
   if [ "$(cat "$TMP/$name.rc" 2>/dev/null)" = 124 ]; then
@@ -74,14 +83,16 @@ why() {
   if [ -n "$line" ]; then printf '%s' "$line"; else t "$prog 未说明原因" "$prog didn't say why"; fi
 }
 
-# 挂载的规矩,都在 jq 里:读 tailscale 的输出、拼地址、撤 / 加回去的命令。$L 是语言
+# The mount rules, all in jq: reading the output of tailscale, building addresses, the commands to remove / add back. $L is
+# the language
 LIB='
 def t($zh; $en): if $L == "zh" then $zh else $en end;
 def text: if type == "string" and . != "" then . else null end;
 def pad($n): if $n > 0 then " " * $n else "" end;
 def hp: capture("^(?<h>.*):(?<p>[0-9]+)$") // null;
 
-# tailscale serve status 的一份配置 → 一条条挂载(TCP 的 host 先空着;目标活着没还没查)
+# One config from tailscale serve status → one mount each (the host of TCP ones left empty for now; whether the target is
+# alive is not checked yet)
 def mounts_of($fg):
   . as $c
   | [($c.AllowFunnel // {}) | to_entries[] | select(.value == true) | (.key | hp) | select(. != null) | .p | tonumber] as $funnel
@@ -103,21 +114,22 @@ def mounts_of($fg):
       | {kind: $kind, host: $a.h, port: $port, path: .key, public: $public, fg: $fg,
          to: (if ($hd.Proxy | text) then {proxy: $hd.Proxy} elif ($hd.Path | text) then {path: $hd.Path} else {text: true} end)}
     end;
-# 前台的在它那条命令活着时另存一份
+# Foreground ones are stored separately while their command is alive
 def parse: [mounts_of(false), ((.Foreground // {}) | .[] | mounts_of(true))] | sort_by(.port, .path, .fg);
 
 def web: .kind == "https" or .kind == "http";
-# 认这一条的名字(drop 认它,也认地址):「https:443/docs」「tcp:2222」,前台的前面加「fg:」
+# The name that identifies this one (drop takes it, and the address too): "https:443/docs", "tcp:2222"; foreground ones get
+# "fg:" in front
 def key: (if .fg then "fg:" else "" end) + .kind + ":" + (.port | tostring) + .path;
 def url:
   if .kind == "https" then "https://\(.host)\(if .port == 443 then "" else ":\(.port)" end)\(.path)"
   elif .kind == "http" then "http://\(.host)\(if .port == 80 then "" else ":\(.port)" end)\(.path)"
   else "\(.host):\(.port)" end;
-# 列表里那一格:「:443 /」「:8080 http /」「:2222 tcp」
+# That cell in the list: ":443 /", ":8080 http /", ":2222 tcp"
 def listen:
   if .kind == "https" then ":\(.port) \(.path)" elif .kind == "http" then ":\(.port) http \(.path)" else ":\(.port) \(.kind)" end;
 def tilde: if $home != "" and (. == $home or startswith($home + "/")) then "~" + .[($home | length):] else . end;
-# 转到哪,短的写法(http:// 不写,家目录写成 ~)
+# Where it forwards to, written short (no http://, the home directory as ~)
 def target:
   if .to.proxy then .to.proxy | ltrimstr("http://") elif .to.path then .to.path | tilde
   elif .to.forward then .to.forward else t("固定文本"; "a fixed text") end;
@@ -130,24 +142,27 @@ def tags: [state, (if .public then t("公网"; "public") else "" end), (if .fg t
 def mark: if .up == true then "●" elif .up == false then "✕" else "·" end;
 def flag: "--" + (if .kind == "tls" then "tls-terminated-tcp" else .kind end) + "=" + (.port | tostring);
 def sub: if .public then "funnel" else "serve" end;
-# 撤这一条:tailscale 后面的参数
+# Removing this one: the arguments after tailscale
 def off_args: [sub, flag] + (if web then ["--set-path=" + .path] else [] end) + ["off"];
-# 怎么把它加回去(撤错了照这条敲);固定的字没读内容,加不回
+# How to add it back (type this if it was removed by mistake); fixed text was never read, so it cannot be added back
 def add_cmd:
   (if .to.proxy then .to.proxy elif .to.path then (if (.to.path | test(" ")) then "\u0027\(.to.path)\u0027" else .to.path end)
    elif .to.forward then "tcp://" + .to.forward else null end) as $to
   | if $to == null then null
     else "tailscale \(sub) --bg \(flag)\(if web and .path != "/" then " --set-path=" + .path else "" end) \($to)" end;
-# 是不是同一条(目标换了也算同一条:一个端口的一个路径只挂得了一样)
+# Whether it is the same one (a changed target still counts as the same: one path on one port can hold only one thing)
 def same($o): [.kind, .port, .path, .fg] == [$o.kind, $o.port, $o.path, $o.fg];
 
-# 代理的目标 → 它听在哪:http://127.0.0.1:8420/x → 127.0.0.1:8420;没写端口的按协议补
+# The target of a proxy → where it listens: http://127.0.0.1:8420/x → 127.0.0.1:8420; a missing port is filled in from
+# the scheme
 def addr_of:
   (if test("://") then {s: (split("://")[0]), r: (split("://")[1:] | join("://"))} else {s: "http", r: .} end) as $x
   | ($x.r | split("/")[0]) as $host
   | if ($host | test(":[0-9]+$")) then $host else "\($host):\(if ($x.s | startswith("https")) then 443 else 80 end)" end;
-# 这个地址(localhost:3000)有没有在听。只认本机回环的:别的机器上的问不到(null)。
-# 听所有地址的算;只听在 tailscale 自己那个地址上的不算(那是 tailscale 给本机访问留的口子,不是目标)
+# Whether this address (localhost:3000) is listening. Only loopback on this machine counts: other machines cannot be asked
+# (null).
+# Listening on all addresses counts; listening only on the address of tailscale itself does not (that is the opening
+# tailscale leaves for local access, not the target)
 def listening($ls):
   hp as $a
   | if $a == null or $ls == null then null else
@@ -158,7 +173,7 @@ def listening($ls):
         end
     end;
 
-# tailscale status --json → 这台机器的名字、毛病
+# tailscale status --json → the name of this machine, and what is wrong
 def who:
   if . == null then {host: "", err: t("无法解析 tailscale 的状态"; "can\u0027t parse tailscale\u0027s status")}
   else {host: ((.Self.DNSName // "") | rtrimstr(".")),
@@ -178,7 +193,8 @@ def pub_label:
 def publish_line: t("发布 "; "publishing ") + pub_label;
 '
 
-# 读现在的样子 → $TMP/state.json:{host, err, mounts, publish}。$1 = pub 时也问 tpub(撤、挂之后核对的不问,省一趟)
+# Read the current state → $TMP/state.json: {host, err, mounts, publish}. With $1 = pub, also ask tpub (not when checking
+# after a remove or a mount, which saves a trip)
 load() {
   : >"$TMP/status.out" >"$TMP/serve.out" >"$TMP/tpub.out" >"$TMP/netstat.out"
   echo 1 >"$TMP/status.rc"
@@ -197,7 +213,8 @@ load() {
     *) run netstat 3 netstat -ltn & ;;
   esac
   wait
-  # 在听的:「v4 v6 地址 端口」一行一个。macOS「tcp4 0 0 127.0.0.1.8420 *.* LISTEN」,Linux「tcp6 0 0 :::22 :::* LISTEN」
+  # What is listening: "v4 v6 ADDRESS PORT", one per line.
+  # macOS: "tcp4 0 0 127.0.0.1.8420 *.* LISTEN", Linux: "tcp6 0 0 :::22 :::* LISTEN"
   if ok netstat; then
     awk '$1 ~ /^tcp/ && $NF == "LISTEN" {
       proto = substr($1, 4); n = match($4, /[.:][0-9]+$/); if (n == 0) next
@@ -209,7 +226,7 @@ load() {
   else
     rm -f "$TMP/listen.tsv"
   fi
-  # 目标是文件 / unix socket 的:在不在(jq 看不了文件)
+  # Targets that are a file / unix socket: whether they exist (jq cannot look at files)
   : >"$TMP/exists.txt"
   if ok serve; then
     jq -r '.. | objects | ((.Path? | strings), (.Proxy? | strings | select(startswith("unix:")) | ltrimstr("unix:")))' "$TMP/serve.out" 2>/dev/null |
@@ -254,7 +271,7 @@ load() {
   ' >"$TMP/state.json"
 }
 
-# 在 state.json 上跑一段 jq(能用上面那些规矩)
+# Run some jq on state.json (with the rules above available)
 q() { jq --arg L "$L" --arg home "${HOME:-}" "$@"; }
 
 rows() {
@@ -301,7 +318,8 @@ add() {
   if q -e --argjson p "$port" 'any(.mounts[]; .port == $p)' "$TMP/state.json" >/dev/null; then
     die "$(t "tailnet 的 :$port 已有其他挂载" "the tailnet's :$port already has something else")"
   fi
-  # 不带 --yes:它要问话(比如这个 tailnet 还没开 HTTPS)就让它问不成、照实报出来,不替人答应
+  # No --yes: if it wants to ask something (say, HTTPS is not enabled on this tailnet yet), let the question fail and report
+  # it as it is, rather than agreeing on behalf of the person
   run change 15 "$TS" serve --bg "--https=$port" "http://localhost:$port"
   ok change || die "$(t '挂载失败:' 'not mounted: ')$(why change tailscale 15)"
   load
@@ -318,7 +336,8 @@ drop() {
   load
   m=$(q -c --arg w "$target" "$LIB"'[.mounts[] | select(key == $w or url == $w)][0] // empty' "$TMP/state.json")
   if [ -z "$m" ]; then
-    # 列表上按的 x:那一行是刚才列的,这会儿已经没了就是没了;命令行敲的多半是写错了
+    # x pressed in the list: that row was just listed, so if it is gone now, it is gone; typed on the command line, it is most
+    # likely a typo
     if [ "${ACA_INVOKED_BY:-}" = menu ]; then
       t "$target 已不存在" "$target wasn't mounted anyway"
       echo
@@ -337,7 +356,7 @@ drop() {
   if q -e --argjson m "$m" "$LIB"'any(.mounts[]; same($m))' "$TMP/state.json" >/dev/null; then
     die "$(t "tailscale 显示已撤销,但它仍在挂载中;请手动撤销:tailscale $*" "tailscale says it's removed, but it's still mounted; remove it by hand: tailscale $*")"
   fi
-  # 别的有没有跟着没了(前台的自己会走,不算)
+  # Whether others went away with it (foreground ones leave by themselves and do not count)
   lost=$(q -r --argjson m "$m" --slurpfile before "$TMP/before.json" "$LIB"'
     . as $after
     | [$before[0].mounts[] | select((.fg | not) and (same($m) | not)) | . as $x | select(any($after.mounts[]; same($x)) | not) | add_cmd // url]
@@ -354,10 +373,10 @@ publish() {
     *) die "$(t 'publish 只接受 on / off' 'publish takes on / off')" ;;
   esac
   [ -n "$TPUB" ] || die "$(t '未安装 tpub' "tpub isn't installed")"
-  # tpub 要起服务、挂上去,头一回还要等证书
+  # tpub has to start the service and mount it, and the first time also wait for a certificate
   run switch 30 "$TPUB" "$ACA_ARG_TO"
   ok switch || die "$(t "无法${word}:" "couldn't $word: ")$(why switch tpub 30)"
-  # 再问一遍它现在怎样,对了才算成
+  # Ask again how it is now; it worked only if that is right
   run tpub 3 "$TPUB" status --json
   if ok tpub; then
     now=$(q -R -s -c "$LIB"'try (fromjson | {state: (.state // "off"), count: (.count // 0), note: (.note // "")})

@@ -1,7 +1,8 @@
-//! `?` 的快捷键弹窗:按用途分组的速查表 + 图例。够宽时排成两三栏(桌面一屏看完),手机上一栏往下翻。
-//! 这里只写「按什么 → 干什么」几个字,不解释;细节在 `aca help keys`(keys.txt)和 README。
-//! 标题和底下那行(怎么滚)是弹窗画的,不在这里。
-//! 弹窗开着时按一个键,说明它的那几行就亮起来(见 `Hit`)。
+//! The `?` keys popup: a cheat sheet grouped by purpose + a legend. When wide enough it's laid out in two or three columns (all
+//! on one desktop screen); on a phone, one column you scroll down.
+//! Only a few words of "press what → does what" here, no explanations; details are in `aca help keys` (keys.txt) and docs/keys.md.
+//! The title and the line below it (how to scroll) are drawn by the popup, not here.
+//! While the popup is open, pressing a key lights up the rows that explain it (see `Hit`).
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
@@ -15,7 +16,8 @@ use crate::data::{Agent, State};
 use crate::theme;
 use crate::ui::{agent_style, dim, icon, wrap_width};
 
-/// 一组:标题 + (键, 干什么)。键那一列里的「空格」「数字」「前缀」是整个词,按键亮行时靠它对上(见 keys_of、hit)
+/// A section: title + (key, what it does). In the key column 「空格」「数字」「前缀」 (Space, 0-9, prefix) are whole words; a
+/// pressed key is matched to its rows by them (see keys_of, hit)
 type Sec = (&'static str, &'static [(&'static str, &'static str)]);
 
 const SECS: &[Sec] = &[
@@ -196,28 +198,29 @@ const SECS_EN: &[Sec] = &[
     ),
 ];
 
-/// 现在那种话的速查表。两份一样长、一样的键,只是字不同(测试查)
+/// The cheat sheet in the current language. Both have the same length and the same keys, only the words differ (a test checks)
 fn secs() -> &'static [Sec] {
     if lang() == Lang::En { SECS_EN } else { SECS }
 }
 
-/// 弹窗里按下的键:亮起说明它的行
+/// A key pressed in the popup: lights up the rows that explain it
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hit {
-    /// 底栏里怎么称呼它:「s」「^R」「空格」
+    /// What the bottom bar calls it: s, ^R, 「空格」 (Space)
     pub label: String,
     keys: Vec<String>,
-    /// 还没滚到它那儿(画的时候滚过去一次,之后随便翻)
+    /// Not scrolled to yet (drawing scrolls there once, then you scroll freely)
     pub jump: bool,
 }
 
-/// 按下的键 → Hit。滚动、关闭的键不走这里(弹窗自己处理),认不出的键也给一个(说没有)
+/// Pressed key → Hit. Scrolling and closing keys don't come here (the popup handles them); an unknown key gets one too (to say
+/// there's none)
 pub fn hit(k: KeyEvent) -> Hit {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let keys: Vec<String> = match k.code {
-        // ^\ 在普通终端里到手是 ^4(0x1C),kitty 键盘协议里才是 ^\ 本身
+        // ^\ arrives as ^4 (0x1C) in a plain terminal; only with the kitty keyboard protocol is it ^\ itself
         KeyCode::Char('4' | '\\') if ctrl => vec!["^\\".into()],
-        // ^` 在弹窗里到手是 NUL(tmux 转的),读成 ^空格
+        // In the popup ^` arrives as NUL (forwarded by tmux), read as ^Space
         KeyCode::Char(' ' | '`') if ctrl => vec!["^`".into()],
         KeyCode::Char(c) if ctrl => vec![format!("^{}", c.to_ascii_uppercase())],
         KeyCode::Char(' ') => vec![t!("空格", "Space").into()],
@@ -239,11 +242,11 @@ pub fn hit(k: KeyEvent) -> Hit {
     Hit { label, keys, jump: true }
 }
 
-/// 一行说明回应哪些键:键那一列(「↑↓ jk」拆成 ↑ ↓ j k;「Tab」「空格」「^R」「⇧⏎」是一个)
+/// Which keys a row answers to: its key column (`↑↓ jk` splits into ↑ ↓ j k; `Tab`, 「空格」 (Space), `^R`, `⇧⏎` are one key each)
 fn keys_of(k: &str) -> Vec<String> {
     let mut out = vec![];
     for t in k.split_whitespace() {
-        // 中文的键名(空格、前缀)是汉字;英文的那几个(Space、prefix)单列
+        // Chinese key names (「空格」, 「前缀」) are all Han characters; the English ones (Space, prefix) are listed one by one
         let word = t.starts_with('^')
             || ["Tab", "⇧Tab", "Esc", "⇧⏎", "Space", "0-9", "tap", "prefix"].contains(&t)
             || t.chars().all(|c| !c.is_ascii() && c.is_alphabetic());
@@ -256,17 +259,18 @@ fn keys_of(k: &str) -> Vec<String> {
     out
 }
 
-/// 栏与栏之间空几格
+/// Spaces between columns
 const GAP: usize = 3;
-/// 一栏最宽这么多,再宽只是空着(说明本来就短)
+/// A column is at most this wide; wider would only be blank (the descriptions are short anyway)
 const COL_MAX: usize = 40;
 
 fn head(t: &str) -> Line<'static> {
     Line::styled(t.to_string(), Style::new().add_modifier(Modifier::BOLD))
 }
 
-/// 一组排成几行:键(强调色)占固定宽的一列,说明太长时折行、和上一行的说明对齐。
-/// 按下的键对得上的行铺上列表选中时的底色、铺满这一栏;第二个返回值是这些行在块里第几行
+/// A section laid out in rows: the key (accent color) in a fixed-width column; a description too long wraps, aligned with the
+/// description above. Rows matching the pressed key get the list's selection background across the whole column; the second
+/// return value is those rows' line numbers within the block
 fn block(sec: &Sec, key_w: usize, w: usize, hit: Option<&Hit>) -> (Vec<Line<'static>>, Vec<usize>) {
     let key = theme::accent().add_modifier(Modifier::BOLD);
     let mut out = vec![head(sec.0)];
@@ -290,7 +294,7 @@ fn block(sec: &Sec, key_w: usize, w: usize, hit: Option<&Hit>) -> (Vec<Line<'sta
     (out, lit)
 }
 
-/// 图例:状态图标照列表里的颜色画,一行三个(窄了两个);再是账号的颜色
+/// The legend: state icons in the list's colors, three per row (two when narrow); then the accounts' colors
 fn legend(w: usize) -> Vec<Line<'static>> {
     let items: Vec<(Span<'static>, &str)> = [
         (State::Ask, t!("等待回应", "needs you")),
@@ -313,7 +317,7 @@ fn legend(w: usize) -> Vec<Line<'static>> {
         (Span::styled("⇄", dim()), t!("别处打开", "open elsewhere")),
     ])
     .collect();
-    // 「图标 + 说明」一格的宽度:英文的说明长一些
+    // Width of one "icon + label" cell: the English labels are longer
     let cell = if lang() == Lang::En { 16 } else { 13 };
     let per = (w / cell).clamp(1, 3);
     let mut out = vec![head(t!("图例", "Legend"))];
@@ -326,7 +330,7 @@ fn legend(w: usize) -> Vec<Line<'static>> {
         }
         out.push(Line::from(spans));
     }
-    // 账号颜色:一行放不下就折到下一行,和第一家对齐
+    // Account colors: what doesn't fit on one line wraps to the next, aligned with the first one
     let label = t!("账号  ", "accounts  ");
     let mut row = vec![Span::styled(label, dim())];
     let mut used = label.width();
@@ -352,8 +356,8 @@ fn width_of(l: &Line) -> usize {
     l.spans.iter().map(|s| s.content.width()).sum()
 }
 
-/// 整页:w 宽时排几栏、每栏多宽,各组按顺序往栏里填,尽量一样高。
-/// 第二个返回值:亮起来的行在第几行(从上往下排好序),弹窗据此滚过去
+/// The whole page: at width w, how many columns and how wide each; sections fill the columns in order, as evenly tall as
+/// possible. Second return value: the line numbers of the lit rows (sorted top to bottom), which the popup scrolls to
 pub fn lines(w: usize, hit: Option<&Hit>) -> (Vec<Line<'static>>, Vec<usize>) {
     let cols = match w {
         0..=69 => 1,
@@ -418,10 +422,10 @@ mod tests {
         let phone = lines(40, None).0;
         let desk = lines(106, None).0;
         assert!(desk.len() * 2 < phone.len(), "桌面分栏后矮得多:{} 对 {}", desk.len(), phone.len());
-        // 桌面弹窗里三栏并排:第一行就有三个标题,一屏放得下
+        // The desktop popup has three columns side by side: the first line already has three titles, it fits on one screen
         assert_eq!(text(&desk[0]).split_whitespace().collect::<Vec<_>>(), ["导航", "会话", "新建时"], "{}", text(&desk[0]));
-        assert!(desk.len() <= 26, "{}", desk.len()); // 加上外框、标题也在 36 行的终端里放得下
-        // 键单独上色(强调色),说明不上色;手机上说明不折行
+        assert!(desk.len() <= 26, "{}", desk.len()); // fits a 36-line terminal even with the frame and title
+        // Keys get their own color (accent), descriptions none; on a phone descriptions don't wrap
         let row = phone.iter().find(|l| text(l).contains("便签 / 编辑器 / 发送")).unwrap();
         assert_eq!(row.spans[0].content.trim(), "e ^G s");
         assert_eq!(row.spans[0].style.fg, Some(theme::pal().accent));
@@ -447,7 +451,7 @@ mod tests {
             lit.iter().map(|&y| text(&ls[y]).split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>()
         };
         let none = KeyModifiers::NONE;
-        // 同一个键在不同界面里干不同的事:都亮
+        // The same key does different things in different views: all of them light up
         assert_eq!(lit(&key(KeyCode::Char('n'), none)), ["n ^N 新建 / 新分组", "n p m 切换文件 / 连同提交"]);
         assert_eq!(lit(&key(KeyCode::Char('N'), KeyModifiers::SHIFT)), ["N 按当前配置新建"]);
         assert_eq!(lit(&key(KeyCode::Char('V'), KeyModifiers::SHIFT)), ["v V 多选 / 连续取消"]);
@@ -456,7 +460,7 @@ mod tests {
         assert_eq!(lit(&key(KeyCode::Char(']'), none)), ["[ ] ` 上 / 下 / 上次的工作区"]);
         assert_eq!(lit(&key(KeyCode::Char('`'), none)), ["[ ] ` 上 / 下 / 上次的工作区"]);
         assert_eq!(lit(&key(KeyCode::Char('F'), KeyModifiers::SHIFT)), ["F 按状态筛选"]);
-        assert!(lit(&key(KeyCode::Char('^'), none)).is_empty()); // 不亮 ^N ^G 那些
+        assert!(lit(&key(KeyCode::Char('^'), none)).is_empty()); // doesn't light ^N, ^G and the like
         assert_eq!(lit(&key(KeyCode::Char('h'), none)), ["h l ← → 返回上层 / 进入下层"]);
         assert_eq!(lit(&key(KeyCode::Left, none)), ["h l ← → 返回上层 / 进入下层"]);
         assert_eq!(lit(&key(KeyCode::Char('}'), none)), ["{ } ⇧Tab 上 / 下 / 上次的分组"]);
@@ -464,27 +468,27 @@ mod tests {
         assert_eq!(lit(&key(KeyCode::Tab, none)), ["Tab W 分组列表 / 仅本组", "Tab 补全", "Tab 输出 ↔ 改动"]);
         assert_eq!(lit(&key(KeyCode::Enter, KeyModifiers::SHIFT)), ["E ⇧⏎ 附带便签打开"]);
         assert_eq!(lit(&key(KeyCode::Char('g'), KeyModifiers::CONTROL)), ["e ^G s 便签 / 编辑器 / 发送"]);
-        assert_eq!(lit(&key(KeyCode::Char('7'), none)).len(), 1); // 数字那行
-        // ^\\ 在普通终端里到手是 ^4
+        assert_eq!(lit(&key(KeyCode::Char('7'), none)).len(), 1); // the 0-9 row
+        // In a plain terminal ^\\ arrives as ^4
         let h = key(KeyCode::Char('4'), KeyModifiers::CONTROL);
         assert_eq!((h.label.as_str(), lit(&h)), ("^\\", vec!["前缀 a ^\\ 弹出 / 关闭 aca".to_string()]));
         let h = key(KeyCode::Char(' '), KeyModifiers::CONTROL);
         assert_eq!((h.label.as_str(), lit(&h)), ("^`", vec!["^` 返回上一个会话".to_string()]));
         assert!(lit(&key(KeyCode::Char('U'), none)).is_empty());
-        // 亮的那行铺满这一栏的底色,键照样是强调色
+        // The lit row has the background across the whole column; the key is still in the accent color
         let (ls, at) = lines(40, Some(&key(KeyCode::Char('t'), none)));
         let row = &ls[at[0]];
         assert_eq!(width_of(row), 40);
         assert!(row.spans.iter().all(|s| s.style.bg == Some(theme::pal().sel)));
         assert_eq!(row.spans[0].style.fg, Some(theme::pal().accent));
-        // 没按键时一行都不亮
+        // With no key pressed, no row is lit
         assert!(lines(40, None).1.is_empty());
     }
 
     #[test]
     fn the_english_sheet_has_the_same_keys_and_fits_the_same_widths() {
         use aca_core::i18n::with;
-        // 两份一一对应:组数、每组的行数、键一样(除了「空格」「数字」这些键名本身)
+        // The two match one to one: number of sections, rows per section, keys (except key names themselves like 「空格」「数字」)
         assert_eq!(SECS.len(), SECS_EN.len());
         for (zh, en) in SECS.iter().zip(SECS_EN) {
             assert_eq!(zh.1.len(), en.1.len(), "{}", zh.0);
@@ -505,7 +509,7 @@ mod tests {
             };
             assert_eq!(lit(&key(KeyCode::Char(' '))), ["Space jump to a row", "Space b page"]);
             assert_eq!(lit(&key(KeyCode::Char('7'))), ["0-9 select by number"]);
-            // prefix、Space 是整词:按 p、S 不会亮它们
+            // prefix and Space are whole words: pressing p or S doesn't light them
             assert!(lit(&key(KeyCode::Char('p'))).iter().all(|l| !l.contains("prefix")));
             assert_eq!(keys_of("^Q prefix d"), ["^Q", "prefix", "d"]);
         });

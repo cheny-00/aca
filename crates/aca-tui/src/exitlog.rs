@@ -1,16 +1,23 @@
-//! 界面不是自己退出时留个底:终端被关掉(kitty 关了窗口、ssh 断了)、程序出错。这时屏幕已经没了或者靠不住,
-//! 话只能写进文件 —— ~/.local/state/aca/ui/exit.log 每次追加一段细节。出错退出的再在 ui/last-exit 记一行,
-//! 下次打开界面时底栏说一次就删掉;终端关掉、断线是常事,只记进 exit.log,不再提。
+//! A record for when the interface didn't quit on its own: the terminal was closed (kitty window closed, ssh dropped), or
+//! the program panicked. By then the screen is gone or can't be trusted, so the only place to say anything is a file:
+//! ~/.local/state/aca/ui/exit.log gets a block of details appended each time. A panic exit also writes one line to
+//! ui/last-exit, which the bottom bar says once the next time the interface opens and then deletes; a closed terminal or a
+//! dropped connection is routine, so it only goes into exit.log and isn't mentioned again.
 //!
-//! 终端没了时不再碰它:往没了的终端打印会出错,ratatui 的出错善后又去恢复终端、又打印,出错时再出错,
-//! 程序直接中止(SIGABRT),一个字都没留下(2026-10-14 kitty ⌘W 关窗那次)。所以 ratatui::init 装的善后
-//! 换成这里的:先写文件,再把终端还回去,还不回去也不打印。
-//! 后台线程出错不会让界面退出:写进文件,底栏马上说一声(不然就是哪样东西悄悄不动了)。
+//! Once the terminal is gone it's left alone: printing to a gone terminal fails, ratatui's panic hook then restores the
+//! terminal and prints again, failing while failing, and the program aborts (SIGABRT) without leaving a word (the
+//! 2026-10-14 kitty ⌘W window close). So the hook ratatui::init installs is replaced with the one here: write the file
+//! first, then hand the terminal back, and don't print if it can't be handed back.
+//! A panic in a background thread doesn't make the interface quit: it goes into the file and the bottom bar says so right
+//! away (otherwise something would just quietly stop working).
 //!
-//! 终端没了也不一定有信号、不一定报错:tmux 关掉窗格时没有 SIGHUP,读终端只是一直读到 0 个字节。crossterm 0.29
-//! 读到 0 个字节(或 EIO 以外的错)会在里面一直重读、不返回,主线程卡死、CPU 占满,永远不退出。只有写终端会报 EIO,
-//! 所以另起一个线程看着(watch):每隔一会儿往终端写 0 个字节(屏幕上什么也不出现),报错了、或者收到挂断信号,
-//! 就记下终端没了;主线程下一轮看到就照常收尾,卡住了没反应就由这个线程替它收尾、退出。
+//! A gone terminal doesn't necessarily send a signal or report an error: when tmux closes a pane there's no SIGHUP, reading
+//! the terminal just keeps returning 0 bytes. crossterm 0.29, on reading 0 bytes (or an error other than EIO), keeps
+//! rereading internally without returning: the main thread hangs, a CPU is maxed out, and it never quits. Only writing to
+//! the terminal reports EIO, so a separate thread watches (watch): every so often it writes 0 bytes to the terminal
+//! (nothing appears on screen); on an error, or on the hangup signal, it records that the terminal is gone; the main
+//! thread sees that on its next round and finishes up as usual, and if it's stuck and doesn't respond, this thread
+//! finishes up and quits for it.
 
 use std::io::Write;
 use std::os::fd::AsFd;
@@ -24,44 +31,47 @@ use aca_core::{t, tr};
 
 type Hook = Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>;
 
-/// 本地时区偏移(秒):开界面时算好,出错时不再去查
+/// Local time zone offset (seconds): computed when the interface opens, not looked up again on a panic
 static TZ: AtomicI64 = AtomicI64::new(0);
 static STARTED: OnceLock<Instant> = OnceLock::new();
-/// 收到了 SIGHUP:终端挂断了
+/// Got SIGHUP: the terminal hung up
 static HUP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-/// 看门的线程发现终端没了
+/// The watchdog thread found the terminal gone
 static GONE: AtomicBool = AtomicBool::new(false);
-/// 是因为写终端报错发现的(不只是收到了挂断信号)
+/// Found because writing to the terminal failed (not just the hangup signal)
 static EIO: AtomicBool = AtomicBool::new(false);
-/// 终端没了的那一笔记过了没有:主线程和看门的线程都可能来记,只记一次
+/// Whether the terminal-gone entry has been written: both the main thread and the watchdog may write it, only once
 static LOGGED: Mutex<bool> = Mutex::new(false);
-/// 后台线程出的错,等主循环拿去在底栏说
+/// A background thread's panic, waiting for the main loop to say it in the bottom bar
 static LIVE: Mutex<Option<String>> = Mutex::new(None);
 
-/// exit.log 超过这么大就挪成 exit.log.1,重新记
+/// Once exit.log is bigger than this it's moved to exit.log.1 and started fresh
 const CAP: u64 = 256 * 1024;
-/// 看门的线程多久看一次终端。SIGHUP 来了不用等它,这个探针只管终端没发信号就没了的情况;连着两次没写进去才算,
-/// 加上 GRACE 三四秒内发现,所以不用看得太勤(250 毫秒时采样里它是界面进程除等待之外最大的一项)
+/// How often the watchdog checks the terminal. SIGHUP doesn't wait for it; this probe only covers the terminal vanishing
+/// without a signal. It takes two failed writes in a row, plus GRACE, so it's found within three or four seconds and
+/// needn't check too often (at 250 ms it was the biggest item in a sample of the interface process apart from waiting)
 const PROBE: Duration = Duration::from_secs(1);
-/// 发现终端没了以后,等主线程自己收尾这么久(它一轮最多 150 毫秒);还在 = 卡住了
+/// After finding the terminal gone, how long to wait for the main thread to finish up itself (a round takes at most 150 ms);
+/// still there = stuck
 const GRACE: Duration = Duration::from_millis(1500);
 
 fn dir() -> PathBuf {
     aca_core::paths::state_dir().join("ui")
 }
 
-/// 开界面时、ratatui::init 之后调。prev = init 之前的出错善后(std 默认的:把出错信息打到标准错误,打不出去就算了);
-/// release = 把终端还回去,主线程出错时调
+/// Called when the interface opens, after ratatui::init. prev = the panic hook from before init (std's default: print the
+/// panic message to stderr, never mind if that fails); release = hand the terminal back, called on a main-thread panic
 pub fn install(prev: Hook, release: fn() -> std::io::Result<()>) {
     TZ.store(crate::usage::local_offset(), Ordering::Relaxed);
     let _ = STARTED.set(Instant::now());
     let flag = HUP.get_or_init(|| Arc::new(AtomicBool::new(false)));
-    // 接住了它,挂断时就不是被直接杀掉,而是主循环看到后收尾、记一笔
+    // With it caught, a hangup doesn't just kill us: the main loop sees it, finishes up and writes an entry
     let _ = signal_hook::flag::register(signal_hook::consts::SIGHUP, flag.clone());
     if let Ok(out) = std::io::stdout().as_fd().try_clone_to_owned() {
         std::thread::spawn(move || watch(std::fs::File::from(out)));
     }
-    // ratatui 装的那个扔掉:它恢复终端失败就 eprintln,终端没了时在这里再出错
+    // Throw away the one ratatui installed: when restoring the terminal fails it eprintln!s, which panics again here when the
+    // terminal is gone
     drop(std::panic::take_hook());
     std::panic::set_hook(Box::new(move |info| {
         let main = std::thread::current().name() == Some("main");
@@ -70,21 +80,23 @@ pub fn install(prev: Hook, release: fn() -> std::io::Result<()>) {
             let _ = release();
             prev(info);
         }
-        // 后台线程的不往屏幕上打:界面还开着,打出来的字会留在画面上
+        // A background thread's isn't printed to the screen: the interface is still open, printed text would stay on it
     }));
 }
 
-/// 收到过挂断信号(SIGHUP)
+/// Got the hangup signal (SIGHUP)
 fn hung_up() -> bool {
     HUP.get().is_some_and(|f| f.load(Ordering::Relaxed))
 }
 
-/// 终端没了:收到过挂断信号,或者看门的线程写终端报错了。主循环每轮看一次,是就收尾退出
+/// The terminal is gone: got the hangup signal, or the watchdog's write to the terminal failed. The main loop checks once a
+/// round and, if so, finishes up and quits
 pub fn gone() -> bool {
     hung_up() || GONE.load(Ordering::Relaxed)
 }
 
-/// 看门的线程:往终端写 0 个字节,终端在时什么也不发生,没了报 EIO。连着两次报错才算(一次可能是碰巧)
+/// The watchdog thread: writes 0 bytes to the terminal; nothing happens while it's there, EIO once it's gone. Only two
+/// failures in a row count (one could be a fluke)
 fn watch(out: std::fs::File) {
     let mut strikes = 0;
     loop {
@@ -100,8 +112,9 @@ fn watch(out: std::fs::File) {
     }
     GONE.store(true, Ordering::Relaxed);
     std::thread::sleep(GRACE);
-    // 主线程到现在还没退出:卡住了(多半是在 crossterm 里一直读 0 个字节)。替它收尾:记一笔,
-    // 回收站里到期的另起进程真删,退出。输入法不切回去:那要在主线程上做
+    // The main thread still hasn't quit: it's stuck (most likely reading 0 bytes forever inside crossterm). Finish up for it:
+    // write an entry, really delete what's due in the trash in a separate process, quit. The input method isn't switched
+    // back: that has to happen on the main thread
     log_gone(None, None, true);
     if crate::trash::Trash::open(crate::trash::Trash::default_path()).due(aca_core::paths::now()) {
         crate::trash::purge_detached();
@@ -109,17 +122,18 @@ fn watch(out: std::fs::File) {
     std::process::exit(0);
 }
 
-/// 后台线程出错了,还没在底栏说过的那一句
+/// A background thread panicked: the message not yet said in the bottom bar
 pub fn take_live() -> Option<String> {
     LIVE.lock().ok()?.take()
 }
 
-/// 终端没了,界面跟着退出:记一笔。why = 主循环停下来时的错(没有 = 看到终端没了停的),restore = 还终端时报的错
+/// The terminal is gone and the interface quits with it: write an entry. why = the error the main loop stopped on (none =
+/// it stopped on seeing the terminal gone), restore = the error from handing the terminal back
 pub fn term_gone(why: Option<&anyhow::Error>, restore: Option<&std::io::Error>) {
     log_gone(why, restore, false);
 }
 
-/// stuck = 主线程卡住了,是看门的线程来记的
+/// stuck = the main thread is stuck, and the watchdog is the one writing it
 fn log_gone(why: Option<&anyhow::Error>, restore: Option<&std::io::Error>, stuck: bool) {
     let Ok(mut logged) = LOGGED.lock() else { return };
     if std::mem::replace(&mut *logged, true) {
@@ -172,7 +186,7 @@ fn on_panic(info: &PanicHookInfo<'_>, main: bool) {
     }
 }
 
-/// 上次的界面出错退出了:底栏说一句。说完就删,只说一次
+/// The last interface quit on a panic: the bottom bar says so. Deleted once said, said only once
 pub fn take_notice() -> Option<String> {
     take_notice_in(&dir(), now_secs(), crate::usage::local_offset())
 }
@@ -183,11 +197,11 @@ fn take_notice_in(dir: &Path, now: i64, tz: i64) -> Option<String> {
     let _ = std::fs::remove_file(&path);
     let mut f = line.trim_end_matches('\n').splitn(4, '\t');
     let at = f.next()?.parse::<i64>().ok()?;
-    // 旧版本还会记终端关掉的(term),不说
+    // Older versions also recorded a closed terminal (term): not said
     if f.next()? != "panic" {
         return None;
     }
-    // 跳过开在哪
+    // Skip where it was open
     let note = f.nth(1).unwrap_or("");
     let when = when(at, now, tz);
     Some(tr!(
@@ -196,7 +210,7 @@ fn take_notice_in(dir: &Path, now: i64, tz: i64) -> Option<String> {
     ))
 }
 
-/// 开在哪:写进 last-exit 的是代号,说的时候再翻成当时的话
+/// Where it's open: last-exit gets a code, turned into words of the language in use when it's said
 fn place() -> &'static str {
     let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
     if crate::data::in_popup() {
@@ -227,14 +241,15 @@ fn payload(info: &PanicHookInfo<'_>) -> String {
     p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "?".into())
 }
 
-/// 一段:标题行(几点、哪个进程、开了多久)+ 细节
+/// One block: a heading line (when, which process, how long it was up) + details
 fn entry(now: i64, tz: i64, up: Option<Duration>, body: &str) -> String {
     let pid = std::process::id();
     let up = up.map(|d| tr!(" · 运行了 {}", " · up {}", span(d))).unwrap_or_default();
     format!("── {} · pid {pid}{up} ──\n{body}\n", stamp(now, tz))
 }
 
-/// 追加一段;太大了先挪走旧的。写不了就算了(这时候没有别处可说)
+/// Append a block; if it's too big, move the old one away first. If it can't be written, never mind (there's nowhere else
+/// to say it at this point)
 fn append(dir: &Path, text: &str) {
     let _ = std::fs::create_dir_all(dir);
     let path = dir.join("exit.log");
@@ -246,7 +261,7 @@ fn append(dir: &Path, text: &str) {
     }
 }
 
-/// last-exit:一行 `<几时(秒)>\t<panic>\t<开在哪>\t<出错信息>`,只留最近一次
+/// last-exit: one line `<when (seconds)>\t<panic>\t<where it was open>\t<panic message>`, only the latest kept
 fn write_last(dir: &Path, at: i64, kind: &str, place: &str, note: &str) {
     let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::write(dir.join("last-exit"), format!("{at}\t{kind}\t{place}\t{}\n", note.replace(['\t', '\n'], " ")));
@@ -260,7 +275,7 @@ fn uptime() -> Option<Duration> {
     STARTED.get().map(Instant::elapsed)
 }
 
-/// 2026-10-14 22:59:33(本地时间)
+/// 2026-10-14 22:59:33 (local time)
 fn stamp(at: i64, tz: i64) -> String {
     let t = at + tz;
     let (y, m, d) = crate::usage::civil_from_days(t.div_euclid(86400));
@@ -268,7 +283,7 @@ fn stamp(at: i64, tz: i64) -> String {
     format!("{y}-{m:02}-{d:02} {:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
-/// 今天的写 22:59,别的天写 10/14 22:59
+/// Today is written 22:59, other days 10/14 22:59
 fn when(at: i64, now: i64, tz: i64) -> String {
     let (t, today) = (at + tz, (now + tz).div_euclid(86400));
     let s = t.rem_euclid(86400);
@@ -292,7 +307,7 @@ fn span(d: Duration) -> String {
     }
 }
 
-/// 出错信息收成一行,太长截断
+/// The panic message folded into one line, cut if too long
 fn one_line(s: &str, max: usize) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if s.chars().count() <= max {
@@ -317,7 +332,7 @@ mod tests {
 
     #[test]
     fn the_terminal_going_away_is_not_told() {
-        // 旧版本记下的那种:不说,也删掉
+        // The kind older versions recorded: not said, and deleted too
         let d = tmp("term");
         write_last(&d, AT, "term", "kitty", "");
         assert_eq!(take_notice_in(&d, AT + 600, CST), None);
@@ -331,7 +346,7 @@ mod tests {
         write_last(&d, AT, "panic", "ssh", "index out of\tbounds\nline two");
         let m = take_notice_in(&d, AT + 86400, CST).unwrap();
         assert_eq!(m, "上次界面于 10/14 22:59 异常退出:index out of bounds line two · 详见 exit.log");
-        // 说过就删了
+        // Deleted once said
         assert_eq!(take_notice_in(&d, AT + 86400, CST), None);
         let _ = std::fs::remove_dir_all(&d);
     }

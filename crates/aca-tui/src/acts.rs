@@ -1,11 +1,15 @@
-//! 主列表的动作一张表:键、叫什么、在哪种行上有效。`:` 面板从这里列 aca 自己的动作(挑中一行 = 在主列表上按了那个键),
-//! `?` 速查的行是手排的(几个键并一行),测试保证两边的键对得上。名字只写两到四个字:面板一行一个,长了挤掉右边的来源。
+//! The main list's actions in one table: key, name, which kind of row it works on. The `:` panel lists aca's own actions from
+//! here (picking a row = pressing that key on the main list);
+//! the `?` cheat sheet's rows are laid out by hand (several keys per row); a test makes sure the keys on both sides match.
+//! Names are two to four (Chinese) characters only: one per row in the panel, and a longer one squeezes out the source on the
+//! right.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use aca_core::i18n::{Lang, lang};
 
-/// 一个动作:键(写法同 `?`:单个字、`^N`、`Tab`)、中英文名、在哪种行上有效(空 = 都行;"session" 登记的会话行、"group" 分组行)
+/// An action: key (written as in `?`: a single character, `^N`, `Tab`), Chinese and English names, which kind of row it works
+/// on (empty = any; "session" a registered session's row, "group" a group row)
 pub struct Act {
     pub key: &'static str,
     zh: &'static str,
@@ -18,12 +22,12 @@ impl Act {
         if lang() == Lang::En { self.en } else { self.zh }
     }
 
-    /// 高亮的行是 on(session / group / global)时能用
+    /// Usable when the highlighted row is on (session / group / global)
     pub fn fits(&self, on: &str) -> bool {
         self.on.is_empty() || self.on.contains(&on)
     }
 
-    /// 它的键按出来是什么(主列表收到的那个事件)
+    /// What pressing its key produces (the event the main list receives)
     pub fn event(&self) -> Option<KeyEvent> {
         let mut cs = self.key.chars();
         match (cs.next(), cs.next(), cs.next()) {
@@ -34,7 +38,7 @@ impl Act {
         }
     }
 
-    /// 按下的是它的键
+    /// The pressed key is its key
     pub fn hit(&self, k: KeyEvent) -> bool {
         self.event().is_some_and(|e| e.code == k.code && e.modifiers.contains(KeyModifiers::CONTROL) == k.modifiers.contains(KeyModifiers::CONTROL))
     }
@@ -47,7 +51,7 @@ const fn act(key: &'static str, zh: &'static str, en: &'static str, on: &'static
 const S: &[&str] = &["session"];
 const SG: &[&str] = &["session", "group"];
 
-/// 面板里的顺序:先是对这一行做的事,再是打开、筛选、整个界面的
+/// The order in the panel: first what's done to this row, then opening, filtering, and the whole interface
 pub const ACTS: &[Act] = &[
     act("n", "新建", "new", &[]),
     act("N", "按当前配置新建", "new with current", &[]),

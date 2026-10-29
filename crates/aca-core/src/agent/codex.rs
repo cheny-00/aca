@@ -1,18 +1,24 @@
-//! Codex。hook 用 `-c hooks.<事件>=…` 在启动时带进去(它的 hook 和 Claude 是同一套形状,状态处理共用);
-//! 对话 id 等 hook 报上来;标题它自己起、写在窗格标题里(`<标题> | <目录>`)。
+//! Codex. Hooks are passed at startup with `-c hooks.<event>=…` (its hooks have the same shape as Claude's, so the state
+//! handling is shared); the conversation id waits for a hook to report it; it comes up with its title itself and writes it
+//! into the pane title (`<title> | <directory>`).
 //!
-//! 两件要知道的事(0.159 上实测):
-//! - **信任**:Codex 对没见过的 hook 会在启动时问一次「Hooks need review」。选「Trust all」后它把信任记在
-//!   那个 `CODEX_HOME` 的 config.toml 里,以后同一条 hook 命令不再问 —— 每个账号点一次,aca 的程序路径变了要再点一次。
-//!   不想点:`[tools.codex] hook_trust = "bypass"`,启动时加 `--dangerously-bypass-hook-trust`
-//!   (这一次启动里所有开着但没审过的 hook 都直接跑,包括别的插件的)。
-//! - **带了 `-c` 就是单机模式**:Codex 不走它那个共用的后台 server(`codex agents` 里看不到这个会话)。
+//! Two things to know (tested on 0.159):
+//! - **Trust**: Codex asks once at startup about hooks it hasn't seen ("Hooks need review"). After "Trust all" it records
+//!   the trust in that `CODEX_HOME`'s config.toml and doesn't ask again for the same hook command — one click per account,
+//!   and again whenever aca's program path changes. To skip clicking: `[tools.codex] hook_trust = "bypass"`, which adds
+//!   `--dangerously-bypass-hook-trust` at startup (every enabled but unreviewed hook in that run just runs, other plugins'
+//!   included).
+//! - **Passing `-c` means standalone mode**: Codex doesn't use its shared background server (`codex agents` doesn't show
+//!   this session).
 //!
-//! 不用老的 `notify`:它只有「一轮结束」,而且 Codex 内部起标题的那次调用也会触发它,报上来的是另一个对话 id。
+//! The old `notify` isn't used: it only has "turn ended", and the call Codex makes internally to come up with a title fires
+//! it too, reporting a different conversation id.
 //!
-//! 别的会话发来的消息排进它自己的队列(`codex queue`,0.152 起有),不往输入框里打字。0.159.3 上实测:
-//! 带着 `-c` 起的(单机模式)窗口也每 10 秒看一次队列,空着就开一轮,在跑就等这一轮结束马上接上,
-//! 你打了一半的草稿不动;按 Esc 打断后排着的不自己开跑,等下一轮正常跑完;退出了,resume 起来马上送。
+//! Messages from other sessions go into its own queue (`codex queue`, since 0.152) rather than being typed into the input
+//! box. Tested on 0.159.3: a window started with `-c` (standalone mode) also checks the queue every 10 seconds; idle, it
+//! starts a turn; running, it picks up right after this turn ends, leaving your half-typed draft alone; after an Esc
+//! interrupt queued ones don't start on their own but wait for the next turn to finish normally; once it has exited,
+//! they're sent as soon as it's resumed.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -29,9 +35,10 @@ use crate::tr;
 
 pub struct Codex;
 
-/// 挂的事件。工具事件只挂 `request_user_input`(它在问你,Plan 模式里才有;和 Claude 的 AskUserQuestion 一个形状),
-/// matcher 是正则:不挂全部,那样每跑一条命令都要多起一个进程。`request_user_input_async` 不挂:它问完马上返回、接着干,
-/// 问题留在屏幕上,读屏幕认得出
+/// Hooked events. Of tool events only `request_user_input` (it's asking you; only in Plan mode; the same shape as Claude's
+/// AskUserQuestion), and matcher is a regex: not all of them, as that would start one more process for every command run.
+/// `request_user_input_async` isn't hooked: it returns right after asking and carries on, the question stays on screen,
+/// and reading the screen catches it
 const EVENTS: &[(&str, Option<&str>)] = &[
     ("SessionStart", None),
     ("UserPromptSubmit", None),
@@ -45,19 +52,21 @@ const EVENTS: &[(&str, Option<&str>)] = &[
     ("PostToolUse", Some("^request_user_input$")),
 ];
 
-/// 启动时的几道关(更新、信任目录、审 hook)和运行中的确认框、问你的题
+/// The startup gates (update, trusting the folder, reviewing hooks), plus confirmation prompts and questions to you while
+/// running
 static ASK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)enter (?:to )?(?:confirm|continue|submit)|esc to cancel|allow command\?|\[y/n\]").unwrap());
-/// 「• Working (1m 05s • esc to interrupt)」,压缩时是「• Compacting context (4s • esc to interrupt)」
+/// "• Working (1m 05s • esc to interrupt)", or when compacting "• Compacting context (4s • esc to interrupt)"
 static RUNNING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\((?:(\d+)h )?(?:(\d+)m )?(\d+)s • [^)]*to interrupt\)").unwrap());
-/// 问你的题头上那行「Question 1/2 (2 unanswered)」:下一行就是题
+/// The line above a question to you, "Question 1/2 (2 unanswered)": the next line is the question
 static QUESTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^Question \d+/\d+\b").unwrap());
-/// 在等你(确认框、问你的题)时,窗格标题开头转圈的那一格换成一句闪着的「[ ! ] Action Required」/「[ . ] Action Required」(0.163)
+/// While waiting for you (a confirmation prompt, a question to you), the spinner cell at the start of the pane title turns
+/// into a blinking "[ ! ] Action Required" / "[ . ] Action Required" (0.163)
 static ACTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\[ \S \] Action Required(?: \| |$)").unwrap());
 const SPINNER: &str = "⠁⠂⠄⡀⢀⠠⠐⠈⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
-/// 一个事件的 `-c` 值:TOML 写的一条 hook,`hooks.Stop=[{ hooks = [{ type = "command", command = "…" }] }]`,
-/// 工具事件多一个 `matcher`
+/// One event's `-c` value: one hook written in TOML, `hooks.Stop=[{ hooks = [{ type = "command", command = "…" }] }]`,
+/// with an extra `matcher` for tool events
 fn hook_flag(event: &str, matcher: Option<&str>, aca: &str) -> String {
     let mut handler = toml::Table::new();
     handler.insert("type".into(), "command".into());
@@ -83,14 +92,21 @@ fn plan(tool: &Tool, s: &Session, how: &How, aca: &str) -> Vec<String> {
     if tool.hook_trust == "bypass" {
         argv.push("--dangerously-bypass-hook-trust".into());
     }
-    // 开着的插件给它的:aca 备好的插件副本(MCP 服务也在里面);做不成副本的 MCP 服务才走 -c mcp_servers
-    // (Codex 给 MCP 子进程的环境只有白名单,会话 id 写进 env)
+    // What enabled plugins give it: the plugin copies aca prepared (MCP servers included); only MCP servers that can't be
+    // copied go through -c mcp_servers (Codex gives MCP child processes an allowlisted environment only, so the session id is
+    // written into env)
     let mut env =
         vec![("ACA_SESSION_ID".to_string(), s.id.clone()), ("ACA_TOOL".into(), s.tool.clone()), ("ACA_BIN".into(), aca.to_string())];
     for k in ["ACA_HOME", "ACA_TMUX_SOCKET"] {
         if let Some(v) = std::env::var(k).ok().filter(|v| !v.is_empty()) {
             env.push((k.to_string(), v));
         }
+    }
+    // The commands it runs need these too (`aca msg --in` and `aca new` find the session by them): a config that inherits only a
+    // few basic variables, like `shell_environment_policy.inherit = "core"`, won't pass them on from the launch environment, so
+    // set them directly (verified 2026-10-29)
+    for (k, v) in &env {
+        argv.extend(["-c".to_string(), format!("shell_environment_policy.set.{k}={}", toml::Value::String(v.clone()))]);
     }
     for (name, args) in &tool.mcp {
         argv.extend(["-c".to_string(), crate::plugin::mount::codex_mcp_flag(name, aca, args, &env)]);
@@ -102,18 +118,22 @@ fn plan(tool: &Tool, s: &Session, how: &How, aca: &str) -> Vec<String> {
     argv
 }
 
-/// `-c` 后面这个是不是 aca 带进去的(hook、插件、插件的 MCP 服务)
+/// Whether this value after `-c` was passed by aca (hooks, plugins, plugins' MCP servers, the session variables for commands)
 fn ours(v: &str) -> bool {
-    v.starts_with("hooks.") || (v.starts_with("plugins.") && v.contains("@aca.")) || v.starts_with("mcp_servers.aca")
+    v.starts_with("hooks.")
+        || (v.starts_with("plugins.") && v.contains("@aca."))
+        || v.starts_with("mcp_servers.aca")
+        || v.starts_with("shell_environment_policy.set.ACA_")
 }
 
-/// 接管时不照搬的:开头「接哪段对话」的子命令(`resume <id>` / `fork <id>`)、aca 自己带进去的 hook 和跳过信任的那个开关
-/// (起的时候会照配置重新拼)。`first` = 这是程序名后面的第一个词
+/// Not carried over when adopting: a leading subcommand saying which conversation to resume (`resume <id>` / `fork <id>`),
+/// plus the hooks aca passed itself and the trust-skipping flag (rebuilt from the config on start). `first` = this is the
+/// first word after the program name
 fn not_carried(rest: &[String], first: bool) -> usize {
     match rest[0].as_str() {
         "resume" | "fork" if first => 1 + usize::from(rest.get(1).is_some_and(|v| !v.starts_with('-'))),
         "--dangerously-bypass-hook-trust" => 1,
-        // 只有 resume / fork 认的开关:子命令不搬,它们也不能留
+        // Flags only resume / fork accept: the subcommand isn't carried, so these can't stay either
         "--last" | "--all" => 1,
         "-c" | "--config" if rest.get(1).is_some_and(|v| ours(v)) => 2,
         _ => 0,
@@ -122,7 +142,7 @@ fn not_carried(rest: &[String], first: bool) -> usize {
 
 const MODEL: &[&str] = &["-m", "--model"];
 
-/// `dir` 往下最多 `depth` 层里,名字是 `rollout-…<tail>` 的那个文件
+/// The file named `rollout-…<tail>` within `depth` levels under `dir`
 fn rollout_in(dir: &Path, tail: &str, depth: u32) -> Option<PathBuf> {
     let mut dirs = vec![];
     for e in std::fs::read_dir(dir).ok()?.flatten() {
@@ -136,12 +156,12 @@ fn rollout_in(dir: &Path, tail: &str, depth: u32) -> Option<PathBuf> {
             dirs.push(e.path());
         }
     }
-    // 新的日子在后面:倒着找,刚说过话的那段多半在最近的目录里
+    // Newer days come later: search backwards, a conversation just talked to is most likely in the latest directory
     dirs.sort();
     dirs.iter().rev().find_map(|d| rollout_in(d, tail, depth - 1))
 }
 
-/// 记录里最后一轮用的模型(`turn_context` 里记着)
+/// The model used by the record's last turn (recorded in `turn_context`)
 fn last_model(log: &Path) -> Option<String> {
     use std::io::BufRead;
     let f = std::fs::File::open(log).ok()?;
@@ -160,8 +180,8 @@ fn last_model(log: &Path) -> Option<String> {
     model
 }
 
-/// 一个账号默认用什么:config.toml 的 `model`、`model_provider`(没写是 openai);
-/// 选了 profile 的(参数里的 `--profile` / `-p`,或者 config.toml 的 `profile`)先看 `[profiles.<它>]` 里的
+/// What an account uses by default: config.toml's `model` and `model_provider` (openai if unset); with a profile selected
+/// (`--profile` / `-p` in the arguments, or `profile` in config.toml), `[profiles.<it>]` is checked first
 struct Defaults {
     model: Option<String>,
     provider: String,
@@ -176,12 +196,14 @@ fn defaults(home: &Path, args: &[String]) -> Defaults {
     Defaults { model: get("model"), provider: get("model_provider").unwrap_or_else(|| "openai".into()) }
 }
 
-/// 记录里的最后一轮已经结束了的:替它补的那个事件,带着结束的时刻 `at`。还在跑、被打断的是 None。
-/// - 带着 `error` 结束:`StopFailure`(原文和类别)
-/// - 正常结束:`Stop`(最后一条回复)。没写结束时刻的不补:分不出是不是上一轮的
+/// If the record's last turn has already ended: the event to fill in for it, with the end time `at`. Still running or
+/// interrupted is None.
+/// - Ended with `error`: `StopFailure` (the raw text and its kind)
+/// - Ended normally: `Stop` (the last reply). Not filled in without an end time: can't tell it isn't the previous turn's
 ///
-/// `since` = hook 记的这一轮开始的时刻:比它早结束的是上一轮的(新的一轮刚开始、记录里还没写上),不算
-/// 记录里最后一轮跑完时带的那条回复(`task_complete` 的 `last_agent_message`)
+/// `since` = when the hook recorded this turn starting: anything that ended earlier is the previous turn's (the new turn
+/// just started and isn't in the record yet), and doesn't count
+/// The reply that comes with the record's last finished turn (`last_agent_message` of `task_complete`)
 fn last_reply(text: &str) -> Option<String> {
     text.lines().rev().filter(|l| l.contains("\"task_complete\"")).find_map(|l| {
         let v: serde_json::Value = serde_json::from_str(l).ok()?;
@@ -203,10 +225,12 @@ fn last_turn_end(text: &str, since: u64) -> Option<serde_json::Value> {
         return Some(serde_json::json!({ "hook_event_name": "Stop", "last_assistant_message": reply, "at": at? }));
     }
     let message = p["error"]["message"].as_str().filter(|m| !m.trim().is_empty()).unwrap_or("本轮出错");
-    // 类别:没带数据的写成字符串("server_overloaded"),带数据的写成只有一个键的对象({"http_connection_failed": {…}})
+    // Kind: without data it's a string ("server_overloaded"), with data an object with a single key
+    // ({"http_connection_failed": {…}})
     let info = &p["error"]["codex_error_info"];
     let key = info.as_str().map(str::to_string).or_else(|| info.as_object()?.keys().next().cloned()).unwrap_or_default();
-    // 连接、流出错的那几类带着 HTTP 状态码:看码(模型名写错是 404,再试也一样)
+    // The connection and stream error kinds carry an HTTP status code: go by the code (a misspelled model name is 404, and
+    // retrying won't change that)
     let status = info[key.as_str()]["http_status_code"].as_u64();
     let kind = match (key.as_str(), status) {
         (_, Some(401 | 403)) => "account",
@@ -230,11 +254,13 @@ fn last_turn_end(text: &str, since: u64) -> Option<serde_json::Value> {
     Some(serde_json::json!({ "hook_event_name": "StopFailure", "error": message, "error_kind": kind, "codex_error": key, "at": at }))
 }
 
-/// 一个正在跑的 Codex 现在是哪段对话:(对话 id, 记录, 标题)。它不留「这个进程是哪段」的文件,但它的日志库
-/// (`logs_2.sqlite`,在 config.toml 的 `sqlite_home` 里,没写就是配置目录)每一行都记着进程(`pid:<进程号>:<uuid>`)和线程。
-/// 这个进程最近写过日志的线程里,第一个是真的对话的:有写入锁(`thread-writer-locks/<id>.lock`;它内部起标题那次调用的线程没有)、
-/// 又不是它派出去的子线程(状态库 `state_5.sqlite` 的 threads 里 `source` 是一段 JSON)。标题、记录在哪也看 threads
-/// (`name` 是它起的标题,`rollout_path`);`/new` 之后还没说过话的那段 threads 里还没有,只有 id。0.163 上实测
+/// Which conversation a running Codex is on now: (conversation id, record, title). It leaves no "which conversation this
+/// process is on" file, but its log database (`logs_2.sqlite`, in config.toml's `sqlite_home`, the config directory if
+/// unset) records the process (`pid:<pid>:<uuid>`) and thread on every row. Of the threads this process logged most
+/// recently, the first that's a real conversation: it has a write lock (`thread-writer-locks/<id>.lock`; the thread of its
+/// internal title call doesn't), and isn't a subthread it spawned (`source` is a JSON snippet in threads of the state
+/// database `state_5.sqlite`). The title and record location also come from threads (`name` is the title it came up with,
+/// `rollout_path`); after `/new` a conversation not talked to yet isn't in threads, only its id. Tested on 0.163
 fn live_in(home: &Path, pid: u32) -> Option<(String, String, String)> {
     use rusqlite::{Connection, OpenFlags, OptionalExtension};
     let t: toml::Table = std::fs::read_to_string(home.join("config.toml")).ok().and_then(|t| t.parse().ok()).unwrap_or_default();
@@ -245,7 +271,8 @@ fn live_in(home: &Path, pid: u32) -> Option<(String, String, String)> {
         db.is_file().then(|| Connection::open_with_flags(format!("file:{}?mode=ro", db.display()), flags).ok()).flatten()
     };
     let logs = open("logs_2.sqlite")?;
-    // 日志 id 是一直往后加的:最近写过的排前面。进程号用范围比(`pid:12:` 到 `pid:12;`):`like 'pid:1%'` 会碰上 `pid:12`
+    // Log ids only grow: the most recently written come first. The pid is compared as a range (`pid:12:` to `pid:12;`):
+    // `like 'pid:1%'` would hit `pid:12`
     let (lo, hi) = (format!("pid:{pid}:"), format!("pid:{pid};"));
     let mut st = logs
         .prepare(
@@ -268,11 +295,11 @@ fn live_in(home: &Path, pid: u32) -> Option<(String, String, String)> {
     )
 }
 
-/// 窗格标题 `⠴ 修登录 | api` → `修登录`;还没起标题时只有目录名,不算。
-/// 在等你时是 `[ ! ] Action Required | 修登录 | api`:那一段是转圈那一格,不是标题
+/// Pane title `⠴ 修登录 | api` → `修登录` ("fix login"); with no title yet it's only the directory name, which doesn't count.
+/// While waiting for you it's `[ ! ] Action Required | 修登录 | api`: that part is the spinner cell, not the title
 fn pane_title(title: &str) -> Option<String> {
     let t = ACTION.replace(title.trim_start(), "");
-    // 干活时前面是转圈的字符,标题还没起好时那个位置也是一个(`⠸ ⠸ | api`)
+    // While working a spinner character comes first, and before the title is ready that spot holds one too (`⠸ ⠸ | api`)
     let t = t.trim_start_matches(|c: char| c.is_whitespace() || SPINNER.contains(c));
     let (name, _dir) = t.rsplit_once(" | ")?;
     let name = name.trim();
@@ -292,7 +319,7 @@ impl Agent for Codex {
         Some("~/.codex")
     }
 
-    /// 对话记录 `sessions/<年>/<月>/<日>/rollout-<时间>-<id>.jsonl`
+    /// The conversation record `sessions/<year>/<month>/<day>/rollout-<time>-<id>.jsonl`
     fn conv_files(&self, home: &Path, conv: &str) -> Vec<PathBuf> {
         if conv.is_empty() || conv.contains('/') {
             return vec![];
@@ -302,9 +329,11 @@ impl Agent for Codex {
         found.and_then(|f| f.strip_prefix(home).ok().map(Path::to_path_buf)).into_iter().collect()
     }
 
-    /// 各账号 config.toml 里的默认模型不一样(这台机器上就是):原来那段用的模型不是新账号默认的,带上 `-m` 接着用它。
-    /// 会话参数里原来的 `-m` 先拿掉再看要不要带(换回原账号时就不用带了)。工具、新账号里写死了模型的不动;
-    /// 两个账号走的不是同一个服务(`model_provider`)的也不动,模型照新账号的,说一声
+    /// Each account's config.toml has a different default model (true on this machine): if the model the conversation used
+    /// isn't the new account's default, pass `-m` to keep using it. The old `-m` in the session's arguments is removed first,
+    /// then we decide whether to pass one (not needed when switching back to the original account). Left alone when the tool
+    /// or new account fixes the model; also left alone when the two accounts use different services (`model_provider`): the
+    /// model follows the new account, with a note
     fn rehome_args(&self, args: &[String], log: &Path, from: &Path, to: &Path, fixed: &[String]) -> (Vec<String>, String) {
         let keep = || (args.to_vec(), String::new());
         let Some(was) = last_model(log) else { return keep() };
@@ -352,7 +381,8 @@ impl Agent for Codex {
         Ok(plan(tool, s, how, aca))
     }
 
-    /// 知道对话 id 就接(第一句话发出去 hook 才报 id;起了没说过话的重新开)
+    /// Resume if the conversation id is known (the hook only reports the id once the first message is sent; a session never
+    /// talked to starts fresh)
     fn resume(&self, conv: &str, _r: &Run) -> How {
         if conv.is_empty() { How::Fresh } else { How::Resume(conv.to_string()) }
     }
@@ -365,8 +395,9 @@ impl Agent for Codex {
         pane_title(title)
     }
 
-    /// 正在跑的 Codex 不留「我现在是哪段对话」的文件:看它的日志库(见 [`live_in`]),`/new` 之后换了也跟得上。
-    /// 日志库里认不出的(老版本、库不在),只有命令行里写着的认得出(`codex resume <id>`)
+    /// A running Codex leaves no "which conversation I'm on now" file: read its log database (see [`live_in`]), which follows
+    /// it after `/new` too. When the log database can't tell (older versions, no database), only what the command line says
+    /// can be recognized (`codex resume <id>`)
     fn live(&self, pid: u32, home: Option<&str>, argv: &[String]) -> Live {
         let args = super::carry(argv, |rest| not_carried(rest, rest.len() + 1 == argv.len()));
         let conf = home.map_or_else(|| PathBuf::from(crate::paths::expand("~/.codex")), PathBuf::from);
@@ -389,8 +420,9 @@ impl Agent for Codex {
         super::Delivery::Queue
     }
 
-    /// 带一个 `-c`:`codex queue` 就在自己进程里写完队列就走,不会给这个账号拉起一个一直挂着的后台服务。
-    /// 那个服务已经在跑时它会拒绝(怕两边各写各的),只能去掉 `-c` 交给那个服务
+    /// Pass a `-c`: then `codex queue` writes the queue within its own process and leaves, rather than starting a long-lived
+    /// background service for this account. When that service is already running it refuses (to avoid both writing
+    /// separately), so the only way is to drop `-c` and hand it to that service
     fn queue_args(&self, conv: &str, text: &str, shared: bool) -> Vec<String> {
         let mut a: Vec<String> = if shared { vec![] } else { vec!["-c".into(), "notify=[]".into()] };
         a.extend(["queue", "--thread", conv, "--message", text].map(String::from));
@@ -401,13 +433,13 @@ impl Agent for Codex {
         Some('›')
     }
 
-    /// 「› 1. Yes, proceed (y) / 2. Yes, and don't ask again … (p) / 3. No, and tell Codex what to do differently (esc)」:
-    /// 同意按 y;拒绝按 Esc,这一轮就停了,它自己报 Interrupt(0.163 上实测)
+    /// "› 1. Yes, proceed (y) / 2. Yes, and don't ask again … (p) / 3. No, and tell Codex what to do differently (esc)":
+    /// approve with y; deny with Esc, which stops the turn and it reports Interrupt itself (tested on 0.163)
     fn permission_keys(&self) -> Option<(&'static str, &'static str)> {
         Some(("y", "Escape"))
     }
 
-    /// 「esc to interrupt」:按一下就停,它自己报 Interrupt
+    /// "esc to interrupt": one press stops it, and it reports Interrupt itself
     fn interrupt_keys(&self) -> Option<&'static [&'static str]> {
         Some(&["Escape"])
     }
@@ -420,20 +452,21 @@ impl Agent for Codex {
         super::opening_after_dashes(text)
     }
 
-    /// 「Folder access … Trust this folder? … › 1. Trust and continue / 2. Quit」。审 hook 的那道关
-    /// (「2. Trust all and continue」)不算:那个归 `hook_trust` 管
+    /// "Folder access … Trust this folder? … › 1. Trust and continue / 2. Quit". The hook review gate ("2. Trust all and
+    /// continue") doesn't count: that's `hook_trust`'s business
     fn trust_keys(&self, lines: &[String]) -> Option<Vec<&'static str>> {
         let g = crate::answer::gate(lines)?;
         let yes = g.opts.iter().position(|o| o == "Trust and continue")?;
         (g.opts.len() == 2 && g.opts.iter().any(|o| o == "Quit")).then(|| crate::answer::gate_keys(&g, yes + 1))
     }
 
-    /// 两种结束它不报 hook,都只在对话记录里留一条 `task_complete`:
-    /// - 一轮出错(限流、过载、断流、额度……,它自己重试几次也不行之后):不跑 Stop hook,也没有别的 hook
-    ///   (0.162 源码:采样出错直接跳出这一轮),那一条带着 `error`
-    /// - 正常跑完、Stop hook 却没被信任:它不跑没信任的 hook,也不提示。信任是一条一条记的,
-    ///   会有 UserPromptSubmit 信任了、Stop 没有的账号(0.162.1 上遇到过):每一轮都只报开始、不报结束。
-    ///   Stop hook 是等它跑完才写 `task_complete` 的,所以记录里有了、hook 还说在跑,就是没跑
+    /// Two kinds of ending report no hook, and only leave a `task_complete` in the conversation record:
+    /// - A turn errors out (rate limits, overload, a dropped stream, usage limits…, after its own few retries fail): no Stop
+    ///   hook, no other hook either (0.162 source: a sampling error breaks straight out of the turn); that entry carries `error`
+    /// - It finishes normally but the Stop hook isn't trusted: it doesn't run untrusted hooks, and doesn't say so. Trust is
+    ///   recorded per hook, so an account can have UserPromptSubmit trusted and Stop not (seen on 0.162.1): every turn only
+    ///   reports its start, never its end. The Stop hook is only run after `task_complete` is written, so if the record has it
+    ///   and the hook still says running, the hook didn't run
     fn unreported_end(&self, r: &Run) -> Option<serde_json::Value> {
         last_turn_end(&tail(&r.transcript, 256 * 1024)?, r.turn)
     }
@@ -446,8 +479,9 @@ impl Agent for Codex {
         let nonempty: Vec<&str> = lines.iter().map(|l| l.as_str()).filter(|l| !l.trim().is_empty()).collect();
         let tail = &nonempty[nonempty.len().saturating_sub(14)..];
         if tail.iter().any(|l| ASK.is_match(l)) {
-            // 问的那句:问你的题是「Question 1/1」下面那行(不一定带问号);别的取以问号结尾的;
-            // 启动那几道关没有问号,取框里第一行有字的(没登录时那一屏上面是点阵画的 logo,最后几行会落进 tail)
+            // The question asked: for a question to you it's the line under "Question 1/1" (not necessarily ending in a question
+            // mark); otherwise the one ending in a question mark; the startup gates have none, so take the first non-empty line in the
+            // box (when logged out that screen has a braille-dot logo on top, whose last few lines fall into tail)
             let rows: Vec<&str> = tail.iter().map(|l| l.trim()).collect();
             let q = rows
                 .iter()
@@ -495,16 +529,16 @@ mod tests {
         )
         .unwrap();
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        // b 选了 profile:默认是 profile 里的 m-fast,和最后一轮的 m-a 不一样,带上;原来的 -m 先拿掉
+        // b selects a profile: the default is the profile's m-fast, not the last turn's m-a, so pass it; the old -m is removed first
         let (args, note) = Codex.rehome_args(&s(&["-m", "old", "--yolo"]), &log, &a, &b, &[]);
         assert_eq!((args, note.contains("m-fast")), (s(&["--yolo", "-m", "m-a"]), true));
-        // 参数里点名了别的 profile:看它的(没有这个 profile 就是顶上的 m-b)
+        // The arguments name another profile: use it (no such profile means the top-level m-b)
         assert_eq!(Codex.rehome_args(&[], &log, &a, &b, &s(&["--profile", "none"])).0, s(&["-m", "m-a"]));
-        // 回到默认就是 m-a 的账号:不用带
+        // Back to the account whose default is m-a: nothing to pass
         assert_eq!(Codex.rehome_args(&s(&["--model=m-a"]), &log, &b, &a, &[]), (vec![], String::new()));
-        // 新账号里写死了模型:不动
+        // The new account fixes the model: left alone
         assert_eq!(Codex.rehome_args(&s(&["--yolo"]), &log, &a, &b, &s(&["-m", "pinned"])).0, s(&["--yolo"]));
-        // 走的不是同一个服务:模型照新账号的,说一声
+        // Not the same service: the model follows the new account, with a note
         let (args, note) = Codex.rehome_args(&s(&["-m", "m-a"]), &log, &a, &c, &[]);
         assert_eq!(args, s(&["-m", "m-a"]));
         assert!(note.contains("openai → relay"), "{note}");
@@ -525,13 +559,13 @@ mod tests {
 
     #[test]
     fn the_folder_trust_question_is_answered_but_the_hook_review_is_not() {
-        // 0.162 上抄下来的
+        // Copied from 0.162
         let ask = "  Folder access\n\n  /p/api\n\n  Trust this folder? Codex can read, edit, and run files here, subject to your\n  permission settings. Folder settings can run code automatically, even\n  without a model request. Continue only if you trust these files. Your trust\n  decision will be saved.\n\n› 1. Trust and continue\n  2. Quit\n\n  enter continue · esc quit\n";
         assert_eq!(Codex.trust_keys(&lines(ask)), Some(vec!["Enter"]));
-        // 光标被挪到 Quit 上了:走回去
+        // The cursor was moved to Quit: move it back
         let moved = ask.replace("› 1. Trust and continue\n  2. Quit", "  1. Trust and continue\n› 2. Quit");
         assert_eq!(Codex.trust_keys(&lines(&moved)), Some(vec!["Up", "Enter"]));
-        // 审 hook 的那道关归 hook_trust 管;运行中的确认框、平常的输入框都不是
+        // The hook review gate is hook_trust's business; neither a confirmation prompt while running nor the usual input box is it
         let review = "  Hooks need review\n  6 hooks are new or changed.\n  Hooks can run outside the sandbox after you trust them.\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n  enter confirm · esc skip";
         assert_eq!(Codex.trust_keys(&lines(review)), None);
         assert_eq!(Codex.trust_keys(&lines("  Allow command?\n› 1. Yes\n  2. No\n")), None);
@@ -543,12 +577,12 @@ mod tests {
         let flag = hook_flag("Stop", None, "/a b/aca");
         let (key, value) = flag.split_once('=').unwrap();
         assert_eq!(key, "hooks.Stop");
-        // 值得是 Codex 读得懂的 TOML:一个数组,里面一组,组里一条命令
+        // The value must be TOML Codex can read: an array with one group, holding one command
         let v: toml::Value = toml::from_str(&format!("x = {value}")).unwrap();
         let h = &v["x"][0]["hooks"][0];
         assert_eq!((h["type"].as_str(), h["command"].as_str()), (Some("command"), Some("'/a b/aca' hook codex")));
         assert!(v["x"][0].get("matcher").is_none());
-        // 工具事件只挂问你的那个(matcher 是正则,0.163 上实测跑 Bash 不触发)
+        // Of tool events only the one that asks you (matcher is a regex; tested on 0.163, running Bash doesn't trigger it)
         let (key, value) = EVENTS
             .iter()
             .find(|e| e.0 == "PreToolUse")
@@ -570,51 +604,56 @@ mod tests {
 
     #[test]
     fn it_resumes_by_thread_id_and_only_bypasses_trust_when_told_to() {
-        let s = Session { args: vec!["--search".into()], ..Default::default() };
+        let s = Session { id: "s1".into(), args: vec!["--search".into()], ..Default::default() };
         let argv = plan(&Tool::default(), &s, &How::Resume("th-1".into()), "aca");
         assert_eq!(argv[..3], ["codex", "resume", "th-1"]);
-        assert_eq!(argv.iter().filter(|a| *a == "-c").count(), EVENTS.len());
+        assert_eq!(argv.iter().filter(|a| a.starts_with("hooks.")).count(), EVENTS.len());
+        // The commands it runs get the session id too, whatever variables the config inherits
+        assert!(argv.iter().any(|a| a == "shell_environment_policy.set.ACA_SESSION_ID=\"s1\""), "{argv:?}");
         assert_eq!(argv.last().unwrap(), "--search");
         assert!(!argv.iter().any(|a| a.contains("bypass")));
         let t = Tool { cmd: vec!["/w/wrapper.sh".into()], hook_trust: "bypass".into(), ..Default::default() };
         let argv = plan(&t, &Session::default(), &How::Fork("th-1".into()), "aca");
         assert_eq!(argv[..3], ["/w/wrapper.sh", "fork", "th-1"]);
-        assert_eq!(argv.last().unwrap(), "--dangerously-bypass-hook-trust");
+        assert!(argv.iter().any(|a| a == "--dangerously-bypass-hook-trust"));
         assert_eq!(Codex.resume("", &Run::default()), How::Fresh);
         assert_eq!(Codex.resume("th", &Run::default()), How::Resume("th".into()));
     }
 
     #[test]
     fn a_turn_that_ended_without_a_hook_is_read_from_the_end_of_its_rollout() {
-        // 0.162 记录里的样子:一轮开始 task_started,结束 task_complete(出错的多一个 error),Esc 打断 turn_aborted
+        // What 0.162 records look like: a turn starts with task_started and ends with task_complete (one with an error has an
+        // extra error), an Esc interrupt is turn_aborted
         let started = r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t2"}}"#;
         let done = |extra: &str| {
             format!(r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"t2","completed_at":200{extra}}}}}"#)
         };
         let usage = r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex"}}}"#;
         let log = |lines: &[&str]| lines.join("\n");
-        // 还在跑、被打断:没结束
+        // Still running, interrupted: not ended
         assert_eq!(last_turn_end(&log(&[started, usage]), 100), None);
         assert_eq!(last_turn_end(&log(&[started, r#"{"type":"event_msg","payload":{"type":"turn_aborted"}}"#]), 100), None);
-        // 正常结束(Stop hook 没被信任时它不报):补一个 Stop,带最后一条回复和结束的时刻
+        // Ended normally (it doesn't report when the Stop hook isn't trusted): fill in a Stop with the last reply and the end time
         let ok = done(r#","last_agent_message":"好了","error":null"#);
         let v = last_turn_end(&log(&[started, &ok, usage]), 100).unwrap();
         assert_eq!(
             (v["hook_event_name"].as_str(), v["last_assistant_message"].as_str(), v["at"].as_u64()),
             (Some("Stop"), Some("好了"), Some(200))
         );
-        // 交给插件的「最后一条回复」也从这读:最后一个跑完的那一轮的,出错的那轮没有回复就再往前找
+        // The "last reply" given to plugins is read here too: from the last finished turn; a failed turn has no reply, so look
+        // further back
         assert_eq!(last_reply(&log(&[started, &ok, usage])).as_deref(), Some("好了"));
         let failed = done(r#","error":{"message":"x","codex_error_info":"server_overloaded"}"#);
         assert_eq!(last_reply(&log(&[&ok, started, &failed])).as_deref(), Some("好了"));
         assert_eq!(last_reply(&log(&[started, usage])), None);
-        // 上一轮的(新的一轮刚开始,记录里还没写上)、没写结束时刻的(分不出是哪一轮的):不补
+        // The previous turn's (the new turn just started and isn't in the record yet), or one with no end time (can't tell which
+        // turn): not filled in
         assert_eq!(last_turn_end(&ok, 300), None);
         assert_eq!(
             last_turn_end(r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t2","last_agent_message":"好了"}}"#, 100),
             None
         );
-        // 出错结束:类别不带数据的是字符串,带数据的是只有一个键的对象
+        // Ended in an error: a kind without data is a string, one with data an object with a single key
         let overloaded = done(r#","error":{"message":"Our servers are currently overloaded.","codex_error_info":"server_overloaded"}"#);
         let v = last_turn_end(&log(&[started, &overloaded, usage]), 100).unwrap();
         assert_eq!(
@@ -623,7 +662,8 @@ mod tests {
         );
         let http = done(r#","error":{"message":"bad gateway","codex_error_info":{"http_connection_failed":{"http_status_code":502}}}"#);
         assert_eq!(last_turn_end(&http, 100).unwrap()["error_kind"], "transient");
-        // 带着 4xx 的看码:模型名写错(0.162 上实测是 http_connection_failed 带 404)再试也一样,401 是账号的
+        // 4xx: go by the code: a misspelled model name (tested on 0.162: http_connection_failed with 404) won't change on retry,
+        // 401 is the account's problem
         let missing = done(
             r#","error":{"message":"unexpected status 404 Not Found: Model \"x\" is not supported","codex_error_info":{"http_connection_failed":{"http_status_code":404}}}"#,
         );
@@ -634,12 +674,12 @@ mod tests {
         assert_eq!(last_turn_end(&limit, 100).unwrap()["error_kind"], "account");
         let window = done(r#","error":{"message":"context window exceeded","codex_error_info":"context_window_exceeded"}"#);
         assert_eq!(last_turn_end(&window, 100).unwrap()["error_kind"], "fatal");
-        // 认不出的类别:看原文
+        // Unrecognized kind: look at the raw text
         let odd = done(r#","error":{"message":"429 Too Many Requests","codex_error_info":"other"}"#);
         assert_eq!(last_turn_end(&odd, 100).unwrap()["error_kind"], "transient");
-        // 比这一轮开始还早结束的:是上一轮的(新的一轮刚开始,记录里还没写上)
+        // Ended before this turn started: it's the previous turn's (the new turn just started and isn't in the record yet)
         assert_eq!(last_turn_end(&overloaded, 300), None);
-        // 读的是文件末尾:从下一个整行开始,半行不算
+        // It reads the end of the file: starting at the next whole line, half lines don't count
         let path = std::env::temp_dir().join(format!("aca-codex-tail-{}.jsonl", std::process::id()));
         std::fs::write(&path, format!("{}\n{started}\n{overloaded}\n", "x".repeat(50))).unwrap();
         let t = tail(&path.to_string_lossy(), (started.len() + overloaded.len() + 10) as u64).unwrap();
@@ -649,26 +689,36 @@ mod tests {
 
     #[test]
     fn a_running_codex_only_shows_its_thread_when_it_was_resumed_by_id() {
-        // 配置目录给一个不存在的:不去碰真的 ~/.codex 的日志库
+        // Give it a config directory that doesn't exist: don't touch the real ~/.codex log database
         let live = |words: &[&str]| Codex.live(1, Some("/nonexistent/aca-test"), &words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
         let some = |words: &[&str]| Some(words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
-        // 手动新开的:不知道是哪段对话;参数照搬
+        // Started fresh by hand: no idea which conversation; arguments carried over
         assert_eq!(
             live(&["codex", "--yolo", "--profile", "labs"]),
             Live { args: some(&["--yolo", "--profile", "labs"]), ..Default::default() }
         );
         let l = live(&["codex", "resume", "th-1", "--yolo"]);
         assert_eq!((l.conv.as_str(), l.args), ("th-1", some(&["--yolo"])));
-        // resume --last、fork 出来的:现在这段的 id 不在命令行里
+        // From resume --last or fork: the current conversation's id isn't on the command line
         assert_eq!(live(&["codex", "resume", "--last", "--yolo"]), Live { args: some(&["--yolo"]), ..Default::default() });
         assert_eq!(live(&["codex", "fork", "th-1"]).conv, "");
-        // aca 自己带的 hook 和跳过信任的开关不搬;别的 -c 照搬
-        let l = live(&["codex", "-c", "hooks.Stop=[{}]", "-c", "model=o3", "--dangerously-bypass-hook-trust", "--search"]);
+        // The hooks aca passed itself and the trust-skipping flag aren't carried; other -c are
+        let l = live(&[
+            "codex",
+            "-c",
+            "hooks.Stop=[{}]",
+            "-c",
+            "shell_environment_policy.set.ACA_SESSION_ID=\"s1\"",
+            "-c",
+            "model=o3",
+            "--dangerously-bypass-hook-trust",
+            "--search",
+        ]);
         assert_eq!(l.args, some(&["-c", "model=o3", "--search"]));
-        // 起的时候就交给它一句话的:不搬
+        // Started with a message handed to it: carry nothing
         assert_eq!(live(&["codex", "修一下登录"]).args, None);
         assert_eq!(live(&[]).args, None);
-        // 不在开头的 resume 是别的参数的值,不当成子命令
+        // A resume that isn't first is another flag's value, not a subcommand
         assert_eq!(live(&["codex", "--profile", "resume"]).args, some(&["--profile", "resume"]));
     }
 
@@ -680,7 +730,8 @@ mod tests {
         assert_eq!(pane_title("⠸ | api"), None);
         assert_eq!(pane_title("⠸ ⠸ | api"), None);
         assert_eq!(pane_title(""), None);
-        // 0.163 在等你时转圈那一格换成闪着的一句,不是标题(以前被认成了标题,tmux 会话名也跟着改成了它)
+        // While waiting for you, 0.163 turns the spinner cell into a blinking phrase, which isn't the title (it used to be taken
+        // as the title, and the tmux session name was changed to it too)
         assert_eq!(
             pane_title("[ . ] Action Required | Ask to choose option A or B | proj").as_deref(),
             Some("Ask to choose option A or B")
@@ -692,14 +743,14 @@ mod tests {
 
     #[test]
     fn startup_gates_and_confirmations_are_asking_and_the_timer_line_is_running() {
-        // 这三屏是 0.159 上实际抓的
+        // These three screens were captured on 0.159
         let review = "  Hooks need review\n  6 hooks are new or changed.\n  Hooks can run outside the sandbox after you trust them.\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n  enter confirm · esc skip";
         assert_eq!(Codex.screen(&lines(review)), Seen::Ask("Hooks need review".into()));
         let trust = "  Folder access\n  /p/api\n  Trust this folder? Codex can read, edit, and run files here.\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit";
         assert!(matches!(Codex.screen(&lines(trust)), Seen::Ask(_)));
         let update = "  Update available · 0.159.3 → 0.160.0\n› 1. Update now\n  2. Skip\n  enter continue · esc skip";
         assert!(matches!(Codex.screen(&lines(update)), Seen::Ask(_)));
-        // 没登录:0.163 上实际抓的,上面 logo 的最后几行不是问的那句
+        // Logged out: captured on 0.163; the last few lines of the logo on top aren't the question
         let login = "  ⢸⣿⣿⡿⢿⣿⣿⣿⣦⣤⣴⣿⣿⣿⡿⠟⠋⢸⣿⣿  ⣿⣿⣿⣴⣿⣿⣿⠃\n  ⠘⣿⣿⣷ ⠈⠛⠿⣿⣿⣿⠿⠋⠉ ⣠⣴⣿⣿⣿  ⣿⣿⣿⣿⣿⠟⠁\n   ⠹⣿⣿⣿⣤⣀ ⠈⠉⠁⢀⣤⣶⣿⣿⣿⡿⠟⠃ ⣸⣿⣿⡟⠋⠁\n    \
                      ⠙⠿⣿⣿⣿⣿⣶⣾⣿⣿⣿⣿⠟⠛⠁  ⣠⣴⣿⣿⡟\n      ⠈⠙⠛⠛⠛⠿⠟⢿⣿⣿⣿⣿⣿⣾⣿⣿⣿⡿⠏\n\n  Welcome to Codex, OpenAI's command-line coding agent\n\n  \
                      Sign in with ChatGPT to use Codex as part of your paid plan\n  or connect an API key for usage-based billing\n\n\
@@ -712,7 +763,8 @@ mod tests {
             Seen::Running(65)
         );
         assert_eq!(Codex.screen(&lines("• ok\n  Worked for 5s • 2:35 AM\n› Ask Codex to do anything\n  Context 97% left")), Seen::Quiet);
-        // 0.163 上抓的:问你的题(题不一定带问号,取「Question 1/1」下面那行)、权限框、手动压缩
+        // Captured on 0.163: a question to you (not necessarily ending in a question mark; take the line under "Question 1/1"),
+        // a permission prompt, a manual compaction
         let question = "› Use request_user_input to ask me to choose between option A and option B. Do nothing else?\n\n  Question 1/1 (1 unanswered)\n  Choose option A or option B.\n\n  › 1. Option A           Select option A.\n    2. Option B           Select option B.\n    3. None of the above  Optionally, add details in notes (tab)\n\n  tab to add notes | enter to submit answer | esc to interrupt";
         assert_eq!(Codex.screen(&lines(question)), Seen::Ask("Choose option A or option B.".into()));
         let perm = "• Running touch made.txt\n\n  Would you like to run the following command?\n\n  Environment: local\n\n  Reason: Allow creating made.txt in the current directory?\n\n  $ touch made.txt\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `touch made.txt` (p)\n  3. No, and tell Codex what to do differently (esc)\n\n  Press enter to confirm or esc to cancel";
@@ -729,7 +781,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("aca-codex-live-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("thread-writer-locks")).unwrap();
-        // 0.163 的两张表(只留用到的列)
+        // The two tables of 0.163 (only the columns used)
         let logs = Connection::open(d.join("logs_2.sqlite")).unwrap();
         logs.execute_batch("create table logs (id integer primary key autoincrement, ts integer, thread_id text, process_uuid text);")
             .unwrap();
@@ -744,7 +796,7 @@ mod tests {
         let thread = |th: &str, source: &str, name: &str| {
             state.execute("insert into threads values (?1, ?2, ?3, ?4)", [th, &format!("/r/{th}.jsonl"), source, name]).unwrap();
         };
-        // 进程 12:先说了一段 th-a;它内部起标题的那次调用(th-t,没有写入锁、不在 threads 里);派出去一个子线程 th-s
+        // Process 12: first talked in th-a; its internal title call (th-t, no write lock, not in threads); a spawned subthread th-s
         thread("th-a", "cli", "修登录");
         lock("th-a");
         thread("th-s", r#"{"subagent":{"thread_spawn":{"parent_thread_id":"th-a"}}}"#, "");
@@ -753,23 +805,24 @@ mod tests {
         log("pid:12:u1", Some("th-a"));
         log("pid:12:u1", Some("th-t"));
         log("pid:12:u1", Some("th-s"));
-        // 进程 1 是别人(`pid:1` 不能碰上 `pid:12`)
+        // Process 1 is someone else (`pid:1` mustn't hit `pid:12`)
         thread("th-o", "cli", "别的");
         lock("th-o");
         log("pid:1:u2", Some("th-o"));
         assert_eq!(live_in(&d, 12), Some(("th-a".into(), "/r/th-a.jsonl".into(), "修登录".into())));
         assert_eq!(live_in(&d, 1).map(|l| l.0).as_deref(), Some("th-o"));
         assert_eq!(live_in(&d, 3), None);
-        // /new 之后:新的那段有写入锁、threads 里还没有,只认得 id
+        // After /new: the new conversation has a write lock but isn't in threads yet, so only its id is known
         lock("th-n");
         log("pid:12:u1", Some("th-n"));
         assert_eq!(live_in(&d, 12), Some(("th-n".into(), String::new(), String::new())));
-        // 接管时:认出来的优先于命令行;日志库认不出的照旧看命令行
+        // When adopting: what's recognized wins over the command line; when the log database can't tell, the command line is used
+        // as before
         let argv: Vec<String> = ["codex", "resume", "th-x", "--search"].map(String::from).to_vec();
         let l = Codex.live(12, Some(&d.to_string_lossy()), &argv);
         assert_eq!((l.conv.as_str(), l.args), ("th-n", Some(vec!["--search".to_string()])));
         assert_eq!(Codex.live(3, Some(&d.to_string_lossy()), &argv).conv, "th-x");
-        // 库放在别处的(config.toml 的 sqlite_home)
+        // The database kept elsewhere (config.toml's sqlite_home)
         let moved = d.join("db");
         std::fs::create_dir_all(&moved).unwrap();
         std::fs::rename(d.join("logs_2.sqlite"), moved.join("logs_2.sqlite")).unwrap();

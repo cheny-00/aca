@@ -1,20 +1,27 @@
-//! aca 带进 Claude 的 mod:在 Claude Code 自己的进程里跑的一小段代码(它叫 function hooks,2.1.295 上有;
-//! 接口还是 early access,每一版都可能变)。和 hook 一样**启动时带进去**(`--plugin-dir <state>/hooks/claude-mod/aca`),
-//! 不装进任何配置目录。开关是 `[tools.claude] mod = true`,不写就不带。
+//! The mod aca passes into Claude: a little code that runs inside Claude Code's own process (it calls them function hooks,
+//! available on 2.1.295; the interface is still early access and may change with any release). Like hooks it's **passed at
+//! startup** (`--plugin-dir <state>/hooks/claude-mod/aca`), not installed into any config directory. Switched on with
+//! `[tools.claude] mod = true`; without it, it isn't passed.
 //!
-//! 现在只做一件事:Claude 每次量出用量(`session.measure`:一起来、每轮结束、额度每动一个点)就原样交给
-//! `aca limits --mod`,订阅额度不用再靠它配置目录里的 statusLine。statusLine 那条路原样留着,
-//! 这边坏了最多是回到没带的样子。
+//! For now it does one thing: every time Claude measures usage (`session.measure`: on startup, at the end of each turn,
+//! whenever the limits move by a point) it hands that as-is to `aca limits --mod`, so subscription limits no longer depend
+//! on the statusLine in its config directory. The statusLine path stays as it is, so if this side breaks, the worst case is
+//! being back to running without the mod.
 //!
-//! 接口会变,所以:
-//! - **mod 只转发**(`claude_mod.js`):一个事件、一个 `$` 调用。认格式在 aca 这边(aca-tui 的 `limits.rs`),变了改 Rust 不改它
-//! - **起之前让这一版 Claude 自己验**(`claude plugin validate --json`,0.6 秒):按程序文件记一次,不过的这一版就不带。
-//!   事件改名、没了它验得出;`$` 上的调用改名、事件里的字段改名它验不出(2.1.295 上试过),靠下面这条
-//! - **对账**:带着起的会话跑完过一轮(hook 记的 `done`,那条路是稳的)却一次都没交来,而且这一版从没有哪个会话交来过
-//!   → 记这一版不报数,之后不带。交来了但认不出的,接收那头当场记([`heard`])
+//! The interface will change, so:
+//! - **The mod only forwards** (`claude_mod.js`): one event, one `$` call. Parsing the format is on aca's side (aca-tui's
+//!   `limits.rs`); when it changes, fix the Rust, not the mod
+//! - **Before starting, let this Claude version check it itself** (`claude plugin validate --json`, 0.6 seconds): recorded
+//!   once per program file; a version that fails doesn't get it. It catches a renamed or removed event; it doesn't catch a
+//!   renamed `$` call or renamed event fields (tried on 2.1.295), which the next rule covers
+//! - **Reconciling**: a session started with it has finished a turn (the `done` the hook records; that path is reliable) yet
+//!   never reported once, and no session on this version has ever reported → record this version as not reporting and
+//!   don't pass it from then on. Reports that arrive but can't be parsed are recorded by the receiving end on the spot
+//!   ([`heard`])
 //!
-//! 记在 `<state>/mod/`:`builds/<这一版的记号>.json` 是结论,`up/<会话>` 是它带着哪一版、什么时候起的,
-//! `heard/<会话>` 是它交来过。Claude 自己还会往 mod 的目录里放一份类型声明(`.claude-plugin/types/`,不到 1 MB)。
+//! Kept in `<state>/mod/`: `builds/<this version's key>.json` is the verdict, `up/<session>` is which version it was started
+//! with and when, `heard/<session>` means it has reported. Claude itself also puts type declarations in the mod's directory
+//! (`.claude-plugin/types/`, under 1 MB).
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
@@ -32,22 +39,23 @@ use crate::{t, tr};
 const MANIFEST: &str = "{ \"name\": \"aca\", \"version\": \"0.1.0\", \"description\": \"aca 起会话时带进来的:把用量交给 aca 记下\", \"author\": { \"name\": \"aca\" } }\n";
 const HOOKS: &str = "{ \"modules\": [\"./register.js\"] }\n";
 const MODULE: &str = include_str!("claude_mod.js");
-/// mod 挂的那个事件:验的时候要看到这一版真的认了它
+/// The event the mod hooks: when checking, we need to see this version really recognizes it
 const EVENT: &str = "session.measure";
-/// 一起来 Claude 就量一次(实测 2 秒内交来);起了这么久、跑完过一轮还没交来的才算数
+/// Claude measures once right on startup (arrives within 2 seconds in tests); only a session up this long that has finished
+/// a turn without reporting counts
 const GRACE: u64 = 20;
 const TIMEOUT: Duration = Duration::from_secs(5);
-/// 没了的会话留下的 `up` / `heard`,过这么久删掉
+/// `up` / `heard` left by sessions that are gone are deleted after this long
 const STALE: u64 = 30 * 86400;
 
-/// 一版 Claude 带不带这个 mod
+/// Whether a Claude version gets this mod
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Verdict {
-    /// 程序文件的名字:它装成按版本号命名的文件,所以通常就是版本号
+    /// The program file's name: it installs files named by version, so usually the version number
     pub build: String,
     pub ok: bool,
-    /// 不带的原因
+    /// Why it isn't passed
     pub why: String,
     pub at: u64,
 }
@@ -64,7 +72,7 @@ fn mark(dir: &str, id: &str) -> PathBuf {
     root().join(dir).join(id)
 }
 
-/// `up/<会话>` 里记的:(哪一版, 什么时候起的)
+/// What `up/<session>` records: (which version, when it started)
 fn up(id: &str) -> Option<(String, u64)> {
     let text = std::fs::read_to_string(mark("up", id)).ok()?;
     let (key, at) = text.trim().split_once(' ')?;
@@ -83,15 +91,15 @@ fn save(key: &str, v: &Verdict) {
     let _ = paths::write_atomic(&verdict_file(key), &serde_json::to_string(v).unwrap_or_default());
 }
 
-/// 这一版的结论改成不带(原来记着能带的才改:头一个原因留着)
+/// Change this version's verdict to "not passed" (only if it was recorded as passable: the first reason is kept)
 fn refuse(key: &str, why: &str) {
     if let Some(v) = load(key).filter(|v| v.ok) {
         save(key, &Verdict { ok: false, why: why.into(), at: paths::now(), ..v });
     }
 }
 
-/// 这一版 Claude 的记号:程序文件(链接指到的那个)的路径、大小、修改时间,和 mod 自己的内容。
-/// 它升级了、mod 改了,记号就变,重新验。第二个是给人看的名字
+/// This Claude version's key: the program file's (the link target's) path, size and modification time, plus the mod's own
+/// content. When it upgrades or the mod changes, the key changes and it's checked again. The second item is a name for people
 fn build(program: &str) -> Option<(String, String)> {
     let real = std::fs::canonicalize(program).ok()?;
     let meta = std::fs::metadata(&real).ok()?;
@@ -101,13 +109,13 @@ fn build(program: &str) -> Option<(String, String)> {
     Some((format!("{:016x}", h.finish()), real.file_name()?.to_string_lossy().into_owned()))
 }
 
-/// `claude plugin validate --json` 的报告 → 这一版认不认这个 mod。光它说过了不够,还要它真的列出了那个事件:
-/// 不认 function hooks 的版本不看 hooks.json 里的 `modules`,也就不会报错
+/// `claude plugin validate --json`'s report → whether this version accepts the mod. Passing isn't enough; it must actually
+/// list that event: versions without function hooks ignore `modules` in hooks.json, so they report no error
 fn judge(report: &Value) -> Result<(), String> {
     let parts: Vec<&Value> = std::iter::once(&report["manifest"]).chain(report["contents"].as_array().into_iter().flatten()).collect();
     let list = |key: &str| parts.iter().flat_map(move |p| p[key].as_array().into_iter().flatten()).collect::<Vec<_>>();
     if let Some(e) = list("errors").first() {
-        // 报错里带着文件的完整路径,只留最后说事的那一段
+        // The error carries the file's full path; keep only the last part, which says what's wrong
         let msg = e["message"].as_str().unwrap_or("").split(';').next().unwrap_or("");
         return Err(msg.rsplit(": ").next().unwrap_or(msg).trim().to_string());
     }
@@ -118,7 +126,8 @@ fn judge(report: &Value) -> Result<(), String> {
     hooked.then_some(()).ok_or_else(|| tr!("此版本无法识别 {EVENT} hook", "this version didn't recognize the {EVENT} hook"))
 }
 
-/// 让这一版 Claude 验一遍。给它一个只放这次验证的配置目录:它一跑就往配置目录里写 `.claude.json`,不让它写到你的那几个里
+/// Have this Claude version check it. Give it a config directory just for this check: it writes `.claude.json` into the config
+/// directory as soon as it runs, and we don't want that written into yours
 fn validate(program: &str, dir: &Path) -> Result<(), String> {
     let mut cmd = Command::new(program);
     cmd.args(["plugin", "validate", "--json"]).arg(dir).env("CLAUDE_CONFIG_DIR", root().join("validate-home"));
@@ -151,7 +160,8 @@ fn validate(program: &str, dir: &Path) -> Result<(), String> {
     judge(&report)
 }
 
-/// mod 的那个目录:写好(内容没变就不动 —— 开着的会话盯着这个目录,一动就重新加载),返回路径
+/// The mod's directory: write it (untouched if the content is the same — running sessions watch this directory and reload
+/// on any change), return the path
 fn write() -> Option<PathBuf> {
     let at = |name: &str| format!("claude-mod/aca/{name}");
     let manifest = super::hook_file(&at(".claude-plugin/plugin.json"), MANIFEST).ok()?;
@@ -160,13 +170,14 @@ fn write() -> Option<PathBuf> {
     Some(manifest.parent()?.parent()?.to_path_buf())
 }
 
-/// 对账的那一半,纯的:`ups` 是带着这一版起的会话(起的时刻、最近一次跑完的时刻、交没交来过)。
-/// 有会话起了够久、之后跑完过一轮、没交来,而且没有一个会话交来过 = 这一版不报数
+/// The reconciling half, pure: `ups` is the sessions started with this version (start time, last time a turn finished,
+/// whether it ever reported). Some session up long enough has since finished a turn without reporting, and no session has
+/// ever reported = this version doesn't report
 fn silent(ups: &[(u64, u64, bool)]) -> bool {
     ups.iter().all(|u| !u.2) && ups.iter().any(|&(at, done, _)| done >= at + GRACE)
 }
 
-/// 翻一遍 `up/`:这一版是不是不报数;顺手删掉早没人管的
+/// Go through `up/`: whether this version doesn't report; delete stale entries nobody cares about along the way
 fn reconcile(key: &str, now: u64) -> bool {
     let Ok(rd) = std::fs::read_dir(root().join("up")) else { return false };
     let mut ups = vec![];
@@ -183,8 +194,9 @@ fn reconcile(key: &str, now: u64) -> bool {
     silent(&ups)
 }
 
-/// 起这个会话时带不带 mod:带的话返回它的目录,并记下这个会话是带着哪一版起的。
-/// 不带的几种:没开;工具自己包了一层命令(不知道里面跑的是哪一版,结论没法按版本记);这一版验不过;这一版对过账不报数
+/// Whether to pass the mod when starting this session: if so, return its directory and record which version the session
+/// started with. Not passed when: it's off; the tool wraps the command itself (can't know which version runs inside, so the
+/// verdict can't be recorded per version); this version fails the check; reconciling found this version doesn't report
 pub(crate) fn offer(tool: &Tool, id: &str) -> Option<PathBuf> {
     let found = offered(tool);
     let now = paths::now();
@@ -216,8 +228,8 @@ fn offered(tool: &Tool) -> Option<(PathBuf, String)> {
     verdict.ok.then_some((dir, key))
 }
 
-/// 接收那头(`aca limits --mod`)报:这个会话的 mod 交来了一次。`understood` = 交来的东西认得出;
-/// 认不出就是事件的形状变了,这一版之后不带(带着也白带)
+/// Reported by the receiving end (`aca limits --mod`): this session's mod reported once. `understood` = what arrived could be
+/// parsed; if not, the event's shape changed, and this version won't get it from now on (it would be no use)
 pub fn heard(id: &str, understood: bool) {
     let Some((key, _)) = up(id) else { return };
     if heard_from(id) != key {
@@ -228,7 +240,7 @@ pub fn heard(id: &str, understood: bool) {
     }
 }
 
-/// 给人看的:现在 PATH 里这一版 Claude 的结论(还没验过 = None)
+/// For people: the verdict for the Claude version now on PATH (not checked yet = None)
 pub fn verdict() -> Option<Verdict> {
     load(&build(&super::which("claude")?)?.0)
 }
@@ -240,37 +252,38 @@ mod tests {
 
     #[test]
     fn a_build_takes_the_mod_only_when_its_own_validator_lists_the_hook() {
-        // 2.1.295 的 `claude plugin validate --json` 原样的报告(路径缩短了)
+        // The raw report of `claude plugin validate --json` on 2.1.295 (paths shortened)
         let passed = json!({"success": true, "manifest": {"errors": [], "warnings": [{"path": "author", "message": "No author"}], "notes": []},
             "contents": [{"type": "hooks", "errors": [], "notes": ["./register.js hooks: session.measure", "./register.js calls: $.process.run"]}]});
         assert_eq!(judge(&passed), Ok(()));
-        // 事件改了名:它自己说不是事件
+        // The event was renamed: it says itself that it's not an event
         let renamed = json!({"success": false, "manifest": {"errors": []}, "contents": [{"errors": [{"path": "modules../register.js",
             "message": "aca: /st/hooks/claude-mod/hooks/register.js:5: \"session.measure\" is not an event; $ is always spelled $.noun.event(...)"}], "notes": []}]});
         assert_eq!(judge(&renamed).unwrap_err(), "\"session.measure\" is not an event");
-        // 不认 function hooks 的版本:清单没毛病就算过,但没列出那个事件
+        // A version without function hooks: passes because the manifest is fine, but doesn't list the event
         let old = json!({"success": true, "manifest": {"errors": []}, "contents": []});
         assert!(judge(&old).unwrap_err().contains("session.measure"));
-        // 不是报告(老版本没有这条命令,打的是用法)
+        // Not a report (old versions don't have this command and print usage)
         assert!(judge(&json!({})).is_err());
     }
 
     #[test]
     fn a_build_is_silent_when_turns_finish_and_nothing_ever_arrives() {
-        // 刚起、还没跑完过:不算
+        // Just started, no turn finished yet: doesn't count
         assert!(!silent(&[(100, 0, false)]));
-        // 起了 5 秒就跑完了一轮(接着原来的对话起的):mod 可能还没来得及交,不算
+        // A turn finished 5 seconds after starting (resumed a conversation): the mod may not have had time to report, doesn't count
         assert!(!silent(&[(100, 105, false)]));
-        // 跑完了一轮,一次都没交来
+        // Finished a turn, never reported once
         assert!(silent(&[(100, 160, false)]));
-        // 别的会话交来过:这一版是通的,是那个会话自己的事
+        // Another session has reported: this version works, it's that session's own problem
         assert!(!silent(&[(100, 160, false), (90, 0, true)]));
         assert!(!silent(&[]));
     }
 
     #[test]
     fn the_shipped_module_stays_a_plain_forwarder() {
-        // 验的时候看的就是这两样;多挂一个事件、多用一个 `$` 调用,都多一处会跟着接口变
+        // These two things are what the check looks at; each extra hooked event or `$` call is one more place that changes with
+        // the interface
         assert_eq!(MODULE.matches("on('").count(), 1);
         assert!(MODULE.contains(&format!("on('{EVENT}'")));
         assert_eq!(MODULE.matches("$.").count(), 1);

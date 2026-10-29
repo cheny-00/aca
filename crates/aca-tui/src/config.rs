@@ -1,19 +1,19 @@
-//! ~/.config/aca/config.toml 里界面自己的那几段,都可以不写,比如
+//! The interface's own sections of ~/.config/aca/config.toml, all optional, e.g.
 //!
 //! ```toml
 //! [new_group]
 //! default_path = "~/workspace"
 //!
 //! [ime]
-//! auto = false                 # 桌面上不自动切英文(默认切)
+//! auto = false                 # don't auto-switch to English on desktop (on by default)
 //!
 //! [ui]
-//! menu = ["work", "team"]      # n 菜单的顺序(见 tools.rs)
+//! menu = ["work", "team"]      # order of the n menu (see tools.rs)
 //! hide = ["official"]
 //! ```
 //!
-//! 账号(`[accounts.*]`)和工具(`[tools.*]`)也在这个文件里,那两段归 aca-core 的 config.rs 读。
-//! 用到时现读,改完不用重启。界面里 `^S` 的设置页改的也是这个文件(`set`,只动那一行)。
+//! Accounts (`[accounts.*]`) and tools (`[tools.*]`) are in this file too; those two sections are read by aca-core's config.rs.
+//! Read fresh on each use, so edits need no restart. The `^S` settings page edits this same file (`set`, touching only that line).
 
 use std::path::PathBuf;
 
@@ -21,10 +21,10 @@ use toml::Value;
 
 use aca_core::{t, tr};
 
-/// `^N` 没配时的默认目录
+/// Default directory for `^N` when not configured
 const NEW_GROUP_DIR: &str = "~/workspace";
 
-/// ~/.config/aca/config.toml(`ACA_HOME` 换地方,测试用)
+/// ~/.config/aca/config.toml (`ACA_HOME` moves it, for tests)
 pub fn path() -> PathBuf {
     aca_core::paths::config_dir().join("config.toml")
 }
@@ -33,12 +33,14 @@ fn read() -> String {
     std::fs::read_to_string(path()).unwrap_or_default()
 }
 
-/// `^N` 起完名后 fzf 的第一行、Esc 回到输入框时填着的目录(`[new_group] default_path`)
+/// The directory on fzf's first line once `^N` has a name, and filled in when Esc goes back to the input box
+/// (`[new_group] default_path`)
 pub fn new_group_dir() -> String {
     new_group_dir_in(&read(), std::path::Path::new(&aca_core::paths::expand(NEW_GROUP_DIR)).is_dir())
 }
 
-/// 读不了 / 格式不对 / 没写都当没配。没配时 ~/workspace 在就是它,不在(新机器上多半没有)就是家目录
+/// Unreadable / malformed / unset all count as not configured. Then it's ~/workspace if that exists, otherwise (usually so on
+/// a new machine) the home directory
 fn new_group_dir_in(text: &str, workspace: bool) -> String {
     let t = text.parse::<toml::Table>().ok();
     t.as_ref()
@@ -49,7 +51,8 @@ fn new_group_dir_in(text: &str, workspace: bool) -> String {
         .to_string()
 }
 
-/// 桌面上 aca 自己切输入法(`[ime] auto`,不写 = 切;环境变量 ACA_IME 压过它,见 ime.rs)
+/// On the desktop aca switches the input method itself (`[ime] auto`, unset = switch; the ACA_IME env var overrides it, see
+/// ime.rs)
 pub fn ime_auto() -> bool {
     ime_auto_in(&read())
 }
@@ -59,7 +62,7 @@ fn ime_auto_in(text: &str) -> bool {
     t.as_ref().and_then(|t| t.get("ime")?.get("auto")?.as_bool()).unwrap_or(true)
 }
 
-/// `[section] key` 写的一串字(`[ui] menu = ["a", "b"]`);没写 / 写的不是这个样子 = 空
+/// The list of strings at `[section] key` (`[ui] menu = ["a", "b"]`); unset / not of this shape = empty
 pub fn list(section: &str, key: &str) -> Vec<String> {
     list_in(&read(), section, key)
 }
@@ -70,7 +73,8 @@ pub(crate) fn list_in(text: &str, section: &str, key: &str) -> Vec<String> {
     v.into_iter().flatten().filter_map(|x| x.as_str()).map(String::from).collect()
 }
 
-/// 这里管的几项写错了的(当没写),设置页列出来。整个文件解析不了由 theme 报,这里不重复
+/// Items managed here that are written wrong (treated as unset), for the settings page to list. A file that doesn't parse at
+/// all is reported by theme, not repeated here
 pub fn problems() -> Vec<String> {
     problems_in(&read())
 }
@@ -96,8 +100,9 @@ fn problems_in(text: &str) -> Vec<String> {
     bad
 }
 
-/// 改一项:`[section] key = value`,别的内容、注释原样留着(见 `with_value`)。Err 是给底栏的一句话
-/// (没记下的大多也没换上:语言、输入法、启动参数都是记下了才换,不说「这次先用着」)
+/// Set one item: `[section] key = value`, leaving other content and comments as they are (see `with_value`). Err is one
+/// sentence for the bottom bar (what wasn't saved mostly wasn't applied either: language, input method and launch args only
+/// switch once saved, so no "using it for now")
 pub fn set(section: &str, key: &str, value: Value) -> Result<(), String> {
     let path = path();
     let text = read();
@@ -105,9 +110,11 @@ pub fn set(section: &str, key: &str, value: Value) -> Result<(), String> {
     crate::state::write_atomic(&path, &new).map_err(|e| tr!("未保存:{e}", "not saved: {e}"))
 }
 
-/// 把 `[section]` 下的 key 改成 value:有这一行就换掉(缩进照旧),有这一段没这行就加在表头下面,都没有就在末尾加一段。
-/// section 可以是嵌套的(`conductor.discord`)。
-/// 原文件解析不了、或者改完读回来不对(写法太特别,比如用的是 `section.key = …` 这种点号写法),返回 None,不碰
+/// Set key under `[section]` to value: replace the line if there is one (indent kept); if the section is there but the line
+/// isn't, add it under the header; if neither, append a section at the end.
+/// section may be nested (`conductor.discord`).
+/// If the original doesn't parse, or reading back after the change doesn't match (an unusual style, e.g. dotted
+/// `section.key = …`), return None and leave it alone
 pub fn with_value(text: &str, section: &str, key: &str, value: &Value) -> Option<String> {
     if !text.trim().is_empty() && text.parse::<toml::Table>().is_err() {
         return None;
@@ -123,7 +130,7 @@ pub fn with_value(text: &str, section: &str, key: &str, value: &Value) -> Option
             let indent = |l: &str| l[..l.len() - l.trim_start().len()].to_string();
             match lines[h + 1..end].iter().position(|l| is_key(l)) {
                 Some(i) => lines[h + 1 + i] = indent(&lines[h + 1 + i]) + &line,
-                // 新加的那行跟着这一段里下一行缩进
+                // The new line takes the indent of the next line in this section
                 None => {
                     let pad = lines[h + 1..end].first().filter(|l| !bare(l).is_empty()).map(|l| indent(l)).unwrap_or_default();
                     lines.insert(h + 1, pad + &line);
@@ -169,11 +176,11 @@ mod tests {
         assert!(ime_auto_in("[ime\nbroken"));
         assert_eq!(problems_in("[ime]\nauto = \"no\"\n[new_group]\ndefault_path = 1\n").len(), 2);
         assert!(problems_in("[ime]\nauto = false\n[new_group]\ndefault_path = \"~/x\"\n").is_empty());
-        // [login] 写错了:那一节当没写,设置页说一句
+        // [login] written wrong: that section counts as unset, the settings page says so
         let bad = problems_in("[login]\nremote = \"maybe\"\n");
         assert!(bad.len() == 1 && bad[0].starts_with("config.toml [login] 已忽略:") && bad[0].contains("maybe"), "{bad:?}");
         assert!(problems_in("[login]\nremote = \"yes\"\nbrowsers = [\"Firefox\"]\n").is_empty());
-        // [idle] 写错了:不自动停,设置页说一句
+        // [idle] written wrong: nothing auto-stops, the settings page says so
         let bad = problems_in("[idle]\nstop_after = \"三小时\"\n");
         assert!(bad.len() == 1 && bad[0].starts_with("config.toml [idle] 已忽略,不会自动停止:") && bad[0].contains("三小时"), "{bad:?}");
         assert!(problems_in("[idle]\nstop_after = \"3h\"\n").is_empty());
@@ -195,10 +202,10 @@ mod tests {
         assert_eq!(with_value(cfg, "ime", "auto", &v).unwrap(), format!("{cfg}\n[ime]\nauto = false\n"));
         let out = with_value(cfg, "new_group", "default_path", &Value::String("~/work".into())).unwrap();
         assert_eq!(out, cfg.replace("\"~/code\"  # 注释", "\"~/work\""));
-        // 段在,键不在:加在表头下面
+        // Section present, key missing: added under the header
         let out = with_value("[ime] # 输入法\n\n[x]\nauto = 1\n", "ime", "auto", &v).unwrap();
         assert_eq!(out, "[ime] # 输入法\nauto = false\n\n[x]\nauto = 1\n");
-        // 嵌套的段、缩进着写的:缩进照旧,别的段里同名的键不动
+        // Nested sections, written indented: indent kept, same-named keys in other sections untouched
         let deck = "[conductor]\n  heartbeat_interval = 0\n  [conductor.discord]\n    listen_mode = \"all\"\n    user_id = 1\n[other]\nlisten_mode = \"x\"\n";
         let out = with_value(deck, "conductor.discord", "listen_mode", &Value::String("mentions".into())).unwrap();
         assert_eq!(out, deck.replace("    listen_mode = \"all\"", "    listen_mode = \"mentions\""));
@@ -206,7 +213,7 @@ mod tests {
         assert_eq!(out, deck.replace("  heartbeat_interval = 0", "  heartbeat_interval = 15"));
         let out = with_value(deck, "conductor.discord", "ignore_replies_to_others", &v).unwrap();
         assert_eq!(out, deck.replace("  [conductor.discord]\n", "  [conductor.discord]\n    ignore_replies_to_others = false\n"));
-        // 点号写法改不动(改完读回来重复定义),不碰
+        // Dotted style can't be edited (reading back gives a duplicate definition), left alone
         assert!(with_value("ime.auto = true\n", "ime", "auto", &v).is_none());
         assert!(with_value("[ime\nbroken", "ime", "auto", &v).is_none());
     }

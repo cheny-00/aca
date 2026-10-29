@@ -1,9 +1,9 @@
-//! 会话里另开的窗口 / 窗格(prefix c、prefix % / "):列表里挂在会话下面,对它的操作只动这一格。
-//! agent 那一格的停 / 重启是 `aca_core::session` 的事(也在原地,别的窗口不受影响)。
-//! - `D`:停下这一格。程序停掉,窗格连最后的画面留着(remain-on-exit),列表里标 ■
-//! - `⏎` 停着的那格 / `R`:在原地照它原来的命令再启动
-//! - `d` 关一格:先把里面的进程收干净 —— tmux 关窗格只发 SIGHUP,不理它的(nohup、trap、有的 MCP)会留下来接着跑,
-//!   窗格没了、哪儿都找不到
+//! Windows / panes opened inside a session (prefix c, prefix % / "): listed under the session; actions on one touch only that pane.
+//! Stopping / restarting the agent's pane is up to `aca_core::session` (also in place, other windows unaffected).
+//! - `D`: stop this pane. The program stops, the pane stays with its last screen (remain-on-exit), the list marks it ■
+//! - `⏎` on a stopped pane / `R`: start its original command again in place
+//! - `d` closes a pane: first clean up the processes inside; tmux closing a pane only sends SIGHUP, and the ones that ignore it
+//!   (nohup, trap, some MCPs) stay behind running, with the pane gone and nowhere to be found
 
 use std::collections::HashMap;
 use std::process::Command;
@@ -13,16 +13,16 @@ use aca_core::{t, tr};
 
 use crate::data::tmux_cmd;
 
-/// 要停 / 再启动的那一格
+/// The pane to stop / start again
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Pane {
-    /// tmux 窗格 id(%12)
+    /// tmux pane id (%12)
     pub id: String,
-    /// 列表里怎么叫它(#2「zsh」),说话用
+    /// What the list calls it (#2 "zsh"), for messages
     pub label: String,
 }
 
-/// tmux 命令,失败时返回它说的
+/// A tmux command; on failure returns what it said
 fn run(args: &[&str]) -> Result<String, String> {
     let o = tmux_cmd().args(args).output().map_err(|e| e.to_string())?;
     if o.status.success() {
@@ -32,7 +32,7 @@ fn run(args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// 窗格的几样
+/// A few things about a pane
 struct Info {
     pid: u32,
     dead: bool,
@@ -44,7 +44,7 @@ fn info(pane: &str) -> Result<Info, String> {
     Ok(Info { pid: pid.parse().unwrap_or(0), dead: dead == "1" })
 }
 
-/// 进程表里 root 和它底下所有的进程
+/// root and every process under it in the process table
 fn tree(root: u32) -> Vec<u32> {
     let out = Command::new("ps")
         .args(["-A", "-o", "pid=,ppid="])
@@ -73,9 +73,11 @@ fn signal(sig: &str, pids: &[u32]) {
     }
 }
 
-/// 收掉 root 和它底下的进程:先 SIGHUP + SIGTERM(交互 shell 不理 TERM、Claude 收到 TERM 会好好收尾)。
-/// 不等它们退(一个不肯退的 MCP 就得干等):两秒后还在的 SIGKILL,交给一个脱离界面的 sh 去做 ——
-/// 弹窗里的界面进了会话就退了,等不到两秒。自己(界面开在要停的那格里)不杀
+/// Clean up root and the processes under it: first SIGHUP + SIGTERM (an interactive shell ignores TERM, Claude wraps up
+/// properly on TERM).
+/// Doesn't wait for them to exit (one MCP refusing to would leave us just waiting): SIGKILL for those still there after two
+/// seconds, done by an sh detached from the interface, since the interface in a popup exits on entering a session and won't
+/// last two seconds. Never kills itself (the interface open in the pane being stopped)
 pub fn kill_tree(root: u32) {
     use std::process::Stdio;
     if root <= 1 {
@@ -95,7 +97,7 @@ pub fn kill_tree(root: u32) {
     );
 }
 
-/// 等它变成停着的格子(进程退了 tmux 才标上),最多等 ms
+/// Wait for it to become a stopped pane (tmux marks it only once the process has exited), at most ms
 fn wait_dead(pane: &str, ms: u64) {
     let until = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < until && info(pane).is_ok_and(|i| !i.dead) {
@@ -103,7 +105,7 @@ fn wait_dead(pane: &str, ms: u64) {
     }
 }
 
-/// D:停下这一格(见文件头)
+/// D: stop this pane (see the file header)
 pub fn park(p: &Pane) -> Result<(), String> {
     let i = info(&p.id)?;
     if i.dead {
@@ -111,38 +113,40 @@ pub fn park(p: &Pane) -> Result<(), String> {
     }
     run(&["set-option", "-p", "-t", &p.id, "remain-on-exit", "on"])?;
     kill_tree(i.pid);
-    // 一般零点几秒就退了:等一小会儿,刷新出来就是 ■;没退完的下一次刷新再标
+    // It usually exits within a fraction of a second: wait a little so the refresh shows ■; one not done yet is marked on the
+    // next refresh
     wait_dead(&p.id, 400);
     Ok(())
 }
 
-/// ⏎ 停着的那格 / R:在原地照原来的命令再启动。在跑的先停掉
+/// ⏎ on a stopped pane / R: start its original command again in place. A running one is stopped first
 pub fn respawn(p: &Pane) -> Result<(), String> {
     let i = info(&p.id)?;
     if !i.dead {
         run(&["set-option", "-p", "-t", &p.id, "remain-on-exit", "on"])?;
         kill_tree(i.pid);
-        // 给它一点时间好好收尾;还没退的 respawn -k 替它关
+        // Give it a moment to wrap up properly; respawn -k closes whatever hasn't exited
         wait_dead(&p.id, 1000);
     }
-    // 还开着 remain-on-exit:起不来、自己退了也留在原地,看得见、能再 ⏎
+    // remain-on-exit is still on: if it fails to start or exits by itself it stays in place, visible, ready for ⏎ again
     run(&["respawn-pane", "-k", "-t", &p.id]).map(drop)
 }
 
-/// d 关一格:先收掉里面的进程,再关(停着的格子进程早没了,直接关)
+/// d closes a pane: first clean up the processes inside, then close it (a stopped pane's process is long gone, so just close)
 pub fn close(pane: &str) -> Result<(), String> {
     let i = info(pane)?;
     if !i.dead {
         kill_tree(i.pid);
     }
     match run(&["kill-pane", "-t", pane]) {
-        // 进程退了窗格自己就关了
+        // The pane closed by itself once the process exited
         Err(_) if info(pane).is_err() => Ok(()),
         r => r.map(drop),
     }
 }
 
-/// d 删普通 tmux 会话:先收掉每一格里的进程。target 是 tmux 认的会话写法(`=名字` / `$3`)
+/// d deleting an ordinary tmux session: first clean up the processes in every pane. target is a session target tmux
+/// understands (`=NAME` / `$3`)
 pub fn close_session(target: &str) {
     let out = run(&["list-panes", "-s", "-t", target, "-F", "#{pane_pid}\t#{pane_dead}"]).unwrap_or_default();
     for (pid, dead) in out.lines().filter_map(|l| l.split_once('\t')) {
@@ -158,7 +162,7 @@ mod tests {
 
     #[test]
     fn the_tree_always_starts_with_its_root() {
-        // 自己这个进程:至少有自己;一个不存在的 pid 底下没有别的
+        // This process: at least itself; a pid that doesn't exist has nothing under it
         assert_eq!(tree(std::process::id())[0], std::process::id());
         assert_eq!(tree(u32::MAX), [u32::MAX]);
     }

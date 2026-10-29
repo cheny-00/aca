@@ -353,7 +353,7 @@ plugins.toml 里不用写它(sync 不会安装它,也不会删除它);要关闭�
 | `agent.waiting` | `ask` `kind`(choice / permission / 空 = 无法识别)`options`(选择题的选项) | 等待你确认或回答 |
 | `agent.exited` | `reason` | agent 进程退出 |
 | `conversation.changed` | `conv` `from` | 对话 id 变了(/clear) |
-| `message.sent` | `id`(这条消息的)`from` `kind`(msg / notice)`what`(通知所说的事;不是通知时为 null)`wake` `text` | 往这个会话的收件箱放了一条消息(`aca msg`,或者它派出去的 worker 自动发的通知) |
+| `message.sent` | `id`(这条消息的)`from` `kind`(msg / notice)`what`(通知所说的事;不是通知时为 null)`wake` `text` `at`(定时的到点时刻,秒;不是定时的为 null)| 往这个会话的收件箱放了一条消息(`aca msg`,或者它派出去的 worker 自动发的通知)。定时的(`aca msg --in`)放进去时就发这一条,送达的那条要等到点 |
 | `message.delivered` | `id` `how`(bell / queue / type / wait) | 那条消息已送达 |
 | `message.throttled` | `from` `count` `secs` | 同一个会话发送过于频繁,之后的只保存、不唤醒 |
 | `ask.answered` | `by`(谁代为回答;`you` = 在外部回答)`answer` `ask` `kind`(choice / permission;启动时的确认框是 `gate`) | `aca answer` 代为回答了确认框 |
@@ -449,7 +449,8 @@ aca 会指出是哪个插件:
   `fork_of`(分叉出来的会话的来源;分叉出来的没有 `parent`)
   `tmux`(tmux 会话名)`pane`(agent 所在的窗格)`attached`(连着的终端数)`conv`(对话 id)`ask`(等待回应时的提问)
   `ran`(这一轮已运行的秒数)`active`(最近有动静的时间)`bg`(后台任务数)`locked` `created` `order` `tokens`(`meta set` 设置的文字)
-  `idle_stopped`(因空闲被 aca 停止的时间,列表里显示 ☾;其他情况为 0)。
+  `idle_stopped`(因空闲被 aca 停止的时间,列表里显示 ☾;其他情况为 0)。`aca show --json` 另有 `work`:它真正在干活的目录
+  (agent cd 进去的目录,或最近改的文件所在的仓库;都查不到时同 `dir`)。
 - `aca show --json` 里的 `run` 是 aca 内部记录的状态,**不是接口**,其中的字段随时可能变。
 - `aca plugin actions --json`:每行一个能力,`{"id", "title", "contexts", "args", "expose"}`。
 - 时间:事件的 `ts` 是毫秒,其他地方是秒。JSON 是紧凑的一行,用 `jq` 读取,不要用 sed 拆分(排版格式不属于接口)。
@@ -473,7 +474,7 @@ plugins.toml 里只写一个 `[plugins."aca.core"]` 表头(不写 source),换台
 | 插件 | 提供什么 |
 |---|---|
 | `aca.delegate` | `/aca:delegate`(Claude 中是斜杠命令,输入 `/dele` 补全出来的就是它;Codex 中是一个 skill):主会话规划、经 aca 派出 worker、验收、汇报;worker 遇到临时错误时自动继续。还带一个 `/aca:spec`:一个变更从提案到归档(`openspec/changes/<slug>/`),每条任务交给 `/aca:delegate` 完成,在真实环境中验收通过才算完成。设置:`worker`(派给谁,默认 `codex`)、`language`(用哪种语言回复你,空 = 跟随你)、`say`(代为发送的那句话)、`max_continue`、`delay` |
-| `aca.core` | 把 aca 的核心能力作为工具提供给 agent(Claude、Codex 都支持):`sessions` 查看会话、`dispatch` 派出 worker(挂在调用者下面,可以带 worktree 分支)、`message` 发送消息、`wait` 等待(每次最多 240 秒)、`answer` 代为回答、`interrupt` 中止。代为回答、中止的对象只能是调用者自己派出的会话 |
+| `aca.core` | 把 aca 的核心能力作为工具提供给 agent(Claude、Codex 都支持):`sessions` 查看会话、`dispatch` 派出 worker(挂在调用者下面,可以带 worktree 分支)、`message` 发送消息、`wait` 等待(每次最多 240 秒)、`answer` 代为回答、`interrupt` 中止、`wakeup` 过会儿叫醒自己(定时消息发给自己,`aca msg --in`)。代为回答、中止的对象只能是调用者自己派出的会话。Codex 另外带一个 `wakeup` skill:要等好几分钟的活不在这一轮里干等,结束这一轮,让 aca 过会儿叫醒它回来看 |
 | `aca.gateway` | MCP gateway,见下一节 |
 | `aca.remote` | 远端任务,全部实现在插件脚本里(sh + jq + curl + ssh):把长任务派到别的机器上后台运行,结束时结果作为一条消息放进派出它的会话的收件箱。`:` 菜单里 `r` 派出、`t` 列表(⏎ 复制查看日志的命令、`x` 撤销、`r` 立即获取)、「测试 server」;agent 有 `run`、`list` 两个工具。回调先发到一台始终在线的 server 上([jobhook](https://github.com/cheny-00/jobhook)),设置:`url`、`token`。有等待中的任务时才开启每 5 分钟拉取一次的定时任务 |
 | `aca.tailnet` | tailnet 挂载,全部实现在插件脚本里(sh + jq,需要 `jq`):`:` 菜单里 `m` 是列表,每条 `tailscale serve` 一行(显示目标端口是否在监听),⏎ 复制地址、`x` 撤销(并写出如何加回去)、`a` 把本机端口挂载出去、`p` 开启 / 关闭发布(需安装 tpub)。agent 可以列出;挂端口是 `agent?`,需你明确允许(`aca plugin allow aca.tailnet add`) |

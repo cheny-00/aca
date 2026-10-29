@@ -1,9 +1,13 @@
-//! 登录链接弹出来挑怎么开(2026-10-14 他说的:登录别自己跳到默认浏览器,不一定用它登这个账号)。
-//! aca 起的登录(账号页的 ⏎、新加的账号)不让工具自己开浏览器(见 `aca_core::agent::quiet_login`),链接到了界面:
-//! 第一项是「复制链接」(在服务器上、从手机连进来也用得上),后面是装着的浏览器(默认的那个排前面、标出来)。
-//! 远程时(`aca_core::agent::remote`)不列浏览器:开也是开在这台机器上;链接换成在别的设备上登得完的那种
-//! (Claude 要把网页给的码贴回终端,Codex 是设备码:表上写着一次性码,也能复制)。每次都问,不记。
-//! Esc 先不开:链接还在登录那个终端里,工具也接着等。
+//! A login link pops up a list to pick how to open it (the user, 2026-10-14: a login shouldn't jump to the default browser
+//! on its own; that isn't necessarily the browser for this account).
+//! Logins aca starts (⏎ on the accounts page, a newly added account) don't let the tool open a browser itself (see
+//! `aca_core::agent::quiet_login`); the link comes to the interface instead:
+//! the first item is 「复制链接」 (copy the link; works on a server or when connected from a phone), then the installed
+//! browsers (the default one first, marked).
+//! Remote (`aca_core::agent::remote`): no browsers listed, they would open on this machine; the link becomes one you can
+//! finish on another device (Claude has you paste the code from the web page back into the terminal; Codex uses a device
+//! code: the list shows the one-time code, also copyable). Asks every time, remembers nothing.
+//! Esc: don't open it for now; the link is still in the login terminal and the tool keeps waiting.
 use std::process::Command;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -15,7 +19,7 @@ use crate::overlay::{Flow, Fx, Overlay, kit};
 use crate::term::Link;
 use crate::theme;
 
-/// 认得的浏览器(macOS 上 .app 的名字),装了几个列几个
+/// Browsers we recognize (.app names on macOS); lists whichever are installed
 const KNOWN: &[&str] = &[
     "Safari",
     "Google Chrome",
@@ -42,17 +46,17 @@ const KNOWN: &[&str] = &[
     "Firefox Nightly",
 ];
 
-/// 挑了以后怎么办
+/// What to do once picked
 #[derive(Clone, Debug, PartialEq)]
 pub enum How {
     Copy,
-    /// 复制设备码登录的一次性码
+    /// Copy the one-time code of a device-code login
     CopyCode,
-    /// 用这个 .app 开(Mac)
+    /// Open with this .app (Mac)
     App(String),
-    /// 跑这条命令:链接接在最后,参数里有 `{url}` 就换在那(`[login] browsers` 写的、Linux 的 .desktop)
+    /// Run this command: the link goes last, or replaces `{url}` if an argument has it (from `[login] browsers`, or a Linux .desktop)
     Cmd(Vec<String>),
-    /// 系统的默认浏览器(认不出装了哪些的时候)
+    /// The system's default browser (when we can't tell which are installed)
     System,
 }
 
@@ -61,7 +65,8 @@ struct Item {
     how: How,
 }
 
-/// 自动找到的一个浏览器:名字、怎么开、它的 id(Mac 的 bundle id、Linux 的 .desktop 文件名;和默认浏览器对得上就排第一)
+/// A browser found automatically: name, how to open it, its id (bundle id on Mac, .desktop file name on Linux; goes first if it matches the
+/// default browser)
 struct Found {
     name: String,
     how: How,
@@ -69,10 +74,10 @@ struct Found {
 }
 
 pub struct Pick {
-    /// 哪个登录(登录终端的标题:「登录 Claude Code · ding」)
+    /// Which login (the login terminal's title: 「登录 Claude Code · ding」)
     title: String,
     link: Link,
-    /// 人不在这台机器跟前:不列浏览器
+    /// The user isn't at this machine: no browsers listed
     far: bool,
     items: Vec<Item>,
     sel: usize,
@@ -80,7 +85,8 @@ pub struct Pick {
 }
 
 impl Pick {
-    /// 列哪些浏览器:远程一个不列;config.toml 的 `[login] browsers` 写了就只列它们;不然自动找(Mac 看 .app,Linux 看 .desktop)
+    /// Which browsers to list: none when remote; only those in config.toml's `[login] browsers` if set; otherwise found automatically (.app
+    /// on Mac, .desktop on Linux)
     pub fn new(title: &str, link: Link) -> Pick {
         let cfg = aca_core::config::load();
         let far = aca_core::agent::remote(&cfg);
@@ -124,11 +130,11 @@ impl Pick {
             }
         };
         fx.copy = Some(copied);
-        // 设备码登录链接和码都要用:复制了一样,表留着好复制另一样
+        // A device-code login needs both the link and the code: after copying one, the list stays open to copy the other
         if self.link.code.is_some() { Flow::Stay } else { Flow::Close }
     }
 
-    /// 表上头写的:怎么登得完
+    /// Shown at the top of the list: how to finish logging in
     fn hint(&self) -> Option<&'static str> {
         if self.link.code.is_some() {
             return Some(t!(
@@ -145,14 +151,15 @@ impl Pick {
     }
 }
 
-/// 找到的浏览器排成表:默认的那个放第一个、标出来。一个都没认出来就给系统默认的
+/// Arrange the found browsers into the list: the default one first, marked. If none is recognized, offer the system default
 fn arrange(mut found: Vec<Found>, default: Option<String>) -> Vec<Item> {
     let def = default.and_then(|id| found.iter().position(|f| f.id.eq_ignore_ascii_case(id.trim())));
     if let Some(i) = def {
         let d = found.remove(i);
         found.insert(0, d);
     }
-    // 同一个名字的(Linux 上 firefox 和 firefox-esr 之类)只留前面那个:默认的已经在最前
+    // Of browsers with the same name (firefox and firefox-esr on Linux and the like) keep only the first: the default is already at the
+    // front
     let mut names = std::collections::HashSet::new();
     found.retain(|f| names.insert(f.name.clone()));
     let out: Vec<Item> = found
@@ -169,7 +176,7 @@ fn arrange(mut found: Vec<Found>, default: Option<String>) -> Vec<Item> {
     out
 }
 
-/// macOS:/Applications、~/Applications 里认得的浏览器
+/// macOS: recognized browsers in /Applications and ~/Applications
 fn installed() -> Vec<Found> {
     let home = std::env::var("HOME").unwrap_or_default();
     let dirs = ["/Applications".to_string(), format!("{home}/Applications")];
@@ -183,7 +190,7 @@ fn installed() -> Vec<Found> {
         .collect()
 }
 
-/// Linux 放 .desktop 的那些目录(XDG 的规矩,再加 flatpak、snap 的):前面的优先
+/// The directories Linux keeps .desktop files in (per XDG, plus flatpak's and snap's): earlier ones win
 fn app_dirs() -> Vec<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let var = |k: &str, or: String| std::env::var(k).ok().filter(|v| !v.is_empty()).unwrap_or(or);
@@ -199,7 +206,8 @@ fn app_dirs() -> Vec<std::path::PathBuf> {
     out
 }
 
-/// Linux:声明能开 https 的 .desktop(`MimeType` 里有 `x-scheme-handler/https`)。同一个文件名的只留前面目录里那个
+/// Linux: .desktop files that declare they open https (`x-scheme-handler/https` in `MimeType`). Of the same file name, keep the one in the
+/// earlier directory
 fn desktop_browsers(dirs: &[std::path::PathBuf]) -> Vec<Found> {
     let mut out: Vec<Found> = vec![];
     for d in dirs {
@@ -218,7 +226,7 @@ fn desktop_browsers(dirs: &[std::path::PathBuf]) -> Vec<Found> {
     out
 }
 
-/// .desktop 里 `[Desktop Entry]` 那一段:能开 https、没藏起来的程序 → (名字, Exec)
+/// The `[Desktop Entry]` section of a .desktop: an application that opens https and isn't hidden → (name, Exec)
 fn parse_desktop(text: &str) -> Option<(String, String)> {
     let (mut name, mut exec, mut https, mut hidden, mut app) = (None, None, false, false, true);
     let mut entry = false;
@@ -242,7 +250,8 @@ fn parse_desktop(text: &str) -> Option<(String, String)> {
     Some((name?, exec.filter(|e| !e.is_empty())?))
 }
 
-/// Exec 那一行拆成参数(双引号、反斜杠照规矩),链接放的位置(%u %U %f %F)换成 `{url}`,别的 % 码去掉
+/// Split the Exec line into arguments (double quotes and backslashes per the spec); the link placeholders (%u %U %f %F) become `{url}`,
+/// other % codes are dropped
 fn exec_argv(exec: &str) -> Vec<String> {
     let mut args: Vec<String> = vec![];
     let (mut cur, mut quoted, mut any) = (String::new(), false, false);
@@ -272,7 +281,7 @@ fn exec_argv(exec: &str) -> Vec<String> {
         .collect()
 }
 
-/// Linux 的默认浏览器(.desktop 的文件名):先问 xdg-settings,没有它就看 mimeapps.list
+/// Linux's default browser (a .desktop file name): ask xdg-settings first; without it, read mimeapps.list
 fn default_desktop() -> Option<String> {
     if let Ok(o) = Command::new("xdg-settings").args(["get", "default-web-browser"]).output() {
         let id = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -287,7 +296,7 @@ fn default_desktop() -> Option<String> {
     lists.iter().find_map(|f| std::fs::read_to_string(f).ok().and_then(|t| default_in_mimeapps(&t)))
 }
 
-/// mimeapps.list 的 `[Default Applications]` 里 https 归谁
+/// Who handles https in mimeapps.list's `[Default Applications]`
 fn default_in_mimeapps(text: &str) -> Option<String> {
     let mut on = false;
     for line in text.lines().map(str::trim) {
@@ -300,7 +309,7 @@ fn default_in_mimeapps(text: &str) -> Option<String> {
     None
 }
 
-/// 命令里放链接:有 `{url}` 就换在那,没有就接在最后
+/// Put the link into the command: in place of `{url}` if present, otherwise at the end
 fn fill(cmd: &[String], url: &str) -> Vec<String> {
     let mut argv: Vec<String> = cmd.iter().map(|a| a.replace("{url}", url)).collect();
     if !cmd.iter().any(|a| a.contains("{url}")) {
@@ -309,7 +318,7 @@ fn fill(cmd: &[String], url: &str) -> Vec<String> {
     argv
 }
 
-/// macOS 的默认浏览器(管 https 的那个 bundle id);没设过、读不了 = None
+/// macOS's default browser (the bundle id that handles https); never set or unreadable = None
 fn default_browser() -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
@@ -332,14 +341,15 @@ fn plutil(args: &[&str]) -> Option<String> {
 
 fn launch(how: &How, url: &str) -> Result<(), String> {
     let argv = match how {
-        // Mac 的 open 一下就回来,等它好知道开没开成
+        // Mac's open returns right away; wait for it to know whether it opened
         How::App(path) => return wait(Command::new("open").args(["-a", path, url])),
         How::System if cfg!(target_os = "macos") => return wait(Command::new("open").arg(url)),
         How::System => vec!["xdg-open".to_string(), url.to_string()],
         How::Cmd(cmd) => fill(cmd, url),
         How::Copy | How::CopyCode => return Ok(()),
     };
-    // 浏览器的命令可能一直开着(Linux 上头一个 firefox 就是):不等,输出也不让它写到界面上;退出了收掉
+    // A browser command may keep running (the first firefox on Linux does): don't wait, keep its output off the interface; reap it when it
+    // exits
     let mut child = Command::new(aca_core::paths::expand(&argv[0]))
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
@@ -359,7 +369,7 @@ fn wait(cmd: &mut Command) -> Result<(), String> {
     }
 }
 
-/// 链接太长:只留站点和路径
+/// The link is too long: keep only the host and path
 fn short(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     match rest.split_once('?') {
@@ -440,7 +450,7 @@ mod tests {
             .collect()
     }
 
-    /// 开 Zen 会失败,别的都开得了
+    /// Opening Zen fails, everything else opens
     fn fake(how: &How, _: &str) -> Result<(), String> {
         match how {
             How::App(p) if p.contains("Zen") => Err("无法打开:Zen 坏了".into()),
@@ -489,35 +499,35 @@ mod tests {
             ],
         );
         assert_eq!(p.sel, 0);
-        // 链接里一次性的参数不显示;本机不用多说怎么登完(回调本机)
+        // The link's one-time parameters aren't shown; locally there's nothing to say about finishing (the callback comes to this machine)
         assert!(rows.iter().all(|r| !r.contains("state=y") && !r.contains("贴回")));
-        // 认不出装了什么:系统默认的
+        // Can't tell what's installed: the system default
         let bare: Vec<String> = arrange(vec![], None).into_iter().map(|i| i.label).collect();
         assert_eq!(bare, ["默认浏览器"]);
-        // 默认的没装在认得的里面:原样排,不标
+        // The default isn't among the recognized ones: original order, unmarked
         let none: Vec<String> = arrange(found(), Some("org.mozilla.firefox".into())).into_iter().map(|i| i.label).collect();
         assert_eq!(none[..2], ["Safari", "Google Chrome"]);
-        // 手机宽度不超宽
+        // Nothing wider than a phone
         assert!(text(&p, 40).iter().all(|r| r.width() <= 40), "{:#?}", text(&p, 40));
     }
 
     #[test]
     fn enter_copies_by_default_a_number_opens_and_esc_leaves_the_link_waiting() {
-        // 什么都不按直接 ⏎:复制
+        // ⏎ right away: copy
         let (f, fx) = press(&mut pick(), KeyCode::Enter);
         assert_eq!((f, fx.copy.as_deref()), (Flow::Close, Some(URL)));
         let mut p = pick();
         let (f, fx) = press(&mut p, KeyCode::Char('3'));
         assert_eq!((f, fx.flash.as_deref()), (Flow::Close, Some("已在 Safari 打开 · 登录后返回终端")));
-        // 开不了:说为什么,表留着
+        // Can't open: say why, the list stays
         let (f, fx) = press(&mut p, KeyCode::Char('4'));
         assert_eq!((f, fx.flash.as_deref()), (Flow::Stay, Some("无法打开:Zen 坏了")));
-        // ↓ 回车 = 第二个
+        // ↓ then ⏎ = the second one
         let mut p = pick();
         press(&mut p, KeyCode::Down);
         assert_eq!(press(&mut p, KeyCode::Enter).1.flash.as_deref(), Some("已在 Google Chrome(默认) 打开 · 登录后返回终端"));
         assert_eq!(press(&mut pick(), KeyCode::Char('c')).1.copy.as_deref(), Some(URL));
-        // 没有的号:不动
+        // A number with no item: nothing happens
         assert_eq!(press(&mut pick(), KeyCode::Char('9')).0, Flow::Stay);
         let (f, fx) = press(&mut pick(), KeyCode::Esc);
         assert!(f == Flow::Close && fx.flash.is_some_and(|m| m.contains("链接仍在登录终端中")) && fx.copy.is_none());
@@ -525,12 +535,12 @@ mod tests {
 
     #[test]
     fn far_away_there_are_no_browsers_and_it_says_how_to_finish() {
-        // Claude 远程:要贴码的链接,只有复制
+        // Claude remote: a link that needs the code pasted back, copy only
         let p = Pick::with("登录 Claude Code · ding", link(URL, None), true, vec![], fake);
         let rows = text(&p, 60);
         shows(&rows, &["在手机或其他电脑上登录", "1  复制链接", "将网页上的验证码粘贴到下方终端"]);
         assert_eq!(p.items.len(), 1);
-        // Codex 设备码:码写在表上,链接和码都能复制,复制了一样表还留着
+        // Codex device code: the code is shown in the list, link and code are both copyable, the list stays after copying one
         let mut p = Pick::with("登录 Codex · px", link("https://auth.openai.com/codex/device", Some("AB12-CD3EF")), true, vec![], fake);
         let rows = text(&p, 60);
         shows(&rows, &["auth.openai.com/codex/device", "验证码  AB12-CD3EF", "1  复制链接", "2  复制验证码 AB12-CD3EF", "15 分钟内有效"]);
@@ -544,7 +554,7 @@ mod tests {
     #[test]
     fn linux_finds_browsers_in_desktop_files_and_the_default_from_mimeapps() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        // Exec:引号、% 码;链接放的位置换成 {url},别的 % 码去掉
+        // Exec: quotes, % codes; the link placeholders become {url}, other % codes are dropped
         assert_eq!(exec_argv("/usr/lib/firefox/firefox %u"), s(&["/usr/lib/firefox/firefox", "{url}"]));
         assert_eq!(exec_argv("\"/opt/my browser/run\" --new-window %U %i"), s(&["/opt/my browser/run", "--new-window", "{url}"]));
         assert_eq!(exec_argv("/usr/bin/flatpak run --command=zen app.zen_browser.zen @@u %u @@"), s(&["/usr/bin/flatpak", "run", "--command=zen", "app.zen_browser.zen", "@@u", "{url}", "@@"]));
@@ -563,17 +573,17 @@ mod tests {
         let https = "MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;";
         std::fs::write(sys.join("firefox.desktop"), entry("Firefox", "firefox %u", https)).unwrap();
         std::fs::write(sys.join("google-chrome.desktop"), entry("Google Chrome", "/usr/bin/google-chrome-stable %U", https)).unwrap();
-        // 不是浏览器的、藏起来的:不列
+        // Not a browser, or hidden: not listed
         std::fs::write(sys.join("gimp.desktop"), entry("GIMP", "gimp %U", "MimeType=image/png;")).unwrap();
         std::fs::write(sys.join("helper.desktop"), entry("Helper", "helper %u", &format!("{https}\nNoDisplay=true"))).unwrap();
         std::fs::write(sys.join("firefox-esr.desktop"), entry("Firefox", "firefox-esr %u", https)).unwrap();
-        // 自己目录里的同一个文件名压过系统的
+        // The same file name in the user's own directory overrides the system's
         std::fs::write(user.join("google-chrome.desktop"), entry("Google Chrome", "/usr/bin/google-chrome-stable --profile-directory=Work %U", https)).unwrap();
         let found = desktop_browsers(&[user.clone(), sys.clone(), root.join("没有这个目录")]);
         let got: Vec<(&str, &str)> = found.iter().map(|f| (f.name.as_str(), f.id.as_str())).collect();
         assert_eq!(got, [("Google Chrome", "google-chrome.desktop"), ("Firefox", "firefox-esr.desktop"), ("Firefox", "firefox.desktop")]);
         assert_eq!(found[0].how, How::Cmd(s(&["/usr/bin/google-chrome-stable", "--profile-directory=Work", "{url}"])));
-        // 默认的从 mimeapps.list 读,排第一、标出来;同名的只留默认那个
+        // The default is read from mimeapps.list, goes first, marked; of same-named ones only the default stays
         let mime = "[Added Associations]\nx-scheme-handler/https=google-chrome.desktop;\n[Default Applications]\nx-scheme-handler/http=firefox.desktop\nx-scheme-handler/https=firefox.desktop;google-chrome.desktop;\n";
         assert_eq!(default_in_mimeapps(mime).as_deref(), Some("firefox.desktop"));
         assert_eq!(default_in_mimeapps("[Default Applications]\ntext/html=x.desktop\n"), None);

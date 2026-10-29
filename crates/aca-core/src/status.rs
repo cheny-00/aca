@@ -1,7 +1,9 @@
-//! 列表:把登记表、tmux 里实际在的窗格、hook 写的状态、屏幕上看到的,合成一行一个会话。
+//! The list: merges the registry, the panes actually in tmux, the state hooks write and what's on the screen into one row
+//! per session.
 //!
-//! 一次刷新 = 一条 `tmux list-panes -a` + 读一次库 + 每个会话一个小文件 + (要读屏幕时)一条 tmux 命令把在跑的会话的屏幕
-//! 一起抓回来(`tmux::capture_many`)。不读屏幕(`--no-screen`)就只剩前三样,几毫秒。
+//! One refresh = one `tmux list-panes -a` + one database read + one small file per session + (when reading screens) one
+//! tmux command that captures the screens of all running sessions together (`tmux::capture_many`). Without screens
+//! (`--no-screen`) only the first three remain: a few milliseconds.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{LazyLock, Mutex};
@@ -21,17 +23,17 @@ use crate::{event, hook};
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
-    /// 在跑
+    /// Running
     Running,
-    /// 在等你(选择框 / 确认框)
+    /// Needs you (a choice prompt / confirmation prompt)
     Ask,
-    /// 跑完了还没看
+    /// Finished and not read yet
     Unread,
     Idle,
     Error,
-    /// agent 退出了,窗格还留着(`aca start` 在原地接着对话再起)
+    /// The agent exited but the pane is still there (`aca start` resumes the conversation in place)
     Exited,
-    /// 登记着,tmux 里没有(停掉的,或者重启过电脑):`aca start` 重新建
+    /// Registered but not in tmux (stopped, or the computer restarted): `aca start` creates it again
     Stopped,
 }
 
@@ -58,47 +60,50 @@ pub struct Row {
     pub group: String,
     pub dir: String,
     pub parent: String,
-    /// 分叉出来的:分自哪个会话(不是 `parent`:没人派它)
+    /// Forked: which session it was forked from (not `parent`: nobody delegated it)
     pub fork_of: String,
-    /// tmux 会话名(= 标题)和 agent 的窗格;没在跑是空的
+    /// The tmux session name (= the title) and the agent's pane; empty when not running
     pub tmux: String,
     pub pane: String,
     pub attached: u32,
     pub conv: String,
-    /// 在等你时它问的那句
+    /// The question it asks when it needs you
     pub ask: String,
-    /// 在跑时已经跑了几秒
+    /// How many seconds it has been running, when running
     pub ran: u64,
-    /// 最近一次有动静的时刻:登记的 agent 不在跑时是 hook 报的(见 [`Run::hook_at`]),别的是窗口最后有输出的时刻
+    /// The last time anything happened: when a registered agent isn't running, what the hook reported (see [`Run::hook_at`]);
+    /// otherwise the last time the window had output
     pub active: u64,
     pub bg: u32,
     pub locked: bool,
     pub created: u64,
     pub order: i64,
-    /// 插件挂上来的小段字
+    /// Short snippets of text plugins attach
     pub tokens: BTreeMap<String, String>,
-    /// 闲着被 aca 停掉的时刻(见 [`crate::session::stop_idle`]);别的(在跑、人停的)是 0
+    /// When aca stopped it for sitting idle (see [`crate::session::stop_idle`]); 0 otherwise (running, stopped by a person)
     pub idle_stopped: u64,
 }
 
 impl Row {
-    /// 状态图标:闲着被 aca 停掉的画 ☾,别的照状态
+    /// The state icon: ☾ if aca stopped it for sitting idle, otherwise by state
     pub fn glyph(&self) -> &'static str {
         if self.idle_stopped > 0 { IDLE_STOPPED } else { self.state.glyph() }
     }
 }
 
-/// 闲着被 aca 停掉的会话的图标(人停的、agent 自己退的是 ■)
+/// The icon for sessions aca stopped for sitting idle (stopped by a person or exited by the agent itself is ■)
 pub const IDLE_STOPPED: &str = "☾";
 
-/// 显示的标题:人改过名听人的,否则 agent 自己起的,还没有就用登记时的
+/// The title shown: a person's rename wins, otherwise the agent's own title, and until there is one, the title from
+/// registration
 pub fn title(s: &Session, r: &Run) -> String {
     if s.title_locked || r.auto_title.is_empty() { s.title.clone() } else { r.auto_title.clone() }
 }
 
-/// 窗格标题上写着的标题和记着的不一样的:记下来,tmux 会话名跟过去(和 hook 里做的是同一件事)。有改名的返回 true。
-/// 列表每次刷新对一遍,不读文件、不多问 tmux:没带 hook 的会话(接管了还没重启)标题只有这一条路跟,
-/// 带了 hook 的也不用等到这一轮跑完
+/// When the title in the pane title differs from the recorded one: record it and rename the tmux session to match (the same
+/// thing the hook does). Returns true if anything was renamed. Checked on every list refresh, without reading files or
+/// asking tmux again: for sessions without hooks (adopted, not restarted yet) this is the only way titles follow, and
+/// sessions with hooks don't have to wait for the turn to finish
 pub fn follow_titles(cfg: &Config, sessions: &[Session], panes: &[Pane]) -> bool {
     let mut renamed = false;
     for s in sessions {
@@ -108,7 +113,7 @@ pub fn follow_titles(cfg: &Config, sessions: &[Session], panes: &[Pane]) -> bool
         if agent.live_title(&r, &p.title).is_none_or(|t| t == r.auto_title) {
             continue;
         }
-        // 到这才拿锁再问一次:hook 可能刚好也在改
+        // Only now take the lock and ask again: the hook may be changing it at the same moment
         for (name, data) in hook::retitle(&s.id, |r| agent.live_title(r, &p.title)) {
             event::emit(name, &s.id, data);
             renamed = true;
@@ -117,8 +122,9 @@ pub fn follow_titles(cfg: &Config, sessions: &[Session], panes: &[Pane]) -> bool
     renamed
 }
 
-/// 列表看的运行时状态:aca 的 hook 写的那份([`runtime::load`])。接管来还没重启的进程没带 aca 的 hook,那份是空的;
-/// 其中 agent-deck 起的还带着它的 hook、照常在报:借它记的最后一件事,「在跑」「跑完没看」不用等重启
+/// The runtime state the list reads: the one aca's hooks write ([`runtime::load`]). An adopted process not restarted yet
+/// doesn't carry aca's hooks, so that one is empty; those agent-deck started still carry its hooks and keep reporting, so
+/// borrow the last thing they recorded: "running" and "unread" don't have to wait for a restart
 pub fn load(id: &str) -> Run {
     let mut r = runtime::load(id);
     if r.status.is_empty()
@@ -129,7 +135,8 @@ pub fn load(id: &str) -> Run {
     r
 }
 
-/// agent-deck 的 hook 记的事件 → aca 的状态。它那边跑完、刚起来、等你批准都记成 waiting,分不出来,所以看事件名
+/// An event recorded by agent-deck's hooks → aca's state. It records finished, just started and waiting for your approval
+/// all as waiting, which can't be told apart, so look at the event name
 fn borrow(r: &mut Run, event: &str, ts: u64) {
     let status = match event {
         "UserPromptSubmit" => {
@@ -147,21 +154,22 @@ fn borrow(r: &mut Run, event: &str, ts: u64) {
     (r.status, r.event, r.ts) = (status.into(), event.into(), ts);
 }
 
-/// 状态以屏幕为准(读了的话),hook 补屏幕看不出来的
+/// The screen decides the state (when it was read); hooks fill in what the screen can't show
 pub fn merge(pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64) -> (State, String, u64) {
     let Some(p) = pane else { return (State::Stopped, String::new(), 0) };
     if p.dead {
         return (State::Exited, String::new(), 0);
     }
     let since_turn = if r.status == "running" && r.turn > 0 { now.saturating_sub(r.turn) } else { 0 };
-    // 屏幕上看不出来的那几家,当成没读屏幕:hook 说什么是什么
+    // Tools whose screen can't tell: treat as if the screen wasn't read, and go by whatever the hook says
     let seen = seen.filter(|s| **s != Seen::Unsure);
     match seen {
-        // 问的那句:hook 报的说得出是哪个工具、哪条命令,比屏幕上那句「Do you want to proceed?」有用
+        // The question: the hook's report can name the tool and the command, which is more useful than the screen's "Do you want
+        // to proceed?"
         Some(Seen::Ask(q)) => {
             return (State::Ask, if q.is_empty() || (r.status == "waiting" && !r.ask.is_empty()) { r.ask.clone() } else { q.clone() }, 0);
         }
-        // 一轮刚开始那几秒屏幕上还没有计时:用 hook 记的这一轮开始的时刻
+        // In the first seconds of a turn there's no timer on the screen yet: use the turn start the hook recorded
         Some(Seen::Running(n)) => return (State::Running, String::new(), if *n > 0 { *n } else { since_turn }),
         _ => {}
     }
@@ -169,14 +177,19 @@ pub fn merge(pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64) -> (St
         return (State::Running, String::new(), since_turn);
     }
     let state = match r.status.as_str() {
-        // 读了屏幕却没看到框:要么框还没画出来(刚报的),要么已经按 Esc 打断了(打断不发事件)
+        // The screen was read but shows no prompt: either the prompt isn't drawn yet (just reported), or it was already
+        // interrupted with Esc (interrupting sends no event)
         "waiting" if seen.is_none() || now.saturating_sub(r.ts) < 5 => State::Ask,
-        // 一轮刚报开始、屏幕还没转起来:事件触发的那次重读常常赶在屏幕前面,不信 hook 就要等下一轮 2 秒的重读。
-        // 过了这几秒屏幕上还安静,当是按 Esc 打断了。正文还在往外吐的(屏幕上只有那几行在变)不算安静
+        // A turn just reported as started but the screen isn't spinning yet: the reread an event triggers often runs ahead of the
+        // screen, and not trusting the hook would mean waiting for the next 2-second reread. If the screen is still quiet after
+        // these few seconds, take it as interrupted with Esc. Text still streaming out (only those lines changing on screen)
+        // doesn't count as quiet
         "running" if seen.is_none() || now.saturating_sub(r.turn) < 3 || seen == Some(&Seen::Moving) => State::Running,
         "error" => State::Error,
-        // 看过:手动标的 / 跑完那一刻正连着(hook 记的)、跑完之后连进去过、跑完之后在里面按过键(一直连着看它跑完再切走的)。
-        // 按键和跑完在同一秒的不算:分不出先后,会话刚建时 tmux 也记一次「有人动过」
+        // Read: marked by hand / someone attached the moment it finished (recorded by the hook), attached after it finished, or
+        // pressed a key inside after it finished (stayed attached watching it finish, then switched away). A key press in the
+        // same second as finishing doesn't count: the order can't be told, and tmux also records "someone touched it" when a
+        // session is created
         "done" if p.attached == 0 && r.done > r.seen.max(p.last_attached) && r.done >= p.activity => State::Unread,
         _ => State::Idle,
     };
@@ -206,7 +219,8 @@ fn row(s: &Session, pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64)
         ask,
         ran,
         active: match r.hook_at() {
-            // 不在跑、还开着的 agent 照 hook 报的(见 [`Run::hook_at`]):闲着的一重画,窗口的活动时间就成了「刚刚」
+            // An agent that isn't running but is still open goes by what the hook reported (see [`Run::hook_at`]): an idle one
+            // redrawing would make the window's activity time "just now"
             at if at > 0 && matches!(state, State::Idle | State::Unread | State::Ask | State::Error) => at,
             _ => pane.map_or(0, |p| p.activity).max(r.ts).max(r.restored).max(s.created),
         },
@@ -219,13 +233,16 @@ fn row(s: &Session, pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64)
     }
 }
 
-/// 正文的尾巴(见 [`Agent::body`])上一次看是什么样、最后一次变是什么时候(毫秒):会话 id → (指纹, 时刻)。
-/// 只记在这个进程里:界面、`aca wait` 这种一直在看的记得住;`aca ls` 只看一次,没得比,当它没在动
+/// What the tail of the text (see [`Agent::body`]) looked like last time and when it last changed (ms): session id →
+/// (fingerprint, time). Only kept in this process: the interface and `aca wait`, which keep watching, remember it;
+/// `aca ls` looks only once, has nothing to compare, and takes it as not moving
 static BODIES: LazyLock<Mutex<HashMap<String, (u64, u64)>>> = LazyLock::new(Default::default);
-/// 正文最后一次变之后这么久(毫秒)还算在动。按 Esc 打断之后 ● 多留这么久
+/// For this long (ms) after the text last changed, it still counts as moving. After an Esc interrupt, ● stays this much
+/// longer
 const MOVING_MS: u64 = 3000;
 
-/// 读屏幕:这一家的读法;读出来安静的,再看正文还在不在动([`Seen::Moving`])。每次看都记下正文的样子
+/// Reading the screen: this tool's reader; if that reads as quiet, check whether the text is still moving
+/// ([`Seen::Moving`]). Every look records what the text looks like
 pub fn look(id: &str, agent: &dyn Agent, lines: &[String]) -> Seen {
     let seen = agent.screen(lines);
     let Some(fp) = agent.body(lines) else { return seen };
@@ -235,8 +252,8 @@ pub fn look(id: &str, agent: &dyn Agent, lines: &[String]) -> Seen {
     if seen == Seen::Quiet && moving { Seen::Moving } else { seen }
 }
 
-/// 这次看到的指纹 `fp` 和上一次记下的(指纹, 最后一次变的时刻)比:返回要记下的、这会儿算不算在动。
-/// 头一回看(没有上一次)不算在动
+/// Compares the fingerprint `fp` seen now with the last recorded one (fingerprint, time of last change): returns what to
+/// record and whether it counts as moving right now. The first look (no previous one) doesn't count as moving
 fn moved(last: Option<(u64, u64)>, fp: u64, now: u64) -> ((u64, u64), bool) {
     let at = match last {
         Some((was, at)) if was == fp => at,
@@ -246,23 +263,25 @@ fn moved(last: Option<(u64, u64)>, fp: u64, now: u64) -> ((u64, u64), bool) {
     ((fp, at), at > 0 && now.saturating_sub(at) < MOVING_MS)
 }
 
-/// 这个会话是哪一家(屏幕怎么读看它);工具从配置里删了的认不出来,就不读屏幕
+/// Which tool this session is (it decides how to read the screen); a tool deleted from the config can't be recognized,
+/// so the screen isn't read
 fn agent_of(cfg: &Config, s: &Session) -> Option<Handle> {
     agent::of(cfg, s).ok().map(|x| x.0)
 }
 
-/// 全部登记着的会话,按分组的先后、组里的先后
+/// All registered sessions, in group order, then their order within the group
 pub fn collect(store: &Store, cfg: &Config, read_screen: bool) -> Res<Vec<Row>> {
     let sessions = store.sessions(false)?;
     let mut panes = tmux::panes();
-    // 会话名改了的话重新列一遍(行里带着会话名)
+    // If session names changed, list again (the rows carry the session name)
     if follow_titles(cfg, &sessions, &panes) {
         panes = tmux::panes();
     }
     let now = paths::now();
     let picked: Vec<Option<&Pane>> = sessions.iter().map(|s| tmux::agent_pane(&panes, &s.id)).collect();
     let agents: Vec<Option<Handle>> = sessions.iter().map(|s| if read_screen { agent_of(cfg, s) } else { None }).collect();
-    // 要读屏幕的那些格一条 tmux 命令抓回来:一格起一个 tmux 的话,几十个会话每刷新一次就是几十个进程
+    // Capture the panes whose screens are needed with one tmux command: one tmux process per pane would mean dozens of
+    // processes per refresh with dozens of sessions
     let want: Vec<Option<&Pane>> = agents.iter().zip(&picked).map(|(a, p)| a.as_ref().and_then(|_| p.filter(|p| !p.dead))).collect();
     let ids: Vec<&str> = want.iter().flatten().map(|p| p.pane.as_str()).collect();
     let mut screens = tmux::capture_many(&ids, false).into_iter();
@@ -290,15 +309,15 @@ pub fn collect(store: &Store, cfg: &Config, read_screen: bool) -> Res<Vec<Row>> 
     Ok(rows)
 }
 
-/// 只读地看一眼全部会话:不读屏幕、不替没报的那一轮补事件、不跟改名。tmux 状态栏这种一直在问的用(`aca tmux-status`),
-/// 不该每问一次就动一下别的
+/// A read-only look at all sessions: no screens, no filling in unreported turn ends, no following renames. For callers that
+/// keep asking, like the tmux status bar (`aca tmux-status`), which shouldn't change anything each time they ask
 pub fn peek(store: &Store) -> Res<Vec<Row>> {
     let panes = tmux::panes();
     let now = paths::now();
     Ok(store.sessions(false)?.iter().map(|s| row(s, tmux::agent_pane(&panes, &s.id), &load(&s.id), None, now)).collect())
 }
 
-/// 一个会话现在的样子(`show`、发消息前等它空下来)
+/// A session as it is now (`show`, waiting for it to go idle before sending a message)
 pub fn one(cfg: &Config, s: &Session, read_screen: bool) -> Row {
     let pane = tmux::find(&s.id);
     let agent = agent_of(cfg, s);
@@ -306,10 +325,11 @@ pub fn one(cfg: &Config, s: &Session, read_screen: bool) -> Row {
     row(s, pane.as_ref(), &settled(cfg, s, agent.as_deref(), seen.as_ref()), seen.as_ref(), paths::now())
 }
 
-/// 运行时状态,先补上它没报的那一轮结束:hook 说在跑、屏幕上却停了,问这一家是不是这一轮已经结束、
-/// 又没报 hook(Codex 出错的、Stop hook 没被信任的,见 [`Agent::unreported_end`])。是的话替它补那个事件,
-/// 和真的 hook 一样记状态、发 `turn.done` / `turn.failed`、通知派它的那个。
-/// 没有常驻进程:有人看(`aca ls`、界面刷新、`aca wait`)才发现
+/// The runtime state, after first filling in a turn end it didn't report: if the hook says running but the screen has
+/// stopped, ask this tool whether the turn already ended without a hook (a Codex error, an untrusted Stop hook; see
+/// [`Agent::unreported_end`]). If so, fill in that event for it, recording the state, emitting `turn.done` /
+/// `turn.failed` and notifying the session that delegated it, just like a real hook. There's no resident process: it's
+/// only noticed when someone looks (`aca ls`, an interface refresh, `aca wait`)
 fn settled(cfg: &Config, s: &Session, agent: Option<&dyn Agent>, seen: Option<&Seen>) -> Run {
     let r = load(&s.id);
     if r.status != "running" || seen != Some(&Seen::Quiet) {
@@ -324,8 +344,9 @@ fn settled(cfg: &Config, s: &Session, agent: Option<&dyn Agent>, seen: Option<&S
     }
 }
 
-/// 自己读屏幕、自己拼列表的那一头(界面)用的 [`settled`]:hook 说在跑的会话逐个问一遍,补上了的接下来读状态文件就是新的。
-/// `screen` = 这个窗格现在的屏幕(不带颜色的字)
+/// [`settled`] for the side that reads screens and builds the list itself (the interface): asks each session the hook says
+/// is running, and anything filled in shows up in the state file it reads next. `screen` = this pane's current screen
+/// (text without colors)
 pub fn settle(cfg: &Config, sessions: &[Session], panes: &[Pane], screen: &dyn Fn(&Pane) -> Vec<String>) {
     for s in sessions {
         if runtime::load(&s.id).status != "running" {
@@ -341,8 +362,9 @@ pub fn settle(cfg: &Config, sessions: &[Session], panes: &[Pane], screen: &dyn F
 mod tests {
     use super::*;
 
-    /// `aca ls --json` / `aca show --json` 外面那一层是插件接口:每个字段 docs/plugins.md(英文)和 plugins.zh-CN.md「接口约定」里都写了。
-    /// Row 加了字段这里编不过 —— 补上,再去文档里写一句
+    /// The outer layer of `aca ls --json` / `aca show --json` is plugin interface: every field is written up in "The contract"
+    /// in docs/plugins.md (English) and its section in plugins.zh-CN.md. Adding a field to Row fails here — add it, then
+    /// write a line in the docs
     #[test]
     fn every_field_of_a_listed_session_is_in_the_plugin_contract() {
         let r = Row {
@@ -393,32 +415,35 @@ mod tests {
     fn the_screen_decides_and_hooks_fill_in_what_it_cannot_show() {
         let p = pane();
         let st = |r: &Run, seen: Option<Seen>| merge(Some(&p), r, seen.as_ref(), 100).0;
-        // 屏幕上有框 / 在转:听屏幕的,不管 hook 说什么
+        // A prompt on the screen / spinning: go by the screen, whatever the hook says
         assert_eq!(merge(Some(&p), &run("done"), Some(&Seen::Ask("要删吗?".into())), 100), (State::Ask, "要删吗?".into(), 0));
         let asked = Run { ask: "Bash:rm -rf build".into(), ..run("waiting") };
         assert_eq!(merge(Some(&p), &asked, Some(&Seen::Ask("Do you want to proceed?".into())), 100).1, "Bash:rm -rf build");
         assert_eq!(merge(Some(&p), &run("idle"), Some(&Seen::Running(72)), 100), (State::Running, String::new(), 72));
-        // 屏幕上在跑但还没有计时(一轮刚开始):跑了多久从 hook 记的这一轮开始算
+        // Running on screen but no timer yet (a turn just started): time run counts from the turn start the hook recorded
         assert_eq!(merge(Some(&p), &Run { turn: 91, ..run("running") }, Some(&Seen::Running(0)), 100).2, 9);
-        // 按 Esc 打断不发事件:hook 还说在跑,屏幕上已经安静了
+        // An Esc interrupt sends no event: the hook still says running, but the screen is already quiet
         assert_eq!(st(&run("running"), Some(Seen::Quiet)), State::Idle);
-        // 一轮刚报开始,屏幕还没转起来:先信 hook;几秒了还安静的才当是打断了
+        // A turn just reported as started and the screen isn't spinning yet: trust the hook first; only quiet after a few
+        // seconds counts as interrupted
         assert_eq!(merge(Some(&p), &Run { turn: 99, ..run("running") }, Some(&Seen::Quiet), 100), (State::Running, String::new(), 1));
         assert_eq!(st(&Run { turn: 97, ..run("running") }, Some(Seen::Quiet)), State::Idle);
-        // 没读屏幕:信 hook
+        // Screen not read: trust the hook
         assert_eq!(merge(Some(&p), &Run { turn: 40, ..run("running") }, None, 100), (State::Running, String::new(), 60));
         assert_eq!(merge(Some(&p), &Run { ask: "Bash:ls".into(), ..run("waiting") }, None, 100), (State::Ask, "Bash:ls".into(), 0));
-        // 刚报的在等你,框还没画出来
+        // Just reported as needing you, and the prompt isn't drawn yet
         assert_eq!(st(&Run { ts: 98, ..run("waiting") }, Some(Seen::Quiet)), State::Ask);
         assert_eq!(st(&Run { ts: 10, ..run("waiting") }, Some(Seen::Quiet)), State::Idle);
         assert_eq!(st(&run("error"), Some(Seen::Quiet)), State::Error);
-        // 屏幕上看不出来的那几家(声明式工具没写 busy):hook 说在跑就是在跑、说在等就是在等
+        // Tools whose screen can't tell (a declared tool without busy): running if the hook says running, waiting if it says
+        // waiting
         assert_eq!(st(&run("running"), Some(Seen::Unsure)), State::Running);
         assert_eq!(st(&Run { ts: 10, ..run("waiting") }, Some(Seen::Unsure)), State::Ask);
         assert_eq!(st(&run("idle"), Some(Seen::Unsure)), State::Idle);
-        // 窗格标题在转圈也算在跑
+        // A spinner in the pane title also counts as running
         assert_eq!(merge(Some(&Pane { title: "⠋ 修登录".into(), ..pane() }), &run("idle"), Some(&Seen::Quiet), 100).0, State::Running);
-        // 正文还在往外吐(屏幕上只有那几行在变):hook 说在跑就是在跑。跑完那一下最后几行也在重画,hook 说跑完了就不算
+        // Text still streaming out (only those lines changing on screen): running if the hook says running. The last lines are
+        // also redrawn right when a turn finishes, so once the hook says finished it doesn't count
         assert_eq!(merge(Some(&p), &Run { turn: 40, ..run("running") }, Some(&Seen::Moving), 100), (State::Running, String::new(), 60));
         assert_eq!(st(&Run { done: 99, ..run("done") }, Some(Seen::Moving)), State::Unread);
         assert_eq!(st(&run("idle"), Some(Seen::Moving)), State::Idle);
@@ -426,12 +451,12 @@ mod tests {
 
     #[test]
     fn the_body_counts_as_moving_for_a_few_seconds_after_it_last_changed() {
-        // 头一回看:没得比
+        // First look: nothing to compare
         assert_eq!(moved(None, 7, 10_000), ((7, 0), false));
         assert_eq!(moved(Some((7, 0)), 7, 12_000), ((7, 0), false));
-        // 变了:从这一刻算
+        // Changed: count from this moment
         assert_eq!(moved(Some((7, 0)), 8, 14_000), ((8, 14_000), true));
-        // 之后没再变(吐完了、按 Esc 打断了):3 秒内还算,过了就不算
+        // No change since (done streaming, interrupted with Esc): still counts within 3 seconds, not after
         assert_eq!(moved(Some((8, 14_000)), 8, 16_999), ((8, 14_000), true));
         assert_eq!(moved(Some((8, 14_000)), 8, 17_000), ((8, 14_000), false));
     }
@@ -447,13 +472,14 @@ mod tests {
                 .collect()
         };
         let (a, b) = (frame("  - 第一条"), frame("  - 第一条\n  - 第二条"));
-        // 头一回看是安静的;再看正文长了,算在动,紧接着再看一眼没变也还算
+        // The first look is quiet; the next one sees the text grew, which counts as moving, and an unchanged look right after
+        // still counts
         assert_eq!(look("look-1", claude, &a), Seen::Quiet);
         assert_eq!(look("look-1", claude, &b), Seen::Moving);
         assert_eq!(look("look-1", claude, &b), Seen::Moving);
-        // 各会话分开记
+        // Each session is tracked separately
         assert_eq!(look("look-2", claude, &b), Seen::Quiet);
-        // 屏幕上自己认得出的照旧
+        // What the screen itself recognizes stands
         assert_eq!(look("look-1", claude, &frame("✻ Pondering… (12s)")), Seen::Running(12));
     }
 
@@ -462,18 +488,18 @@ mod tests {
         let done = Run { done: 50, ..run("done") };
         let st = |p: &Pane, r: &Run| merge(Some(p), r, None, 100).0;
         assert_eq!(st(&pane(), &done), State::Unread);
-        // 跑完之后连进去过
+        // Attached after it finished
         assert_eq!(st(&Pane { last_attached: 60, ..pane() }, &done), State::Idle);
-        // 现在正连着
+        // Attached right now
         assert_eq!(st(&Pane { attached: 1, ..pane() }, &done), State::Idle);
-        // 跑完那一刻有人连着(hook 记的),或者手动标了已读
+        // Someone was attached the moment it finished (recorded by the hook), or it was marked read by hand
         assert_eq!(st(&pane(), &Run { seen: 50, ..done.clone() }), State::Idle);
-        // 一直连着看它跑完(连进去在跑完之前),之后在里面按过键才切走
+        // Stayed attached watching it finish (attached before it finished), and pressed a key inside before switching away
         assert_eq!(st(&Pane { last_attached: 40, activity: 55, ..pane() }, &done), State::Idle);
-        // 按键在跑完之前(发了话就切走了)、和跑完同一秒:没看
+        // Key press before it finished (sent a prompt and switched away), or in the same second it finished: not read
         assert_eq!(st(&Pane { last_attached: 40, activity: 45, ..pane() }, &done), State::Unread);
         assert_eq!(st(&Pane { activity: 50, ..pane() }, &done), State::Unread);
-        // 看过之后又跑完一轮
+        // Finished another turn after being read
         assert_eq!(st(&Pane { last_attached: 60, ..pane() }, &Run { done: 70, ..done }), State::Unread);
     }
 
@@ -486,11 +512,12 @@ mod tests {
         };
         let st = |r: &Run| merge(Some(&pane()), r, None, 100).0;
         assert_eq!((at("Stop").status.as_str(), at("Stop").done, st(&at("Stop"))), ("done", 50, State::Unread));
-        // 手动标的「看过」(`aca seen`、界面里的 u)记在 aca 自己那份上,照样算
+        // A manual "read" mark (`aca seen`, u in the interface) is recorded in aca's own copy and counts all the same
         assert_eq!(st(&Run { seen: 60, ..at("Stop") }), State::Idle);
         assert_eq!(merge(Some(&pane()), &at("UserPromptSubmit"), None, 100), (State::Running, String::new(), 50));
         assert_eq!((st(&at("PermissionRequest")), st(&at("SessionStart"))), (State::Ask, State::Idle));
-        // 认不得的事件(SessionEnd、以后新加的)不动:还是只看屏幕;原来记着的对话 id 这些不丢
+        // Unrecognized events (SessionEnd, ones added later) change nothing: still go by the screen only; the recorded
+        // conversation id and the like aren't lost
         assert_eq!((at("SessionEnd").status.as_str(), at("Stop").conv.as_str(), at("Stop").seen), ("", "c-1", 7));
     }
 

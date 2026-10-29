@@ -1,34 +1,43 @@
 #!/bin/sh
-# aca.remote:把长任务派到别的机器上后台跑(ssh),结束时结果作为一条消息发回派它的会话。整个功能就是这个脚本 ——
-# aca 里没有远端任务的代码,用的只是插件接口(ACA_ARG_<名字>、ACA_SETTING_<名字>、ACA_SESSION_ID、ACA_LANG、
-# 定时 aca plugin timer on / off、收件箱 aca msg)和外面的 curl、ssh、jq。
+# aca.remote: send a long task to another machine to run in the background (ssh); when it ends, the result comes back as a
+# message to the session that sent it. The whole feature is this script —
+# aca has no code for remote tasks; it only uses the plugin interface (ACA_ARG_<NAME>, ACA_SETTING_<NAME>, ACA_SESSION_ID,
+# ACA_LANG, the timer via aca plugin timer on / off, the inbox via aca msg) and curl, ssh and jq from outside.
 #
-#   run       登记,再到 ACA_ARG_HOST 上后台跑起来(ssh),马上返回
-#   new       只登记:打印 id 和一行 curl,自己接在任务末尾
-#   list      给人、给 agent 看的几行字
-#   rows      列表视图要的 JSON(docs/plugins.md「列表视图的输出」)
-#   rm        不要了(ACA_ARG_ID:id 的开头几位)
-#   collect   去 server 取一次,结束的发进登记它的会话。定时 collect 每 5 分钟跑它:有在等的才开着,都了结了关掉
-#   check     测一下 server:连不连得上、口令对不对
+#   run       register, then start it in the background on ACA_ARG_HOST (ssh), and return at once
+#   new       register only: print the id and a curl line, for you to append to the end of the task
+#   list      a few lines of text for people and agents
+#   rows      the JSON a list view wants (docs/plugins.md "Output of a list view")
+#   rm        drop it (ACA_ARG_ID: the first few characters of the id)
+#   collect   fetch from the server once, and send finished ones to the sessions that registered them. The collect timer runs
+#             it every 5 minutes: on only while something is waiting, off once all are settled
+#   check     test the server: can it be reached, is the token right
 #
-# 为什么绕一个 server(jobhook,https://github.com/cheny-00/jobhook,跑在一台一直在线的机器上):这台 Mac 会合盖、
-# 会被带出门,远端也连不到它。所以远端结束时把结果交给 server(server 立刻推通知给人),这边到点了再去取(只有这边往外连)。
+# Why go through a server (jobhook, https://github.com/cheny-00/jobhook, running on a machine that is always online): this Mac
+# gets its lid closed and gets carried out the door, and the remote cannot reach it either. So when a task ends, the remote
+# hands the result to the server (which pushes a notification to the person right away), and this side fetches it when the time
+# comes (only this side connects out).
 #
-# 一个 id 一个文件 $ACA_PLUGIN_STATE_DIR/tasks/<id>.json,state 是它的一生:
-#   waiting  登记了,远端还没回调
-#   lost     过了时限还没回调(被 kill -9、机器重启都不会回调):告诉会话一次;之后回调到了照样算结束
-#   done     结果取回来了,还没发进会话
-#   sent     发进会话的收件箱了(aca msg 挑它方便的时候送进去:在跑的等这一轮跑完,在等你确认的等你答完)
-#   kept     发不进去(会话没了、不是在会话里登记的):结果留在列表里
-# 了结的(sent / kept)在列表里留 7 天。等的时候不经过模型:去取是这边和 server 之间的一次 HTTP;
-# 会话只在结束(和失联)时各收到一条消息,里面只有退出码、耗时和日志最后几行。
+# One file per id, $ACA_PLUGIN_STATE_DIR/tasks/<id>.json; state is its life:
+#   waiting  registered, the remote has not called back yet
+#   lost     no callback by the deadline (after kill -9 or a machine reboot there is none): tell the session once; a callback
+#            that arrives later still counts as finished
+#   done     the result is fetched, not yet sent into the session
+#   sent     sent to the inbox of the session (aca msg delivers it when convenient: to a running one after this turn ends, to
+#            one waiting on your confirmation after you answer)
+#   kept     could not be sent (the session is gone, or it was not registered from a session): the result stays in the list
+# Settled ones (sent / kept) stay in the list for 7 days. Waiting does not go through the model: a fetch is one HTTP request
+# between this side and the server;
+# the session gets one message only at the end (and on going lost), holding just the exit code, the duration and the last
+# lines of the log.
 #
-# 往外连都交给 curl:口令和正文从标准输入给(-K -),不上命令行(同一台机器的别人 ps 看得到)。
+# All outbound connections go through curl: the token and the body are given on stdin (-K -), never on the command line (other
+# users on the same machine can see it with ps).
 set -u
 
 case "${ACA_LANG:-}" in zh*) L=zh ;; *) L=en ;; esac
 
-# 说一句:t 中文 English
+# Say something: t CHINESE ENGLISH
 t() { if [ "$L" = zh ]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
 die() {
   printf '%s\n' "$1" >&2
@@ -44,18 +53,19 @@ LOCKED=
 trap 'rm -rf "$TMP"; [ -n "$LOCKED" ] && rm -f "$D/.lock"' EXIT
 trap 'exit 1' INT TERM
 
-# 定时:每 5 分钟去取的那个(清单的 [[timers]])
+# The timer: the one that fetches every 5 minutes ([[timers]] in the manifest)
 SELF="$ACA_PLUGIN_ID.collect"
 NOW=$(date +%s)
-# 结束了发不进会话的(会话还在,只是这次没成),试这么久就不试了
+# A finished one that cannot be sent into its session (the session is still there, it just failed this time): stop trying
+# after this long
 GIVE_UP=86400
-# 失联这么久还没回调的,不再等
+# Lost and still no callback after this long: stop waiting
 LOST_KEEP=604800
-# 了结的在列表里留多久
+# How long settled ones stay in the list
 KEEP=604800
-# 去取的锁放了这么久还在,当占着它的已经没了
+# A fetch lock still there after this long: assume whoever held it is gone
 LOCK_STALE=900
-# 回调带回来的日志末尾
+# The tail of the log that a callback brings back
 TAIL_LINES=20
 
 trim() { printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
@@ -63,7 +73,8 @@ trim() { printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 URL=$(trim "${ACA_SETTING_URL:-}" | sed 's:/*$::')
 TOKEN=${ACA_SETTING_TOKEN:-}
 
-# 还没配 / 配得不对:为什么(配好了是空的)。地址要原样写进远端的脚本和 curl 的配置:只认普通的 http(s) 地址
+# Not set up yet / set up wrong: why (empty once set up properly). The address is written as is into the remote script and the
+# curl config: only plain http(s) addresses are accepted
 unset_why() {
   if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
     t '尚未配置 server:在插件页(P)中为 aca.remote 填写 url 和 token(或运行 aca plugin setting aca.remote url https://…)' \
@@ -78,7 +89,7 @@ need_conf() {
   [ -z "$why" ] || die "$why"
 }
 
-# 90m / 6h / 2d / 3600(秒);0 = 不限。看不懂的返回 1
+# 90m / 6h / 2d / 3600 (seconds); 0 = no limit. Returns 1 on anything it cannot read
 secs_of() {
   v=$(printf '%s' "$1" | tr -d ' ')
   case $v in
@@ -92,11 +103,13 @@ secs_of() {
   echo $((n * u))
 }
 
-# curl 配置文件里的一个带引号的值
+# A quoted value for a curl config file
 cq() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
 
-# 问 server:连上了返回 0,状态码在 $CODE,正文在 $TMP/body;连不上返回 1,为什么在 $NET。
-# 跨境的线路十次里会断一次:连不上再试两次(server 的每个接口重复做一遍结果都一样;回了 HTTP 的不算失败,不重试)
+# Ask the server: returns 0 when connected, with the status code in $CODE and the body in $TMP/body; returns 1 when not, with
+# why in $NET.
+# A cross-border link drops one time in ten: if it cannot connect, try twice more (every server endpoint gives the same result
+# when repeated; an HTTP reply does not count as a failure and is not retried)
 http() {
   {
     printf 'url = %s\nrequest = %s\nheader = %s\n' "$(cq "$URL$2")" "$(cq "$1")" "$(cq "X-Jobhook-Token: $TOKEN")"
@@ -117,14 +130,14 @@ http() {
   esac
 }
 
-# server 回的错:它的 error 字段,没有就是正文第一行
+# The error the server replied with: its error field, or else the first line of the body
 said() {
   e=$(jq -r '.error // empty' "$TMP/body" 2>/dev/null)
   [ -n "$e" ] || e=$(grep -v '^[[:space:]]*$' "$TMP/body" | head -n 1)
   printf '%s' "$e"
 }
 
-# 跑一条命令,标准输入是 $2 那个文件,最多等 $1 秒(等超了留下 $TMP/late)
+# Run a command with the file $2 as stdin, waiting at most $1 seconds (on timeout it leaves $TMP/late)
 limited() {
   secs=$1 in=$2
   shift 2
@@ -145,7 +158,7 @@ limited() {
   return $rc
 }
 
-# 话、状态、列表都在 jq 里拼($L 哪种话,$now 现在)
+# Messages, states and the list are all put together in jq ($L the language, $now the current time)
 DEFS=$(
   cat <<'JQ'
 def t($zh; $en): if $L == "zh" then $zh else $en end;
@@ -224,15 +237,15 @@ def rows($unset; $timer_off):
 JQ
 )
 
-# 一个 id 的文件用 jq 读一样东西:q <文件> <jq 表达式>
+# Read one thing from the file of an id with jq: q <FILE> <JQ-EXPR>
 q() { jq -r --arg L "$L" --argjson now "$NOW" "$DEFS $2" "$1"; }
-# 改一个 id 的文件:upd <id> [jq 的参数…] <jq 表达式>
+# Change the file of an id: upd <ID> [JQ-ARGS…] <JQ-EXPR>
 upd() {
   uf="$D/$1.json"
   shift
   jq "$@" "$uf" >"$uf.tmp" && mv "$uf.tmp" "$uf"
 }
-# 全部(先登记的在前)
+# All of them (earliest registered first)
 tasks() {
   set -- "$D"/*.json
   if [ -e "$1" ]; then jq -s 'map(select((.id // "") != "")) | sort_by(.created, .id)' "$@"; else echo '[]'; fi
@@ -240,9 +253,9 @@ tasks() {
 open_count() { tasks | jq '[.[] | select(.state == "waiting" or .state == "lost" or .state == "done")] | length'; }
 
 timer() { "$ACA_BIN" plugin timer "$1" "$SELF" >/dev/null 2>"$TMP/timer.err"; }
-# 都了结了关掉定时:没在等的就不再每 5 分钟起来
+# Once all are settled, turn the timer off: with nothing waiting, no more waking up every 5 minutes
 settle_timer() { [ "$(open_count)" != 0 ] || timer off; }
-# 定时开着没(aca 那头装上了)
+# Whether the timer is on (installed on the aca side)
 scheduled() { "$ACA_BIN" plugin timer --json 2>/dev/null | jq -r --arg id "$SELF" 'select(.id == $id) | .scheduled' | grep -qx true; }
 
 alone() {
@@ -250,12 +263,12 @@ alone() {
   printf '\n%s' "$(t '不在 aca 的会话中:结束时只有 server 的 Bark 通知,结果请在列表中查看。' "Not inside an aca session: when it ends there's only the server's Bark notification; see the result in the list.")"
 }
 
-# 登记一个 id:server 上记下,本机记下它是哪个会话的,开上定时。$ID 是它
+# Register an id: record it on the server, record locally which session it belongs to, turn the timer on. $ID is it
 register() {
   host=$(trim "$1") note=$(trim "$2") within=$3
   ID=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   [ ${#ID} -ge 16 ] || die "$(t '无法生成 id' "can't generate an id")"
-  # 会话的标题只是给列表看的,问不到不耽误
+  # The session title is only for the list; failing to get it holds nothing up
   title=
   [ -n "${ACA_SESSION_ID:-}" ] && title=$("$ACA_BIN" show "$ACA_SESSION_ID" --json 2>/dev/null | jq -r '.title // empty' 2>/dev/null)
   body=$(jq -nc --arg note "$note" --arg host "$host" --argjson within "$within" '{note: $note, host: $host, within: $within}')
@@ -270,12 +283,12 @@ register() {
     '{id: $id, note: $note, host: $host, created: $created, within: $within, session: $session, title: $title,
       log: "", state: "waiting", rc: null, ended: null, tail: "", told_lost: false, why: "", closed: 0}' >"$D/$ID.json.tmp" &&
     mv "$D/$ID.json.tmp" "$D/$ID.json" || die "$(t '无法记录' "can't record it")"
-  # 定时没开上不算登记失败:结果还在 server 上,手动取得到
+  # The timer not turning on does not fail the registration: the result is still on the server and can be fetched by hand
   timer on || printf '%s%s%s\n' "$(t '! 定时任务未能开启:' '! the timer did not turn on: ')" "$(head -n 1 "$TMP/timer.err")" \
     "$(t '(需要手动获取结果:aca plugin run aca.remote.collect)' ' (fetch the result by hand: aca plugin run aca.remote.collect)')" >&2
 }
 
-# 不要了:还在等的先在 server 上删掉,再删本机的
+# Drop it: if still waiting, delete it on the server first, then locally
 forget() {
   ff="$D/$1.json"
   case $(jq -r .state "$ff") in
@@ -294,9 +307,12 @@ forget() {
   settle_timer
 }
 
-# 交给远端的脚本:把命令存成文件,起一个后台的包装 —— 跑命令、等它结束、把退出码和日志末尾发给 server
-# (发不出去隔一阵再试,一共试半天)。包装收到 TERM / HUP 会转给命令(有 setsid 的机器上连它起的子进程一起)、照样回调;
-# 被 kill -9、机器重启就回调不了(失联)。地址不上命令行(同机器的别人 ps 看得到),文件都只有自己能读
+# The script handed to the remote: save the command as a file and start a background wrapper — it runs the command, waits for
+# it to end, and sends the exit code and the tail of the log to the server
+# (if that cannot be sent, it retries after a while, for half a day in all). On TERM / HUP the wrapper passes the signal on to
+# the command (on machines with setsid, together with the child processes it started) and still calls back;
+# after kill -9 or a machine reboot there is no callback (lost). The address never goes on the command line (other users on
+# the same machine can see it with ps), and the files are readable only by their owner
 launch_script() {
   id=$1 url=$2 cmd=$3 end="ACA_$1_END"
   cat <<EOF
@@ -355,7 +371,7 @@ cmd_run() {
     else
       e=$(cat "$TMP/ssh.out" "$TMP/ssh.err" | grep -v '^[[:space:]]*$' | head -n 1)
     fi
-    # 没跑起来:把刚登记的撤掉
+    # It did not start: undo the registration just made
     forget "$ID" 2>/dev/null
     die "$(t "无法在 $host 上启动:" "didn't start on $host: ")$e"
   fi
@@ -418,8 +434,9 @@ cmd_rm() {
   echo
 }
 
-# 去取的时候占着的锁:定时起的和手动的(列表里按 r)撞上了,后来的那个不做 —— 不然同一个结果各发一遍。
-# 占着的被杀了锁会留下,过了 LOCK_STALE 的当它没人要
+# The lock held while fetching: when one started by the timer and a manual one (r in the list) collide, the later one does
+# nothing — otherwise the same result would be sent twice.
+# If the holder is killed, the lock stays behind; one older than LOCK_STALE is treated as unclaimed
 lock() {
   if (set -C && printf '%s' "$NOW" >"$D/.lock") 2>/dev/null; then
     LOCKED=1
@@ -434,7 +451,8 @@ lock() {
 
 report() { printf '%s\n' "$1" >>"$TMP/report"; }
 
-# 照 server 的清单更新本机的:结束的把结果存下再 ack(存不下就不 ack,下次还取得到)
+# Update the local tasks from the server list: for finished ones, save the result, then ack (if it cannot be saved, no ack, so
+# the next fetch still gets it)
 pull() {
   cp "$TMP/body" "$TMP/hooks.json"
   for f in "$D"/*.json; do
@@ -444,13 +462,14 @@ pull() {
     case $st in waiting | lost) ;; *) continue ;; esac
     jq -c --arg id "$id" '[.hooks[]? | select(.id == $id)][0] // empty' "$TMP/hooks.json" >"$TMP/r"
     if [ ! -s "$TMP/r" ]; then
-      # server 上没有它了(在别处取走 / 删掉了,或者 server 的数据没了)
+      # The server no longer has it (fetched / deleted elsewhere, or the server lost its data)
       upd "$id" --arg why "$(t 'server 上已没有这个 id' 'the server no longer has this id')" '.state = "kept" | .why = $why'
       continue
     fi
     case $(jq -r .state "$TMP/r") in
       done)
-        # 两台机器的钟不一定对得上:耗时用 server 那边结束减登记,接在本机登记的时刻后面
+        # The clocks of the two machines may not agree: the duration is end minus registration on the server side, added to the local
+        # registration time
         upd "$id" --slurpfile r "$TMP/r" --argjson now "$NOW" '$r[0] as $r | .state = "done" | .rc = $r.rc | .tail = ($r.tail // "")
           | .ended = (if ($r.ended | type) == "number" and ($r.created | type) == "number"
                       then .created + ([$r.ended - $r.created, 0] | max | floor) else $now end)' &&
@@ -461,10 +480,11 @@ pull() {
   done
 }
 
-# 发进会话的收件箱。发件人是「你」(不是哪个会话):列表上高亮着的、调工具的那个会话不算
+# Send to the inbox of a session. The sender is "you" (not some session): neither the session highlighted in the list nor the
+# one calling the tool counts
 send() { ACA_SESSION_ID='' "$ACA_BIN" msg "$1" <"$2" >/dev/null 2>"$TMP/msg.err"; }
 
-# 把结束的发进会话
+# Send finished ones into their sessions
 deliver() {
   df="$D/$1.json"
   s=$(jq -r .session "$df")
@@ -480,7 +500,7 @@ deliver() {
     fi
     why=$(grep -v '^[[:space:]]*$' "$TMP/msg.err" | head -n 1)
     if "$ACA_BIN" show "$s" >/dev/null 2>&1; then
-      # 会话还在,只是这次没成:下次去取时再试,一天都没成就不试了
+      # The session is still there, it just failed this time: retry on the next fetch, and give up after a day of failures
       if [ $((NOW - $(jq -r '.ended // 0' "$df"))) -le $GIVE_UP ]; then
         upd "$1" --arg why "$why" '.why = $why'
         return
@@ -522,7 +542,7 @@ cmd_collect() {
       done) deliver "$id" ;;
       lost)
         if [ "$(jq -r .told_lost "$f")" != true ]; then
-          # 告诉会话一次;发没发成都不再发(server 的 Bark 已经提醒过人了)
+          # Tell the session once; whether or not it got through, no resending (the server already alerted the person through Bark)
           s=$(jq -r .session "$f")
           if [ -n "$s" ]; then
             q "$f" lost_msg >"$TMP/msg"
@@ -536,11 +556,12 @@ cmd_collect() {
         fi
         ;;
     esac
-    # 刚了结的记下时刻;了结很久的清掉
+    # Note the time for ones just settled; clear out ones settled long ago
     upd "$id" --argjson now "$NOW" 'if (.state == "sent" or .state == "kept") and .closed == 0 then .closed = $now else . end'
     if [ "$(jq --argjson now "$NOW" '.closed > 0 and $now - .closed > '"$KEEP" "$f")" = true ]; then rm -f "$f"; fi
   done
-  # 关定时放最后、锁先放:去取的这一次要是定时起的,aca 等它跑完才卸
+  # Turn the timer off last, release the lock first: if this fetch was started by the timer, aca waits for it to finish before
+  # taking the timer down
   rm -f "$D/.lock"
   LOCKED=
   settle_timer
@@ -550,11 +571,12 @@ cmd_collect() {
     return
   fi
   cat "$TMP/report"
-  # 定时跑的时候断网是常事:说一句,不算失败
+  # Being offline during a timed run is common: say so, it does not count as a failure
   [ -z "$offline" ] || printf '%s%s\n' "$(t '本次未获取到:' 'nothing fetched this time: ')" "$offline"
 }
 
-# 先问 /ping(不要口令,新的 jobhook 报出名字和版本),再拿管理口令列一次它那边还没取走的:连得上、口令对才算成
+# Ask /ping first (no token needed; a newer jobhook reports its name and version), then list once, with the admin token, what
+# has not been fetched there yet: it passes only if it connects and the token is right
 cmd_check() {
   need_conf
   not_it=$(t '这个地址指向的是 jobhook 吗' 'is jobhook behind this address?')

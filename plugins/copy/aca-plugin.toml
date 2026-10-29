@@ -6,13 +6,15 @@ needs = ["fzf"]
 description = "按一个键,从最后一条回复中选出命令或代码块并复制"
 description_en = "One key picks a command or code block from the last reply and copies it."
 
-# 整个功能在 copy.sh 里,aca 里没有它的代码。不认屏幕(屏幕上的代码块没有记号,长的还折了行),认回复的原文:
-# ``` 围起来的代码块整块给,行内的 `…` 默认只要带空格的。只认出一条就直接复制,多了才弹出来挑(数字键)。
+# The whole feature is in copy.sh; aca has no code for it. It reads the original text of the reply, not the screen (code blocks
+# on screen carry no markers, and long ones are wrapped): a block fenced with ``` is taken whole; inline `…` only when it has
+# a space in it, by default. If only one is found it's copied right away; only with several does a picker pop up (number keys).
 #
-# 在会话里按 Ctrl+Alt+Y(往上翻着看的时候也行;y = yank,和 : 菜单里的 y 一个字母)。这是个热键:aca 把它绑在 tmux 上,
-# 只在 aca 的会话里拦;装上就有,停掉、删掉插件它就解了,不用动 tmux.conf。
-#   换一个键:aca plugin hotkey aca.copy pick M-y        不要键:aca plugin hotkey aca.copy pick --none
-# 想按终端自己的键(tmux 收不到 cmd):让终端把它换成这个键发过来。kitty.conf:
+# Press Ctrl+Alt+Y inside a session (also while scrolled up; y = yank, the same letter as y in the : menu). It's a hotkey: aca
+# binds it in tmux and intercepts it only in aca's sessions; it's there once installed, and stopping or deleting the plugin
+# unbinds it, with no change to tmux.conf.
+#   Another key: aca plugin hotkey aca.copy pick M-y        No key: aca plugin hotkey aca.copy pick --none
+# To use a key of the terminal itself (tmux doesn't receive cmd): have the terminal send this key in its place. kitty.conf:
 #   map cmd+shift+c send_text all \x1b\x19
 
 [settings.inline]
@@ -50,12 +52,12 @@ contexts = ["session"]
 input = "reply"
 command = ["sh", "copy.sh", "list"]
 
-# 在会话里面直接按
+# Pressed directly inside a session
 [[hotkeys]]
 key = "C-M-y"
 run = "pick"
 
-# 界面的 : 菜单里
+# In the : menu of the UI
 [[keys]]
 key = "y"
 run = "pick"

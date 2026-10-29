@@ -1,22 +1,30 @@
-//! Claude 的对话记录 → `trace` 的树。规则是 2026-09 在本机 440 份记录(2.1.141–2.1.285)上实测的:
-//! - 一轮:`user` 行,`origin.kind` 是 human / task-notification / peer / coordinator,内容里没有 tool_result
-//!   (老记录没有 origin,按内容认);`system/turn_duration` 的 durationMs 是这一轮的耗时。
-//!   没人回应就被重打的提问(没有后代)丢掉,只留后面那句
-//! - 一次调用:同一个 message.id 的几行(一行一个内容块),usage / stop_reason 取最后一行(输出数只增不减);
-//!   从第一块的上一行(工具结果 / 提问)算起,到最后一块为止
-//! - 工具:tool_use.id ↔ tool_result.tool_use_id,挂在发起它的那次调用下(按 message.id 分,不顺 parentUuid:
-//!   并行工具、流式块会让它分叉);钩子的耗时在 hook_success 附件里
-//! - model 是 `<synthetic>` 且 isApiErrorMessage 的是 API 出错,不算调用
-//! - resume / 继续时新文件开头抄了旧文件的尾巴(uuid、时间戳照旧):文件开头连着的、比文件创建早 2 秒以上的对话行。
-//!   不能看 session_id ≠ sessionId —— session_id 是写这一行的进程的会话 id,resume 之后接着写的新行也不一样
-//!   (本机 13 份记录 5,704 行);开头那一两行会话启动的钩子附件也会早几秒,附件不算
-//! - 压缩:`system/compact_boundary`,只画一行(压缩那次调用本身不写进记录)
-//! - 子代理:`<会话 id>/subagents/agent-<id>.jsonl`,旁边的 `.meta.json` 写着类型、说明、是哪个 Agent 工具起的(toolUseId),
-//!   嵌套的还有 parentAgentId(那个工具在上一层子代理的记录里)。本机 175 个全挂得回去。
-//!   现在的 Agent 多是后台跑:工具马上返回,跑完了在父会话里来一条 task-notification(task-id = agentId,带 status)。
-//!   fork 出来的子代理第一行是 fork-context-ref(接着父对话,父对话的行不抄进来)
+//! Claude's conversation record -> the `trace` tree. The rules were tested in 2026-09 on this machine's 440 records
+//! (2.1.141-2.1.285):
+//! - A turn: a `user` line whose `origin.kind` is human / task-notification / peer / coordinator, with no tool_result in
+//!   the content (old records have no origin and are recognized by content); `system/turn_duration`'s durationMs is the
+//!   turn's duration.
+//!   A prompt retyped before anything answered it (no descendants) is dropped, only the later one is kept
+//! - A call: the lines with the same message.id (one content block per line), usage / stop_reason taken from the last line
+//!   (the output count only grows); counted from the line before the first block (tool result / prompt) to the last block
+//! - A tool: tool_use.id <-> tool_result.tool_use_id, attached under the call that issued it (split by message.id, not by
+//!   following parentUuid: parallel tools and streamed blocks make that fork); hook time is in the hook_success attachment
+//! - model `<synthetic>` with isApiErrorMessage is an API error, not a call
+//! - On resume / continue the new file starts with a copy of the old file's tail (uuids, timestamps unchanged): the
+//!   consecutive conversation lines at the start of the file that are more than 2 seconds older than the file's creation.
+//!   session_id != sessionId can't be used: session_id is the session id of the process writing that line, and new lines
+//!   written after a resume differ too (13 records, 5,704 lines on this machine); the session-start hook attachments in
+//!   the first line or two are also a few seconds early, but attachments don't count
+//! - Compaction: `system/compact_boundary`, drawn as one line (the compaction call itself isn't written to the record)
+//! - Subagents: `<session id>/subagents/agent-<id>.jsonl`; the `.meta.json` next to it has the type, description, and
+//!   which Agent tool started it (toolUseId), plus parentAgentId for nested ones (that tool is in the parent subagent's
+//!   record). All 175 on this machine attach back.
+//!   Agents now mostly run in the background: the tool returns right away, and when done a task-notification arrives in
+//!   the parent session (task-id = agentId, with status).
+//!   A forked subagent's first line is fork-context-ref (it continues the parent conversation; the parent's lines aren't
+//!   copied in)
 //!
-//! 大字段(内容块、工具结果、附件)用 RawValue 跳过,不展开 base64(最长的一行有好几 MB)。
+//! Large fields (content blocks, tool results, attachments) are skipped with RawValue, base64 is not expanded (the longest
+//! line is several MB).
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -137,7 +145,7 @@ struct OutDetails {
     thinking_tokens: Option<u64>,
 }
 
-/// 工具输入里摘要要用的几个字段(别的,比如 Write 的整份内容,跳过不读)
+/// The few tool input fields the summary needs (the rest, like Write's whole content, are skipped)
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Input {
@@ -170,7 +178,7 @@ fn key(s: &str) -> u64 {
     h.finish()
 }
 
-/// <name>…</name> 里的字
+/// The text inside <name>…</name>
 fn tag<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     let open = format!("<{name}>");
     let start = s.find(&open)? + open.len();
@@ -178,7 +186,7 @@ fn tag<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     Some(s[start..end].trim())
 }
 
-/// 一行记录
+/// One record line
 pub(crate) fn line(t: &mut Trace, buf: &[u8], off: u64) {
     let Ok(r) = serde_json::from_slice::<Rec>(buf) else { return };
     let ts = r.timestamp.as_deref().map_or(0, ts_ms);
@@ -199,7 +207,7 @@ pub(crate) fn line(t: &mut Trace, buf: &[u8], off: u64) {
         Some("assistant") => assistant(t, &r, ts, src, copied),
         Some("system") => system(t, &r, ts, copied),
         Some("attachment") => attachment(t, &r),
-        // fork 出来的子代理:接着父对话往下干(父对话的行没抄进来)
+        // A forked subagent: carries on from the parent conversation (the parent's lines weren't copied in)
         Some("fork-context-ref") => {
             let i = t.add_top(Kind::Mark, ts, false);
             t.nodes[i].label = t!("上一段在父对话里", "earlier: in the parent conversation").into();
@@ -243,7 +251,7 @@ fn user(t: &mut Trace, r: &Rec, ts: i64, src: (u64, u32), copied: bool) {
     prompt(t, r, &text, ts, src, copied);
 }
 
-/// 工具的结果回来了
+/// A tool's result came back
 fn result(t: &mut Trace, r: &Rec, b: &Block, ts: i64, src: (u64, u32)) {
     let Some(&i) = b.tool_use_id.as_ref().and_then(|id| t.tools.get(id)) else { return };
     let interrupted = r.result.is_some_and(|x| x.get().contains("\"interrupted\":true"));
@@ -258,7 +266,7 @@ fn result(t: &mut Trace, r: &Rec, b: &Block, ts: i64, src: (u64, u32)) {
     n.src.push(src);
 }
 
-/// 用户这边的一句话:新的一轮,或者命令、打断
+/// A message from the user side: a new turn, or a command, an interrupt
 fn prompt(t: &mut Trace, r: &Rec, text: &str, ts: i64, src: (u64, u32), copied: bool) {
     if r.meta == Some(true) {
         return;
@@ -271,7 +279,7 @@ fn prompt(t: &mut Trace, r: &Rec, text: &str, ts: i64, src: (u64, u32), copied: 
         }
         return;
     }
-    // 命令的输出、说明:不是一轮
+    // Command output, notes: not a turn
     if ["<local-command-", "<bash-stdout>", "<bash-stderr>"].iter().any(|p| text.starts_with(p)) {
         return;
     }
@@ -281,7 +289,7 @@ fn prompt(t: &mut Trace, r: &Rec, text: &str, ts: i64, src: (u64, u32), copied: 
     } else if let Some(cmd) = tag(text, "bash-input") {
         ("!".to_string(), first_line(&format!("! {cmd}"), LABEL))
     } else if text.contains("<task-notification>") {
-        // 后台的子代理 / 命令跑完了:记下是哪个、怎么结束的
+        // A background subagent / command finished: record which one and how it ended
         if let Some(id) = tag(text, "task-id") {
             let st = match tag(text, "status") {
                 Some("failed") => St::Err,
@@ -308,7 +316,8 @@ fn prompt(t: &mut Trace, r: &Rec, text: &str, ts: i64, src: (u64, u32), copied: 
     t.turn = Some(i);
 }
 
-/// 上一句没人回应(没有调用、没结束)就又来了一句:那是重打的,丢掉上一句
+/// Another message came before anything answered the previous one (no calls, not finished): it was retyped, drop the
+/// previous one
 fn drop_abandoned(t: &mut Trace) {
     let Some(cur) = t.turn else { return };
     let n = &t.nodes[cur];
@@ -322,7 +331,7 @@ fn drop_abandoned(t: &mut Trace) {
     t.turn = None;
 }
 
-/// 现在这一轮;没有(记录从半截开始)就补一个
+/// The current turn; if there is none (the record starts halfway), make one up
 fn cur_turn(t: &mut Trace, ts: i64, copied: bool) -> usize {
     match t.turn {
         Some(x) if t.nodes[x].copied == copied => x,
@@ -363,7 +372,7 @@ fn assistant(t: &mut Trace, r: &Rec, ts: i64, src: (u64, u32), copied: bool) {
             n.id.clone_from(&id);
             n.model = mi;
             t.calls.insert(id, c);
-            // 前面出过错、这次成了:是重试成功,这一轮不算出错
+            // An error earlier, success this time: a retry succeeded, so the turn doesn't count as an error
             if t.nodes[turn].state == St::Err {
                 t.nodes[turn].state = St::Ok;
             }
@@ -381,7 +390,7 @@ fn assistant(t: &mut Trace, r: &Rec, ts: i64, src: (u64, u32), copied: bool) {
             n.stop.clone_from(s);
         }
         if let Some(u) = &m.usage {
-            // 老记录没有分 5 分钟 / 1 小时,算 5 分钟的(同 usage.rs)
+            // Old records don't split 5 minutes / 1 hour; counted as 5 minutes (same as usage.rs)
             let (w5, w1) = match &u.cache_creation {
                 Some(c) if c.ephemeral_5m_input_tokens.unwrap_or(0) + c.ephemeral_1h_input_tokens.unwrap_or(0) > 0 => {
                     (c.ephemeral_5m_input_tokens.unwrap_or(0), c.ephemeral_1h_input_tokens.unwrap_or(0))
@@ -472,8 +481,10 @@ struct Meta {
     parent: Option<String>,
 }
 
-/// 找新的子代理,挂到起它的那个 Agent 工具下(最上面那份记录找;嵌套的挂进上一层子代理的那份)。
-/// 起它的工具还没读到、记录还没写出来的,下次再找。有新挂上的返回 true
+/// Find new subagents and attach each under the Agent tool that started it (searched from the top-level record; nested
+/// ones go into the parent subagent's record).
+/// Those whose starting tool hasn't been read yet, or whose record isn't written yet, are tried again next time. Returns
+/// true if any new ones were attached
 pub(crate) fn find_subs(t: &mut Trace) -> bool {
     if t.is_sub {
         return false;
@@ -492,7 +503,7 @@ pub(crate) fn find_subs(t: &mut Trace) -> bool {
         }
     }
     let mut grew = false;
-    // 上一层的先挂上,嵌套的才找得到它
+    // Attach the outer level first so nested ones can find it
     loop {
         let before = metas.len();
         metas.retain(|(id, m)| !attach(t, id, m, &dir));
@@ -504,7 +515,8 @@ pub(crate) fn find_subs(t: &mut Trace) -> bool {
     grew
 }
 
-/// 一个子代理挂上去:找到起它的工具(在最上面那份,或者 parentAgentId 那个子代理的记录里),读它的记录
+/// Attach one subagent: find the tool that started it (in the top-level record, or in the record of the parentAgentId
+/// subagent), read its record
 fn attach(root: &mut Trace, id: &str, m: &Meta, dir: &std::path::Path) -> bool {
     let path = match &m.parent {
         Some(p) => match sub_path(root, p) {
@@ -527,7 +539,7 @@ fn attach(root: &mut Trace, id: &str, m: &Meta, dir: &std::path::Path) -> bool {
     true
 }
 
-/// 某个子代理在第几层:一路上起它的那些工具
+/// Where a subagent sits: the tools along the way that started it
 fn sub_path(t: &Trace, id: &str) -> Option<Vec<usize>> {
     for (i, n) in t.nodes.iter().enumerate() {
         let Some(s) = n.sub.and_then(|k| t.subs.get(k)) else { continue };
@@ -552,7 +564,8 @@ fn at_mut<'a>(t: &'a mut Trace, path: &[usize]) -> &'a mut Trace {
     }
 }
 
-/// 工具的一句话摘要:Bash 写命令、读写文件写路径、搜索写词、MCP 写「服务 · 工具」
+/// A tool's one-line summary: the command for Bash, the path for file reads / writes, the term for searches, "server ·
+/// tool" for MCP
 fn tool_label(name: &str, i: &Input, cwd: &str) -> String {
     let path = || i.file_path.as_deref().or(i.notebook_path.as_deref()).or(i.path.as_deref()).map(|p| short_path(p, cwd));
     let s = match name {
@@ -580,9 +593,9 @@ fn tool_label(name: &str, i: &Input, cwd: &str) -> String {
     s.map(|x| first_line(&x, LABEL)).unwrap_or_default()
 }
 
-// ---------- 读回来的内容(排成字在 trace_page) ----------
+// ---------- Content read back (laid out as text in trace_page) ----------
 
-/// 内容块:字符串或者块的数组
+/// Content blocks: a string or an array of blocks
 fn blocks(content: &Value) -> Vec<Value> {
     match content {
         Value::String(s) => vec![serde_json::json!({ "type": "text", "text": s })],
@@ -591,7 +604,7 @@ fn blocks(content: &Value) -> Vec<Value> {
     }
 }
 
-/// 块里的字;图片写成 [图片]
+/// The text in the blocks; images are written as [image]
 fn text_of(content: &Value) -> String {
     let mut out = vec![];
     for b in blocks(content) {
@@ -614,12 +627,12 @@ fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
 
-/// 读回这个节点记下的几行
+/// Read back the lines this node recorded
 fn lines_of(t: &Trace, n: &Node) -> Vec<Value> {
     n.src.iter().filter_map(|&x| t.read_at(x)).collect()
 }
 
-/// 一次调用想的、说的(一块一段)
+/// What a call thought and said (one paragraph per block)
 pub(crate) fn said(t: &Trace, n: &Node) -> (Vec<String>, Vec<String>) {
     let (mut thought, mut text) = (vec![], vec![]);
     for v in lines_of(t, n) {
@@ -637,7 +650,8 @@ pub(crate) fn said(t: &Trace, n: &Node) -> (Vec<String>, Vec<String>) {
     (thought, text)
 }
 
-/// 谁问的、问了什么:提问是原文,命令、后台任务的通知写摘要。记录从一轮中间开始的(补出来的那轮)谁也不是
+/// Who asked and what: a prompt is the original text, commands and background task notifications get a summary. When the
+/// record starts mid-turn (the made-up turn) it's nobody
 pub(crate) fn asked(t: &Trace, n: &Node) -> (Asker, String) {
     if let Some(what) = n.label.strip_prefix('↩') {
         return (Asker::Notice, what.trim().to_string());
@@ -651,12 +665,12 @@ pub(crate) fn asked(t: &Trace, n: &Node) -> (Asker, String) {
     }
 }
 
-/// API 出错那条假回复里写的
+/// What the fake reply for an API error says
 pub(crate) fn fail_text(t: &Trace, n: &Node) -> String {
     n.src.first().and_then(|&x| t.read_at(x)).map(|v| text_of(&content(&v))).unwrap_or_default()
 }
 
-/// 缓存为什么没命中(记录里写了才有),说成话;不认得的照写
+/// Why the cache missed (only when the record says), put into words; unknown ones are written as is
 pub(crate) fn call_note(t: &Trace, n: &Node) -> Option<String> {
     let last = t.read_at(*n.src.last()?)?;
     let why = match last.pointer("/message/diagnostics/cache_miss_reason/type")?.as_str()? {
@@ -672,27 +686,28 @@ pub(crate) fn call_note(t: &Trace, n: &Node) -> Option<String> {
     Some(tr!("缓存未命中:{why}", "cache miss: {why}"))
 }
 
-/// 工具发起时的输入
+/// The input the tool was issued with
 fn tool_input(t: &Trace, n: &Node) -> Option<Value> {
     let v = t.read_at(*n.src.first()?)?;
     blocks(&content(&v)).into_iter().find(|b| b.get("id").and_then(Value::as_str) == Some(n.id.as_str()))?.get("input").cloned()
 }
 
-/// 工具的结果那一整行(toolUseResult 里有改动)
+/// The whole line with the tool's result (toolUseResult has the changes)
 fn tool_result(t: &Trace, n: &Node) -> Option<Value> {
     t.read_at(*n.src.get(1)?)
 }
 
-/// 结果那行里给这个工具的字
+/// The text for this tool in the result line
 fn result_text(v: &Value, id: &str) -> Option<String> {
     let b = blocks(&content(v)).into_iter().find(|b| b.get("tool_use_id").and_then(Value::as_str) == Some(id))?;
     Some(text_of(b.get("content").unwrap_or(&Value::Null)))
 }
 
-/// 改文件的工具:底下露改动,不露输出(输出只是「改好了」)
+/// Tools that change files: show the changes below, not the output (the output just says "done")
 const FILE_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
-/// 一个工具的内容:Bash 是命令,改文件的是改动,Read 是读到的文件内容,别的是整理过的 JSON 输入;都有输出
+/// A tool's content: the command for Bash, the changes for file-changing tools, the file content read for Read, the
+/// tidied JSON input for the rest; all have output
 pub(crate) fn io(t: &Trace, n: &Node) -> Io {
     let inp = tool_input(t, n);
     let res = tool_result(t, n);
@@ -702,7 +717,7 @@ pub(crate) fn io(t: &Trace, n: &Node) -> Io {
     let mut io = Io::default();
     if FILE_TOOLS.contains(&n.name.as_str()) {
         let ch = changes(&n.name, inp.as_ref(), res.as_ref());
-        // e 停在改完的第一行
+        // e stops at the first changed line
         let line = ch.iter().find(|c| c.c == '+').or_else(|| ch.iter().find(|c| c.c == '-')).and_then(|c| c.no).unwrap_or(1);
         io.file = Some((path.clone(), line));
         io.edits = vec![(path.clone(), ch)];
@@ -723,8 +738,8 @@ pub(crate) fn io(t: &Trace, n: &Node) -> Io {
     io
 }
 
-/// Edit / Write 改了什么。结果里有 structuredPatch 就用它(带上下文、行号);
-/// 没有的(新建的文件、被拒的、还没结果的)拿输入比,头尾相同的行不列
+/// What Edit / Write changed. If the result has a structuredPatch, use it (with context, line numbers);
+/// otherwise (new files, denied, no result yet) compare the input, leaving out identical leading and trailing lines
 pub(crate) fn changes(name: &str, inp: Option<&Value>, res: Option<&Value>) -> Vec<Change> {
     let ch = |c, no, text: &str| Change { c, no, text: text.to_string() };
     let hunks = res.and_then(|r| r.pointer("/toolUseResult/structuredPatch")).and_then(Value::as_array).filter(|h| !h.is_empty());
@@ -757,7 +772,8 @@ pub(crate) fn changes(name: &str, inp: Option<&Value>, res: Option<&Value>) -> V
     }
 }
 
-/// 一处改动的几行(" 上下文" / "-删的" / "+加的"),从原来的第 old 行、改完的第 new 行起
+/// The lines of one hunk (" context" / "-removed" / "+added"), starting at line old of the original and line new of the
+/// result
 pub(crate) fn hunk<'a>(mut old: u64, mut new: u64, lines: impl Iterator<Item = &'a str>) -> Vec<Change> {
     let mut out = vec![];
     for l in lines {
@@ -771,7 +787,7 @@ pub(crate) fn hunk<'a>(mut old: u64, mut new: u64, lines: impl Iterator<Item = &
                 out.push(Change { c: '+', no: Some(new), text: cs.as_str().to_string() });
                 new += 1;
             }
-            // 「\ No newline at end of file」
+            // "\ No newline at end of file"
             Some('\\') => {}
             _ => {
                 out.push(Change { c: ' ', no: Some(new), text: cs.as_str().to_string() });
@@ -783,7 +799,7 @@ pub(crate) fn hunk<'a>(mut old: u64, mut new: u64, lines: impl Iterator<Item = &
     out
 }
 
-/// 新旧两段:头尾相同的行不列(不知道在第几行)
+/// Old and new text: identical leading and trailing lines are left out (line numbers unknown)
 fn pair(old: &str, new: &str) -> Vec<Change> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
@@ -793,7 +809,8 @@ fn pair(old: &str, new: &str) -> Vec<Change> {
     a[head..a.len() - tail].iter().map(line('-')).chain(b[head..b.len() - tail].iter().map(line('+'))).collect()
 }
 
-/// Read 的结果是「行号<Tab>内容」:拆成 (行号, 内容);后面跟的提示不是文件内容,不要
+/// Read's result is "line number<Tab>content": split into (line number, content); the hint that follows isn't file
+/// content and is dropped
 fn numbered(text: &str) -> Vec<(u64, String)> {
     let mut out = vec![];
     for l in text.lines() {
@@ -818,7 +835,7 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use unicode_width::UnicodeWidthStr;
 
-    /// 测试用的记录文件(每个测试一份)
+    /// A record file for tests (one per test)
     pub(crate) fn file(name: &str, lines: &[Value]) -> PathBuf {
         let d = std::env::temp_dir().join(format!("aca-trace-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -863,12 +880,13 @@ pub(crate) mod tests {
                "sessionId": "s1", "durationMs": dur})
     }
 
-    /// born = 0:不找抄过来的(测试记录的时间戳都比文件早)
+    /// born = 0: don't look for copied lines (test record timestamps are all older than the file)
     fn open(name: &str, lines: &[Value]) -> Trace {
         Trace::open_born(file(name, lines), Agent::Claude, 0).unwrap()
     }
 
-    /// 界面测试用的一段:抄过来的一轮、正常的一轮(工具 + 结束)、压缩、API 出错的一轮、还在跑的一轮
+    /// A stretch for interface tests: a copied turn, a normal turn (tools + end), a compaction, a turn with an API error,
+    /// a turn still running
     pub(crate) fn fixture(name: &str) -> (Trace, PathBuf) {
         let lines = vec![
             json!({"type": "system", "subtype": "compact_boundary", "uuid": "cb", "parentUuid": null, "timestamp": at(0), "sessionId": "s1",
@@ -953,7 +971,8 @@ pub(crate) mod tests {
         t.nodes[i].kids.iter().map(|&k| t.nodes[k].kind).collect()
     }
 
-    /// 起了后台子代理的一段:第一轮起两个(一个 Explore,一个 fork),Explore 里又起了一个;跑完了来一条通知开第二轮
+    /// A stretch that starts background subagents: the first turn starts two (an Explore, a fork), and Explore starts one
+    /// more; when done, a notification starts the second turn
     pub(crate) fn with_subs(name: &str) -> (PathBuf, Vec<Value>, Vec<Value>) {
         let agent = |id: &str, kind: &str, desc: &str| json!({"type": "tool_use", "id": id, "name": "Agent", "input": {"subagent_type": kind, "description": desc, "prompt": "找出所有 width( 的调用"}});
         let launched = |uuid: &str, parent: &str, ms: u32, tool: &str, agent: &str| {
@@ -1011,7 +1030,7 @@ pub(crate) mod tests {
                 ),
             ],
         );
-        // 嵌套的:起它的工具在 a1 的记录里
+        // Nested: the tool that started it is in a1's record
         write(
             "a2",
             json!({"agentType": "general-purpose", "description": "细看 ui.rs", "toolUseId": "ag2", "parentAgentId": "a1", "spawnDepth": 2}),
@@ -1020,7 +1039,7 @@ pub(crate) mod tests {
                 reply("t2", "t1", 3050, "y1", json!({"type": "text", "text": "ui.rs 里有 2 处"}), 60, Some("end_turn")),
             ],
         );
-        // fork 出来的:第一行是 fork-context-ref
+        // Forked: the first line is fork-context-ref
         write(
             "a3",
             json!({"agentType": "fork", "description": "接着想", "toolUseId": "ag3", "spawnDepth": 1, "isFork": true}),
@@ -1046,18 +1065,18 @@ pub(crate) mod tests {
         let (ag1, ag3) = (t.nodes[call].kids[0], t.nodes[call].kids[1]);
         let s1 = t.sub_of(ag1).expect("Explore 挂在 ag1 下");
         assert_eq!((s1.kind.as_str(), s1.desc.as_str(), s1.t.is_sub), ("Explore", "找 width", true));
-        // 嵌套的挂进 a1 自己的记录,不在最上面这层
+        // The nested one goes into a1's own record, not the top level
         assert_eq!(t.subs.len(), 2);
         let ag2 = s1.t.nodes[s1.t.nodes[s1.t.roots[0]].kids[0]].kids[0];
         assert_eq!(s1.t.sub_of(ag2).map(|s| s.kind.as_str()), Some("general-purpose"));
-        // fork 出来的开头一行「上一段在父对话里」
+        // The forked one starts with a 「上一段在父对话里」 (earlier: in the parent conversation) row
         let s3 = t.sub_of(ag3).unwrap();
         assert_eq!((s3.t.nodes[s3.t.roots[0]].kind, s3.t.nodes[s3.t.roots[0]].label.as_str()), (Kind::Mark, "上一段在父对话里"));
-        // 子代理收到的是任务;干完了、也收到了通知:不在跑
+        // What the subagent receives is a task; finished and notified: not running
         assert_eq!(crate::trace::asked(&s1.t, s1.t.roots[0]), ("任务", "找出所有 width( 的调用".to_string()));
         assert!(!t.sub_live(ag1, true, ts_ms(&at(30_000))) && !t.sub_live(ag3, true, ts_ms(&at(30_000))));
         assert_eq!(t.sub_dur(ag1, false, 0), 9000 - 2050);
-        // 钱:四份记录 $ 读出来的加起来;子代理的算进起它的那一轮
+        // Cost: what $ reads from the four records, added up; a subagent's counts in the turn that started it
         let bill = |files: &[&str]| -> f64 {
             files
                 .iter()
@@ -1068,11 +1087,11 @@ pub(crate) mod tests {
         let subs = bill(&["s1/subagents/agent-a1.jsonl", "s1/subagents/agent-a2.jsonl", "s1/subagents/agent-a3.jsonl"]);
         let (turns, _, all) = t.total(false, 0);
         assert!((all.cost - bill(&["s1.jsonl"]) - subs).abs() < 1e-12, "{} vs {}", all.cost, bill(&["s1.jsonl"]) + subs);
-        // 第一轮:自己的两次调用 + 三个子代理(连嵌套的)的钱
+        // First turn: its own two calls + the cost of three subagents (including the nested one)
         let s = t.sum(turn);
         assert_eq!((turns, s.calls, s.subs), (2, 2, 3));
         assert!((s.sub_cost - subs).abs() < 1e-12 && (s.cost + t.sum(t.roots[1]).cost - all.cost).abs() < 1e-12);
-        // 右边:Agent 那一步写子代理的数字,底下露它最后说的前 3 行
+        // Right side: the Agent step shows the subagent's numbers, with the first 3 lines of what it said last below
         let plain = |ps: &[crate::trace::Para], w: usize| {
             crate::trace::wrap(ps, w).iter().map(|l| crate::ansi::plain(l).trim_end().to_string()).collect::<Vec<_>>()
         };
@@ -1080,12 +1099,12 @@ pub(crate) mod tests {
         let text = plain(&ps, 80);
         assert!(fold && text[0].starts_with("▸ Agent Explore · 找 width") && text[0].contains("3 调用 · $"), "{text:#?}");
         assert_eq!(&text[1..], ["  找到 4 处:", "  src/bill.rs:12", "  src/ui.rs:88", "  … 还有 2 行"]);
-        // 几个子代理写在右栏这一轮的头上,左栏底下只有时刻、时长、钱
+        // The number of subagents is in the turn's heading in the right pane; under the left pane only time, duration, cost
         let head = plain(&steps(&t, turn, false, 0, &|_| false)[0].paras, 80);
         assert!(head[0].contains(" · 3 子代理 · "), "{head:?}");
         let c = crate::trace::chat(&t, turn, false, 0);
         assert!(!crate::ansi::plain(&c.foot.body).contains("子代理"), "{:?}", crate::ansi::plain(&c.foot.body));
-        // e:连子代理的过程一起写进去
+        // e: the subagent's steps are written in too
         let Some(View::Text { text, .. }) = view(&t, ag1, false, 0) else { panic!() };
         assert!(text.contains("## 任务\n\n找出所有 width( 的调用") && text.contains("rg -n 'width\\('"), "{text}");
         drop(main);
@@ -1094,12 +1113,12 @@ pub(crate) mod tests {
     #[test]
     fn a_background_subagent_runs_until_it_says_its_last_word_and_later_ones_are_found_as_the_record_grows() {
         let (p, main, later) = with_subs("subs-live");
-        // a1 还没写完(停在跑命令)、也没有通知
+        // a1 hasn't finished writing (stopped while running a command), and no notification either
         let a1 = p.with_extension("").join("subagents/agent-a1.jsonl");
         let full = std::fs::read_to_string(&a1).unwrap();
         let cut: String = full.lines().take(4).map(|l| format!("{l}\n")).collect();
         std::fs::write(&a1, &cut).unwrap();
-        // a3 的 meta 晚一点才写出来
+        // a3's meta is written a bit later
         let a3 = p.with_extension("").join("subagents/agent-a3.meta.json");
         let meta3 = std::fs::read_to_string(&a3).unwrap();
         std::fs::remove_file(&a3).unwrap();
@@ -1110,7 +1129,7 @@ pub(crate) mod tests {
         assert!(t.sub_of(ag3).is_none());
         let busy = crate::trace::chat(&t, t.roots[0], true, ts_ms(&at(6000)));
         assert!(crate::ansi::plain(&busy.foot.body).starts_with("● 子代理运行中 · "));
-        // 接着写:a1 写完、a3 出来、通知到了
+        // Writing continues: a1 finishes, a3 appears, the notification arrives
         std::fs::write(&a1, &full).unwrap();
         std::fs::write(&a3, meta3).unwrap();
         let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
@@ -1142,14 +1161,14 @@ pub(crate) mod tests {
         assert_eq!(kinds(&t, turn), [Kind::Call, Kind::Call]);
         let c1 = t.nodes[turn].kids[0];
         let n = &t.nodes[c1];
-        // 从提问那行算起,到最后一块
+        // Counted from the prompt line to the last block
         assert_eq!((n.t1 - n.t0, n.tok, n.stop.as_str(), n.label.as_str()), (8400, [10, 0, 100, 1000, 640], "tool_use", "先跑单测"));
         let tool = &t.nodes[n.kids[0]];
         assert_eq!(
             (tool.name.as_str(), tool.label.as_str(), tool.t1 - tool.t0, tool.state),
             ("Bash", "cargo test --release", 12_300, St::Ok)
         );
-        // 第二次调用从工具结果那行算起
+        // The second call is counted from the tool result line
         let c2 = &t.nodes[t.nodes[turn].kids[1]];
         assert_eq!(c2.t1 - c2.t0, 3200);
         assert!(t.nodes[turn].exact);
@@ -1185,7 +1204,7 @@ pub(crate) mod tests {
                     9,
                     Some("tool_use"),
                 ),
-                // 块 2 和块 1 的结果都挂在块 1 下面(parentUuid 分叉),照样归同一次调用
+                // Block 2 and block 1's result both hang under block 1 (parentUuid forks), still the same call
                 done("r1", "a1", 1200, "t1", false),
                 done("r2", "a2", 1300, "t2", true),
             ],
@@ -1193,7 +1212,7 @@ pub(crate) mod tests {
         let call = t.nodes[t.roots[0]].kids[0];
         assert_eq!(t.nodes[call].kids.len(), 2);
         let tools: Vec<(String, St)> = t.nodes[call].kids.iter().map(|&k| (t.nodes[k].label.clone(), t.nodes[k].state)).collect();
-        // 没有它记的目录:照原样写
+        // No folder recorded for it: written as is
         assert_eq!(tools, [("/p/app/src/a.rs".to_string(), St::Ok), ("/p/app/src/b.rs".to_string(), St::Err)]);
     }
 
@@ -1223,7 +1242,7 @@ pub(crate) mod tests {
         let fail = &t.nodes[t.nodes[a].kids[1]];
         assert_eq!(fail.label, "529 server_error");
         assert_eq!(t.nodes[t.nodes[t.nodes[a].kids[0]].kids[0]].state, St::Denied);
-        // 出错那条不算调用
+        // The error doesn't count as a call
         assert_eq!(t.sum(a).calls, 1);
         assert_eq!(t.nodes[b].state, St::Stopped);
         let tool = &t.nodes[t.nodes[t.nodes[b].kids[0]].kids[0]];
@@ -1233,13 +1252,14 @@ pub(crate) mod tests {
     #[test]
     fn copied_history_folds_into_one_row_and_is_not_counted() {
         let lines = vec![
-            // 会话启动的钩子附件比文件早几秒也不算抄的
+            // A session-start hook attachment a few seconds older than the file doesn't count as copied
             json!({"type": "attachment", "uuid": "h0", "parentUuid": null, "timestamp": at(0), "sessionId": "s1", "attachment": {"type": "hook_success"}}),
             json!({"type": "system", "subtype": "compact_boundary", "uuid": "cb", "parentUuid": null, "timestamp": at(0), "sessionId": "s1",
                    "compactMetadata": {"trigger": "manual", "preTokens": 182_000, "postTokens": 21_000, "durationMs": 38_000}}),
             prompt("o1", Some("cb"), 100, "以前的"),
             reply("o2", "o1", 1000, "m0", json!({"type": "text", "text": "好"}), 50, Some("end_turn")),
-            // 文件是 4 秒时建的:往后的是这段对话自己的;resume 之后写的行 session_id 不一样,照样算
+            // The file was created at 4 s: what follows is this conversation's own; lines written after a resume have a
+            // different session_id and still count
             json!({"type": "user", "uuid": "u1", "parentUuid": "o2", "timestamp": at(5000), "sessionId": "s1", "session_id": "other",
                    "origin": {"kind": "human"}, "message": {"role": "user", "content": "接着来"}}),
             reply("a1", "u1", 6000, "m1", json!({"type": "text", "text": "嗯"}), 7, Some("end_turn")),
@@ -1329,7 +1349,7 @@ pub(crate) mod tests {
         let res = json!({"toolUseResult": {"structuredPatch": [
             {"oldStart": 7, "newStart": 7, "lines": [" a", "-b", "+c", "+d", " e"]},
             {"oldStart": 40, "newStart": 41, "lines": ["-f", "\\ No newline at end of file"]}]}});
-        // 删的写原来的行号,加的、上下文写改完的;两处中间一行 '~'
+        // Removed lines get the original line number, added and context lines the new one; a '~' line between two hunks
         assert_eq!(
             rows(changes("Edit", None, Some(&res))),
             [
@@ -1342,15 +1362,15 @@ pub(crate) mod tests {
                 ('-', Some(40), s("f"))
             ]
         );
-        // 没有结果(被拒、还没回来):拿输入比,头尾相同的行不列,不知道行号
+        // No result (denied, not back yet): compare the input, identical leading and trailing lines left out, no line numbers
         let inp = json!({"old_string": "x\nold\ny", "new_string": "x\nnew\nnewer\ny"});
         assert_eq!(rows(changes("Edit", Some(&inp), None)), [('-', None, s("old")), ('+', None, s("new")), ('+', None, s("newer"))]);
-        // 新建的文件:每行都是加的,从第 1 行起
+        // A new file: every line is added, starting at line 1
         let new_file = changes("Write", Some(&json!({"content": "l1\nl2"})), Some(&json!({"toolUseResult": {"structuredPatch": []}})));
         assert_eq!(rows(new_file), [('+', Some(1), s("l1")), ('+', Some(2), s("l2"))]);
     }
 
-    /// 右边一个工具排成的字(宽 60)
+    /// The text one tool on the right is laid out as (width 60)
     fn tool_text(t: &Trace, i: usize, open: bool) -> (Vec<String>, bool) {
         let (ps, fold) = tool_item(t, i, false, 0, open);
         (crate::trace::wrap(&ps, 60).iter().map(|l| crate::ansi::plain(l).trim_end().to_string()).collect(), fold)
@@ -1360,7 +1380,8 @@ pub(crate) mod tests {
     fn a_tool_folds_to_a_peek_and_o_opens_all_of_it() {
         let (t, _) = fixture("fold");
         let tool = |name: &str| (0..t.nodes.len()).find(|&i| t.nodes[i].name == name).unwrap();
-        // 收着:头一行写名字、相对路径,靠右写改了几行;底下只露改动的行(带行号),上下文不露
+        // Folded: the heading row has the name and relative path, lines changed on the right; below only the changed lines
+        // (with line numbers), no context
         let (text, fold) = tool_text(&t, tool("Edit"), false);
         assert!(fold);
         assert!(text[0].starts_with("▸ Edit  src/bill.rs ") && text[0].ends_with("+2 -2"), "{text:?}");
@@ -1368,7 +1389,8 @@ pub(crate) mod tests {
             text[1..],
             ["  12 -     let w = s.len();", "  12 +     let w = s.width();", "  41 -     pad(w)", "  41 +     pad(w.max(1))"]
         );
-        // 上色:代码按 .rs 上色,加的那行铺淡绿底一直到行尾、删的淡红底,行号不铺
+        // Coloring: code colored as .rs, added lines on a pale green background to the end of the line, removed on pale red,
+        // line numbers without background
         let p = theme::pal();
         let lines = crate::trace::wrap(&tool_item(&t, tool("Edit"), false, 0, false).0, 60);
         let seg_of = |l: &Styled, w: &str| l.iter().find(|s| s.text.contains(w)).map(|s| s.style).unwrap();
@@ -1378,7 +1400,7 @@ pub(crate) mod tests {
         assert_eq!(seg_of(&lines[2], "12").bg, None);
         assert_eq!(lines[2].last().unwrap().style.bg, Some(p.add_bg));
         assert_eq!(crate::ansi::plain(&lines[2]).width(), 60);
-        // 展开:带上下文,两处中间一行点线
+        // Unfolded: with context, a dotted line between two hunks
         let (text, _) = tool_text(&t, tool("Edit"), true);
         assert!(text[0].starts_with("▾ Edit"), "{text:?}");
         assert_eq!(
@@ -1391,14 +1413,15 @@ pub(crate) mod tests {
                 "  ┈┈┈┈┈"
             ]
         );
-        // Read 收着什么都不露,靠右写读了几行;展开是带行号的文件内容,后面跟的提示不要
+        // Read folded shows nothing, lines read on the right; unfolded is the file content with line numbers, without the
+        // trailing hint
         let (text, fold) = tool_text(&t, tool("Read"), false);
         assert!(fold && text.len() == 1 && text[0].starts_with("▸ Read  src/usage.rs") && text[0].ends_with("5 行"), "{text:?}");
         let (text, _) = tool_text(&t, tool("Read"), true);
         assert_eq!(text[1..], ["  1  use std::io;", "  2", "  3  fn main() {", "  4      run();", "  5  }"]);
         let lines = crate::trace::wrap(&tool_item(&t, tool("Read"), false, 0, true).0, 60);
         assert_eq!(seg_of(&lines[1], "use").fg, Some(p.syn_kw));
-        // Bash:收着露输出的头 3 行;展开先写整条命令,再是全部输出
+        // Bash: folded shows the first 3 lines of output; unfolded writes the whole command first, then all the output
         let (text, _) = tool_text(&t, tool("Bash"), false);
         assert_eq!(text[1..], ["  running 220 tests", "  test bill::cols ... ok", "  test ui::wide ... ok", "  … 还有 3 行"]);
         let (text, _) = tool_text(&t, tool("Bash"), true);
@@ -1406,14 +1429,14 @@ pub(crate) mod tests {
         let lines = crate::trace::wrap(&tool_item(&t, tool("Bash"), false, 0, true).0, 60);
         assert_ne!(seg_of(&lines[1], "cargo").fg, None, "命令上色:{:?}", lines[1]);
         assert_eq!(text.last().unwrap(), "  test result: ok. 220 passed");
-        // 全露了的不能 o
+        // One that shows everything can't be o'd
         let (text, fold) = tool_text(&t, tool("Grep"), false);
         assert!(fold && text.last().unwrap() == "  … 还有 1 行", "{text:?}");
     }
 
     #[test]
     fn coloring_never_changes_how_many_lines_a_block_takes() {
-        // 界面先不上色地量高度、看得见了再上色:两边必须一样高
+        // The interface measures heights uncolored first and colors once visible: both must be the same height
         let (t, _) = fixture("same-height");
         for &turn in t.roots.iter().filter(|&&r| t.nodes[r].kind == Kind::Turn) {
             for open in [false, true] {
@@ -1421,7 +1444,7 @@ pub(crate) mod tests {
                     let heights = |ss: Vec<Step>| ss.iter().map(|s| crate::trace::wrap(&s.paras, w).len()).collect::<Vec<_>>();
                     let plain = heights(crate::hl::plain(|| steps(&t, turn, false, 0, &|_| open)));
                     assert_eq!(plain, heights(steps(&t, turn, false, 0, &|_| open)), "第 {turn} 轮 open={open} w={w}");
-                    // 一块块单独排的和一起排的一样
+                    // Laying out block by block gives the same as laying out all at once
                     let one: Vec<Step> = (0..plain.len()).map(|k| step(&t, turn, k, false, 0, &|_| open).unwrap()).collect();
                     assert_eq!(plain, heights(one));
                 }
@@ -1437,17 +1460,17 @@ pub(crate) mod tests {
             Some(View::Text { text, ext, line: 1 }) if ext == "md" => text,
             x => panic!("{x:?}"),
         };
-        // 文件不在了:改动写成 diff 代码块,每处写从第几行起
+        // The file is gone: changes written as a diff code block, each hunk with the line it starts at
         let edit = md(node("Edit"));
         for want in
             ["# Edit · src/bill.rs", "```diff", "@@ 第 11 行 @@", "-    let w = s.len();", "+    let w = s.width();", "@@ 第 40 行 @@"]
         {
             assert!(edit.contains(want), "缺「{want}」:{edit}");
         }
-        // 读到的内容按文件的语言写,没有行号、没有后面跟的提示
+        // Content read is written in the file's language, without line numbers or the trailing hint
         let read = md(node("Read"));
         assert!(read.contains("```rs\nuse std::io;\n\nfn main() {") && !read.contains("system-reminder"), "{read}");
-        // 一轮:你说的、每次调用(数字、想的引用、说的)、每个工具的命令和全部输出
+        // A turn: what you said, each call (numbers, thinking quoted, what was said), each tool's command and all its output
         let turn = md(t.roots.iter().copied().find(|&r| t.nodes[r].label == "看看两栏为什么对不齐").unwrap());
         for want in [
             "# 第 1 轮 · ",
@@ -1463,11 +1486,11 @@ pub(crate) mod tests {
         ] {
             assert!(turn.contains(want), "缺「{want}」:{turn}");
         }
-        // 压缩那行没有可看的
+        // The compaction row has nothing to view
         assert_eq!(view(&t, t.roots[0], false, 0), None);
-        // 输出里有 ``` 的,外面的围栏多一个
+        // Output containing ``` gets an outer fence one longer
         assert_eq!(fenced("text", "a\n```\nb"), "````text\na\n```\nb\n````\n\n");
-        // 文件还在:看文件本身,停在读的那行 / 改完的第一行
+        // The file is still there: view the file itself, at the line read / the first changed line
         let dir = std::env::temp_dir().join(format!("aca-trace-real-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a.rs");
@@ -1540,7 +1563,7 @@ pub(crate) mod tests {
                 ls.iter().map(crate::ansi::plain).find(|l| l.starts_with("── ")).unwrap().trim_end_matches(['─', ' ']).to_string()
             })
             .collect();
-        // 头一次跟用得最多的(opus)比;换成 haiku 写一次,换回来再写一次
+        // The first is compared with the most used (opus); switching to haiku writes it once, switching back writes it again
         let model = |l: &String| l.split(" · ").nth(3).map(str::to_string);
         assert_eq!(
             rules.iter().map(model).collect::<Vec<_>>(),
@@ -1561,7 +1584,8 @@ pub(crate) mod tests {
         );
         let call = &t.nodes[t.nodes[t.roots[0]].kids[0]];
         assert_eq!((call.thought.as_str(), call.label.as_str()), ("先想想", "结论:用 width()"));
-        // 对话里:数字写在分隔线上、想的摊成一段(没有句末标点的行后面用 · 隔开)、说的全文;展开了想的照原来分行
+        // In the conversation: numbers on the separator, thinking flattened into one paragraph (lines without
+        // sentence-ending punctuation followed by ·), what was said in full; unfolded, thinking keeps its original lines
         let text = |open: bool| -> Vec<String> {
             flow(&t, t.roots[0], false, 0, false, &|_| open)
                 .iter()
@@ -1594,7 +1618,7 @@ pub(crate) mod tests {
         let turn = t.roots[0];
         let call = |k: usize, open: bool| step(&t, turn, k, false, 0, &|_| open).unwrap();
         let plain = |ls: Vec<crate::ansi::Styled>| ls.iter().map(|l| crate::ansi::plain(l).trim_end().to_string()).collect::<Vec<_>>();
-        // 手机(39 格)和桌面(57 格)都只露 5 行,末尾 …;这一步能 o
+        // Both phone (39 columns) and desktop (57 columns) show only 5 lines, ending in …; this step can be o'd
         for w in [39, 57] {
             let (lines, clipped) = crate::trace::wrap_clipped(&call(1, false).paras, w);
             let thought: Vec<String> = plain(lines).into_iter().skip(1).filter(|l| !l.is_empty()).collect();
@@ -1602,10 +1626,10 @@ pub(crate) mod tests {
             assert!(thought[0].starts_with("思考 先确认") && thought[4].ends_with('…') && clipped, "{w}: {thought:#?}");
             assert!(thought.iter().all(|l| l.width() <= w), "{w}: {thought:#?}");
         }
-        // 展开了不截
+        // Unfolded isn't cut
         let (lines, clipped) = crate::trace::wrap_clipped(&call(1, true).paras, 39);
         assert!(lines.len() > 6 && !clipped);
-        // 短的整段露出来,标题后面用 · 隔开,没东西可展开
+        // A short one shows whole, the heading followed by ·, nothing to unfold
         let (lines, clipped) = crate::trace::wrap_clipped(&call(2, false).paras, 39);
         assert_eq!((plain(lines)[1].as_str(), clipped), ("思考 看一眼 · 就改", false));
     }
@@ -1628,7 +1652,8 @@ mod probe {
     use crate::trace::{Kind, Trace};
     use std::path::PathBuf;
 
-    /// 本机真实记录上核对子代理(只打印数字):ACA_TRACE_SUBS = 一行一个记录文件的清单
+    /// Check subagents against this machine's real records (prints numbers only): ACA_TRACE_SUBS = a list of record files,
+    /// one per line
     #[test]
     #[ignore]
     fn probe_subs() {
@@ -1671,7 +1696,8 @@ mod probe {
             let (s, rolled) = (t.total(false, 0).2, t.nodes.iter().filter(|n| n.rolled).count());
             let (cp, own) = copied(&t);
             if codex {
-                // 父线程自己的 $ + 子线程在记录视图里的钱(子线程的 $ 连抄来的一起算了,另列)
+                // The parent thread's own $ + the child threads' cost in the record view (the child threads' $ also counts
+                // copied lines, listed separately)
                 let mine = price(crate::usage::tests::codex_seen(std::path::Path::new(p)));
                 let kids_bill: f64 = fs.iter().map(|f| price(crate::usage::tests::codex_seen(f))).sum();
                 let expected = std::fs::read_to_string(p).unwrap_or_default().matches("\"spawn_agent\"").count();
@@ -1689,7 +1715,7 @@ mod probe {
                     .map_or(0, |d| d.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".meta.json")).count());
                 let bill: f64 = price(crate::usage::tests::claude_seen(std::path::Path::new(p)))
                     + fs.iter().map(|f| price(crate::usage::tests::claude_seen(f))).sum::<f64>();
-                // 没写完、也没收到通知的(不管多久没动静)
+                // Not finished writing and not notified (however long it's been quiet)
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
                 let live = (0..t.nodes.len()).filter(|&i| t.sub_live(i, true, i64::MIN / 2)).count();
                 for i in (0..t.nodes.len()).filter(|&i| t.sub_live(i, true, i64::MIN / 2)) {
@@ -1706,7 +1732,8 @@ mod probe {
                         t.nodes[i].t1 > 0
                     );
                 }
-                // 画一屏要算的:整段的合计、每一轮的合计、左边每一轮的对话块
+                // What drawing one screen computes: the whole record's total, each turn's total, each turn's conversation
+                // block on the left
                 let t1 = std::time::Instant::now();
                 let _ = t.total(false, 0);
                 for &r in &t.roots {
@@ -1730,7 +1757,8 @@ mod probe {
         }
     }
 
-    /// 只在手动时跑:ACA_TRACE_PROBE=<记录文件> cargo test --release probe -- --ignored --nocapture。只打印数量和耗时
+    /// Run by hand only: ACA_TRACE_PROBE=<record file> cargo test --release probe -- --ignored --nocapture. Prints only counts
+    /// and timings
     #[test]
     #[ignore]
     fn probe_real_file() {
@@ -1741,7 +1769,7 @@ mod probe {
         let t = crate::trace::Trace::open(p.clone().into(), agent).unwrap();
         let el = t0.elapsed();
         if codex {
-            // 工具按名字数;exec 认出了什么;没有提问的轮;钱和 $ 读同一份算的比
+            // Tools counted by name; what exec recognized; turns with no prompt; cost compared with $ computed from the same file
             let mut names = std::collections::BTreeMap::new();
             for n in t.nodes.iter().filter(|n| n.kind == crate::trace::Kind::Tool) {
                 *names.entry(n.name.clone()).or_insert(0usize) += 1;
@@ -1758,7 +1786,7 @@ mod probe {
                 "codex ver={:?} tools={names:?} no_prompt_turns={no_prompt} steer_turns={steer} calls={} bill_calls={calls} cost={:.4} bill={bill:.4}",
                 t.cx.ver, s.calls, s.cost
             );
-            // 每个工具读回来整理一遍要多久(右边展开、详情都要读)
+            // How long reading back and tidying each tool takes (unfolding on the right and the detail both read it)
             let t4 = std::time::Instant::now();
             let (mut with_cmd, mut with_edit, mut js, mut empty) = (0, 0, 0, 0);
             for i in (0..t.nodes.len()).filter(|&i| t.nodes[i].kind == crate::trace::Kind::Tool && t.nodes[i].name != "stdin") {
@@ -1788,7 +1816,7 @@ mod probe {
         let ex: i64 = durs.iter().filter(|d| d.1).map(|d| d.0).sum();
         let nx: i64 = durs.iter().filter(|d| !d.1).map(|d| d.0).sum();
         println!("top turns (secs, exact, kids, tools): {:?}  exact_sum={ex}s inexact_sum={nx}s", &durs[..durs.len().min(8)]);
-        // 最大的一轮(节点最多)排成对话、折好要多久
+        // How long laying out and wrapping the biggest turn (most nodes) as a conversation takes
         let big = t
             .roots
             .iter()
@@ -1796,7 +1824,8 @@ mod probe {
             .filter(|&r| t.nodes[r].kind == crate::trace::Kind::Turn)
             .max_by_key(|&r| t.nodes[r].kids.len())
             .unwrap();
-        // 界面的做法:先不上色地排整轮、整段对话(量高度),再给一屏看得见的上色
+        // What the interface does: lay out the whole turn and the whole conversation uncolored (to measure heights), then
+        // color one visible screen
         let t1 = std::time::Instant::now();
         let items = crate::hl::plain(|| crate::trace::steps(&t, big, false, 0, &|_| false));
         let lines: usize = items.iter().map(|s| crate::trace::wrap(&s.paras, 80).len()).sum();
@@ -1819,7 +1848,8 @@ mod probe {
                 .sum()
         });
         let el_chat = t2.elapsed();
-        // 上色一屏(50 行):全展开的那轮从头数到 50 行为止的块;第一次要编译用到的语法
+        // Color one screen (50 lines): the blocks of the fully unfolded turn from the top up to 50 lines; the first time has
+        // to compile the syntaxes used
         let screen = |open: bool| {
             let t5 = std::time::Instant::now();
             let (mut k, mut n) = (0, 0);

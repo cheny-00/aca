@@ -1,7 +1,8 @@
-//! 从命令行这一头整条跑一遍:起真的 tmux 会话(里面是个假 agent),发 hook,看状态、标题、事件。
+//! Runs it all end to end from the command line: starts real tmux sessions (with a fake agent inside), sends hooks, and checks
+//! states, titles and events.
 //!
-//! 每个测试自己一个 `ACA_HOME` 和一个 tmux 服务(`-L`),互不相干,也碰不到真的会话。
-//! 机器上没有 tmux 就跳过。
+//! Each test has its own `ACA_HOME` and its own tmux server (`-L`): they don't affect each other and can't touch real sessions.
+//! Skipped when the machine has no tmux.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -13,21 +14,22 @@ struct Sandbox {
     socket: String,
 }
 
-/// 外层会话的身份变量一个不留:tmux 服务会把起它那一刻的环境带给每个会话
+/// Not a single identity variable of the outer session is kept: a tmux server hands every session the environment of the moment
+/// it started
 fn scrub(c: &mut Command) -> &mut Command {
     for (k, _) in std::env::vars() {
-        // CLAUDE 开头的全拿:里面有外层会话用哪个配置目录、登录凭据去哪取
+        // Drop everything starting with CLAUDE: it says which config directory the outer session uses and where to get login credentials
         if k.starts_with("AGENTDECK_") || k.starts_with("CLAUDE") || k.starts_with("ACA_") || matches!(k.as_str(), "TMUX" | "TMUX_PANE") {
             c.env_remove(k);
         }
     }
-    // aca 开 worktree 时调 git:不读你的全局配置(hook、签名)
+    // aca calls git when it opens a worktree: don't read your global config (hooks, signing)
     c.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
-    // 下面的断言按中文写(默认是英文)
+    // The assertions below are written in Chinese (the default is English)
     c.env("ACA_LANG", "zh")
 }
 
-/// 测试里自己调 git:同样不读全局配置,要成功,给标准输出
+/// git called by the tests themselves: likewise without the global config; must succeed; returns stdout
 fn git(dir: &Path, args: &[&str]) -> String {
     let mut c = Command::new("git");
     let o = scrub(&mut c).arg("-C").arg(dir).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap();
@@ -36,7 +38,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 impl Sandbox {
-    /// None = 没装 tmux
+    /// None = tmux isn't installed
     fn new(name: &str) -> Option<Sandbox> {
         if Command::new("tmux").arg("-V").output().is_err() {
             eprintln!("没有 tmux,跳过");
@@ -46,7 +48,7 @@ impl Sandbox {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("config")).unwrap();
         std::fs::create_dir_all(home.join("proj")).unwrap();
-        // 假 agent:按 Claude 那一家起(带着 --session-id、--settings),自己什么也不干
+        // The fake agent: started the Claude way (with --session-id, --settings), and does nothing itself
         std::fs::write(home.join("agent.sh"), "#!/bin/sh\necho fake agent up\nexec sleep 600\n").unwrap();
         let cfg = format!("[tools.fake]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{}\"]\n", home.join("agent.sh").display());
         std::fs::write(home.join("config/config.toml"), cfg).unwrap();
@@ -63,7 +65,7 @@ impl Sandbox {
         self.cmd().args(args).output().unwrap()
     }
 
-    /// 跑一条,要成功,给标准输出
+    /// Run one command; must succeed; returns stdout
     fn aca(&self, args: &[&str]) -> String {
         let o = self.run(args);
         assert!(o.status.success(), "aca {args:?} 失败:{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
@@ -74,7 +76,7 @@ impl Sandbox {
         serde_json::from_str(&self.aca(args)).unwrap()
     }
 
-    /// agent 那边来了一个事件:和真的一样,JSON 进标准输入,是哪个会话看环境变量
+    /// An event arrived from the agent side: as for real, the JSON goes to stdin and the session is read from environment variables
     fn hook(&self, id: &str, pane: &str, payload: &str) {
         self.hook_as("claude", id, pane, payload)
     }
@@ -103,7 +105,7 @@ impl Sandbox {
         self.home.join("proj").to_string_lossy().into_owned()
     }
 
-    /// 等窗格上出现这段字(假 agent 起来要一点时间),返回整屏
+    /// Wait until this text appears on the pane (the fake agent takes a moment to start); returns the whole screen
     fn wait_screen(&self, pane: &str, want: &str) -> String {
         let mut screen = String::new();
         for _ in 0..50 {
@@ -123,9 +125,9 @@ impl Sandbox {
             .collect()
     }
 
-    /// 屏幕由文件管的两个假 agent:`scr` 按 Claude 那一家、`fcx` 按 Codex 那一家起。`screens/<会话 id>` 里写什么,
-    /// 它那一格就显示什么(在跑、在等你选、输入框里有草稿……都靠这个摆出来);被当成 `codex queue` 调的时候,
-    /// 把收到的参数一行一个记进 queued.txt
+    /// Two fake agents whose screens are driven by files: `scr` is started the Claude way, `fcx` the Codex way. Whatever is written
+    /// in `screens/<SESSION-ID>` is what its pane shows (running, waiting for you to pick, a draft in the input box… are all staged
+    /// this way); when called as `codex queue`, it records the arguments it got in queued.txt, one per line
     fn screen_tools(&self) {
         let home = self.home.display();
         write(
@@ -148,10 +150,10 @@ impl Sandbox {
         write(&cfg, &text);
     }
 
-    /// 摆好一个会话的屏幕;不是空的就等它画出来
+    /// Stage a session's screen; when it isn't empty, wait for it to be drawn
     fn set_screen(&self, id: &str, pane: &str, text: &str) {
         write(&self.home.join("screens").join(id), text);
-        // 屏幕上(不带颜色)应该出现的:第一行去掉颜色之后的头几个字
+        // What should appear on screen (without colors): the first few characters of the first line, colors stripped
         let mut plain = String::new();
         let mut cs = text.lines().next().unwrap_or("").chars();
         while let Some(c) = cs.next() {
@@ -173,7 +175,7 @@ impl Sandbox {
         self.json(&["show", id, "--json"])["pane"].as_str().unwrap().to_string()
     }
 
-    /// 以某个会话的身份跑(在那个会话里调的),标准输入给一段
+    /// Run as a session (called from inside that session), with some text on stdin
     fn as_session(&self, me: &str, args: &[&str], input: &str) -> Output {
         use std::io::Write;
         let mut child = self
@@ -189,7 +191,7 @@ impl Sandbox {
         child.wait_with_output().unwrap()
     }
 
-    /// 等到成真,最多 8 秒(后台送信的那些进程要一点时间)
+    /// Wait until it's true, at most 8 seconds (the background delivery processes take a moment)
     fn until(&self, ok: impl Fn() -> bool) -> bool {
         for _ in 0..80 {
             if ok() {
@@ -209,7 +211,8 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         use std::os::unix::fs::MetadataExt;
         self.tmux(&["kill-server"]);
-        // 服务没了,套接字文件 tmux 不收。这时候问不到它了(测试里服务可能早就自己退了),按 tmux 的规矩拼出来
+        // The server is gone, and tmux doesn't take the socket file. It can't be asked anymore (in tests the server may have exited long
+        // ago), so build the path by tmux's rules
         if let Ok(meta) = std::fs::metadata(&self.home) {
             let tmp = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".into());
             let _ = std::fs::remove_file(Path::new(&tmp).join(format!("tmux-{}", meta.uid())).join(&self.socket));
@@ -227,25 +230,27 @@ fn write(path: &Path, text: &str) {
 fn a_session_is_a_tmux_session_named_by_its_title_and_stops_and_restarts_in_place() {
     let Some(sb) = Sandbox::new("life") else { return };
     let id = sb.aca(&["new", "fake", &sb.proj(), "-t", "修登录 v1.2", "-g", "work/app"]);
-    // 会话名就是标题(`.` 换掉),身份记在 tmux 的选项上
+    // The session name is the title (`.` replaced), and the identity is kept in a tmux option
     assert_eq!(sb.tmux(&["list-sessions", "-F", "#{session_name}|#{@aca_id}"]), format!("修登录 v1_2|{id}"));
     let row = sb.json(&["show", &id, "--json"]);
     assert_eq!((row["state"].as_str(), row["group"].as_str(), row["tmux"].as_str()), (Some("idle"), Some("work/app"), Some("修登录 v1_2")));
+    // A tool that keeps no record of where it is: it works where it was registered
+    assert_eq!(row["work"], row["dir"]);
     let pane = row["pane"].as_str().unwrap().to_string();
 
-    // 改名:tmux 会话名、窗口名一起变;id 写开头几位、写标题都找得到
+    // Rename: the tmux session name and the window name change together; the first few characters of the id or the title both find it
     sb.aca(&["rename", &id[..4], "登录页改版"]);
     assert_eq!(sb.tmux(&["list-windows", "-a", "-F", "#{session_name}|#{window_name}"]), "登录页改版|登录页改版");
     assert_eq!(sb.json(&["show", "登录页改版", "--json"])["id"], id.as_str());
 
-    // 停:agent 没了,窗格和会话都留着;再起还是那一格
+    // Stop: the agent is gone, the pane and the session stay; starting again uses the same pane
     sb.aca(&["stop", &id]);
     assert_eq!(sb.json(&["show", &id, "--json"])["state"], "exited");
     assert_eq!(sb.tmux(&["list-panes", "-a", "-F", "#{pane_id}|#{pane_dead}"]), format!("{pane}|1"));
     sb.aca(&["start", &id]);
     assert_eq!(sb.tmux(&["list-panes", "-a", "-F", "#{pane_id}|#{pane_dead}"]), format!("{pane}|0"));
 
-    // tmux 里整个没了(像重启过电脑):登记还在,再起就重新建
+    // tmux entirely gone (as after a reboot): the registration is still there; starting again creates it anew
     sb.tmux(&["kill-server"]);
     assert_eq!(sb.json(&["show", &id, "--json"])["state"], "stopped");
     sb.aca(&["start", &id]);
@@ -259,7 +264,8 @@ fn a_session_is_a_tmux_session_named_by_its_title_and_stops_and_restarts_in_plac
 #[test]
 fn stop_idle_stops_only_sessions_really_idle_long_enough_and_marks_them_apart() {
     let Some(sb) = Sandbox::new("idle") else { return };
-    // 假 agent 按 Claude 那一家起,屏幕上画一个输入框;draft 的输入框里有没发的字,ticker 底下一直在刷(像干活时转圈、计时)
+    // The fake agents are started the Claude way and draw an input box on screen; draft's input box holds unsent text, and ticker
+    // keeps refreshing at the bottom (like the spinner and timer while working)
     let mut cfg = std::fs::read_to_string(sb.home.join("config/config.toml")).unwrap();
     for (tool, script) in [
         ("box", "printf '────\\n❯ \\n────\\n'; exec sleep 600"),
@@ -271,8 +277,10 @@ fn stop_idle_stops_only_sessions_really_idle_long_enough_and_marks_them_apart() 
         cfg.push_str(&format!("[tools.{tool}]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{}\"]\n", path.display()));
     }
     write(&sb.home.join("config/config.toml"), &cfg);
-    // 都说过话(有对话记录,再起接得上)。finish:这一轮跑完了(Stop),没跑完的只报了开头;seen:看过了;
-    // record:对话记录里另外写的几行(Claude 给自己定的到点再来;会话起来之后才写,早于这次起来的那一秒的不算);then:跑完之后又报的 hook
+    // All have talked (have a transcript, so starting again resumes). finish: this turn ran to the end (Stop); unfinished ones only
+    // reported the start; seen: looked at;
+    // record: extra lines written in the transcript (Claude scheduling itself to come back; written after the session started —
+    // anything before the second of this start doesn't count); then: hooks reported after finishing
     let now_iso = || {
         let o = Command::new("date").args(["-u", "+%Y-%m-%dT%H:%M:%S.000Z"]).output().unwrap();
         String::from_utf8_lossy(&o.stdout).trim().to_string()
@@ -321,31 +329,35 @@ fn stop_idle_stops_only_sessions_really_idle_long_enough_and_marks_them_apart() 
     let idle = talk("box", "甲", "c1", Some("[]"), true);
     let unread = talk("box", "跑完没看", "c2", Some("[]"), false);
     let bg = talk("box", "有后台任务", "c3", Some("[{\"id\":1}]"), true);
-    // 跑到一半:hook 只报了开头。假 agent 的屏幕上没有转圈,读屏幕会当它空闲 —— 屏幕认错了也不能停
+    // Halfway through a turn: the hook only reported the start. The fake agent's screen has no spinner, so reading the screen takes
+    // it as idle — even with the screen misread, it must not be stopped
     let half = talk("box", "跑到一半", "c4", None, false);
     let half_at = std::time::Instant::now();
     let draft = talk("draft", "有草稿", "c5", Some("[]"), true);
     let ticking = talk("ticker", "屏幕在刷", "c6", Some("[]"), true);
     let subs = talk("box", "子代理在写", "c7", Some("[]"), true);
-    // 给自己定了每天的定时、/loop 的下一次还没到:只在它进程里,停了就没了;定了又删掉的照常停
+    // A daily schedule it set itself, a /loop whose next run hasn't come yet: they live only in its process and are lost if it stops;
+    // one set and then deleted is stopped as usual
     let cron_on = talk_with("box", "有定时", "c8", Some("[]"), true, &|| cron("aa11"), &[]);
     let looping = talk_with("box", "loop 在等", "c9", Some("[]"), true, &|| call("ScheduleWakeup", "u-w", "{\"delaySeconds\":3600}"), &[]);
     let cron_off =
         talk_with("box", "定时删掉了", "c10", Some("[]"), true, &|| cron("bb22") + &call("CronDelete", "u-d", "{\"id\":\"bb22\"}"), &[]);
-    // 闲着快一小时 Claude 自己压缩对话:没有一轮,hook 状态一直是跑完,只报了开始压;压完了的照常停
+    // Idle for nearly an hour, Claude compacts the conversation by itself: there's no turn, the hook state stays finished, and only
+    // the start of compacting was reported; one done compacting is stopped as usual
     let auto = ",\"trigger\":\"auto\"";
     let compacting = talk_with("box", "在压缩", "c11", Some("[]"), true, &String::new, &[("PreCompact", auto)]);
     let compacted = talk_with("box", "压完了", "c12", Some("[]"), true, &String::new, &[("PreCompact", auto), ("PostCompact", auto)]);
     let show = |id: &str| sb.json(&["show", id, "--json"]);
     let state = |id: &str| show(id)["state"].as_str().unwrap().to_string();
 
-    // 还没闲够:不停
+    // Not idle long enough yet: not stopped
     assert_eq!(sb.aca(&["stop", "--idle", "1h"]), "没有空闲超过 1h 且可停止的会话");
     std::thread::sleep(std::time::Duration::from_millis(2100));
-    // 一轮刚报开始的头 3 秒列表先信 hook(在跑);过了这几秒,跑到一半的那个屏幕上看着是闲的
+    // For the first 3 seconds after a turn reports its start, the list trusts the hook (running); after that, the one halfway through
+    // looks idle on screen
     std::thread::sleep(std::time::Duration::from_millis(3200).saturating_sub(half_at.elapsed()));
     assert_eq!([state(&idle), state(&unread), state(&half), state(&draft)], ["idle", "unread", "idle", "idle"]);
-    // 主线程跑完了,后台的子代理还在往它的记录里写
+    // The main thread has finished, a background subagent is still writing to its record
     write(&sb.home.join("c7/subagents/agent-a1.jsonl"), "{}\n");
     let out = sb.aca(&["stop", "--idle", "2s"]);
     let mut titles: Vec<&str> = out.lines().map(|l| l.split("  ").nth(1).unwrap_or("").split('(').next().unwrap()).collect();
@@ -359,17 +371,17 @@ fn stop_idle_stops_only_sessions_really_idle_long_enough_and_marks_them_apart() 
         assert_eq!(show(id)["idle_stopped"], 0);
     }
     assert!(show(&idle)["idle_stopped"].as_u64().unwrap() > 0);
-    // 列表里画 ☾;事件里带着停之前空闲了几秒
+    // The list draws ☾; the event carries how many seconds it was idle before stopping
     assert!(sb.aca(&["ls"]).contains(&format!("☾ {idle}")));
     let ev = sb.aca(&["events", "-n", "200"]).lines().find(|l| l.contains("session.stopped")).unwrap().to_string();
     assert!(serde_json::from_str::<Value>(&ev).unwrap()["idle"].as_u64().unwrap() >= 2, "{ev}");
 
-    // 再起:接着原来的对话,记号清掉;人再停一次就是 ■
+    // Start again: it resumes the original conversation and the mark is cleared; stopped once more by a person, it's ■
     assert_eq!(sb.aca(&["start", &idle]), "已启动,继续原对话");
     assert_eq!(show(&idle)["idle_stopped"], 0);
     sb.aca(&["stop", &idle]);
     assert!(sb.aca(&["ls"]).contains(&format!("■ {idle}")));
-    // 写不对的时长
+    // A badly written duration
     let o = sb.run(&["stop", "--idle", "3"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("30m、3h、1d、1h30m"));
 }
@@ -389,14 +401,15 @@ fn hooks_move_the_status_and_the_agents_own_title_becomes_the_session_name() {
 
     hook("SessionStart", ",\"source\":\"startup\"");
     hook("UserPromptSubmit", ",\"prompt\":\"登录页 500 了\"");
-    // 假 agent 的屏幕上什么也没有,所以这里只看 hook 说的(--no-screen)
+    // The fake agent's screen shows nothing, so only what the hooks say is looked at here (--no-screen)
     let state = |sb: &Sandbox| sb.json(&["ls", "--json", "--no-screen"])[0]["state"].clone();
     assert_eq!(state(&sb), "running");
     hook("PermissionRequest", ",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"kubectl logs web-1\"}");
     let row = &sb.json(&["ls", "--json", "--no-screen"])[0];
     assert_eq!((row["state"].as_str(), row["ask"].as_str()), (Some("ask"), Some("Bash:kubectl logs web-1")));
 
-    // 跑完时对话记录里已经有它自己起的标题:会话名跟着改,最后一条回复留着,没人看过所以是「没看」
+    // When the turn finishes, the transcript already has a title it gave itself: the session name follows, the last reply is kept,
+    // and nobody has looked yet, so it's unread
     write(&transcript, "{\"type\":\"user\"}\n{\"type\":\"ai-title\",\"aiTitle\":\"登录页 500 排查\",\"sessionId\":\"c1\"}\n");
     hook("Stop", ",\"last_assistant_message\":\"是 session 过期,已修。\",\"background_tasks\":[]");
     let row = show(&sb);
@@ -409,7 +422,7 @@ fn hooks_move_the_status_and_the_agents_own_title_becomes_the_session_name() {
     sb.aca(&["seen", &id]);
     assert_eq!(state(&sb), "idle");
 
-    // 人改过名之后不再跟 agent 的标题;放开锁又跟回去
+    // Once a person has renamed it, it no longer follows the agent's title; unlocked, it follows again
     sb.aca(&["rename", &id, "我起的名字"]);
     write(&transcript, "{\"type\":\"ai-title\",\"aiTitle\":\"换了个标题\",\"sessionId\":\"c1\"}\n");
     hook("Stop", ",\"last_assistant_message\":\"好\",\"background_tasks\":[]");
@@ -426,7 +439,8 @@ fn hooks_move_the_status_and_the_agents_own_title_becomes_the_session_name() {
 #[test]
 fn a_tool_declared_only_in_config_starts_reports_through_the_hook_protocol_and_resumes() {
     let Some(sb) = Sandbox::new("declared") else { return };
-    // 不写 kind 的工具:假 agent 把收到的参数、aca 放进环境的工具名打在屏幕上,TOY_BUSY 有值时再打一行「在忙」
+    // A tool with no kind: the fake agent prints on screen the arguments it got and the tool name aca put in its environment, plus
+    // a "busy" line when TOY_BUSY has a value
     write(
         &sb.home.join("toy.sh"),
         "#!/bin/sh\necho \"args:[$*]\"\necho \"tool:$ACA_TOOL\"\n[ -n \"$TOY_BUSY\" ] && echo 'Working...'\nexec sleep 600\n",
@@ -444,10 +458,11 @@ fn a_tool_declared_only_in_config_starts_reports_through_the_hook_protocol_and_r
     let pane = sb.json(&["show", &id, "--json"])["pane"].as_str().unwrap().to_string();
     let screen = sb.wait_screen(&pane, "Working...");
     assert!(screen.contains("args:[]") && screen.contains("tool:toy"), "{screen}");
-    // 屏幕上认出来在忙(配置里的正则)
+    // Recognized as busy from the screen (the regex in the config)
     assert_eq!(sb.json(&["show", &id, "--json"])["state"], "running");
 
-    // 转发脚本按协议报事件:`aca hook <工具名>`。对话 id、最后一条回复、它自己起的标题都接住了
+    // The forwarding script reports events by the protocol: `aca hook <TOOL-NAME>`. The conversation id, the last reply and the
+    // title it gave itself are all picked up
     let hook = |json: &str| sb.hook_as("toy", &id, &pane, json);
     hook(r#"{"hook_event_name":"SessionStart","session_id":"t-1"}"#);
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"t-1","prompt":"改一下"}"#);
@@ -459,19 +474,20 @@ fn a_tool_declared_only_in_config_starts_reports_through_the_hook_protocol_and_r
     );
     assert_eq!(sb.aca(&["output", &id]), "改好了");
 
-    // 停了再起:照 resume 的模板接着那段对话
+    // Stopped and started again: resumes that conversation by the resume template
     sb.aca(&["stop", &id]);
     sb.aca(&["start", &id]);
     let screen = sb.wait_screen(&pane, "args:[--session t-1]");
     assert!(screen.contains("args:[--session t-1]"), "{screen}");
-    // 没写 fork:分不了叉
+    // No fork written: it can't fork
     assert!(!sb.run(&["fork", &id]).status.success());
 }
 
 #[test]
 fn an_account_is_a_layer_on_the_launch_and_run_hands_it_to_the_tools_own_commands() {
     let Some(sb) = Sandbox::new("account") else { return };
-    // 假 agent 把账号那一层打在屏幕上(目录只打最后一段,免得折行);带了 login 就当成它自己的子命令,打完就退
+    // The fake agent prints the account layer on screen (only the last part of directories, so lines don't wrap); given login, it
+    // takes it as its own subcommand and exits after printing
     write(
         &sb.home.join("toy.sh"),
         "#!/bin/sh\necho \"args:[$*]\"\necho \"home:[${TOY_HOME##*/}]\"\necho \"key:[$TOY_KEY]\"\necho \"sess:[$ACA_SESSION_ID]\"\n\
@@ -496,11 +512,12 @@ fn an_account_is_a_layer_on_the_launch_and_run_hands_it_to_the_tools_own_command
         sb.wait_screen(&pane, want)
     };
 
-    // 登记过的账号:目录、env_file 里的 key、参数都带上了,参数接在工具的后面
+    // A registered account: its directory, the key from env_file and its arguments are all passed, the arguments after the tool's
     let work = sb.aca(&["new", "toy:work", &sb.proj()]);
     let screen = screen_of(&work, "sess:[");
     assert!(screen.contains("args:[--yolo --profile w]") && screen.contains("home:[toy-work]") && screen.contains("key:[k-1]"), "{screen}");
-    // 账号只带在 agent 那一格上:同一个 tmux 会话里另开的窗口(prefix c、以后放进来的别的 agent)一样都拿不到
+    // The account is passed only to the agent's pane: another window opened in the same tmux session (prefix c, other agents put
+    // in later) gets none of it
     let pane = sb.json(&["show", &work, "--json"])["pane"].as_str().unwrap().to_string();
     let sid = sb.tmux(&["display-message", "-p", "-t", &pane, "#{session_id}"]);
     let side = sb.tmux(&[
@@ -517,12 +534,13 @@ fn an_account_is_a_layer_on_the_launch_and_run_hands_it_to_the_tools_own_command
     let screen = sb.wait_screen(&side, "side:[");
     assert!(screen.contains("side:[][][]"), "{screen}");
 
-    // 不写账号:aca 什么都不加
+    // No account given: aca adds nothing
     let bare = sb.aca(&["new", "toy", &sb.proj()]);
     let screen = screen_of(&bare, "sess:[");
     assert!(screen.contains("args:[--yolo]") && screen.contains("home:[]") && screen.contains("key:[]"), "{screen}");
 
-    // 没登记的目录直接用:记完整路径,列表里显示目录名;正好是登记过的那个目录,就叫它的名字
+    // An unregistered directory used directly: the full path is recorded and the list shows the directory name; if it happens to
+    // be a registered directory, it's called by that name
     let adhoc = sb.aca(&["new", &format!("toy:{}/", at("toy-new")), &sb.proj()]);
     assert!(screen_of(&adhoc, "sess:[").contains("home:[toy-new]"));
     assert_eq!(sb.json(&["show", &adhoc, "--json"])["account"], at("toy-new").as_str());
@@ -530,12 +548,13 @@ fn an_account_is_a_layer_on_the_launch_and_run_hands_it_to_the_tools_own_command
     let plain = sb.aca(&["new", &format!("toy:{}", at("toy-plain")), &sb.proj(), "--hold"]);
     assert_eq!(sb.json(&["show", &plain, "--json"])["account"], "plain");
 
-    // 不建会话,带着账号原样跑它自己的命令:账号的环境在,参数只有你给的,会话的身份不带
+    // No session created; the tool's own command runs as is, with the account: the account's environment is there, the arguments
+    // are only yours, and the session identity isn't passed
     let o = sb.cmd().args(["run", "toy:work", "--", "login", "--device"]).env("ACA_SESSION_ID", &work).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&o.stdout), "args:[login --device]\nhome:[toy-work]\nkey:[k-1]\nsess:[]\n");
     assert_eq!(sb.json(&["ls", "--json", "--no-screen"]).as_array().unwrap().len(), 4);
 
-    // 写坏了的配置:命令行说一声坏在哪
+    // A broken config: the command line says where it's broken
     write(&cfg, "[accounts.toy]\nwork = { home = 1 }\n");
     let o = sb.run(&["names"]);
     assert!(String::from_utf8_lossy(&o.stderr).contains("config.toml"), "{}", String::from_utf8_lossy(&o.stderr));
@@ -551,7 +570,7 @@ fn a_plugin_hears_events_and_can_put_a_token_on_the_row() {
          [[events]]\non = \"turn.done\"\ncommand = [\"sh\", \"mark.sh\"]\n\
          [[actions]]\nid = \"hello\"\ntitle = \"打招呼\"\ncontexts = [\"session\"]\ncommand = [\"sh\", \"-c\", \"echo hi $ACA_SESSION_ID from $ACA_PLUGIN_ID\"]\n",
     );
-    // 事件钩子:回头调 aca 往这一行上挂一段字,再留个记号说自己跑过了
+    // An event hook: it calls back into aca to attach some text to this row, then leaves a mark saying it ran
     write(
         &dir.join("mark.sh"),
         "\"$ACA_BIN\" meta set \"$ACA_SESSION_ID\" mark \"$ACA_PLUGIN_EVENT\"\ntouch \"$ACA_PLUGIN_STATE_DIR/ran\"\n",
@@ -561,7 +580,7 @@ fn a_plugin_hears_events_and_can_put_a_token_on_the_row() {
     let id = sb.aca(&["new", "fake", &sb.proj()]);
     let pane = sb.json(&["show", &id, "--json"])["pane"].as_str().unwrap().to_string();
     sb.hook(&id, &pane, "{\"hook_event_name\":\"Stop\",\"session_id\":\"c1\",\"last_assistant_message\":\"好\"}");
-    // 钩子是不等的:给它一点时间
+    // Hooks aren't waited for: give it a moment
     let ran = sb.home.join("state/plugins/test.mark/ran");
     for _ in 0..50 {
         if ran.exists() {
@@ -572,16 +591,18 @@ fn a_plugin_hears_events_and_can_put_a_token_on_the_row() {
     assert!(ran.exists(), "插件的事件钩子没跑:{}", sb.aca(&["plugin", "log", "test.mark"]));
     assert_eq!(sb.json(&["show", &id, "--json"])["tokens"]["mark"], "turn.done");
 
-    // 动作在前台跑,拿得到是冲着哪个会话的
+    // Actions run in the foreground and know which session they're for
     assert_eq!(sb.aca(&["plugin", "run", "test.mark.hello", "--session", &id]), format!("hi {id} from test.mark"));
-    // 关掉之后不再收事件、动作也调不了
+    // Once disabled, it gets no more events and its actions can't be called
     sb.aca(&["plugin", "disable", "test.mark"]);
     assert!(!sb.run(&["plugin", "run", "test.mark.hello"]).status.success());
 }
 
-/// 一个不是 aca 起的「Claude」:进程名是 claude、什么参数都收、一直挂着;外面包着一层 shell(agent-deck 起的就是这个样子),
-/// 带着自己的配置目录。返回 (tmux 会话号, 窗格, agent 的 pid);这台机器编不出那个假程序 = None。
-/// 得是个真叫这个名字的程序:系统认进程名看的是文件本身,链接、脚本都骗不过;系统自带的程序拷出来又不让跑。所以现编一个
+/// A "Claude" not started by aca: the process name is claude, it takes any arguments and just hangs around; wrapped in a
+/// shell (that's what agent-deck starts look like), with its own config directory. Returns (tmux session number, pane,
+/// agent pid); None = the fake program can't be compiled on this machine.
+/// It must be a program really called that: the system takes the process name from the file itself, so links and scripts
+/// can't fool it, and system programs copied out aren't allowed to run. So one is compiled on the spot
 fn foreign_claude(sb: &Sandbox, name: Option<&str>, env: &str) -> Option<(String, String, String)> {
     let bin = sb.home.join("bin/claude");
     if !bin.exists() {
@@ -624,7 +645,7 @@ fn alive(pid: &str) -> bool {
     Command::new("kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status().unwrap().success()
 }
 
-/// 接管要读 `~` 底下的东西(默认的配置目录、agent-deck 的库):把 HOME 也指进沙盒
+/// Adopting reads things under `~` (the default config directory, agent-deck's database): point HOME into the sandbox too
 fn at_home(sb: &Sandbox, args: &[&str]) -> String {
     let o = sb.cmd().env("HOME", &sb.home).args(args).output().unwrap();
     assert!(o.status.success(), "aca {args:?} 失败:{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
@@ -634,7 +655,8 @@ fn at_home(sb: &Sandbox, args: &[&str]) -> String {
 #[test]
 fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_released() {
     let Some(sb) = Sandbox::new("adopt") else { return };
-    // 重启之后 aca 起的也是那个假的 claude(什么参数都收);起成了什么样,看进程的命令行
+    // After a restart, what aca starts is that fake claude too (takes any arguments); what it started as is read from the
+    // process's command line
     let cfg = sb.home.join("config/config.toml");
     let mut text = std::fs::read_to_string(&cfg).unwrap();
     text += &format!(
@@ -645,7 +667,7 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
     write(&cfg, &text);
     let Some((sid, pane, pid)) = foreign_claude(&sb, None, "") else { return };
     let tmux_name = sb.tmux(&["display-message", "-p", "-t", &pane, "#{session_name}"]);
-    // 真的 Claude 自己记的那份:现在是哪段对话、标题;对话记录在它的配置目录里
+    // What the real Claude records itself: which conversation it's on now, the title; the transcript is in its config directory
     write(
         &sb.home.join(format!("cc/sessions/{pid}.json")),
         &format!(r#"{{"pid":{pid},"sessionId":"c-live","cwd":"{}","name":"修登录"}}"#, sb.proj()),
@@ -655,7 +677,8 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
     let ls = || serde_json::from_str::<Value>(&aca(&["ls", "--json"])).unwrap();
     let panes = || sb.tmux(&["list-panes", "-a", "-F", "#{session_name}|#{@aca_id}|#{@aca_agent}|#{remain-on-exit}|#{pane_dead}"]);
 
-    // 不带参数:列出来看,什么都不动。认出了哪一家、哪个账号、哪段对话、要照搬的参数
+    // No arguments: list them to look at, change nothing. Which harness, which account, which conversation, which arguments to
+    // carry over were recognized
     let listed = aca(&["adopt"]);
     assert!(
         listed.contains("「修登录」 claude:sub")
@@ -667,7 +690,8 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
     assert_eq!(ls(), serde_json::json!([]));
     assert_eq!(panes(), format!("{tmux_name}|||off|0"));
 
-    // 接管:登记了、tmux 会话名改成标题、agent 那一格记上了;进程还是原来那个,没被动过
+    // Adopt: registered, the tmux session renamed to the title, the agent's pane recorded; the process is the original one,
+    // untouched
     let said = aca(&["adopt", &tmux_name, "-g", "work"]);
     assert!(said.contains("已接管「修登录」") && said.contains(&format!("{tmux_name} → 修登录")), "{said}");
     let row = ls()[0].clone();
@@ -685,15 +709,16 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
     );
     assert_eq!(row["pane"].as_str(), Some(pane.as_str()));
     assert_eq!(panes(), format!("修登录|{id}|1|on|0"));
-    // 照搬的参数里没有「接哪段对话」的那两个词
+    // The carried-over arguments don't include the two words for "which conversation to resume"
     assert!(aca(&["show", &id, "--json"]).contains("\"args\":[\"--dangerously-skip-permissions\"]"));
     assert!(alive(&pid), "接管不该动那个进程");
-    // 再接一次:已经是 aca 的了
+    // Adopting again: it's already aca's
     let again = sb.cmd().env("HOME", &sb.home).args(["adopt", "修登录"]).output().unwrap();
     assert!(!again.status.success() && String::from_utf8_lossy(&again.stderr).contains("已是 aca 会话"));
 
-    // 重启:原来那个进程退干净了(它不是窗格的根进程,外面还有一层 shell),在同一格里由 aca 起:接着那段对话、
-    // 带着 hook、照搬的参数还在
+    // Restart: the original process exits cleanly (it isn't the pane's root process; there's a shell around it), and aca starts
+    // it in the same pane: resuming that conversation,
+    // with hooks, and the carried-over arguments still there
     aca(&["restart", &id]);
     assert!(!alive(&pid), "原来的进程还在");
     assert_eq!(sb.tmux(&["list-panes", "-a", "-F", "#{pane_id}|#{pane_dead}"]), format!("{pane}|0"));
@@ -705,14 +730,16 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
         "{line}"
     );
 
-    // 放手:登记没了,tmux 会话和里面的进程照留,变回普通会话(remain-on-exit 也收回去)
+    // Release: the registration is gone, the tmux session and the process in it stay, back to an ordinary session
+    // (remain-on-exit is taken back too)
     assert!(aca(&["release", &id]).contains("已将「修登录」移出 aca"));
     assert_eq!(ls(), serde_json::json!([]));
     assert_eq!(panes(), "修登录|||off|0");
     assert!(alive(&now));
 
-    // 再接回来:这个进程是 aca 起的,它的 hook 还在往原来那个 id 上报 —— 沿用那个 id;账号从它的环境里认;
-    // aca 自己带进去的那几样(--resume、它的 --settings)不当成要照搬的参数
+    // Adopt it back: this process was started by aca and its hooks still report to the original id — keep that id; the account
+    // is recognized from its environment;
+    // what aca itself passed in (--resume, its --settings) isn't taken as arguments to carry over
     write(&sb.home.join(format!("cc/sessions/{now}.json")), &format!(r#"{{"pid":{now},"sessionId":"c-live","cwd":"{}"}}"#, sb.proj()));
     let said = aca(&["adopt", &pane]);
     assert!(said.contains(&format!("已接管「修登录」 {id}")) && !said.contains("重启前"), "{said}");
@@ -720,7 +747,7 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
     assert_eq!((row["id"].as_str(), row["account"].as_str(), row["conv"].as_str()), (Some(id.as_str()), Some("sub"), Some("c-live")));
     assert!(aca(&["show", &id, "--json"]).contains("\"args\":[\"--dangerously-skip-permissions\"]"));
 
-    // 认不出的程序(一个 sleep):照 --as 说的登记;标题、对话、参数自己给
+    // A program it can't recognize (a sleep): registered as --as says; title, conversation and arguments given by hand
     let other = sb.tmux(&["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", "杂项", "-c", &sb.proj(), "sleep 600"]);
     assert!(aca(&["adopt", "杂项", "-n"]).contains("shell"));
     let said = aca(&["adopt", &other, "--as", "fake:sub", "-t", "又一个", "--conv", "c-9", "--", "--mine"]);
@@ -739,7 +766,8 @@ fn a_running_session_aca_did_not_start_is_adopted_in_place_restarted_and_release
 fn the_title_an_agent_writes_on_its_pane_is_followed_without_any_hook() {
     let Some(sb) = Sandbox::new("pane-title") else { return };
     let Some((_, pane, pid)) = foreign_claude(&sb, None, "") else { return };
-    // 真的 Claude 没起名字时自己编一个占位的(nameSource 是 derived):那不是标题。标题它写在窗格标题上
+    // When the real Claude hasn't named it, it makes up a placeholder itself (nameSource is derived): that isn't a title. The
+    // title it writes on the pane title
     write(
         &sb.home.join(format!("cc/sessions/{pid}.json")),
         &format!(r#"{{"pid":{pid},"sessionId":"c-live","cwd":"{}","name":"proj-5e","nameSource":"derived"}}"#, sb.proj()),
@@ -759,26 +787,27 @@ fn the_title_an_agent_writes_on_its_pane_is_followed_without_any_hook() {
     };
     let id = serde_json::from_str::<Value>(&aca(&["ls", "--json", "--no-screen"])).unwrap()[0]["id"].as_str().unwrap().to_string();
 
-    // 接管了没重启,没带 hook:它换了标题,列一次就跟上,tmux 会话名也改
+    // Adopted and not restarted, so no hooks: it changed its title, and one listing catches up, the tmux session name too
     on_pane(&pane, "✳ 换了个标题");
     assert_eq!(names(&id), ("换了个标题".into(), "换了个标题".into()));
-    // 新开一段对话时它写回「还没起标题」的那个:不算,留着原来的
+    // When it starts a new conversation it writes back the "no title yet" one: doesn't count, the original is kept
     on_pane(&pane, "✳ Claude Code");
     assert_eq!(names(&id).0, "换了个标题");
-    // 人改过名的不跟,放开又跟回去
+    // One renamed by a person doesn't follow; unlocked, it follows again
     aca(&["rename", &id, "我起的名字"]);
     on_pane(&pane, "◐ 又换了");
     assert_eq!(names(&id), ("我起的名字".into(), "我起的名字".into()));
     aca(&["rename", &id, "--auto"]);
     assert_eq!(names(&id), ("又换了".into(), "又换了".into()));
 
-    // aca 自己起的也一样:这一轮还没跑完,标题已经在窗格上了,不用等跑完的那个事件
+    // The same for one aca started itself: this turn hasn't finished, the title is already on the pane, no need to wait for the
+    // finishing event
     let own = aca(&["new", "fake", &sb.proj()]);
     let own_pane = row(&own)["pane"].as_str().unwrap().to_string();
     assert_eq!(names(&own).0, "proj");
     on_pane(&own_pane, "✳ 第一轮就有的标题");
     assert_eq!(names(&own), ("第一轮就有的标题".into(), "第一轮就有的标题".into()));
-    // 跑完时对话记录里写的是另一个:听窗格上的(它自己显示的就是那个),不来回改
+    // When the turn finishes, the transcript has a different one: go by the pane (that's what it shows itself), no flip-flopping
     let transcript = sb.home.join("c1.jsonl");
     write(&transcript, "{\"type\":\"ai-title\",\"aiTitle\":\"记录里的\",\"sessionId\":\"c1\"}\n");
     sb.hook(
@@ -787,7 +816,7 @@ fn the_title_an_agent_writes_on_its_pane_is_followed_without_any_hook() {
         &format!("{{\"hook_event_name\":\"Stop\",\"session_id\":\"c1\",\"transcript_path\":\"{}\"}}", transcript.display()),
     );
     assert_eq!(names(&own), ("第一轮就有的标题".into(), "第一轮就有的标题".into()));
-    // 事件只在真跟着改了的那两次发:占位的、锁着的、没变的都不发
+    // Events are sent only for the two times it really followed: placeholder, locked and unchanged ones send none
     let titled = sb.event_names().iter().filter(|n| *n == "session.titled").count();
     assert_eq!(titled, 2, "{:?}", sb.event_names());
 }
@@ -799,7 +828,7 @@ fn a_session_agent_deck_started_keeps_its_title_group_and_id_when_adopted() {
         eprintln!("没有 sqlite3,跳过");
         return;
     }
-    // agent-deck 的库:只放接管要读的那几列
+    // agent-deck's database: only the few columns adopting reads
     let db = sb.home.join(".local/share/agent-deck/profiles/default/state.db");
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     let sql = "create table instances(id text, title text, title_locked integer, group_path text, sort_order integer, tool text, account text, \
@@ -807,11 +836,12 @@ fn a_session_agent_deck_started_keeps_its_title_group_and_id_when_adopted() {
                insert into instances values('ad-77', '架构替换方案', 0, 'runtime', 4, 'claude', 'sub', '/p', \
                '{\"claude_session_id\":\"c-deck\"}', 'agentdeck_iron-dune_92cb', 0, '', 1790000000);";
     assert!(Command::new("sqlite3").arg(&db).arg(sql).status().unwrap().success());
-    // 它起的会话:会话名是它编的,进程环境里带着它的 id。这个假的没留「现在是哪段对话」的文件:认命令行里的那个
+    // A session it started: the session name is one it made up, and the process environment carries its id. This fake left no
+    // "which conversation is it on now" file: go by the one on the command line
     let Some((_, pane, pid)) = foreign_claude(&sb, Some("agentdeck_iron-dune_92cb"), "AGENTDECK_INSTANCE_ID=ad-77") else { return };
     let aca = |args: &[&str]| at_home(&sb, args);
 
-    // 写名字里的一段就行
+    // Part of the name is enough
     let said = aca(&["adopt", "iron-dune"]);
     assert!(said.contains("已接管「架构替换方案」 ad-77") && said.contains("agent-deck -p default remove ad-77"), "{said}");
     let row = serde_json::from_str::<Value>(&aca(&["show", "ad-77", "--json"])).unwrap();
@@ -819,13 +849,14 @@ fn a_session_agent_deck_started_keeps_its_title_group_and_id_when_adopted() {
         (row["title"].as_str(), row["group"].as_str(), row["conv"].as_str(), row["tmux"].as_str(), row["created"].as_u64()),
         (Some("架构替换方案"), Some("runtime"), Some("c-old"), Some("架构替换方案"), Some(1_790_000_000))
     );
-    // 没登记过的配置目录:账号直接记那个目录
+    // An unregistered config directory: the account records that directory directly
     assert_eq!(row["account"].as_str(), sb.home.join("cc").to_str());
-    // 库只读:那边的记录原样
+    // The database is read-only: the records there are unchanged
     let o = Command::new("sqlite3").arg(&db).arg("select tmux_session from instances").output().unwrap();
     assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "agentdeck_iron-dune_92cb");
 
-    // 重启之前它没带 aca 的 hook,但带着 agent-deck 的、照常在报:那边记的借过来,不用等重启就有「在跑」「没看」
+    // Before the restart it doesn't carry aca's hooks, but carries agent-deck's, which keep reporting: borrow what that side
+    // records, so "running" and "unread" are there without waiting for a restart
     let hook = sb.home.join(".local/share/agent-deck/hooks/ad-77.json");
     std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
     let state = || serde_json::from_str::<Value>(&aca(&["ls", "--json", "--no-screen"])).unwrap()[0]["state"].clone();
@@ -838,7 +869,7 @@ fn a_session_agent_deck_started_keeps_its_title_group_and_id_when_adopted() {
     std::fs::write(&hook, format!(r#"{{"status":"running","session_id":"c-old","event":"UserPromptSubmit","ts":{now}}}"#)).unwrap();
     assert_eq!(state(), "running");
 
-    // 停:里面的 agent 和外面那层 shell 都退了,窗格留着
+    // Stop: the agent inside and the shell around it both exit, the pane stays
     aca(&["stop", "ad-77"]);
     assert_eq!(sb.tmux(&["list-panes", "-a", "-F", "#{pane_id}|#{pane_dead}"]), format!("{pane}|1"));
     assert!(!alive(&pid));
@@ -866,12 +897,13 @@ fn a_session_imported_while_running_is_attached_to_its_registration_and_the_rest
     let aca = |args: &[&str]| at_home(&sb, args);
     let ls = || serde_json::from_str::<Value>(&aca(&["ls", "--json"])).unwrap();
 
-    // 先整批搬过(连在跑的也登记了):登记着,在 aca 看来是停着的
+    // First move all of them over in one batch (the running one registered too): registered, and stopped as far as aca can tell
     assert!(aca(&["import", "agent-deck", "--apply", "--all"]).contains("已导入 1 个"));
     assert_eq!(ls()[0]["state"], "stopped");
     let Some((_, pane, _)) = foreign_claude(&sb, Some("agentdeck_k_5"), "AGENTDECK_INSTANCE_ID=ad-5") else { return };
 
-    // 接管:不另登记一条,把这个 tmux 会话接到那条上。对话、参数以进程上现在的为准,别的照登记的
+    // Adopt: no new registration; this tmux session is attached to that one. Conversation and arguments follow what's on the
+    // process now, the rest follows the registration
     let said = aca(&["adopt", "k_5"]);
     assert!(said.contains("已接管「导入过的」 ad-5"), "{said}");
     let rows = ls();
@@ -885,7 +917,7 @@ fn a_session_imported_while_running_is_attached_to_its_registration_and_the_rest
         serde_json::json!(["--dangerously-skip-permissions"])
     );
 
-    // 又来两个没登记的:--all 只接认得出 agent 的那个,已经是 aca 的不重复接
+    // Two more unregistered ones: --all adopts only the one with a recognizable agent, and doesn't adopt again what's already aca's
     foreign_claude(&sb, None, "").unwrap();
     sb.tmux(&["new-session", "-d", "-s", "只是个壳", "-c", &sb.proj(), "sleep 600"]);
     let listed = aca(&["adopt"]);
@@ -910,15 +942,17 @@ fn a_dir_becomes_a_group_named_after_it_and_the_group_can_be_renamed_and_rehomed
         d.canonicalize().unwrap().to_string_lossy().into_owned()
     };
     let (a, b, c) = (dir("x/aca"), dir("y/aca"), dir("z/home"));
-    // 目录登记成分组:名字是目录名,再来一次还是它
+    // Register a directory as a group: the name is the directory name, and doing it again gives the same one
     assert_eq!(sb.aca(&["group", "add", &a]), "aca");
     assert_eq!(sb.aca(&["group", "add", &a]), "aca");
-    // 同名的记着别的目录:往后编号。new -g . 进按目录定的组,目录记成它的默认目录
+    // The same name already has another directory: number onward. new -g . goes into the group decided by directory, with the
+    // directory recorded as its default directory
     let id = sb.aca(&["new", "fake", &b, "--hold", "-g", "."]);
     assert_eq!(sb.json(&["show", &id, "--json"])["group"], "aca-2");
     assert_eq!(sb.aca(&["group", "dir", "aca-2"]), b);
 
-    // 改名(换个上级):会话跟过去,界面记着它的(工作区、在看的组、折着的)一起改
+    // Rename (under another parent): the sessions move along, and what the UI remembers about it (workspace, the group being
+    // viewed, folded ones) changes with it
     let ui = sb.home.join("state/ui");
     write(&ui.join("spaces"), "group\tdefault\taca-2\th\ngroup\tdefault\taca\t2\n");
     write(&ui.join("view"), "group=aca-2\nfolded=aca-2\tother\n");
@@ -928,21 +962,23 @@ fn a_dir_becomes_a_group_named_after_it_and_the_group_can_be_renamed_and_rehomed
     assert!(spaces.contains("group\tdefault\tlab/aca\th\n") && spaces.contains("group\tdefault\taca\t2\n"), "{spaces}");
     let view = std::fs::read_to_string(ui.join("view")).unwrap();
     assert!(view.contains("group=lab/aca\n") && view.contains("folded=lab/aca\tother\n"), "{view}");
-    // 撞上已有的:不改
+    // Clashes with an existing one: not changed
     let o = sb.run(&["group", "rename", "lab/aca", "ACA"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("aca 已存在"));
 
-    // 默认目录:换一个;是别的组的不收;'' = 不记
+    // Default directory: change it; one belonging to another group isn't accepted; '' = none
     sb.aca(&["group", "dir", "lab/aca", &c]);
     assert_eq!(sb.aca(&["group", "dir", "lab/aca"]), c);
     let o = sb.run(&["group", "dir", "lab/aca", &a]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("分组 aca"));
     sb.aca(&["group", "dir", "lab/aca", ""]);
     assert_eq!(sb.aca(&["group", "dir", "lab/aca"]), "");
-    // move .:b 不再是谁的默认目录了,按名字重新定(aca 记着别的目录 → aca-2),说一声进了哪个
+    // move .: b is no longer anyone's default directory, so it's decided by name again (aca has another directory → aca-2), and
+    // it says which one it went into
     assert_eq!(sb.aca(&["move", &id, "."]), "aca-2");
     assert_eq!(sb.aca(&["group", "dir", "aca-2"]), b);
-    // 上一级目录名是已有的分组:嵌在它下面(和界面的 N 是同一套),目录记成新组的默认目录
+    // The parent directory's name is an existing group: nest under it (the same rules as N in the UI), with the directory recorded
+    // as the new group's default directory
     sb.aca(&["group", "create", "work"]);
     let d = dir("w/work/new thing");
     let id = sb.aca(&["new", "fake", &d, "--hold", "-g", "."]);
@@ -957,8 +993,9 @@ fn the_mod_rides_along_only_on_a_claude_build_that_takes_it_and_keeps_reporting(
     let Some(sb) = Sandbox::new("mod") else { return };
     let cfg = sb.home.join("config/config.toml");
     write(&cfg, &(std::fs::read_to_string(&cfg).unwrap() + "[tools.claude]\nmod = true\n"));
-    // 假的 claude:`plugin validate` 时把 report.json 打出来(真的那条是让这一版自己验 mod),别的时候是假 agent,把收到的参数记下。
-    // 每「装」一版文件就变(多一个 #),结论按版本重新下
+    // A fake claude: on `plugin validate` it prints report.json (the real one has this build check the mod itself), otherwise it's
+    // a fake agent that records the arguments it got.
+    // Every "installed" build changes the file (one more #), so the verdict is made again per build
     let bin = sb.home.join("bin");
     let install = |build: usize, report: &str| {
         write(&bin.join("report.json"), report);
@@ -1005,25 +1042,25 @@ fn the_mod_rides_along_only_on_a_claude_build_that_takes_it_and_keeps_reporting(
     let mods = state.join("hooks/claude-mod/aca");
     let carried = format!("--plugin-dir {}", mods.display());
 
-    // 这一版验得过:mod 和 hook 一样是启动时带的,文件在 aca 自己的状态目录里
+    // This build passes the check: the mod is passed at start, like hooks, with the files in aca's own state directory
     install(1, passes);
     let (one, argv) = start();
     assert!(argv.contains(&carried) && argv.contains("--settings"), "{argv}");
     assert!(mods.join("hooks/register.js").is_file() && mods.join(".claude-plugin/plugin.json").is_file());
-    // 它交来一次用量:记在这个会话自己的文件里,账号是它环境里的配置目录
+    // It hands in usage once: recorded in this session's own file, with the account being the config directory in its environment
     let measure = r#"{"context":{"window":1000000},"rateLimits":[{"kind":"five_hour","percentUsed":6,"resetsAt":"2026-10-09T11:40:00.000Z"}],"cost":{"usd":0},"changed":["rateLimits"]}"#;
     hands_over(&one, measure);
     let rec: Value = serde_json::from_str(&std::fs::read_to_string(state.join(format!("ui/limits/mod-{one}.json"))).unwrap()).unwrap();
     assert_eq!(rec["dir"].as_str().unwrap(), sb.home.join("acct").to_string_lossy());
     assert_eq!((rec["wins"][0]["label"].as_str(), rec["wins"][0]["used"].as_f64()), (Some("5h"), Some(6.0)));
     assert!(state.join(format!("mod/heard/{one}")).is_file());
-    // 交来的东西认不出了(事件的形状变了):这一版之后不带
+    // What it hands in can't be recognized (the event's shape changed): not passed after this build
     hands_over(&one, r#"{"context":{"window":1000000},"limits":[]}"#);
     let (two, argv) = start();
     assert!(!argv.contains("--plugin-dir"), "{argv}");
     assert!(whys().contains("无法识别") && !state.join(format!("mod/up/{two}")).exists());
 
-    // 换了一版,它自己说不认这个事件:不带
+    // Another build, and it says itself that it doesn't know this event: not passed
     install(
         2,
         r#"{"success":false,"manifest":{"errors":[]},"contents":[{"errors":[{"path":"modules../register.js","message":"aca: /x/register.js:5: \"session.measure\" is not an event; $ is always spelled $.noun.event(...)"}],"notes":[]}]}"#,
@@ -1031,11 +1068,12 @@ fn the_mod_rides_along_only_on_a_claude_build_that_takes_it_and_keeps_reporting(
     assert!(!start().1.contains("--plugin-dir"));
     assert!(whys().contains("is not an event"));
 
-    // 又一版,验得过、带上了,但跑完一轮一次都没交来(`$` 上的调用改了名,它验不出):下次起就不带了
+    // Yet another build: passes the check and is passed, but hands in nothing during a whole turn (the call on `$` was renamed, which
+    // the check can't catch): not passed on the next start
     install(3, passes);
     let (four, argv) = start();
     assert!(argv.contains(&carried), "{argv}");
-    // 起了一分钟了(把记的时刻往回拨),跑完一轮
+    // It has been up a minute (turn the recorded time back), and a turn finishes
     let up = state.join(format!("mod/up/{four}"));
     let (key, at) =
         std::fs::read_to_string(&up).unwrap().trim().split_once(' ').map(|(k, t)| (k.to_string(), t.parse::<u64>().unwrap())).unwrap();
@@ -1051,12 +1089,13 @@ fn the_mod_rides_along_only_on_a_claude_build_that_takes_it_and_keeps_reporting(
 fn a_finished_worker_rings_its_parents_doorbell_and_claude_takes_the_notice_itself() {
     let Some(sb) = Sandbox::new("bell") else { return };
     let lead = sb.aca(&["new", "fake", &sb.proj(), "-t", "主线"]);
-    // 没说要通知的:跑完也不叫醒谁
+    // Nobody asked to be notified: finishing wakes no one
     let quiet = sb.aca(&["new", "fake", &sb.proj(), "-t", "安静", "--parent", &lead]);
     sb.hook(&quiet, &sb.pane(&quiet), r#"{"hook_event_name":"Stop","session_id":"c9","last_assistant_message":"好"}"#);
     assert_eq!(sb.json(&["inbox", &lead, "--json"]), serde_json::json!([]));
     let w = sb.aca(&["new", "fake", &sb.proj(), "-t", "读文档", "--parent", &lead, "--notify", "all"]);
-    // 主线的 Claude 起来了:SessionStart 多跑的那一条回一个要它盯着的文件(它的门铃),标准输出只有这一段
+    // The lead's Claude has started: the extra command run on SessionStart answers with a file for it to watch (its doorbell), and
+    // stdout holds only that
     let o = sb.as_session(&lead, &["inbox", "watch"], r#"{"hook_event_name":"SessionStart","source":"startup"}"#);
     let v: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
@@ -1064,7 +1103,7 @@ fn a_finished_worker_rings_its_parents_doorbell_and_claude_takes_the_notice_itse
     assert!(bell.ends_with(&format!("inbox/{lead}.bell")), "{v}");
     let before = std::fs::read_to_string(&bell).unwrap();
 
-    // worker 跑完一轮:它自己的 hook 往主线的收件箱放一条通知,再按一下门铃
+    // The worker finished a turn: its own hook puts a notice in the lead's inbox, then rings the doorbell
     sb.hook(&w, &sb.pane(&w), r#"{"hook_event_name":"Stop","session_id":"c1","last_assistant_message":"整理好了,\n结论写在 notes.md"}"#);
     assert!(sb.until(|| std::fs::read_to_string(&bell).unwrap() != before), "门铃没响");
     let inbox = sb.json(&["inbox", &lead, "--json"]);
@@ -1073,7 +1112,8 @@ fn a_finished_worker_rings_its_parents_doorbell_and_claude_takes_the_notice_itse
         (Some("notice"), Some("turn.done"), Some(w.as_str()), Some("pending"))
     );
 
-    // Claude 看到门铃变了,在后台跑取信的那条 hook:写到 stderr、退出码 2,它就把这段当成系统提示给模型
+    // Claude sees the doorbell change and runs the fetching hook in the background: written to stderr with exit code 2, it gives
+    // that text to the model as a system reminder
     let take = || {
         sb.as_session(&lead, &["inbox", "take"], &format!(r#"{{"hook_event_name":"FileChanged","file_path":"{bell}","event":"change"}}"#))
     };
@@ -1088,33 +1128,34 @@ fn a_finished_worker_rings_its_parents_doorbell_and_claude_takes_the_notice_itse
         "{said}"
     );
     assert!(o.stdout.is_empty());
-    // 取过了:再响一次什么都不发生
+    // Already fetched: ringing again does nothing
     assert_eq!(take().status.code(), Some(0));
     assert_eq!(sb.json(&["inbox", &lead, "--json"])[0]["stage"], "got");
 
-    // 你自己开的会话(没有 parent)跑完了,不通知谁
+    // A session you started yourself (no parent) finished: nobody is notified
     sb.hook(&lead, &sb.pane(&lead), r#"{"hook_event_name":"Stop","session_id":"c0","last_assistant_message":"好"}"#);
     let names = sb.event_names();
     assert_eq!(names.iter().filter(|n| *n == "message.sent").count(), 1, "{names:?}");
     assert_eq!(names.iter().filter(|n| *n == "message.delivered").count(), 1, "{names:?}");
-    // 删掉会话,收件箱一起没了
+    // Deleting the session removes its inbox too
     sb.aca(&["rm", &lead]);
     assert!(!Path::new(&bell).exists());
 }
 
-/// 分叉出来的是你自己接着聊的另一条路:和原会话平级(没有 parent,分自谁在 fork_of),排在原会话那一家的紧后面;
-/// 它跑完不通知原会话,原会话也不能替它答
+/// A fork is another path you continue yourself: a peer of the original session (no parent; who it forked from is in fork_of),
+/// listed right after the original session's family;
+/// when it finishes it doesn't notify the original session, and the original session can't answer for it
 #[test]
 fn a_fork_is_a_peer_listed_right_after_the_original_and_not_one_it_dispatched() {
     let Some(sb) = Sandbox::new("fork-peer") else { return };
-    // 配置里让 worker 跑完都通知派它的那个:分叉出来的不该跟着通知
+    // The config has workers notify whoever sent them out whenever they finish: a fork shouldn't notify too
     let cfg = sb.home.join("config/config.toml");
     write(&cfg, &format!("{}[inbox]\nnotify = [\"done\"]\n", std::fs::read_to_string(&cfg).unwrap()));
     let lead = sb.aca(&["new", "fake", &sb.proj(), "-t", "主线"]);
     let worker = sb.aca(&["new", "fake", &sb.proj(), "-t", "读文档", "--parent", &lead]);
     let other = sb.aca(&["new", "fake", &sb.proj(), "-t", "别的事"]);
     let fork = sb.aca(&["fork", &lead]);
-    // worker 的分叉:也是顶格的,排到派 worker 的那个后面
+    // A fork of the worker: also top-level, listed after the one that sent out the worker
     let wfork = sb.aca(&["fork", &worker, "-t", "换个读法"]);
 
     let rows = sb.json(&["ls", "--json", "--no-screen"]);
@@ -1130,17 +1171,17 @@ fn a_fork_is_a_peer_listed_right_after_the_original_and_not_one_it_dispatched() 
     let ids: Vec<String> = by_order.into_iter().map(|x| x.1).collect();
     assert_eq!(ids, [lead.clone(), wfork.clone(), fork.clone(), worker.clone(), other]);
 
-    // 事件里:分自谁,没有 parent
+    // In the events: who it forked from, no parent
     let made: Vec<Value> = sb.aca(&["events", "-n", "100"]).lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).collect();
     let made = made.iter().find(|e| e["event"] == "session.created" && e["session"] == fork.as_str()).unwrap();
     assert_eq!((made["fork"].as_bool(), made["fork_of"].as_str(), made["parent"].as_str()), (Some(true), Some(lead.as_str()), Some("")));
 
-    // 分叉跑完一轮:主线的收件箱里没有它;worker 跑完的照样通知
+    // The fork finishes a turn: it isn't in the lead's inbox; the worker finishing still notifies
     sb.hook(&fork, &sb.pane(&fork), r#"{"hook_event_name":"Stop","session_id":"f1","last_assistant_message":"好"}"#);
     assert_eq!(sb.json(&["inbox", &lead, "--json"]), serde_json::json!([]));
     sb.hook(&worker, &sb.pane(&worker), r#"{"hook_event_name":"Stop","session_id":"w1","last_assistant_message":"读完了"}"#);
     assert_eq!(sb.json(&["inbox", &lead, "--json"])[0]["from"], worker.as_str());
-    // 分叉里发给 parent:它没有
+    // Sending to parent from the fork: it has none
     assert!(!sb.as_session(&fork, &["msg", "parent", "在吗"], "").status.success());
 }
 
@@ -1153,27 +1194,28 @@ fn a_message_to_codex_goes_into_its_own_queue_and_waits_while_it_is_busy() {
     let hook = |json: &str| sb.hook_as("codex", &cx, &pane, json);
     let stage = |n: usize| sb.json(&["inbox", &cx, "--json"])[n]["stage"].as_str().unwrap().to_string();
 
-    // 还没说过话:没有对话 id 排不进去;屏幕上也没有输入框,不打字。先存着
+    // It hasn't talked yet: with no conversation id it can't be queued; there's no input box on screen either, so nothing is typed.
+    // Hold it for now
     let said = sb.aca(&["msg", &cx, "先看看 README"]);
     assert!(said.contains("暂存"), "{said}");
     assert_eq!(sb.queued(), "");
-    // 它说过一句、这一轮跑完了:它自己的 Stop hook 把存着的排进它的队列
+    // It said something and this turn finished: its own Stop hook queues the held one
     hook(r#"{"hook_event_name":"SessionStart","session_id":"th-1","source":"startup"}"#);
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"th-1","prompt":"第一句"}"#);
     hook(r#"{"hook_event_name":"Stop","session_id":"th-1","last_assistant_message":"好"}"#);
     assert!(sb.until(|| sb.queued().contains("先看看 README")), "没排进去:{}", sb.queued());
-    // 带一个 -c(在自己进程里写完就走,不拉起后台服务)、对话 id、那段话
+    // With a -c (writes within its own process and leaves, without bringing up the background server), the conversation id, the text
     let q = sb.queued();
     let args: Vec<&str> = q.lines().collect();
     assert_eq!(args[..6], ["-c", "notify=[]", "queue", "--thread", "th-1", "--message"]);
-    // 你发的:原样排进去,不加「别的会话转来的」(Codex 会当成注入)
+    // Sent by you: queued as is, without the "forwarded from another session" wrapper (Codex would take that as an injection)
     assert_eq!(args[6], "先看看 README", "{q}");
     assert!(sb.until(|| stage(0) == "queued"), "{}", stage(0));
-    // Codex 为这段开了一轮:UserPromptSubmit 里带着原话,记成送到了
+    // Codex started a turn for it: UserPromptSubmit carries the original text, recorded as delivered
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"th-1","prompt":"先看看 README"}"#);
     assert_eq!(stage(0), "got");
 
-    // 它在跑:再发的先存着,这一轮跑完马上排进去
+    // It's running: another message is held first, and queued as soon as this turn finishes
     sb.set_screen(&cx, &pane, "• Working (5s • esc to interrupt)");
     let said = sb.aca(&["msg", &cx, "再补一句"]);
     assert!(said.contains("它正在运行"), "{said}");
@@ -1181,7 +1223,7 @@ fn a_message_to_codex_goes_into_its_own_queue_and_waits_while_it_is_busy() {
     hook(r#"{"hook_event_name":"Stop","session_id":"th-1","last_assistant_message":"好了"}"#);
     assert!(sb.until(|| sb.queued().contains("再补一句")), "{}", sb.queued());
 
-    // 你刚按 Esc 打断了它:不去催,等你下一轮跑完
+    // You just interrupted it with Esc: don't push, wait for your next turn to finish
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"th-1","prompt":"写一篇长文"}"#);
     hook(r#"{"hook_event_name":"Interrupt","session_id":"th-1"}"#);
     let said = sb.aca(&["msg", &cx, "第三句"]);
@@ -1190,17 +1232,69 @@ fn a_message_to_codex_goes_into_its_own_queue_and_waits_while_it_is_busy() {
 }
 
 #[test]
+fn an_argument_that_is_not_utf8_is_reported_instead_of_a_panic() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(sb) = Sandbox::new("badarg") else { return };
+    // What a real Codex once wrote: sh swallowed the first byte of a full-width comma into the variable name (`PID=$pid,`),
+    // leaving half a character
+    let o = sb.cmd().args(["msg", "x"]).arg(std::ffi::OsStr::from_bytes(b"PID=\xBC\x8C log")).output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("参数不是合法的 UTF-8") && !err.contains("panicked"), "{err}");
+}
+
+#[test]
+fn a_scheduled_message_waits_until_it_is_due_and_one_can_go_to_yourself() {
+    let Some(sb) = Sandbox::new("later") else { return };
+    sb.screen_tools();
+    let cx = sb.aca(&["new", "fcx", &sb.proj()]);
+    let pane = sb.pane(&cx);
+    let hook = |json: &str| sb.hook_as("codex", &cx, &pane, json);
+    hook(r#"{"hook_event_name":"SessionStart","session_id":"th-1","source":"startup"}"#);
+    hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"th-1","prompt":"第一句"}"#);
+    hook(r#"{"hook_event_name":"Stop","session_id":"th-1","last_assistant_message":"好"}"#);
+    let inbox = || sb.json(&["inbox", &cx, "--json"]);
+
+    // Scheduled: put in but not delivered yet, it's 「定时」 (scheduled); delivering another message doesn't bring it along
+    let said = sb.aca(&["msg", "--in", "2s", &cx, "看一下 CI"]);
+    assert!(said.contains("送达"), "{said}");
+    assert_eq!(inbox()[0]["stage"], "scheduled");
+    assert!(inbox()[0]["at"].as_u64().unwrap() > 0);
+    assert!(sb.aca(&["inbox", &cx]).contains("[定时 "), "{}", sb.aca(&["inbox", &cx]));
+    sb.aca(&["msg", &cx, "先看 README"]);
+    assert!(sb.until(|| sb.queued().contains("先看 README")));
+    assert!(!sb.queued().contains("看一下 CI"), "{}", sb.queued());
+    // Due: goes into its queue as usual
+    assert!(sb.until(|| sb.queued().contains("看一下 CI")), "到点没送:{}", sb.queued());
+    assert!(sb.until(|| inbox()[0]["stage"] == "queued"), "{}", inbox()[0]);
+
+    // One that isn't scheduled can't be sent to yourself; a scheduled one can, waking it when due and saying it scheduled it itself
+    let err = |o: &Output| String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(err(&sb.as_session(&cx, &["msg", &cx, "x"], "")).contains("不能发送给自己"));
+    let o = sb.as_session(&cx, &["msg", "--in", "1s", &cx, "回来看看测试"], "");
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(sb.until(|| sb.queued().contains("回来看看测试")), "{}", sb.queued());
+    let q = sb.queued();
+    let last = q.split("----\n").filter(|b| b.contains("回来看看测试")).last().unwrap();
+    assert!(last.contains("[aca] 定时到点了(你 刚刚定的):\n回来看看测试"), "{last}");
+
+    // A duration written wrong, or too long
+    assert!(err(&sb.run(&["msg", "--in", "soon", &cx, "x"])).contains("--in"));
+    assert!(!sb.run(&["msg", "--in", "8d", &cx, "x"]).status.success());
+}
+
+#[test]
 fn without_a_doorbell_a_message_is_typed_in_only_when_the_input_box_is_empty() {
     let Some(sb) = Sandbox::new("type") else { return };
     sb.screen_tools();
-    // 按 Claude 起的,但这次没接上门铃(像接管来、还没重启的):只能打字
+    // Started the Claude way, but not hooked to the doorbell this time (like one adopted and not restarted yet): typing is the only way
     let id = sb.aca(&["new", "scr", &sb.proj()]);
     let pane = sb.pane(&id);
-    // 输入框中有你未发送的内容:不打,过一阵再看
+    // The input box has something you haven't sent: don't type, look again in a while
     sb.set_screen(&id, &pane, "❯ 人打的草稿");
     let said = sb.aca(&["msg", &id, "补一下测试"]);
     assert!(said.contains("输入框中有你未发送的内容"), "{said}");
-    // 只有灰色的提示:打进去,存着的那条一起
+    // Only a gray placeholder hint: type it in, together with the held one
     sb.set_screen(&id, &pane, "❯ \x1b[2mTry \"fix typecheck errors\"\x1b[0m");
     let said = sb.aca(&["msg", &id, "跑一下 e2e"]);
     assert!(said.contains("已输入并发送"), "{said}");
@@ -1208,10 +1302,10 @@ fn without_a_doorbell_a_message_is_typed_in_only_when_the_input_box_is_empty() {
     assert!(screen.contains("补一下测试") && screen.contains("跑一下 e2e") && !screen.contains("[aca]"), "{screen}");
     let inbox = sb.json(&["inbox", &id, "--json"]);
     assert!(inbox.as_array().unwrap().iter().all(|m| m["stage"] == "got"), "{inbox}");
-    // shell 会话不收:打进去就成了一条命令
+    // A shell session doesn't take it: typed in, it would become a command
     let sh = sb.aca(&["new", "shell", &sb.proj()]);
     assert!(sb.aca(&["msg", &sh, "ls"]).contains("shell"));
-    // 没有这个会话、没给话
+    // No such session, no message given
     assert!(!sb.run(&["msg", "nope", "x"]).status.success());
     assert!(!sb.run(&["msg", &id, "  "]).status.success());
 }
@@ -1224,38 +1318,39 @@ fn a_waiting_worker_is_answered_by_number_and_only_by_the_one_that_sent_it_out()
     let other = sb.aca(&["new", "fake", &sb.proj()]);
     let w = sb.aca(&["new", "scr", &sb.proj(), "--parent", &lead, "--notify", "waiting"]);
     let pane = sb.pane(&w);
-    // 它用选择题问了一句(2.1.294 的样子)
+    // It asked a multiple-choice question (as in 2.1.294)
     sb.set_screen(&w, &pane, " ☐ 测试选择\n测试选 A 还是 B？\n❯ 1. A\n  2. B\nEnter to select · ↑/↓ to navigate · Esc to cancel");
     sb.hook(
         &w,
         &pane,
         r#"{"hook_event_name":"PreToolUse","session_id":"c1","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"测试选 A 还是 B？","multiSelect":false,"options":[{"label":"A"},{"label":"B"}]}]}}"#,
     );
-    // 派它的那个收到通知:问的什么、有哪几个选项、怎么答
+    // The one that sent it out gets a notice: what was asked, which options there are, how to answer
     let notice = sb.json(&["inbox", &lead, "--json"])[0]["text"].as_str().unwrap().to_string();
     assert_eq!(notice, format!("在问:「测试选 A 还是 B？」\n选项:1 A  2 B  回答:aca answer {w} <选项号>"));
     let shown = sb.aca(&["answer", &w]);
     assert!(shown.contains("  1 A\n  2 B") && shown.contains("aca answer"), "{shown}");
 
-    // 普通的 send 不往确认框里打
+    // A plain send doesn't type into a confirmation box
     let o = sb.run(&["send", &w, "-m", "hi"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("aca answer"));
-    // 别的会话不能替它答;选项号要对得上
+    // Other sessions can't answer for it; the option number has to match
     let o = sb.as_session(&other, &["answer", &w, "2"], "");
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("不是你派出的会话"));
     assert!(!sb.as_session(&lead, &["answer", &w, "3"], "").status.success());
-    // 派它的那个能:按下 2(假 agent 不读键,终端把它回显在屏幕上)
+    // The one that sent it out can: presses 2 (the fake agent doesn't read keys, the terminal echoes it on screen)
     let o = sb.as_session(&lead, &["answer", &w, "2"], "");
     assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("2 B"), "{}", String::from_utf8_lossy(&o.stderr));
     let screen = sb.wait_screen(&pane, "cancel\n2");
     assert!(screen.ends_with("Esc to cancel\n2"), "{screen}");
     let answered = sb.aca(&["events", "-n", "100"]).lines().find(|l| l.contains("ask.answered")).unwrap().to_string();
     assert!(answered.contains(&format!("\"by\":\"{lead}\"")) && answered.contains("\"answer\":\"2 B\""), "{answered}");
-    // 答完了:问的那句清掉了
+    // Answered: the question is cleared
     assert_eq!(sb.json(&["show", &w, "--json"])["run"]["ask"], "");
 }
 
-/// 启动时的关卡(Codex 的信任框)只在屏幕上:列出编号的选项,答的时候用方向键走过去再回车
+/// The gate at start (Codex's trust box) exists only on screen: numbered options are listed, and answering moves there with
+/// arrow keys, then presses Enter
 #[test]
 fn a_startup_gate_seen_only_on_screen_is_answered_by_walking_to_the_option() {
     let Some(sb) = Sandbox::new("gate") else { return };
@@ -1274,7 +1369,7 @@ fn a_startup_gate_seen_only_on_screen_is_answered_by_walking_to_the_option() {
         "{shown}"
     );
     assert!(!sb.as_session(&lead, &["answer", &w, "3"], "").status.success());
-    // 选 2:往下一格再回车(假 agent 不读键,终端把方向键回显成 ^[[B)
+    // Pick 2: one down, then Enter (the fake agent doesn't read keys, the terminal echoes the arrow key as ^[[B)
     let o = sb.as_session(&lead, &["answer", &w, "2"], "");
     assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("2 Quit"), "{}", String::from_utf8_lossy(&o.stderr));
     let screen = sb.wait_screen(&pane, "^[[B");
@@ -1294,7 +1389,7 @@ fn waiting_for_a_worker_returns_when_its_turn_ends_and_its_notice_does_not_wake_
     sb.set_screen(&w, &pane, "✻ Pondering… (3s · ↓ 1k tokens)");
     sb.hook(&w, &pane, r#"{"hook_event_name":"UserPromptSubmit","session_id":"c1","prompt":"读文档"}"#);
 
-    // 主线挂着等它
+    // The lead hangs on, waiting for it
     let mut child =
         sb.cmd().args(["wait", &w, "--timeout", "20"]).env("ACA_SESSION_ID", &lead).stdout(std::process::Stdio::piped()).spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -1303,11 +1398,11 @@ fn waiting_for_a_worker_returns_when_its_turn_ends_and_its_notice_does_not_wake_
     sb.hook(&w, &pane, r#"{"hook_event_name":"Stop","session_id":"c1","last_assistant_message":"读完了"}"#);
     let o = child.wait_with_output().unwrap();
     assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stdout).trim()), (Some(0), format!("{w} 完成一轮:「读完了」").as_str()));
-    // 它的通知已经记成送到了:门铃响了也不会再为它叫醒一次
+    // Its notice is already recorded as delivered: the doorbell ringing won't wake anyone for it again
     assert_eq!(sb.json(&["inbox", &lead, "--json"])[0]["stage"], "got");
     assert_eq!(sb.as_session(&lead, &["inbox", "take"], "{}").status.code(), Some(0));
 
-    // 一直没开始干活的:到时间就回,退出码 124
+    // One that never starts working: returns when time is up, exit code 124
     let idle = sb.aca(&["new", "scr", &sb.proj()]);
     let o = sb.run(&["wait", &idle, "--timeout", "1"]);
     assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stdout).trim()), (Some(124), format!("{idle} 尚未完成(已超时)").as_str()));
@@ -1316,7 +1411,7 @@ fn waiting_for_a_worker_returns_when_its_turn_ends_and_its_notice_does_not_wake_
 #[test]
 fn a_plugin_installed_from_git_brings_its_claude_plugin_while_enabled_and_goes_away_cleanly() {
     let Some(sb) = Sandbox::new("plugins") else { return };
-    // 一个插件仓库:清单里说要给 Claude 带 claude/ 这个插件目录
+    // A plugin repo: the manifest says to pass Claude the plugin directory claude/
     let src = sb.home.join("src");
     std::fs::create_dir_all(src.join("claude/.claude-plugin")).unwrap();
     std::fs::create_dir_all(src.join("claude/commands")).unwrap();
@@ -1328,52 +1423,53 @@ fn a_plugin_installed_from_git_brings_its_claude_plugin_while_enabled_and_goes_a
     git(&src, &["add", "."]);
     git(&src, &["commit", "-q", "-m", "v1"]);
     let v1 = git(&src, &["rev-parse", "HEAD"]);
-    // 按 Claude 起、把参数打在屏幕上的假 agent
+    // A fake agent started the Claude way that prints its arguments on screen
     let cfg = sb.home.join("config/config.toml");
     std::fs::write(sb.home.join("args.sh"), "#!/bin/sh\necho \"args:[$*]\"\nexec sleep 600\n").unwrap();
     let text = std::fs::read_to_string(&cfg).unwrap()
         + &format!("[tools.argc]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{}\"]\n", sb.home.join("args.sh").display());
     std::fs::write(&cfg, text).unwrap();
-    // 窗格 80 列,长参数会折行:接回去再看
+    // The pane is 80 columns, so long arguments wrap: join them back before looking
     let args_of = |id: &str| sb.wait_screen(&sb.pane(id), "]").replace('\n', "");
 
-    // 从 git 装:克隆到 aca 的数据目录,记下从哪来的,带给 Claude
+    // Install from git: cloned into aca's data directory, where it came from is recorded, passed to Claude
     let url = format!("file://{}", src.display());
     assert!(sb.aca(&["plugin", "install", &url]).contains("已安装 t.deleg(Deleg 0.1.0)"));
     let dir = sb.home.join("data/plugins/t.deleg");
     assert!(dir.join("claude/commands/hello.md").is_file());
     let ls = sb.aca(&["plugin", "ls"]);
     assert!(ls.contains("● t.deleg  Deleg 0.1.0") && ls.contains(&format!("安装自 {url}")) && ls.contains("提供给 claude"), "{ls}");
-    // 开着:起 Claude 时带上它的插件目录(只对这一次启动)
+    // Enabled: when Claude starts, its plugin directory is passed (for that one start only)
     let a = sb.aca(&["new", "argc", &sb.proj()]);
     let want = format!("--plugin-dir {}", dir.join("claude").canonicalize().unwrap().display());
     assert!(args_of(&a).contains(&want), "{}", args_of(&a));
-    // 停着:新起的不带
+    // Disabled: new starts don't get it
     sb.aca(&["plugin", "disable", "t.deleg"]);
     let b = sb.aca(&["new", "argc", &sb.proj()]);
     assert!(!args_of(&b).contains("--plugin-dir"), "{}", args_of(&b));
     sb.aca(&["plugin", "enable", "t.deleg"]);
-    // 同一个再装一次:不覆盖
+    // Installing the same one again: no overwrite
     assert!(!sb.run(&["plugin", "install", &url]).status.success());
-    // 仓库里出了新版本:update 拉过来,清单重新读
+    // A new version in the repo: update pulls it and rereads the manifest
     std::fs::write(src.join("aca-plugin.toml"), manifest("0.2.0")).unwrap();
     git(&src, &["commit", "-q", "-am", "v2"]);
     let said = sb.aca(&["plugin", "update"]);
     assert!(said.contains("t.deleg:") && said.contains("→") && said.contains("Deleg 0.2.0"), "{said}");
     assert!(sb.aca(&["plugin", "update", "t.deleg"]).contains("已是最新版本"));
-    // 删:连目录一起删,登记没了;插件自己的配置留着(aca 替它建的目录要是空的就不留,见 aca.copy 那条测试)
+    // Remove: deleted along with its directory, the registration gone; the plugin's own config stays (the directory aca made for it
+    // doesn't stay if it's empty, see the aca.copy test)
     write(&sb.home.join("config/plugins/t.deleg/mine.toml"), "x = 1\n");
     assert!(sb.aca(&["plugin", "remove", "t.deleg"]).contains("已删除 t.deleg"));
-    // 一个插件都不列了;起来时带着它的那个会话被点名:要重启才去掉
+    // No plugin is listed anymore; the session that started with it is named: it needs a restart to drop it
     let ls = sb.aca(&["plugin", "ls"]);
     assert!(!dir.exists() && !ls.lines().any(|l| l.starts_with(['●', '○'])) && ls.contains("重启"), "{ls}");
     assert!(sb.home.join("config/plugins/t.deleg/mine.toml").is_file());
-    // 钉在一个版本上:update 不动它
+    // Pinned to a version: update leaves it alone
     sb.aca(&["plugin", "install", &url, "--ref", &v1]);
     assert!(sb.aca(&["plugin", "update", "t.deleg"]).contains("固定在"));
     assert!(sb.aca(&["plugin", "ls"]).contains("Deleg 0.1.0"));
     sb.aca(&["plugin", "remove", "t.deleg"]);
-    // 本地目录:就是链接,删的时候目录不动
+    // A local directory: just a link; removing leaves the directory alone
     assert!(sb.aca(&["plugin", "install", &src.to_string_lossy()]).contains("已安装 t.deleg"));
     assert!(sb.aca(&["plugin", "remove", "t.deleg"]).contains("未删除"));
     assert!(src.join("aca-plugin.toml").is_file());
@@ -1382,7 +1478,8 @@ fn a_plugin_installed_from_git_brings_its_claude_plugin_while_enabled_and_goes_a
 #[test]
 fn a_plugin_whose_auto_setting_is_on_gives_claude_its_commands_without_the_only_when_typed_line() {
     let Some(sb) = Sandbox::new("auto") else { return };
-    // 清单:auto 这个开关设置管 claude/ 里的命令 agent 自己能不能用;命令文件写着「只有你敲才进上下文」
+    // The manifest: the auto setting decides whether the agent may use the commands in claude/ by itself; the command file says
+    // "only enters the context when you type it"
     let dir = sb.home.join("autop");
     write(
         &dir.join("aca-plugin.toml"),
@@ -1392,7 +1489,7 @@ fn a_plugin_whose_auto_setting_is_on_gives_claude_its_commands_without_the_only_
     let cmd = "---\ndescription: go\ndisable-model-invocation: true\n---\ngo $ARGUMENTS\n";
     write(&dir.join("claude/commands/go.md"), cmd);
     sb.aca(&["plugin", "link", &dir.to_string_lossy()]);
-    // 按 Claude 起、把参数一行一个写进文件的假 agent
+    // A fake agent started the Claude way that writes its arguments into a file, one per line
     write(
         &sb.home.join("args.sh"),
         &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}/args-'\"$ACA_SESSION_ID\"\nexec sleep 600\n", sb.home.display()),
@@ -1413,7 +1510,7 @@ fn a_plugin_whose_auto_setting_is_on_gives_claude_its_commands_without_the_only_
         panic!("{id} 没起来");
     };
 
-    // 开着(默认):Claude 拿到的是 aca 数据目录里的副本,那一行没了;插件目录里的文件没动
+    // On (the default): Claude gets a copy in aca's data directory, with that line gone; the files in the plugin directory are untouched
     let a = sb.aca(&["new", "argc", &sb.proj(), "-t", "开着起的"]);
     let copy = sb.home.join("data/claude-plugins/t-auto/local");
     assert_eq!(plugin_dirs(&a), [copy.canonicalize().unwrap()]);
@@ -1421,13 +1518,13 @@ fn a_plugin_whose_auto_setting_is_on_gives_claude_its_commands_without_the_only_
     assert!(copy.join(".claude-plugin/plugin.json").is_file());
     assert_eq!(std::fs::read_to_string(dir.join("claude/commands/go.md")).unwrap(), cmd);
     assert!(!sb.aca(&["plugin", "ls"]).contains("重启"));
-    // 关掉:新起的直接拿插件目录;开着起的那个要重启才变
+    // Off: new starts take the plugin directory directly; the one started while on changes only after a restart
     sb.aca(&["plugin", "setting", "t.auto", "auto", "off"]);
     let b = sb.aca(&["new", "argc", &sb.proj(), "-t", "关着起的"]);
     assert_eq!(plugin_dirs(&b), [dir.join("claude").canonicalize().unwrap()]);
     let ls = sb.aca(&["plugin", "ls"]);
     assert!(ls.contains("「开着起的」") && !ls.contains("「关着起的」") && ls.contains("重启"), "{ls}");
-    // 回到默认(开):反过来
+    // Back to the default (on): the other way around
     sb.aca(&["plugin", "setting", "t.auto", "auto", "--reset"]);
     let ls = sb.aca(&["plugin", "ls"]);
     assert!(!ls.contains("「开着起的」") && ls.contains("「关着起的」"), "{ls}");
@@ -1439,19 +1536,21 @@ fn the_delegate_plugin_says_continue_to_a_worker_whose_turn_failed_for_a_transie
     sb.screen_tools();
     let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/delegate").canonicalize().unwrap();
     assert!(sb.aca(&["plugin", "link", &plugin.to_string_lossy()]).contains("已链接 aca.delegate"));
-    // 它给 Claude、Codex 带同一个插件目录,里面有 /delegate。文件写着模型自己不调它,设置 auto(默认开)开着时不作数
+    // It passes Claude and Codex the same plugin directory, which holds /delegate. The file says the model doesn't call it by
+    // itself, which doesn't hold while the auto setting (on by default) is on
     let ls = sb.aca(&["plugin", "ls"]);
     assert!(ls.contains("● aca.delegate") && ls.contains("提供给 claude、codex"), "{ls}");
     let cmd = std::fs::read_to_string(plugin.join("claude/commands/delegate.md")).unwrap();
     assert!(cmd.starts_with("---\n") && cmd.contains("\ndisable-model-invocation: true\n"));
     assert_eq!(sb.aca(&["plugin", "setting", "aca.delegate", "auto"]), "true");
-    // 设置:默认值、改了记进 plugins.toml、读得出来;替它说的那句改成「继续」
+    // Settings: the default value, a change recorded in plugins.toml and read back; what it says for the worker changed to 「继续」
+    // ("continue" in Chinese)
     assert_eq!(sb.aca(&["plugin", "setting", "aca.delegate", "worker"]), "codex");
     sb.aca(&["plugin", "setting", "aca.delegate", "say", "继续"]);
     assert_eq!(sb.aca(&["plugin", "setting", "aca.delegate", "say"]), "继续");
     assert!(sb.aca(&["plugin", "setting", "aca.delegate"]).contains("say = 继续(已修改)"));
     assert!(!sb.run(&["plugin", "setting", "aca.delegate", "nope", "1"]).status.success());
-    // 照默认值的类型读:整数的填字不行;字的写 true 也还是字
+    // Read by the type of the default value: an integer one won't take text; a text one given true is still text
     let o = sb.run(&["plugin", "setting", "aca.delegate", "max_continue", "many"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("应为整数"));
     sb.aca(&["plugin", "setting", "aca.delegate", "say", "true"]);
@@ -1461,11 +1560,11 @@ fn the_delegate_plugin_says_continue_to_a_worker_whose_turn_failed_for_a_transie
     let lead = sb.aca(&["new", "fake", &sb.proj()]);
     let w = sb.aca(&["new", "scr", &sb.proj(), "--parent", &lead]);
     let mine = sb.aca(&["new", "scr", &sb.proj(), "--parent", "-"]);
-    // 钩子是 hook 进程起的,继承它的环境:测试里不等 30 秒
+    // Hooks are started by the hook process and inherit its environment: the test doesn't wait 30 seconds
     let fail = |id: &str, error: &str| {
         let pane = sb.pane(id);
         sb.set_screen(id, &pane, "❯ ");
-        // 等假 agent 把这一屏画出来:不然它清屏重画时会把替它打进去的「继续」一起擦掉
+        // Wait for the fake agent to draw this screen: otherwise its clear-and-redraw would wipe out the 「继续」 typed in for it too
         sb.wait_screen(&pane, "❯");
         let payload = serde_json::json!({ "hook_event_name": "StopFailure", "session_id": "c1", "error": error }).to_string();
         let mut child = sb
@@ -1482,13 +1581,13 @@ fn the_delegate_plugin_says_continue_to_a_worker_whose_turn_failed_for_a_transie
         assert!(child.wait().unwrap().success());
         pane
     };
-    // 派出去的、临时的错误:替它说「继续」
+    // A worker that was sent out, a transient error: say 「继续」 for it
     let pane = fail(&w, "API Error: 529 Overloaded");
     let log = || std::fs::read_to_string(sb.home.join("state/plugin-logs/aca.delegate.log")).unwrap_or_default();
     assert!(sb.wait_screen(&pane, "继续").contains("继续"), "{}\n{}", sb.tmux(&["capture-pane", "-p", "-t", &pane]), log());
     let log = log();
     assert!(log.contains("第 1 次代为发送「继续」"), "{log}");
-    // 再试也一样的、你自己开的(没有 parent):不碰
+    // Errors a retry won't fix, sessions you started yourself (no parent): left alone
     let other = sb.aca(&["new", "scr", &sb.proj(), "--parent", &lead]);
     let p2 = fail(&other, "prompt is too long");
     let p3 = fail(&mine, "API Error: 529 Overloaded");
@@ -1515,14 +1614,15 @@ fn a_codex_turn_that_ends_in_an_error_without_a_hook_is_found_in_its_rollout() {
 
     let child = sb.cmd().args(["wait", &w, "--timeout", "20"]).stdout(std::process::Stdio::piped()).spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    // 它自己重试几次也不行,这一轮带着错误结束:不跑任何 hook,只在记录里留一条,屏幕上停了
+    // Its own few retries don't help, and this turn ends with the error: no hooks run at all, just one entry in the record, and the
+    // screen has stopped
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 1;
     let failed = format!(
         r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"t1","completed_at":{now},"error":{{"message":"stream disconnected before completion: Our servers are currently overloaded.","codex_error_info":{{"response_stream_disconnected":{{"http_status_code":null}}}}}}}}}}"#
     );
     std::fs::write(&rollout, format!("{started}\n{failed}\n")).unwrap();
     sb.set_screen(&w, &pane, "› ");
-    // 在等它的那个看出来了:出错、哪一类、原文(不是拿上一轮的回复冒充跑完)
+    // The one waiting on it can tell: an error, which kind, the original text (not passing off the last turn's reply as finished)
     let o = child.wait_with_output().unwrap();
     let said = String::from_utf8_lossy(&o.stdout).to_string();
     assert_eq!(o.status.code(), Some(3), "{said}");
@@ -1530,15 +1630,15 @@ fn a_codex_turn_that_ends_in_an_error_without_a_hook_is_found_in_its_rollout() {
     let is_failed = |l: &&str| l.contains(r#""event":"turn.failed""#);
     let ev = sb.aca(&["events", "-n", "100"]).lines().find(is_failed).unwrap().to_string();
     assert!(ev.contains("\"kind\":\"transient\""), "{ev}");
-    // 派它的那个要了 failed 通知:收到了,说了是哪一类
+    // The one that sent it out asked for failed notices: got one, saying which kind
     let notice = sb.json(&["inbox", &lead, "--json"]);
     assert_eq!(notice[0]["what"], "turn.failed");
     assert!(notice[0]["text"].as_str().unwrap().contains("临时错误"), "{notice}");
-    // 只补一次:再看一眼不会再发
+    // Filled in only once: another look doesn't send it again
     sb.aca(&["ls"]);
     let all = sb.aca(&["events", "-n", "100"]);
     assert_eq!(all.lines().filter(is_failed).count(), 1, "{all}");
-    // 接着说一句(它开了新的一轮,记录里有了开始):错误清掉,又在跑
+    // Saying something next (it started a new turn, and the record has the start): the error is cleared, running again
     std::fs::write(&rollout, format!("{started}\n{failed}\n{}\n", started.replace("t1", "t2"))).unwrap();
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"th-1","prompt":"继续"}"#);
     sb.set_screen(&w, &pane, "• Working (1s • esc to interrupt)");
@@ -1558,21 +1658,23 @@ fn a_codex_turn_that_finishes_without_its_stop_hook_is_found_in_its_rollout() {
     let rollout = sb.home.join("rollout.jsonl");
     let started = r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#;
     std::fs::write(&rollout, format!("{started}\n")).unwrap();
-    // 这个账号只信任了 SessionStart、UserPromptSubmit 两条 hook,Stop 没信任:每一轮只报开始
+    // This account trusts only the SessionStart and UserPromptSubmit hooks, not Stop: each turn reports only its start
     hook(&serde_json::json!({"hook_event_name": "SessionStart", "session_id": "th-1", "transcript_path": rollout}).to_string());
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"th-1","prompt":"改登录页"}"#);
     sb.set_screen(&w, &pane, "• Working (5s • esc to interrupt)");
     assert_eq!(show()["state"], "running");
-    // 屏幕上停了、记录里还没写结束(刚停下的那一下,或者按 Esc 打断的):不当成跑完
+    // The screen has stopped but the record has no end yet (the moment right after stopping, or interrupted with Esc): not taken as
+    // finished
     sb.set_screen(&w, &pane, "› ");
     assert!(sb.until(|| show()["state"] == "idle"), "{}", show());
-    // 跑完了:Codex 不跑没信任的 Stop hook,也不提示,只在记录里留一条
+    // Finished: Codex doesn't run the untrusted Stop hook and doesn't say so either, it just leaves an entry in the record
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let done = format!(
         r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"t1","completed_at":{at},"last_agent_message":"登录页改好了","error":null}}}}"#
     );
     std::fs::write(&rollout, format!("{started}\n{done}\n")).unwrap();
-    // 有人看一眼就认出来了:跑完没看,最后一条回复是记录里那条,跑完的时刻是它真跑完的时刻(不是看的这一刻)
+    // Anyone taking a look recognizes it: finished and unread, the last reply is the one in the record, and the finishing time is
+    // when it really finished (not the moment of looking)
     let v = show();
     assert_eq!(
         (v["state"].as_str(), v["run"]["status"].as_str(), v["run"]["done"].as_u64()),
@@ -1580,22 +1682,23 @@ fn a_codex_turn_that_finishes_without_its_stop_hook_is_found_in_its_rollout() {
         "{v}"
     );
     assert_eq!(sb.aca(&["output", &w]), "登录页改好了");
-    // 派它的那个要了 done 通知:收到了
+    // The one that sent it out asked for done notices: got one
     let notice = sb.json(&["inbox", &lead, "--json"]);
     assert_eq!(notice[0]["what"], "turn.done", "{notice}");
-    // 只补一次:再看几眼不会再发
+    // Filled in only once: more looks don't send it again
     sb.aca(&["ls"]);
     sb.aca(&["ls"]);
     let is_done = |l: &&str| l.contains(r#""event":"turn.done""#);
     let all = sb.aca(&["events", "-n", "100"]);
     assert_eq!(all.lines().filter(is_done).count(), 1, "{all}");
-    // 看过了,再说一句:新的一轮刚开始、记录里还没写上时,上一轮那条结束不算这一轮的
+    // Looked at, then saying something more: while the new turn has just started and the record has nothing yet, the last turn's
+    // end doesn't count for this one
     sb.aca(&["seen", &w]);
     assert_eq!(show()["state"], "idle");
     std::thread::sleep(std::time::Duration::from_millis(1100));
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"th-1","prompt":"再改注册页"}"#);
     let v = show();
-    // 刚报开始的头 3 秒,屏幕还安静也先信 hook:在跑
+    // For the first 3 seconds after reporting a start, trust the hook even with a quiet screen: running
     assert_eq!((v["state"].as_str(), v["run"]["status"].as_str()), (Some("running"), Some("running")), "{v}");
     let all = sb.aca(&["events", "-n", "100"]);
     assert_eq!(all.lines().filter(is_done).count(), 1, "{all}");
@@ -1612,7 +1715,8 @@ fn a_worker_in_its_own_worktree_leaves_the_main_checkout_alone_and_rm_keeps_the_
     git(&repo, &["commit", "-q", "-m", "init"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
 
-    // 在仓库的子目录里建:worktree 开在仓库的 .worktrees/ 下,会话起在里面同一个子目录,分支就叫给的名字
+    // Created in a subdirectory of the repo: the worktree opens under the repo's .worktrees/, the session starts in the same
+    // subdirectory inside it, and the branch is named as given
     let o = sb.run(&["new", "fake", &repo.join("sub").to_string_lossy(), "-w", "feat/x"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let id = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -1620,19 +1724,19 @@ fn a_worker_in_its_own_worktree_leaves_the_main_checkout_alone_and_rm_keeps_the_
     assert!(String::from_utf8_lossy(&o.stderr).contains(&format!("worktree {}(分支 feat/x)", wt.display())));
     assert_eq!(sb.json(&["show", &id, "--json"])["dir"], wt.join("sub").to_string_lossy().as_ref());
     assert_eq!((git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]), git(&wt, &["rev-parse", "HEAD"])), ("feat/x".to_string(), head));
-    // 主仓库的 git status 里看不到它
+    // The main repo's git status doesn't show it
     assert_eq!(git(&repo, &["status", "--porcelain"]), "");
-    // 同一个分支再建一个:接着用那个 worktree
+    // Another one on the same branch: reuses that worktree
     let id2 = sb.aca(&["new", "fake", &repo.to_string_lossy(), "--worktree", "feat/x"]);
     assert_eq!(sb.json(&["show", &id2, "--json"])["dir"], wt.to_string_lossy().as_ref());
 
-    // 还有别的会话在里面:删一个,worktree 留着
+    // Another session is still in it: delete one, the worktree stays
     assert!(sb.aca(&["rm", &id]).contains("仍有其他会话在使用"));
-    // 有没跟踪的文件(探针脚本之类):留着,不加 --force
+    // Untracked files (probe scripts and the like): kept, no --force
     std::fs::write(wt.join("probe.sh"), "echo\n").unwrap();
     assert!(sb.aca(&["rm", &id2]).contains("已保留"));
     assert!(wt.is_dir());
-    // 干净了:删 worktree,分支和它上面的提交都还在
+    // Clean now: the worktree is deleted, the branch and its commits are all still there
     std::fs::remove_file(wt.join("probe.sh")).unwrap();
     std::fs::write(wt.join("b.txt"), "b\n").unwrap();
     git(&wt, &["add", "b.txt"]);
@@ -1643,7 +1747,7 @@ fn a_worker_in_its_own_worktree_leaves_the_main_checkout_alone_and_rm_keeps_the_
     assert!(!wt.exists());
     assert_eq!(git(&repo, &["log", "-1", "--format=%s", "feat/x"]), "work");
 
-    // 不是仓库、分支名不对:不建
+    // Not a repo, a bad branch name: not created
     let o = sb.run(&["new", "fake", &sb.home.join("config").to_string_lossy(), "-w", "x"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("不在 git 仓库中"));
     assert!(!sb.run(&["new", "fake", &repo.to_string_lossy(), "-w", "bad..name"]).status.success());
@@ -1658,18 +1762,18 @@ fn interrupting_a_running_worker_presses_esc_only_for_the_one_that_sent_it_out()
     let w = sb.aca(&["new", "scr", &sb.proj(), "--parent", &lead]);
     let pane = sb.pane(&w);
     let err = |o: &Output| String::from_utf8_lossy(&o.stderr).to_string();
-    // 没在跑:不按
+    // Not running: no key pressed
     sb.set_screen(&w, &pane, "❯ ");
     assert!(err(&sb.as_session(&lead, &["interrupt", &w], "")).contains("无需中止"));
-    // 在跑:别的会话按不了,派它的那个能
+    // Running: other sessions can't press it, the one that sent it out can
     sb.set_screen(&w, &pane, "✻ Pondering… (3s · ↓ 1k tokens)");
     sb.hook(&w, &pane, r#"{"hook_event_name":"UserPromptSubmit","session_id":"c1","prompt":"写一篇长文"}"#);
     assert!(err(&sb.as_session(&other, &["interrupt", &w], "")).contains("不是你派出的会话"));
     let o = sb.as_session(&lead, &["interrupt", &w], "");
     assert!(o.status.success(), "{}", err(&o));
-    // 按下的是 Esc(假 agent 不读键,终端回显成 ^[)
+    // What's pressed is Esc (the fake agent doesn't read keys, the terminal echoes it as ^[)
     assert!(sb.wait_screen(&pane, "^[").contains("^["));
-    // Claude 停下不报 hook:aca 自己记成空着,事件里写着谁按的
+    // Claude reports no hook when it stops: aca records it as idle itself, and the event says who pressed it
     assert_eq!(sb.json(&["show", &w, "--json"])["run"]["status"], "idle");
     let ev = sb.aca(&["events", "-n", "100"]).lines().find(|l| l.contains("turn.interrupted")).unwrap().to_string();
     assert!(ev.contains(&format!("\"by\":\"{lead}\"")), "{ev}");
@@ -1679,7 +1783,7 @@ fn interrupting_a_running_worker_presses_esc_only_for_the_one_that_sent_it_out()
 fn plugins_toml_says_which_plugins_with_what_settings_and_sync_makes_it_so() {
     let Some(sb) = Sandbox::new("decl") else { return };
     sb.screen_tools();
-    // 一个本地插件:一项设置、一个带参数的能力、一个只对 fake 会话起的事件钩子
+    // A local plugin: one setting, one capability with arguments, and an event hook that runs only for fake sessions
     let dir = sb.home.join("p1");
     write(
         &dir.join("aca-plugin.toml"),
@@ -1700,18 +1804,18 @@ command = ["sh", "-c", "echo \"$ACA_SETTING_GREETING\" >> \"$ACA_PLUGIN_STATE_DI
 "#,
     );
     let decl = sb.home.join("config/plugins.toml");
-    // 链接:plugins.toml 里记下它从哪来
+    // Link: plugins.toml records where it came from
     sb.aca(&["plugin", "link", &dir.to_string_lossy()]);
     let text = std::fs::read_to_string(&decl).unwrap();
     assert!(text.contains("[plugins.\"t.decl\"]") && text.contains(&dir.canonicalize().unwrap().to_string_lossy().into_owned()), "{text}");
-    // 能力的参数照清单的类型变成 JSON,设置在环境里
+    // The capability's arguments become JSON by the types in the manifest, and the settings are in the environment
     assert_eq!(sb.aca(&["plugin", "run", "t.decl.say", "who=me", "n=2"]), r#"hi {"n":2,"who":"me"}"#);
     let o = sb.run(&["plugin", "run", "t.decl.say", "n=2"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("who"));
-    // plugins.toml 里改设置:下一次就是新的
+    // A setting changed in plugins.toml: the new one applies next time
     std::fs::write(&decl, text.trim_end().to_string() + "\nsettings = { greeting = \"yo\" }\n").unwrap();
     assert!(sb.aca(&["plugin", "run", "t.decl.say", "who=me"]).starts_with("yo "));
-    // 事件钩子的 if:fake 起的会话跑,scr 起的不跑
+    // The event hook's if: runs for sessions started by fake, not for those started by scr
     sb.aca(&["new", "fake", &sb.proj(), "--hold"]);
     sb.aca(&["new", "scr", &sb.proj(), "--hold"]);
     let seen = sb.home.join("state/plugins/t.decl/seen");
@@ -1725,16 +1829,16 @@ command = ["sh", "-c", "echo \"$ACA_SETTING_GREETING\" >> \"$ACA_PLUGIN_STATE_DI
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert_eq!(std::fs::read_to_string(&seen).unwrap_or_default(), "yo\n", "{got}");
-    // 命令行停它:plugins.toml 里记下停着,别的行、设置原样
+    // Disabled from the command line: plugins.toml records it as disabled, with other lines and settings unchanged
     sb.aca(&["plugin", "disable", "t.decl"]);
     let text = std::fs::read_to_string(&decl).unwrap();
     assert!(text.contains("enabled = false") && text.contains("greeting = \"yo\""), "{text}");
-    // 从 plugins.toml 里划掉:sync 后本机也没了(链接的目录不动)
+    // Crossed out of plugins.toml: after sync it's gone locally too (the linked directory is untouched)
     let kept = text.lines().take_while(|l| !l.contains("t.decl")).collect::<Vec<_>>().join("\n");
     std::fs::write(&decl, kept + "\n").unwrap();
     assert!(sb.aca(&["plugin", "sync"]).contains("已移除 t.decl"));
     assert!(sb.aca(&["plugin", "ls"]).is_empty() && dir.join("aca-plugin.toml").is_file());
-    // 写回去:sync 照它链接,停着的照样停着
+    // Written back: sync links it accordingly, and a disabled one stays disabled
     std::fs::write(&decl, format!("[plugins.\"t.decl\"]\nsource = \"{}\"\nenabled = false\n", dir.display())).unwrap();
     assert!(sb.aca(&["plugin", "sync"]).contains("已链接 t.decl"));
     assert!(sb.aca(&["plugin", "ls"]).starts_with("○ t.decl"));
@@ -1744,7 +1848,7 @@ command = ["sh", "-c", "echo \"$ACA_SETTING_GREETING\" >> \"$ACA_PLUGIN_STATE_DI
 #[test]
 fn a_plugin_mounts_its_directory_and_mcp_on_claude_and_codex_and_its_commands_become_tools() {
     let Some(sb) = Sandbox::new("mount") else { return };
-    // 插件:给两家的目录(一个斜杠命令)、一个 MCP 服务、一个露给 agent 的能力
+    // A plugin: directories for both harnesses (one slash command), one MCP server, and one capability exposed to agents
     let dir = sb.home.join("both");
     write(
         &dir.join("aca-plugin.toml"),
@@ -1767,7 +1871,8 @@ command = ["sh", "-c", "echo \"hello $ACA_PLUGIN_ARGS_JSON from $ACA_SESSION_ID\
     write(&dir.join("agent/.claude-plugin/plugin.json"), r#"{"name":"both"}"#);
     write(&dir.join("agent/commands/greet.md"), "---\ndescription: 打招呼\n---\n跟 $ARGUMENTS 打招呼\n");
     sb.aca(&["plugin", "link", &dir.to_string_lossy()]);
-    // 两个假 agent:按 Claude / Codex 起,把参数一行一个写进文件;Codex 那个账号有自己的配置目录
+    // Two fake agents: started the Claude / Codex way, writing their arguments into a file, one per line; the Codex account has its
+    // own config directory
     let codex_home = sb.home.join("codexhome");
     write(
         &sb.home.join("args.sh"),
@@ -1794,7 +1899,8 @@ command = ["sh", "-c", "echo \"hello $ACA_PLUGIN_ARGS_JSON from $ACA_SESSION_ID\
     };
     let after = |args: &[String], flag: &str| -> Vec<String> { args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].clone()).collect() };
 
-    // Claude:插件目录 --plugin-dir,两个 MCP 服务(插件自己的、能力包成的 aca)写在一份 --mcp-config 里
+    // Claude: the plugin directory via --plugin-dir, and two MCP servers (the plugin's own, and aca wrapping the capabilities) in one
+    // --mcp-config
     let c = sb.aca(&["new", "argc", &sb.proj()]);
     let args = args_of(&c);
     assert!(after(&args, "--plugin-dir").contains(&dir.join("agent").canonicalize().unwrap().to_string_lossy().into_owned()), "{args:?}");
@@ -1804,8 +1910,10 @@ command = ["sh", "-c", "echo \"hello $ACA_PLUGIN_ARGS_JSON from $ACA_SESSION_ID\
     assert_eq!(mcp["mcpServers"]["aca-t-both"]["args"], serde_json::json!(["plugin", "mcp", "t.both"]));
     assert_eq!(mcp["mcpServers"]["aca"]["args"], serde_json::json!(["plugin", "tools"]));
 
-    // Codex:插件目录变成它认得的副本、按会话打开;插件 MCP 和能力的 MCP 也各做成一个只有 .mcp.json 的副本,
-    // 不走 -c mcp_servers(那样 Codex 起不了标题),会话 id 从 Codex 的环境里转过去
+    // Codex: the plugin directory becomes a copy it recognizes, enabled per session; the plugin MCP and the capability MCP each also
+    // become a copy holding only .mcp.json,
+    // instead of going through -c mcp_servers (that way Codex can't produce a title), and the session id is passed through from
+    // Codex's environment
     let x = sb.aca(&["new", "argx:t", &sb.proj()]);
     let flags = after(&args_of(&x), "-c");
     assert!(!flags.iter().any(|f| f.starts_with("mcp_servers.")), "{flags:?}");
@@ -1824,14 +1932,14 @@ command = ["sh", "-c", "echo \"hello $ACA_PLUGIN_ARGS_JSON from $ACA_SESSION_ID\
     assert!(skill.starts_with("---\nname: greet\ndescription: 打招呼\n---\n"), "{skill}");
     assert!(std::fs::read_to_string(copy.join(".codex-plugin/plugin.json")).unwrap().contains("\"t-both\""));
 
-    // 停了插件:新起的什么都不多带
+    // Plugin disabled: new starts get nothing extra
     sb.aca(&["plugin", "disable", "t.both"]);
     let bare = sb.aca(&["new", "argc", &sb.proj()]);
     let args = args_of(&bare);
     assert!(!args.iter().any(|a| a == "--mcp-config" || a == "--plugin-dir"), "{args:?}");
     sb.aca(&["plugin", "enable", "t.both"]);
 
-    // 能力包成的 MCP 服务:握手、列出工具、调一个(会话是 agent 环境里那个)
+    // The MCP server wrapping capabilities: handshake, list the tools, call one (the session is the one in the agent's environment)
     let mut child = sb
         .cmd()
         .args(["plugin", "tools"])
@@ -1860,13 +1968,13 @@ command = ["sh", "-c", "echo \"hello $ACA_PLUGIN_ARGS_JSON from $ACA_SESSION_ID\
     let said = replies[2]["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(said.trim(), format!(r#"hello {{"who":"me"}} from {c}"#));
 
-    // 插件自己的 MCP 服务:切到插件目录、带上插件的环境,换成它的命令
+    // The plugin's own MCP server: switch to the plugin directory, with the plugin's environment, and exec its command
     let o = sb.cmd().args(["plugin", "mcp", "t.both"]).env("ACA_SESSION_ID", &x).output().unwrap();
     let said = String::from_utf8_lossy(&o.stdout).trim().to_string();
     assert_eq!(said, format!("mcp of t.both for {x} in {}", dir.canonicalize().unwrap().display()));
 }
 
-/// 经转接和 gateway 说 MCP 的一个连接(测试用):一直开着,一问一答
+/// One connection that speaks MCP with the gateway through the relay (for tests): stays open, one question, one answer
 struct GwConn {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
@@ -1906,7 +2014,7 @@ impl GwConn {
         writeln!(self.stdin, "{v}").unwrap();
     }
 
-    /// 问一句,等编号对得上的回答(中间来的通知跳过)
+    /// Ask one question and wait for the answer with the matching id (notifications in between are skipped)
     fn ask(&mut self, id: u64, method: &str, params: Value) -> Value {
         self.say(serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
         loop {
@@ -1937,8 +2045,9 @@ impl GwConn {
 fn with_the_gateway_on_an_agent_mounts_one_server_and_a_shared_mcp_runs_once_for_everyone() {
     let Some(sb) = Sandbox::new("gw") else { return };
     let aca = env!("CARGO_BIN_EXE_aca");
-    // gateway 这个插件(仓库里的),和两个插件:各有一个露给 agent 的能力,MCP 都是 aca 自己的能力服务(一个真的 MCP 服务);
-    // 一个共用,一个每个会话一份
+    // The gateway plugin (from the repo), and two plugins: each has one capability exposed to agents, and both MCPs are aca's own
+    // capability server (a real MCP server);
+    // one shared, one per session
     let gwp = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/gateway").canonicalize().unwrap();
     sb.aca(&["plugin", "link", &gwp.to_string_lossy()]);
     for (id, scope) in [("t.gw", "shared"), ("t.ses", "session")] {
@@ -1952,13 +2061,13 @@ fn with_the_gateway_on_an_agent_mounts_one_server_and_a_shared_mcp_runs_once_for
         );
         sb.aca(&["plugin", "link", &dir.to_string_lossy()]);
     }
-    // 测试里起的 gateway 一分钟没人连就自己退
+    // The gateway started in the test exits by itself after a minute with nobody connected
     let decl = sb.home.join("config/plugins.toml");
     let text = std::fs::read_to_string(&decl)
         .unwrap()
         .replace("[plugins.\"aca.gateway\"]", "[plugins.\"aca.gateway\"]\nsettings = { idle_minutes = 1 }");
     std::fs::write(&decl, text).unwrap();
-    // 按 Claude 起的假 agent,把参数写进文件
+    // A fake agent started the Claude way that writes its arguments into a file
     write(
         &sb.home.join("args.sh"),
         &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}/args-'\"$ACA_SESSION_ID\"\nexec sleep 600\n", sb.home.display()),
@@ -1968,7 +2077,8 @@ fn with_the_gateway_on_an_agent_mounts_one_server_and_a_shared_mcp_runs_once_for
         + &format!("[tools.argc]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{}\"]\n", sb.home.join("args.sh").display());
     std::fs::write(&cfg, text).unwrap();
 
-    // gateway 开着:agent 只挂一个 aca,是到 gateway 的转接;插件自己的 MCP 不再直接挂
+    // The gateway is on: the agent gets only one aca, the relay to the gateway; the plugins' own MCPs are no longer attached
+    // directly
     let a = sb.aca(&["new", "argc", &sb.proj()]);
     let b = sb.aca(&["new", "argc", &sb.proj()]);
     let args_file = sb.home.join(format!("args-{a}"));
@@ -1985,7 +2095,7 @@ fn with_the_gateway_on_an_agent_mounts_one_server_and_a_shared_mcp_runs_once_for
     assert_eq!(servers, ["aca"]);
     assert_eq!(mcp["mcpServers"]["aca"]["args"], serde_json::json!(["plugin", "gateway", "connect"]));
 
-    // 两个会话同时连着:工具一样;调用时插件命令拿到的是调它的那个会话
+    // Two sessions connected at once: the same tools; on a call, the plugin command gets the session that called it
     let mut ca = GwConn::open(&sb, &a);
     let mut cb = GwConn::open(&sb, &b);
     let names = ca.tools();
@@ -1995,32 +2105,32 @@ fn with_the_gateway_on_an_agent_mounts_one_server_and_a_shared_mcp_runs_once_for
     assert_eq!(cb.tools().len(), names.len());
     assert_eq!(ca.call(10, "t-gw__who"), a);
     assert_eq!(cb.call(11, "t-gw__who"), b);
-    // 共用的那个插件 MCP:只有一份,两个会话的调用都经它,它从 _meta 里知道是谁
+    // The shared plugin MCP: just one, both sessions' calls go through it, and it knows who from _meta
     assert_eq!(ca.call(12, "t-gw__t-gw__who"), a);
     assert_eq!(cb.call(13, "t-gw__t-gw__who"), b);
-    // 每会话一份的:各有各的进程,环境里就是自己的会话
+    // The per-session one: each has its own process, and the environment holds its own session
     assert_eq!(cb.call(14, "t-ses__t-ses__who"), b);
     let st = sb.aca(&["plugin", "gateway", "status"]);
     assert!(st.contains("2 个连接"), "{st}");
     assert_eq!(st.matches("服务 t-gw:ready").count(), 1, "{st}");
     assert!(st.contains(&format!("服务 t-ses(会话 {a}):ready")) && st.contains(&format!("服务 t-ses(会话 {b}):ready")), "{st}");
     assert!(st.contains("✓ t-gw t-gw__who"), "{st}");
-    // 只对 a 关掉每会话一份的那个:a 看不到了,b 照旧;再打开就回来
+    // Turn the per-session one off for a only: a no longer sees it, b is unchanged; turned on again, it's back
     assert!(sb.aca(&["plugin", "gateway", "off", "t-ses", "--session", &a]).contains("不再"));
     assert!(!ca.tools().iter().any(|n| n == "t-ses__t-ses__who"));
     assert!(cb.tools().iter().any(|n| n == "t-ses__t-ses__who"));
     sb.aca(&["plugin", "gateway", "on", "t-ses", "--session", &a]);
     assert!(ca.tools().iter().any(|n| n == "t-ses__t-ses__who"));
-    // [mcps.*] 里没有的收不进来
+    // Anything not in [mcps.*] can't be taken in
     let o = sb.run(&["plugin", "gateway", "add", "nope"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("[mcps.nope]"));
-    // 一个会话断了:它那份每会话的收掉,共用的留着
+    // One session disconnects: its per-session one is shut down, the shared one stays
     cb.close();
     std::thread::sleep(std::time::Duration::from_millis(300));
     let st = sb.aca(&["plugin", "gateway", "status"]);
     assert!(st.contains("1 个连接") && !st.contains(&format!("会话 {b}):ready")) && st.contains("服务 t-gw:ready"), "{st}");
     ca.close();
-    // 停掉:不留进程
+    // Stop: no process left behind
     assert!(sb.aca(&["plugin", "gateway", "stop"]).contains("已停止"));
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(sb.aca(&["plugin", "gateway", "status"]).contains("未运行"));
@@ -2033,7 +2143,7 @@ fn the_core_plugin_lets_an_agent_dispatch_a_worker_message_it_and_only_manage_it
     sb.aca(&["plugin", "link", &core.to_string_lossy()]);
     let lead = sb.aca(&["new", "fake", &sb.proj(), "-t", "主线"]);
     let mine = sb.aca(&["new", "fake", &sb.proj(), "--parent", "-"]);
-    // 主线的 agent 经能力服务调 aca.core 的工具(它环境里的会话就是主线)
+    // The lead's agent calls aca.core's tools through the capability server (the session in its environment is the lead)
     let mut child = sb
         .cmd()
         .args(["plugin", "tools"])
@@ -2065,29 +2175,34 @@ fn the_core_plugin_lets_an_agent_dispatch_a_worker_message_it_and_only_manage_it
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(tools.len(), 6, "{tools:?}");
+    assert_eq!(tools.len(), 7, "{tools:?}");
     assert!(tools.contains(&"aca-core__dispatch".to_string()) && tools.contains(&"aca-core__interrupt".to_string()));
     let mut call = |id: u64, name: &str, args: Value| -> (bool, String) {
         let r = ask(id, "tools/call", serde_json::json!({ "name": name, "arguments": args }));
         (r["result"]["isError"].as_bool() == Some(true), r["result"]["content"][0]["text"].as_str().unwrap_or("").trim().to_string())
     };
-    // 派一个 worker:挂在主线下面,话也发进去了
+    // Dispatch a worker: it goes under the lead, and the message got in too
     let (err, w) = call(3, "aca-core__dispatch", serde_json::json!({ "tool": "fake", "task": "看看登录页", "title": "读登录" }));
     assert!(!err, "{w}");
     let w = w.lines().last().unwrap().to_string();
     let (_, shown) = call(4, "aca-core__sessions", serde_json::json!({ "id": w }));
     let v: Value = serde_json::from_str(&shown).unwrap();
     assert_eq!((v["parent"].as_str(), v["title"].as_str()), (Some(lead.as_str()), Some("读登录")));
-    // 递话:进了它的收件箱
+    // Pass a message: it went into its inbox
     let (err, said) = call(5, "aca-core__message", serde_json::json!({ "to": w, "text": "顺便看一下注册页" }));
     assert!(!err, "{said}");
     assert!(sb.aca(&["inbox", &w]).contains("顺便看一下注册页"));
-    // 不是它派出去的:中止不了
+    // Not one it sent out: can't interrupt it
     let (err, said) = call(6, "aca-core__interrupt", serde_json::json!({ "id": mine }));
     assert!(err, "{said}");
-    // 列会话
+    // List sessions
     let (_, all) = call(7, "aca-core__sessions", serde_json::json!({}));
     assert!(all.contains(&lead) && all.contains(&w), "{all}");
+    // Wake itself up in a while: the scheduled message goes into the lead's own inbox
+    let (err, said) = call(8, "aca-core__wakeup", serde_json::json!({ "after": "10m", "text": "回来看看 CI" }));
+    assert!(!err, "{said}");
+    let inbox = sb.aca(&["inbox", &lead]);
+    assert!(inbox.contains("[定时 ") && inbox.contains("回来看看 CI"), "{inbox}");
     drop(stdin);
     let _ = child.wait();
 }
@@ -2096,36 +2211,36 @@ fn the_core_plugin_lets_an_agent_dispatch_a_worker_message_it_and_only_manage_it
 fn first_party_plugins_install_by_name_bring_what_they_need_and_running_sessions_hear_they_need_a_restart() {
     let Some(sb) = Sandbox::new("bundled") else { return };
     sb.aca(&["new", "fake", &sb.proj(), "-t", "主线"]);
-    // 没有插件时起的:不用重启
+    // Started while there was no plugin: no restart needed
     assert!(!sb.aca(&["plugin", "ls"]).contains("主线"));
-    // 自带的不写路径;装完说带了什么
+    // Built-in ones need no path; after installing it says what it brings
     let out = sb.aca(&["plugin", "install", "aca.delegate"]);
     assert!(out.contains("已安装 aca.delegate") && out.contains("提供给 agent:claude、codex 的插件目录"), "{out}");
     let copy = sb.home.join("data/first-party/delegate");
     assert!(copy.join("aca-plugin.toml").exists() && copy.join("claude/commands/delegate.md").exists());
     let decl = std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap();
     assert!(decl.contains("[plugins.\"aca.delegate\"]") && !decl.contains("source"), "{decl}");
-    // 它给 Claude 带东西了:开着的「主线」起来时没有,要重启
+    // It brings something to Claude: the open 「主线」 (the lead) didn't have it at start, so it needs a restart
     let ls = sb.aca(&["plugin", "ls"]);
     assert!(ls.contains("aca.delegate") && ls.contains("aca 自带") && ls.contains("「主线」") && ls.contains("重启"), "{ls}");
-    // 写了 requires 的插件:要的第一方插件一起装上
+    // A plugin that declares requires: the first-party plugins it needs are installed along with it
     let mine = sb.home.join("needs-core");
     std::fs::create_dir_all(&mine).unwrap();
     std::fs::write(mine.join("aca-plugin.toml"), "id = \"my.needs\"\nname = \"N\"\nversion = \"1\"\nrequires = [\"aca.core\"]\n").unwrap();
     let out = sb.aca(&["plugin", "install", &mine.to_string_lossy()]);
     assert!(out.contains("aca.core") && sb.aca(&["plugin", "ls"]).contains("aca.core"), "{out}");
-    // plugins.toml 里只写个表头,sync 也装得上自带的
+    // With only a table header in plugins.toml, sync installs built-in ones too
     let mut decl = std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap();
     decl.push_str("\n[plugins.\"aca.remote\"]\n");
     std::fs::write(sb.home.join("config/plugins.toml"), decl).unwrap();
     assert!(sb.aca(&["plugin", "sync"]).contains("已安装 aca.remote"));
-    // 视图:命令行打出它的输出
+    // A view: the command line prints its output
     assert!(sb.aca(&["plugin", "view", "aca.remote.tasks"]).contains("暂无远端任务"));
     assert!(sb.aca(&["plugin", "actions"]).contains("aca.remote.tasks  视图  远端任务"));
-    // 删:aca 写出来的那份一起删
+    // Remove: the copy aca wrote out is deleted too
     sb.aca(&["plugin", "remove", "aca.remote"]);
     assert!(!sb.home.join("data/first-party/remote").exists());
-    // 自带的再装一遍:就地重写、重新登记,不报已经有了
+    // Installing a built-in one again: rewritten in place and registered again, no "already there" error
     let o = sb.run(&["plugin", "install", "aca.delegate"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }
@@ -2135,7 +2250,7 @@ fn mcps_scattered_in_accounts_are_listed_and_taken_into_the_gateway_without_touc
     let Some(sb) = Sandbox::new("import") else { return };
     let gwp = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/gateway").canonicalize().unwrap();
     sb.aca(&["plugin", "link", &gwp.to_string_lossy()]);
-    // 一个假的家目录:默认的 Claude、登记了的 claude:sub、默认的 Codex 各有几个 MCP
+    // A fake home directory: the default Claude, the registered claude:sub and the default Codex each have a few MCPs
     let home = sb.home.join("h");
     let gh = r#"{ "command": "npx", "args": ["-y", "gh"], "env": { "TOKEN": "s3cret" } }"#;
     write(
@@ -2154,7 +2269,7 @@ fn mcps_scattered_in_accounts_are_listed_and_taken_into_the_gateway_without_touc
         String::from_utf8_lossy(&o.stdout).to_string()
     };
     let before = std::fs::read_to_string(home.join(".claude.json")).unwrap();
-    // 只列:同名同写法的并成一个,HTTP 的标出来;key 的值不打出来
+    // List only: same name with the same definition merged into one, HTTP ones marked; key values aren't printed
     let out = run(&["plugin", "gateway", "import"]);
     assert!(out.contains("github  [claude claude:sub]  npx -y gh  env TOKEN") && !out.contains("s3cret"), "{out}");
     assert!(
@@ -2162,7 +2277,7 @@ fn mcps_scattered_in_accounts_are_listed_and_taken_into_the_gateway_without_touc
         "{out}"
     );
     assert!(!std::fs::read_to_string(&cfg).unwrap().contains("[mcps."));
-    // 收进来:写进 aca 的 config.toml、gateway 的 servers;账号里的原样
+    // Take them in: written into aca's config.toml and the gateway's servers; the ones in accounts stay as they are
     let out = run(&["plugin", "gateway", "import", "--apply"]);
     assert!(out.contains("已导入 gateway:fs github") && out.contains("账号中的配置仍保留"), "{out}");
     let conf = std::fs::read_to_string(&cfg).unwrap();
@@ -2172,15 +2287,16 @@ fn mcps_scattered_in_accounts_are_listed_and_taken_into_the_gateway_without_touc
     );
     assert!(std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap().contains("servers = [\"fs\", \"github\"]"));
     assert_eq!(std::fs::read_to_string(home.join(".claude.json")).unwrap(), before);
-    // 再来一遍:已经有的不重复写
+    // Once more: what's already there isn't written again
     run(&["plugin", "gateway", "import", "--apply"]);
     assert_eq!(std::fs::read_to_string(&cfg).unwrap().matches("[mcps.github]").count(), 1);
-    // drop 移出 gateway
+    // drop moves it out of the gateway
     assert!(run(&["plugin", "gateway", "drop", "fs"]).contains("不再通过 gateway"));
     assert!(std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap().contains("servers = [\"github\"]"));
 }
 
-/// 列表视图:aca plugin view 打成一行一条,--json 原样;它的键要跑的能力没露给菜单也能从视图跑
+/// A list view: aca plugin view prints one row per line, --json as is; the capability its key runs can be run from the view even
+/// when it isn't exposed to the menu
 #[test]
 fn a_list_view_prints_as_rows_and_its_keys_commands_run_though_not_in_the_menu() {
     let Some(sb) = Sandbox::new("listview") else { return };
@@ -2189,10 +2305,10 @@ fn a_list_view_prints_as_rows_and_its_keys_commands_run_though_not_in_the_menu()
     assert!(text.contains("尚未配置 server") && text.contains("暂无远端任务"), "{text}");
     let raw: Value = serde_json::from_str(&sb.aca(&["plugin", "view", "--json", "aca.remote.tasks"])).unwrap();
     assert_eq!(raw["rows"], serde_json::json!([]));
-    // collect 只露给 cli,菜单里没有;键 r 要跑它
+    // collect is exposed only to cli, not in the menu; the key r runs it
     let actions = sb.aca(&["plugin", "actions"]);
     assert!(actions.contains("aca.remote.tasks"), "{actions}");
-    // --json:一个能力一行(全局的 --json 在分到 plugin 之前就拿走了,照样认)
+    // --json: one capability per line (the global --json is taken out before dispatching to plugin, and still understood)
     let ids: Vec<String> = sb
         .aca(&["plugin", "actions", "--json"])
         .lines()
@@ -2200,16 +2316,18 @@ fn a_list_view_prints_as_rows_and_its_keys_commands_run_though_not_in_the_menu()
         .collect();
     assert_eq!(ids, ["aca.remote.run", "aca.remote.new", "aca.remote.list", "aca.remote.rm", "aca.remote.collect", "aca.remote.check"]);
     assert!(sb.aca(&["plugin", "run", "aca.remote.collect"]).contains("已获取,没有新结果"));
-    // aca mounts、aca remote 挪进了插件:指路
+    // aca mounts and aca remote moved into plugins: point the way
     let o = sb.run(&["mounts", "nope"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("已移到插件 aca.tailnet"));
     let o = sb.run(&["remote", "run", "gpu1", "--", "make"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("已移到插件 aca.remote"));
 }
 
-/// aca.remote 整个在插件里(remote.sh,sh + jq + curl + ssh):用假的 server(curl)和假的远端(ssh 在本机跑)走一遍 ——
-/// 派出去、远端跑完回调、到点去取、结果放进派它的会话的收件箱、定时开了又关;失联、会话没了、不在会话里登记的、
-/// 连不上 server、撤掉
+/// aca.remote lives entirely in its plugin (remote.sh, sh + jq + curl + ssh): run it through with a fake server (curl) and a
+/// fake remote (ssh running locally) —
+/// sent out, the remote finishes and calls back, fetched when the time comes, the result put in the inbox of the session that
+/// sent it, the timer turned on and off again; lost, the session gone, registered outside a session,
+/// the server unreachable, removed
 #[test]
 fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox() {
     let Some(sb) = Sandbox::new("remote") else { return };
@@ -2223,7 +2341,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
         write(&bin.join(name), body);
         Command::new("chmod").arg("+x").arg(bin.join(name)).status().unwrap();
     }
-    // PATH:假的在前(真的 curl、ssh 在 /usr/bin);jq、tmux 单独接进来
+    // PATH: the fakes first (the real curl and ssh are in /usr/bin); jq and tmux brought in separately
     let tools = fake.join("tools");
     std::fs::create_dir_all(&tools).unwrap();
     for prog in ["jq", "tmux"] {
@@ -2261,12 +2379,12 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     };
     sb.aca(&["plugin", "install", "aca.remote"]);
 
-    // 还没配 server:说去哪配
+    // No server set up yet: say where to set it up
     let (good, out) = run(&["plugin", "run", "aca.remote.run", "--session", &lead, "host=gpu1", "command=true"]);
     assert!(!good && out.contains("尚未配置 server") && out.contains("aca plugin setting aca.remote url"), "{out}");
     sb.aca(&["plugin", "setting", "aca.remote", "url", "https://hook.test/"]);
     sb.aca(&["plugin", "setting", "aca.remote", "token", "right-token-0123456789"]);
-    // 口令打码列;记它的 plugins.toml 只有自己能读
+    // The token is listed masked; the plugins.toml recording it is readable only by its owner
     assert!(!sb.aca(&["plugin", "setting", "aca.remote"]).contains("right-token"));
     let decl = std::fs::metadata(sb.home.join("config/plugins.toml")).unwrap();
     assert_eq!(std::os::unix::fs::PermissionsExt::mode(&decl.permissions()) & 0o777, 0o600);
@@ -2277,14 +2395,15 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     let out = ok(&["plugin", "run", "aca.remote.check"]);
     assert!(out.contains("已连接,口令正确 · jobhook 0.1.0"), "{out}");
 
-    // 连不上那台机器:说为什么,刚登记的撤掉(server、本机都没留),定时没开着
+    // The machine can't be reached: say why, undo the registration just made (nothing left on the server or locally), the timer
+    // isn't on
     let (good, out) = run(&["plugin", "run", "aca.remote.run", "--session", &lead, "host=nohost", "command=true"]);
     assert!(!good && out.contains("无法在 nohost 上启动:ssh: Could not resolve hostname nohost"), "{out}");
     assert_eq!(std::fs::read_dir(&hub).unwrap().count(), 0);
     assert_eq!(std::fs::read_dir(&tasks).map(|d| d.count()).unwrap_or(0), 0);
     assert_eq!(timer()["on"], false);
 
-    // 派出去:远端后台跑起来,马上返回;定时开了
+    // Send it out: it starts in the background on the remote and returns at once; the timer is on
     let out = ok(&[
         "plugin",
         "run",
@@ -2305,12 +2424,13 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     let tm = timer();
     assert_eq!((tm["on"].as_bool(), tm["scheduled"].as_bool()), (Some(true), Some(true)), "{tm}");
     assert!(ok(&["plugin", "run", "aca.remote.list"]).contains("gpu1 上的「训练」  等待中 · 已等"));
-    // 远端跑完回调到 server(假的远端在本机后台跑,等它)
+    // The remote finishes and calls back to the server (the fake remote runs in the background locally; wait for it)
     let rec = hub.join(format!("{id}.json"));
     assert!(sb.until(|| std::fs::read_to_string(&rec).is_ok_and(|t| t.contains("\"done\""))), "没回调");
     assert!(std::fs::read_to_string(fake.join(format!("remote/.aca-hooks/{id}.log"))).unwrap().contains("第一行"));
 
-    // 到点去取:结果放进 lead 的收件箱(发件人是你),server 上的取走了;都了结了,定时在这一次跑完后关掉
+    // Fetch when the time comes: the result goes into lead's inbox (the sender is you), and is taken off the server; all settled,
+    // so the timer turns off after this run
     assert_eq!(ok(&["plugin", "timer", "tick", "aca.remote.collect"]), "");
     let got = inbox(&lead);
     assert!(got.contains("[aca 远端任务] gpu1 上的「训练」结束了:失败了,退出码 3") && got.contains("最后一行"), "{got}");
@@ -2320,7 +2440,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     let tm = timer();
     assert_eq!((tm["on"].as_bool(), tm["scheduled"].as_bool(), tm["rc"].as_i64()), (Some(false), Some(false), Some(0)), "{tm}");
     assert!(ok(&["plugin", "log", "aca.remote"]).contains("gpu1 上的「训练」:已发送到会话"));
-    // 列表:✕ 退出码,⏎ 复制看日志的命令
+    // The list: ✕ exit code, ⏎ copies the command for viewing the log
     let v: Value = serde_json::from_str(&ok(&["plugin", "view", "--json", "aca.remote.tasks"])).unwrap();
     let row = &v["rows"][0];
     assert_eq!((row["mark"].as_str(), row["tone"].as_str()), (Some("✕"), Some("bad")), "{v}");
@@ -2328,7 +2448,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     assert_eq!(row["fields"]["log_cmd"], format!("ssh gpu1 tail -n 50 ~/.aca-hooks/{id}.log"));
     assert!(row["detail"][0].as_str().unwrap().contains("会话「lead」"), "{v}");
 
-    // 只登记的(自己接回调):失联告诉会话一次;之后回调到了照样发
+    // Registered only (wiring up the callback yourself): going lost tells the session once; a callback arriving later is still sent
     let other = new_session("other");
     let out = ok(&["plugin", "run", "aca.remote.new", "--session", &other, "note=手动"]);
     let lost = out.lines().next().unwrap().strip_prefix("id ").unwrap().to_string();
@@ -2348,7 +2468,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     ok(&["plugin", "run", "aca.remote.collect"]);
     assert!(inbox(&other).contains("「手动」结束了:退出码 0"));
 
-    // 会话没了、不在会话里登记的:结果留在列表里,说为什么
+    // The session gone, registered outside a session: the result stays in the list, saying why
     let gone = new_session("gone");
     let id_gone = ok(&["plugin", "run", "aca.remote.new", "--session", &gone, "note=没人收"]).lines().next().unwrap()[3..].to_string();
     sb.aca(&["rm", &gone]);
@@ -2366,7 +2486,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     assert_eq!(task(&id_gone)["state"], "kept");
     assert_eq!(timer()["on"], false);
 
-    // 连不上 server:这次没取到,不算失败;撤掉一个在等的:server 上也删
+    // The server unreachable: nothing fetched this time, not a failure; removing one that's waiting: deleted on the server too
     let waiting = ok(&["plugin", "run", "aca.remote.new", "--session", &lead, "note=等着"]).lines().next().unwrap()[3..].to_string();
     write(&fake.join("down"), "");
     let out = ok(&["plugin", "run", "aca.remote.collect"]);
@@ -2374,7 +2494,7 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     let (good, out) = run(&["plugin", "run", "aca.remote.rm", &format!("id={}", &waiting[..6])]);
     assert!(!good && out.contains("无法连接 server"), "{out}");
     std::fs::remove_file(fake.join("down")).unwrap();
-    // 另一个正在取:这次不取;锁放了很久的当没人要
+    // Another fetch is in progress: don't fetch this time; a lock held for very long is treated as unclaimed
     write(&tasks.join(".lock"), &format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()));
     assert!(ok(&["plugin", "run", "aca.remote.collect"]).contains("另一次获取正在进行"));
     write(&tasks.join(".lock"), "1000");
@@ -2386,8 +2506,10 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     assert_eq!(timer()["on"], false);
 }
 
-/// 定时:清单里的 [[timers]],到点 launchd 跑 aca plugin timer tick(测试里不碰 launchd:plist 写在 state/timers 里,到点由这里 tick)。
-/// 没写 manual 的跟着插件开关;manual 的插件自己开关,跑着的那一次里关掉自己等跑完才卸;清单改了、插件删了照着收拾
+/// Timers: the [[timers]] in the manifest; when the time comes, launchd runs aca plugin timer tick (the test doesn't touch
+/// launchd: the plists are written in state/timers, and ticks are made here).
+/// Ones without manual follow the plugin's on/off; manual ones are turned on and off by the plugin itself, and one turned off
+/// during its own run is removed only after the run; a changed manifest or a deleted plugin gets cleaned up to match
 #[test]
 fn timers_run_when_due_follow_their_plugin_and_a_manual_one_switches_itself_off_after_its_run() {
     let Some(sb) = Sandbox::new("timers") else { return };
@@ -2409,7 +2531,7 @@ fn timers_run_when_due_follow_their_plugin_and_a_manual_one_switches_itself_off_
         &dir.join("tick.sh"),
         "echo ran >> \"$ACA_PLUGIN_STATE_DIR/ticks\"\necho \"tick out\"\n[ -e \"$ACA_PLUGIN_STATE_DIR/fail\" ] && exit 3\nexit 0\n",
     );
-    // 跑完一次就关掉自己(像远端任务都了结了)
+    // Turns itself off after one run (like when all remote tasks are settled)
     write(&dir.join("poll.sh"), "echo polled >> \"$ACA_PLUGIN_STATE_DIR/polls\"\n\"$ACA_BIN\" plugin timer off \"$ACA_PLUGIN_ID.poll\"\n");
     let d = dir.to_str().unwrap();
     let out = sb.aca(&["plugin", "link", d]);
@@ -2419,20 +2541,20 @@ fn timers_run_when_due_follow_their_plugin_and_a_manual_one_switches_itself_off_
     let count = |f: &str| std::fs::read_to_string(sb.home.join("state/plugins/t.timed").join(f)).unwrap_or_default().lines().count();
     let rows = || -> Vec<Value> { sb.aca(&["plugin", "timer", "--json"]).lines().map(|l| serde_json::from_str(l).unwrap()).collect() };
 
-    // 链接上:跟着插件的那个开了(plist 跑这个 aca 的 tick),manual 的关着
+    // Linked: the one following the plugin is on (the plist runs this aca's tick), the manual one is off
     let ls = sb.aca(&["plugin", "timer"]);
     assert!(ls.contains("● t.timed.tick  每 10m · 已开启") && ls.contains("○ t.timed.poll  每 1m · 由插件自行开关 · 已关闭"), "{ls}");
     let p = std::fs::read_to_string(plist("tick")).unwrap();
     assert!(p.contains("<string>tick</string>\n        <string>t.timed.tick</string>") && p.contains("<integer>600</integer>"), "{p}");
     assert!(p.contains(env!("CARGO_BIN_EXE_aca")), "{p}");
     assert!(!plist("poll").exists());
-    // 到点:跑一次,输出进插件的日志,记下退出码
+    // The time comes: it runs once, the output goes to the plugin's log, the exit code is recorded
     let o = sb.run(&["plugin", "timer", "tick", "t.timed.tick"]);
     assert!(o.status.success() && o.stdout.is_empty(), "{o:?}");
     assert_eq!(count("ticks"), 1);
     let log = sb.aca(&["plugin", "log", "t.timed"]);
     assert!(log.contains(" timer tick\ntick out"), "{log}");
-    // 刚跑过:跨过整秒、机器忙一点就是 1s、2s 前
+    // Just ran: crossing a whole second, or a slightly busy machine, makes it 1s or 2s ago
     let ls = sb.aca(&["plugin", "timer"]);
     assert!(["上次 0s 前 ✓", "上次 1s 前 ✓", "上次 2s 前 ✓"].iter().any(|s| ls.contains(s)), "{ls}");
     write(&sb.home.join("state/plugins/t.timed/fail"), "");
@@ -2440,11 +2562,12 @@ fn timers_run_when_due_follow_their_plugin_and_a_manual_one_switches_itself_off_
     assert_eq!(rows()[0]["rc"], 3);
     assert!(sb.aca(&["plugin", "log", "t.timed"]).contains("(退出码 3)"));
     assert!(sb.aca(&["plugin", "timer"]).contains("✕ 退出码 3"));
-    // 跟着插件的关不了
+    // One that follows the plugin can't be turned off
     let o = sb.run(&["plugin", "timer", "off", "t.timed.tick"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("随插件开关"), "{o:?}");
 
-    // manual 的:插件说开才开;跑着的那一次里它关掉自己,跑完才卸(plist 没了、记着关了),上次跑得怎么样照记
+    // The manual one: on only when the plugin says so; during its own run it turns itself off and is removed after the run (the
+    // plist gone, recorded as off), with how the last run went still recorded
     assert!(sb.aca(&["plugin", "timer", "on", "t.timed.poll"]).contains("已开启 t.timed.poll:每 1m 运行一次"));
     assert!(plist("poll").exists());
     sb.aca(&["plugin", "timer", "tick", "t.timed.poll"]);
@@ -2452,15 +2575,15 @@ fn timers_run_when_due_follow_their_plugin_and_a_manual_one_switches_itself_off_
     assert!(!plist("poll").exists());
     let r = rows().into_iter().find(|r| r["id"] == "t.timed.poll").unwrap();
     assert_eq!((r["on"].as_bool(), r["scheduled"].as_bool(), r["rc"].as_i64()), (Some(false), Some(false), Some(0)), "{r}");
-    // 关着的到点了(launchd 那头还没卸干净):不跑
+    // An off one whose time comes (not fully removed on the launchd side yet): doesn't run
     sb.aca(&["plugin", "timer", "tick", "t.timed.poll"]);
     assert_eq!(count("polls"), 1);
-    // run:现在跑一次,输出打出来,关着也跑
+    // run: run once now and print the output, even when off
     std::fs::remove_file(sb.home.join("state/plugins/t.timed/fail")).unwrap();
     assert!(sb.aca(&["plugin", "timer", "run", "t.timed.tick"]).contains("tick out"));
     assert_eq!(count("ticks"), 3);
 
-    // 插件停着:都卸掉,到点了也不跑;开回来照原来的
+    // Plugin disabled: all removed, and nothing runs when the time comes; enabled again, back as before
     sb.aca(&["plugin", "disable", "t.timed"]);
     assert!(!plist("tick").exists());
     assert!(sb.aca(&["plugin", "timer"]).contains("○ t.timed.tick  每 10m · 插件已关闭"));
@@ -2468,23 +2591,24 @@ fn timers_run_when_due_follow_their_plugin_and_a_manual_one_switches_itself_off_
     assert_eq!(count("ticks"), 3);
     sb.aca(&["plugin", "enable", "t.timed"]);
     assert!(plist("tick").exists() && !plist("poll").exists());
-    // 清单改了:every 变了重装;定时删了收拾掉
+    // Manifest changed: every changed, so reinstalled; a deleted timer is cleaned up
     manifest("20m", false);
     sb.aca(&["plugin", "link", d]);
     assert!(std::fs::read_to_string(plist("tick")).unwrap().contains("<integer>1200</integer>"));
     assert!(!timers.join("t.timed.poll.json").exists());
     assert_eq!(rows().len(), 1);
-    // 插件删了:它的定时都没了
+    // Plugin deleted: its timers are all gone
     sb.aca(&["plugin", "unlink", "t.timed"]);
     assert!(!plist("tick").exists() && !timers.join("t.timed.tick.json").exists());
     assert!(sb.aca(&["plugin", "timer"]).contains("没有插件设置定时任务"));
-    // 已经没了的到点了:把自己卸掉,什么都不跑
+    // One already gone whose time comes: removes itself, runs nothing
     assert!(sb.run(&["plugin", "timer", "tick", "t.timed.tick"]).status.success());
     assert_eq!(count("ticks"), 3);
 }
 
-/// aca.tailnet 整个在插件里(tailnet.sh,sh + jq):用假的 tailscale / netstat / tpub 跑一遍列、撤、挂、发布。
-/// aca 只管把它跑起来、把话说成界面用的那种(ACA_LANG):这里不设 ACA_LANG,config.toml 写中文
+/// aca.tailnet lives entirely in its plugin (tailnet.sh, sh + jq): run listing, removing, mounting and publishing with a fake
+/// tailscale / netstat / tpub.
+/// aca only runs it and makes it speak the UI's language (ACA_LANG): ACA_LANG isn't set here, and config.toml says Chinese
 #[test]
 fn the_tailnet_plugin_does_mounts_on_its_own_through_the_plugin_interface() {
     let Some(sb) = Sandbox::new("tailnet") else { return };
@@ -2519,7 +2643,8 @@ fn the_tailnet_plugin_does_mounts_on_its_own_through_the_plugin_interface() {
     }}"#,
         docs.display()
     );
-    // 3000 只听 ::1,22 听所有地址,9000 只有 tailscale 自己留的口子,8420 没人听(连着的不算)
+    // 3000 listens only on ::1, 22 on all addresses, 9000 only on the opening tailscale itself leaves, and nobody listens on 8420
+    // (a connection doesn't count)
     let netstat = "Active Internet connections (including servers)
 Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)
 tcp4       0      0  127.0.0.1.8420         127.0.0.1.51234        ESTABLISHED
@@ -2541,8 +2666,9 @@ tcp6       0      0  fd7a:115c:a1e0::.9000  *.*                    LISTEN
     };
     let cfg = sb.home.join("config/config.toml");
     write(&cfg, &format!("{}\n[ui]\nlang = \"zh\"\n", std::fs::read_to_string(&cfg).unwrap()));
-    // PATH 只给假的和系统目录:机器上真的 tailscale、tpub(~/.local/bin、/opt/homebrew/bin 里)一个都找不到,
-    // 测「撤」「发布」时碰不到真的挂载。jq 单独放一个目录接进来
+    // PATH holds only the fakes and system directories: not one of the real tailscale and tpub on the machine (in ~/.local/bin,
+    // /opt/homebrew/bin) can be found,
+    // so testing remove and publish can't touch real mounts. jq is brought in from a directory of its own
     let tools = fake.join("tools");
     std::fs::create_dir_all(&tools).unwrap();
     let jq = String::from_utf8_lossy(&Command::new("sh").args(["-c", "command -v jq"]).output().unwrap().stdout).trim().to_string();
@@ -2555,11 +2681,12 @@ tcp6       0      0  fd7a:115c:a1e0::.9000  *.*                    LISTEN
     };
     let did = || std::fs::read_to_string(fake.join("log")).unwrap_or_default();
     sb.aca(&["plugin", "install", "aca.tailnet"]);
-    // 像是刚升级了 aca:写出来的还是老的那份(调已经没了的 aca mounts)。跑它之前先换成新的
+    // As if aca had just been upgraded: what was written out is still the old one (calling the gone aca mounts). Before running it,
+    // it's replaced with the new one
     write(&sb.home.join("data/first-party/tailnet/tailnet.sh"), "#!/bin/sh\nexec \"$ACA_BIN\" mounts --json\n");
     reset();
 
-    // 列表视图:一行一条,目标活着没,公网 / 前台标出来;发布的开关在上面
+    // The list view: one row per line, whether the target is alive, public / foreground marked; the publish switch on top
     let (ok, out) = run(true, &["plugin", "view", "--json", "aca.tailnet.mounts"]);
     assert!(ok, "{out}");
     let v: Value = serde_json::from_str(&out).unwrap();
@@ -2575,12 +2702,12 @@ tcp6       0      0  fd7a:115c:a1e0::.9000  *.*                    LISTEN
     assert_eq!(row("tcp:2222")["right"], "监听中");
     let fg = row("fg:https:9000/");
     assert!(fg["fields"].get("drop").is_none() && fg["right"] == "未监听 · 前台", "{fg}");
-    // 给人 / agent 看的那份
+    // The one for people / agents to read
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.list"]);
     assert!(ok && out.starts_with("mac.tail.ts.net\n✕ https://mac.tail.ts.net/ "), "{out}");
     assert!(out.contains("● https://mac.tail.ts.net:8443/docs  → ") && out.contains("文件存在 · 公网"), "{out}");
 
-    // 撤:带上端口和路径;开到公网的用 funnel 撤;撤完写出怎么加回去
+    // Remove: passes the port and path; one open to the internet is removed with funnel; afterwards it writes how to add it back
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.drop", "target=https:8443/docs"]);
     assert!(
         ok && out.contains("已撤销 https://mac.tail.ts.net:8443/docs")
@@ -2590,13 +2717,14 @@ tcp6       0      0  fd7a:115c:a1e0::.9000  *.*                    LISTEN
     run(false, &["plugin", "run", "aca.tailnet.drop", "target=https://mac.tail.ts.net/"]);
     run(false, &["plugin", "run", "aca.tailnet.drop", "target=tcp:2222"]);
     assert_eq!(did(), "funnel --https=8443 --set-path=/docs off\nserve --https=443 --set-path=/ off\nserve --tcp=2222 off\n");
-    // 没有这条、前台的:不去敲命令
+    // One that isn't there, a foreground one: no command is typed
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.drop", "target=https:443/"]);
     assert!(!ok && out.contains("没有挂载 https:443/"), "{out}");
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.drop", "target=fg:https:9000/"]);
     assert!(!ok && out.contains("前台挂载无法撤销"), "{out}");
     assert_eq!(did().lines().count(), 3);
-    // tailscale 说撤了、其实没撤;撤一条带走了别的:都照实说,带走的写出怎么加回去
+    // tailscale says it removed one but didn't; removing one took others with it: both reported as they are, with how to add back
+    // the ones taken along
     reset();
     write(&fake.join("off_ignored"), "");
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.drop", "target=https:443/"]);
@@ -2607,7 +2735,7 @@ tcp6       0      0  fd7a:115c:a1e0::.9000  *.*                    LISTEN
     assert!(!ok && out.contains("也一起消失了") && out.contains("tailscale serve --bg --tcp=2222 tcp://127.0.0.1:22"), "{out}");
     assert!(out.contains("http://mac.tail.ts.net:8080/hi") && !out.contains("9000"), "{out}");
 
-    // 挂:tailnet 里同一个端口号;目标没在听的提一句;端口号已经有了的不动
+    // Mount: the same port number on the tailnet; a target not listening gets a mention; a port number already taken is left alone
     reset();
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.add", "port=3000"]);
     assert!(ok && out.trim() == "已挂载 https://mac.tail.ts.net:3000/", "{out}");
@@ -2618,7 +2746,7 @@ tcp6       0      0  fd7a:115c:a1e0::.9000  *.*                    LISTEN
         assert!(!ok && out.contains("已有其他挂载"), "{taken}: {out}");
     }
     assert_eq!(did(), "serve --bg --https=3000 http://localhost:3000\nserve --bg --https=5174 http://localhost:5174\n");
-    // tailscale 没在跑:列表照样出来,写着为什么;挂不了
+    // tailscale not running: the list still comes out, saying why; can't mount
     reset();
     write(&fake.join("down"), "");
     let (ok, out) = run(false, &["plugin", "view", "--json", "aca.tailnet.mounts"]);
@@ -2626,7 +2754,7 @@ tcp6       0      0  fd7a:115c:a1e0::.9000  *.*                    LISTEN
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.add", "port=3000"]);
     assert!(!ok && out.contains("is Tailscale running"), "{out}");
 
-    // 发布:tpub 说的照实转;说开了其实没开的不算
+    // Publish: what tpub says is passed on as is; saying on while actually not on doesn't count
     reset();
     write(&fake.join("tpub"), "busy");
     let (ok, out) = run(true, &["plugin", "run", "aca.tailnet.publish", "to=on"]);
@@ -2642,12 +2770,13 @@ tcp6       0      0  fd7a:115c:a1e0::.9000  *.*                    LISTEN
     assert!(out.contains("发布 已开启 · 2 项") && out.contains(r#""publish_to":"off""#), "{out}");
     let (ok, out) = run(false, &["plugin", "run", "aca.tailnet.publish", "to=on"]);
     assert!(!ok && out.contains("未安装 tpub"), "{out}");
-    // 没装 tpub:没有发布那行,p 按不了
+    // tpub not installed: no publish line, p can't be pressed
     let (_, out) = run(false, &["plugin", "view", "--json", "aca.tailnet.mounts"]);
     assert!(!out.contains("发布") && !out.contains("publish_to"), "{out}");
 }
 
-/// 从零写一个插件:new 建好就能 link、run;check 不链接也能查;emit 让事件钩子在前台跑、输出打出来
+/// Writing a plugin from scratch: right after new it can be linked and run; check works without linking; emit runs an event hook
+/// in the foreground and prints its output
 #[test]
 fn a_new_plugin_links_and_runs_check_names_problems_and_emit_runs_hooks_in_the_foreground() {
     let Some(sb) = Sandbox::new("plugdev") else { return };
@@ -2656,27 +2785,27 @@ fn a_new_plugin_links_and_runs_check_names_problems_and_emit_runs_hooks_in_the_f
     let out = sb.aca(&["plugin", "new", d]);
     assert!(out.contains("(me.hello)") && out.contains("aca plugin run me.hello.hello"), "{out}");
     assert!(sb.aca(&["plugin", "check", d]).contains("✓ 未发现问题"));
-    // 已经有东西的目录不动
+    // A directory that already has things in it is left alone
     assert!(!sb.run(&["plugin", "new", d]).status.success());
     sb.aca(&["plugin", "link", d]);
     assert!(sb.aca(&["plugin", "run", "me.hello.hello"]).contains("你好!会话 (没有)"));
-    // 钩子还注释着:没人订
+    // The hook is still commented out: nobody subscribes
     assert!(sb.aca(&["plugin", "emit", "turn.done"]).contains("没有已开启的插件订阅 turn.done"));
     let m = dir.join("aca-plugin.toml");
     let text = std::fs::read_to_string(&m).unwrap();
     write(&m, &text.replace("# [[events]]\n# on = \"turn.done\"\n# command = [\"sh\", \"hello.sh\"]", "[[events]]\non = \"turn.done\"\ncommand = [\"sh\", \"-c\", \"echo $ACA_PLUGIN_EVENT $ACA_PLUGIN_EVENT_JSON\"]\n\n[[events]]\non = \"turn.failed\"\nif = { kind = \"transient\" }\ncommand = [\"sh\", \"-c\", \"echo again; exit 3\"]"));
     sb.aca(&["plugin", "link", d]);
-    // 事件的字段照类型放进那一行;--plugin 只跑它的
+    // The event's fields go into that line by type; --plugin runs only that one
     let out = sb.aca(&["plugin", "emit", "turn.done", "secs=12", "last=好了", "--plugin", "me.hello"]);
     assert!(out.contains("--- me.hello · sh -c echo") && out.contains("退出码 0"), "{out}");
     assert!(out.contains(r#""event":"turn.done""#) && out.contains(r#""secs":12"#) && out.contains(r#""last":"好了""#), "{out}");
-    // if 对不上的不跑;对得上、退出码不是 0 的,emit 的退出码也不是 0
+    // One whose if doesn't match doesn't run; when one matches and exits nonzero, emit's exit code isn't 0 either
     assert!(sb.aca(&["plugin", "emit", "turn.failed", "kind=account"]).contains("没有已开启的插件订阅"));
     let o = sb.run(&["plugin", "emit", "turn.failed", "kind=transient"]);
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(!o.status.success() && out.contains("退出码 3") && out.contains("again"), "{out}");
     assert!(!sb.run(&["plugin", "emit", "turn.nope"]).status.success());
-    // check:脚本不在、要用的程序没有,都点名;有毛病退出码是 1
+    // check: a missing script, a missing program it needs, each named; with problems the exit code is 1
     let bad = sb.home.join("work/bad");
     std::fs::create_dir_all(&bad).unwrap();
     write(
@@ -2689,14 +2818,16 @@ fn a_new_plugin_links_and_runs_check_names_problems_and_emit_runs_hooks_in_the_f
         !o.status.success() && out.contains("✕ 命令 a:插件目录中没有 gone.sh") && out.contains("⚠ 需要 surely-missing-prog-aca"),
         "{out}"
     );
-    // 链接时也提醒缺的程序;aca plugin ls 也说
+    // Linking also warns about missing programs; aca plugin ls says so too
     let out = sb.aca(&["plugin", "link", bad.to_str().unwrap()]);
     assert!(out.contains("需要 surely-missing-prog-aca"), "{out}");
     assert!(sb.aca(&["plugin", "ls"]).contains("⚠ x.bad:需要 surely-missing-prog-aca"));
 }
 
-/// 插件接口(api 1)的约定:每种调法交给命令的环境变量正好是这些、文档里都写了;列表视图只读标准输出;
-/// 清单里不认识的字段提醒、版本比 aca 新的不让链接、在 agent 那边撞名的不让链接
+/// The contract of the plugin interface (api 1): each way of calling hands the command exactly these environment variables, all
+/// documented; a list view reads only stdout;
+/// unknown fields in the manifest get a warning, one for a newer interface than aca's can't be linked, one whose name clashes on
+/// the agent side can't be linked
 #[test]
 fn the_plugin_contract_gives_each_kind_of_call_its_documented_variables_and_guards_the_manifest() {
     let Some(sb) = Sandbox::new("contract") else { return };
@@ -2733,7 +2864,8 @@ every = "5m"
 manual = true
 "#,
     );
-    // 外面带进来的(测试给 aca 的 ACA_HOME、ACA_TMUX_SOCKET)不算:插件的进程照样继承 aca 的环境
+    // What comes in from outside (ACA_HOME and ACA_TMUX_SOCKET the test gives aca) doesn't count: plugin processes inherit aca's
+    // environment anyway
     write(
         &dir.join("env.sh"),
         "env | sed -n 's/^\\(ACA_[A-Z0-9_]*\\)=.*/\\1/p' | grep -v -e '^ACA_HOME$' -e '^ACA_TMUX_SOCKET$' | sort -u | tr '\\n' ' '\necho\necho \"parent=$ACA_SESSION_PARENT\"\necho \"by=$ACA_INVOKED_BY timer=$ACA_PLUGIN_TIMER\"\n",
@@ -2778,23 +2910,24 @@ manual = true
         line.split_whitespace().map(String::from).collect()
     };
     let command = ["ACA_ARG_WORD", "ACA_PLUGIN_ACTION_ID", "ACA_PLUGIN_ARGS_JSON", "ACA_PLUGIN_ENTRYPOINT_ID"];
-    // 命令行跑一条能力:冲着 worker,派它的那个在 ACA_SESSION_PARENT
+    // A capability run from the command line: aimed at the worker, and the one that sent it out is in ACA_SESSION_PARENT
     let out = sb.aca(&["plugin", "run", "t.contract.env", "--session", &worker, "word=hi"]);
     assert_eq!(names(&out), want(&command), "{out}");
     assert!(out.contains(&format!("parent={lead}")), "{out}");
-    // 视图
+    // A view
     let out = sb.aca(&["plugin", "view", "t.contract.envview"]);
     assert_eq!(names(&out), want(&["ACA_PLUGIN_ENTRYPOINT_ID"]), "{out}");
-    // 事件钩子
+    // An event hook
     let out = sb.aca(&["plugin", "emit", "turn.done", "--plugin", "t.contract", "--session", &worker]);
     assert_eq!(names(&out), want(&["ACA_PLUGIN_EVENT", "ACA_PLUGIN_EVENT_JSON"]), "{out}");
     assert!(out.contains(&format!("parent={lead}")), "{out}");
     assert!(out.contains("by=event timer=\n") || out.ends_with("by=event timer="), "{out}");
-    // 定时:跟命令行跑这个能力一样的环境,没有会话,ACA_PLUGIN_TIMER 是哪个定时
+    // A timer: the same environment as running this capability from the command line, no session, and ACA_PLUGIN_TIMER says which
+    // timer
     let out = sb.aca(&["plugin", "timer", "run", "t.contract.env"]);
     assert_eq!(names(&out), want(&command[1..]), "{out}");
     assert!(out.contains("parent=\n") && out.contains("by=timer timer=t.contract.env"), "{out}");
-    // agent 调的工具(MCP)
+    // A tool called by an agent (MCP)
     let mut child = sb
         .cmd()
         .args(["plugin", "tools"])
@@ -2818,7 +2951,8 @@ manual = true
     let text = reply["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{out}"));
     assert_eq!(names(text), want(&command[1..]), "{text}");
     assert!(text.contains(&format!("parent={lead}")), "{text}");
-    // 上面出现过的每一个,文档(英文 plugins.md、中文 plugins.zh-CN.md)「交给命令的环境」里都有
+    // Every one seen above is in the docs (the English plugins.md, the Chinese plugins.zh-CN.md) under the environment handed to
+    // commands
     for file in ["plugins.md", "plugins.zh-CN.md"] {
         let docs = std::fs::read_to_string(format!("{}/../../docs/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap();
         for n in want(&["ACA_PLUGIN_EVENT", "ACA_PLUGIN_EVENT_JSON", "ACA_INPUT_FILE"])
@@ -2830,14 +2964,15 @@ manual = true
         }
     }
 
-    // 列表视图跑成了只读标准输出:标准错误写进插件的日志,不搅进 JSON
+    // A list view runs reading only stdout: stderr goes into the plugin's log, not mixed into the JSON
     let out = sb.aca(&["plugin", "view", "t.contract.rows"]);
     assert!(out.contains("第一条") && !out.contains("a note"), "{out}");
     let raw = sb.json(&["plugin", "view", "t.contract.rows", "--json"]);
     assert_eq!(raw["rows"][0]["id"], "a");
     assert!(sb.aca(&["plugin", "log", "t.contract"]).contains("a note on stderr"));
 
-    // 清单里不认识的字段:链接照样链接,点名提醒(写在 [[keys]] 后面的 needs 归了那个键)
+    // Unknown fields in the manifest: linking still links, with a warning naming them (a needs written after [[keys]] belongs to
+    // that key)
     let typo = sb.home.join("work/typo");
     write(
         &typo.join("aca-plugin.toml"),
@@ -2846,20 +2981,22 @@ manual = true
     let out = sb.aca(&["plugin", "link", typo.to_str().unwrap()]);
     assert!(out.contains("无法识别的 descripton") && out.contains("无法识别的 keys[1].needs"), "{out}");
     assert!(sb.aca(&["plugin", "check", typo.to_str().unwrap()]).contains("⚠ 清单中有无法识别的 keys[1].needs"));
-    // 照新一版接口写的:不让链接,说先升级 aca
+    // Written for a newer interface version: can't be linked, says to upgrade aca first
     let newer = sb.home.join("work/newer");
     write(&newer.join("aca-plugin.toml"), "id = \"t.newer\"\nname = \"Newer\"\nversion = \"1\"\napi = 2\n");
     let o = sb.run(&["plugin", "link", newer.to_str().unwrap()]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("先升级 aca"), "{o:?}");
-    // id 换成 agent 那边的名字跟已经链接的撞了(t-contract 和 t.contract 都是 t-contract):不让链接
+    // An id that, turned into its agent-side name, clashes with one already linked (t-contract and t.contract are both t-contract):
+    // can't be linked
     let twin = sb.home.join("work/twin");
     write(&twin.join("aca-plugin.toml"), "id = \"t-contract\"\nname = \"Twin\"\nversion = \"1\"\n");
     let o = sb.run(&["plugin", "link", twin.to_str().unwrap()]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("同名"), "{o:?}");
 }
 
-/// 你在某个会话的 tmux 里另开的窗口:不写 id 的 show / output / plugin run 冲着这个会话。
-/// 只是补上没写的 id:agent 自己(环境里有 ACA_SESSION_ID)不补,新建的会话也不因此挂到它下面
+/// A window you opened in some session's tmux: show / output / plugin run without an id are aimed at that session.
+/// It only fills in an id that wasn't given: not for an agent itself (ACA_SESSION_ID in its environment), and new sessions don't
+/// go under it because of this
 #[test]
 fn a_window_you_opened_in_a_sessions_tmux_needs_no_session_id() {
     let Some(sb) = Sandbox::new("here") else { return };
@@ -2881,7 +3018,7 @@ fn a_window_you_opened_in_a_sessions_tmux_needs_no_session_id() {
     assert!(o.status.success(), "{o:?}");
     assert_eq!(serde_json::from_slice::<Value>(&o.stdout).unwrap()["id"], id.as_str());
     assert!(typed(&mine, None, &["output"]).status.success());
-    // 插件的命令也冲着它
+    // Plugin commands are aimed at it too
     let dir = sb.home.join("work/here");
     write(
         &dir.join("aca-plugin.toml"),
@@ -2890,18 +3027,20 @@ fn a_window_you_opened_in_a_sessions_tmux_needs_no_session_id() {
     sb.aca(&["plugin", "link", dir.to_str().unwrap()]);
     let o = typed(&mine, None, &["plugin", "run", "t.here.who"]);
     assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), format!("session={id}"));
-    // 新建的会话不挂到这个会话下面(「我是谁」还是只看 ACA_SESSION_ID)
+    // A new session doesn't go under this session ("who am I" still looks only at ACA_SESSION_ID)
     let o = typed(&mine, None, &["new", "fake", &proj, "-t", "child", "--hold", "--json"]);
     assert_eq!(serde_json::from_slice::<Value>(&o.stdout).unwrap()["parent"], "", "{o:?}");
-    // agent 自己调的(环境里有 ACA_SESSION_ID)不补:不写 id 就是没写
+    // Called by an agent itself (ACA_SESSION_ID in its environment): not filled in, no id given means none given
     assert!(!typed(&mine, Some(&other), &["show"]).status.success());
-    // 不是 aca 的 tmux 会话:没有可补的
+    // Not one of aca's tmux sessions: nothing to fill in
     let plain = sb.tmux(&["new-session", "-d", "-s", "plain", "-P", "-F", "#{pane_id}"]);
     assert!(!typed(&plain, None, &["show"]).status.success());
 }
 
-/// Claude 的名字跟着会话走(`aca hook-name`):起了名的一起来就交给它,已经叫这个了不再说;
-/// 在 aca 里改了名跟过去,它在 Claude 里 /rename 过就不动;别的事件、不是 aca 的会话一个字不写
+/// Claude's name follows the session (`aca hook-name`): a named one hands it over at start, and says nothing more when it's
+/// already called that;
+/// renamed in aca, it follows; once /rename was used in Claude, it's left alone; other events and non-aca sessions write not a
+/// single character
 #[test]
 fn claude_gets_the_session_name_as_its_own() {
     let Some(sb) = Sandbox::new("name") else { return };
@@ -2936,7 +3075,8 @@ fn claude_gets_the_session_name_as_its_own() {
     assert_eq!(ask("", "UserPromptSubmit", ""), "");
 }
 
-/// tmux 状态栏那一段:在等你确认的、跑完没看的各有几个(不打名字),你正看着的那个不算,看过了就没了;只读,不动别的
+/// The tmux status bar segment: how many need you and how many are finished and unread (no names), not counting the one you're
+/// looking at, gone once seen; read-only, changes nothing else
 #[test]
 fn the_tmux_status_segment_counts_what_waits_for_you() {
     let Some(sb) = Sandbox::new("bar") else { return };
@@ -2948,19 +3088,21 @@ fn the_tmux_status_segment_counts_what_waits_for_you() {
     assert_eq!(sb.aca(&["tmux-status"]), "");
     hook("PermissionRequest", ",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}");
     assert_eq!(sb.aca(&["tmux-status"]), "#[fg=red reverse bold] ◆ 1 #[default]");
-    // 正看着它:不算
+    // Looking at it right now: doesn't count
     assert_eq!(sb.aca(&["tmux-status", &id]), "");
     hook("Stop", ",\"last_assistant_message\":\"好了\",\"background_tasks\":[]");
     assert_eq!(sb.aca(&["tmux-status"]), "#[fg=brightblack]◐ 1#[default]");
     let events = sb.event_names().len();
     sb.aca(&["seen", &id]);
     assert_eq!(sb.aca(&["tmux-status"]), "");
-    // 问了几次也没多出事件
+    // Asking several times adds no events
     assert_eq!(sb.event_names().len(), events);
 }
 
-/// 插件的事件钩子没跑成:`aca plugin ls`、状态栏那一段都标出来(哪个插件、哪一处);下一轮跑成了就不提了。
-/// 插件停了不提,再开着又提;重新链接(清单可能换了,第几个钩子对不上)记录清掉
+/// A plugin's event hook failed to run: `aca plugin ls` and the status bar segment both mark it (which plugin, which hook); once
+/// a later turn runs fine, it's no longer mentioned.
+/// A disabled plugin isn't mentioned, and is again once enabled; linking again (the manifest may have changed, so the hook
+/// numbers may not match) clears the record
 #[test]
 fn a_failing_hook_is_flagged_until_it_runs_fine_again() {
     let Some(sb) = Sandbox::new("health") else { return };
@@ -2969,7 +3111,7 @@ fn a_failing_hook_is_flagged_until_it_runs_fine_again() {
         &dir.join("aca-plugin.toml"),
         "id = \"test.flaky\"\nname = \"Flaky\"\nversion = \"0.1.0\"\n[[events]]\non = \"turn.done\"\ncommand = [\"sh\", \"flaky.sh\"]\n",
     );
-    // 状态目录里有 fail 这个文件就退出 3
+    // Exits 3 when the state directory has a file named fail
     write(&dir.join("flaky.sh"), "[ -e \"$ACA_PLUGIN_STATE_DIR/fail\" ] && exit 3\nexit 0\n");
     sb.aca(&["plugin", "link", &dir.to_string_lossy()]);
     let fail = sb.home.join("state/plugins/test.flaky/fail");
@@ -2977,7 +3119,7 @@ fn a_failing_hook_is_flagged_until_it_runs_fine_again() {
     let id = sb.aca(&["new", "fake", &sb.proj(), "-t", "写文档"]);
     let pane = sb.pane(&id);
     let rec = sb.home.join("state/plugin-health/test.flaky/hook-0");
-    // 一轮:说一句、答完;钩子不等,等它把退出码记下来
+    // One turn: say something, answer; hooks aren't waited for, so wait until it records its exit code
     let turn = |want: &str| {
         sb.hook(&id, &pane, "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"c1\",\"prompt\":\"再来\"}");
         sb.hook(&id, &pane, "{\"hook_event_name\":\"Stop\",\"session_id\":\"c1\",\"last_assistant_message\":\"好\"}");
@@ -2988,7 +3130,7 @@ fn a_failing_hook_is_flagged_until_it_runs_fine_again() {
             sb.aca(&["plugin", "log", "test.flaky"])
         );
     };
-    // 正看着的那个会话不算在等你的里面:这一段只剩插件那半
+    // The session you're looking at isn't counted among those that need you: only the plugin half of the segment remains
     let bar = || sb.aca(&["tmux-status", &id]);
     turn("3");
     let ls = sb.aca(&["plugin", "ls"]);
@@ -3010,8 +3152,10 @@ fn a_failing_hook_is_flagged_until_it_runs_fine_again() {
     assert_eq!(bar(), "");
 }
 
-/// aca tmux install / uninstall:aca 那份写在 aca 自己的目录里,你的 tmux.conf 只多两行(在 TPM 前面),开着的 tmux 马上用上;
-/// 装两遍不重复;卸了 tmux.conf 一字不差地回到原样,开着的 tmux 里 aca 的键和状态栏那一段也撤了
+/// aca tmux install / uninstall: aca's part is written in aca's own directory, your tmux.conf gains just two lines (before TPM),
+/// and a running tmux uses it right away;
+/// installing twice doesn't duplicate; after uninstalling, tmux.conf is back to the original character for character, and aca's
+/// keys and status bar segment are taken out of the running tmux too
 #[test]
 fn aca_tmux_install_adds_two_lines_and_uninstall_puts_everything_back() {
     let Some(sb) = Sandbox::new("tmuxconf") else { return };
@@ -3022,7 +3166,7 @@ fn aca_tmux_install_adds_two_lines_and_uninstall_puts_everything_back() {
         keys.lines().filter(|l| l.contains("#{socket_path}") && l.contains(" ui --client")).count()
     };
     let before = right();
-    // 设了 ACA_HOME 时「你的 tmux.conf」是 $ACA_HOME/tmux.conf
+    // With ACA_HOME set, "your tmux.conf" is $ACA_HOME/tmux.conf
     let conf = sb.home.join("tmux.conf");
     let original = "set -g status-right \"MINE\"\nbind a run-shell 'tmux display-popup \"aca ui --client #{client_name}\"'\n\n# ====\n# TPM\n# ====\nrun '~/.tmux/plugins/tpm/tpm'\n";
     write(&conf, original);
@@ -3035,16 +3179,17 @@ fn aca_tmux_install_adds_two_lines_and_uninstall_puts_everything_back() {
     assert!(std::fs::read_to_string(&ours).unwrap().contains("tmux-status #{@aca_id}"));
     assert_eq!(ours_bound(), 2);
     assert_eq!(right().matches("tmux-status").count(), 1, "{}", right());
-    // 再装一遍:那份重写,tmux.conf 里不多一行,状态栏不接两遍
+    // Installing again: that part is rewritten, tmux.conf gains no extra line, and the status bar segment isn't attached twice
     assert!(sb.aca(&["tmux", "install"]).contains("中已有 source 它的行"));
     assert_eq!(std::fs::read_to_string(&conf).unwrap(), text);
     assert_eq!(right().matches("tmux-status").count(), 1);
     assert!(sb.aca(&["tmux"]).contains("已安装"));
-    // 会话自己设了 status-right(agent-deck 建的那些):看的还是全局那份,不再接
+    // A session that set its own status-right (the ones agent-deck made): the global one is still what's looked at, not attached
+    // again
     sb.tmux(&["set-option", "-t", &sb.pane(&id), "status-right", "这个会话自己的"]);
     assert!(!sb.aca(&["tmux", "install"]).contains("已去重"));
     assert_eq!(right().matches("tmux-status").count(), 1, "{}", right());
-    // 早先接重了的:装的时候收成一遍,你自己的那些原样
+    // Duplicates attached earlier: folded into one when installing, with your own parts unchanged
     let file = std::fs::read_to_string(&ours).unwrap();
     let seg = file.lines().find_map(|l| l.trim().strip_prefix("set -ag status-right \"")?.strip_suffix('"')).unwrap();
     let one = right();
@@ -3053,7 +3198,7 @@ fn aca_tmux_install_adds_two_lines_and_uninstall_puts_everything_back() {
     assert!(out.contains("原先重复了 3 次,已去重"), "{out}\n{}", right());
     assert_eq!(right().matches(seg).count(), 1, "{}", right());
     assert_eq!(right().replace(seg, ""), one.replace(seg, ""));
-    // 卸:原样回来
+    // Uninstall: back to the original
     let out = sb.aca(&["tmux", "uninstall"]);
     assert!(out.contains("配置的两行") && out.contains("已同时移除"), "{out}");
     assert_eq!(std::fs::read_to_string(&conf).unwrap(), original);
@@ -3063,8 +3208,9 @@ fn aca_tmux_install_adds_two_lines_and_uninstall_puts_everything_back() {
     assert!(sb.aca(&["tmux", "uninstall"]).contains("中没有 source aca 配置的行"));
 }
 
-/// 升级了 aca、没跑 install.sh(brew 之类):界面一打开,aca 那份 tmux 设置照这一版重写,开着的 tmux 也用上。
-/// 那份写的是别的 aca(工作树里编的、另一种装法装的)就不动
+/// aca upgraded without running install.sh (brew and the like): as soon as the UI opens, aca's tmux settings are rewritten for
+/// this build, and a running tmux uses them too.
+/// Left alone when that part was written by another aca (built in a worktree, installed some other way)
 #[test]
 fn opening_the_interface_brings_aca_s_tmux_settings_up_to_this_version() {
     let Some(sb) = Sandbox::new("tmuxfresh") else { return };
@@ -3072,7 +3218,7 @@ fn opening_the_interface_brings_aca_s_tmux_settings_up_to_this_version() {
     sb.aca(&["tmux", "install"]);
     let ours = sb.home.join("config/tmux.conf");
     let now = std::fs::read_to_string(&ours).unwrap();
-    // 「旧版」写的:还没有 prefix + a 那个键,开着的 tmux 里也没有
+    // Written by an "old build": no prefix + a key yet, and none in the running tmux either
     let old: String = now.lines().filter(|l| !l.starts_with("bind a ")).map(|l| format!("{l}\n")).collect();
     assert_ne!(old, now);
     sb.tmux(&["unbind-key", "-T", "prefix", "a"]);
@@ -3096,7 +3242,7 @@ fn opening_the_interface_brings_aca_s_tmux_settings_up_to_this_version() {
         assert!(sb.until(|| sb.tmux(&["capture-pane", "-p", "-t", name]).contains("快捷键")), "界面没打开");
     };
 
-    // 别的 aca 写的:不动
+    // Written by another aca: left alone
     let elsewhere = old.replace(env!("CARGO_BIN_EXE_aca"), "/elsewhere/aca");
     assert_ne!(elsewhere, old);
     write(&ours, &elsewhere);
@@ -3105,15 +3251,17 @@ fn opening_the_interface_brings_aca_s_tmux_settings_up_to_this_version() {
     assert_eq!(std::fs::read_to_string(&ours).unwrap(), elsewhere);
     assert!(!bound());
 
-    // 这个 aca 写的旧版:重写成这一版的,开着的 tmux 里键也有了
+    // An old one written by this aca: rewritten for this build, and the running tmux gets the key too
     write(&ours, &old);
     open("second");
     assert!(sb.until(|| std::fs::read_to_string(&ours).unwrap() == now), "没重写");
     assert!(sb.until(bound), "开着的 tmux 没换上");
 }
 
-/// Claude 的状态栏(aca statusline):闲着又没人连着看的会话,照上次画的原样打(别的会话一干活额度就变,跟着重画的话
-/// 屏幕一直有输出,自动停等不到它闲下来);在说话的、不在 tmux 里的照常重算
+/// Claude's status bar (aca statusline): for a session that's idle with nobody attached and watching, print exactly what was
+/// drawn last time (other sessions working change the quota, and redrawing along with them
+/// would keep the screen producing output, so auto-stop would never see it go idle); talking ones and ones outside tmux are
+/// recomputed as usual
 #[test]
 fn an_idle_unwatched_session_prints_its_last_status_bar() {
     use std::io::Write as _;
@@ -3137,18 +3285,19 @@ fn an_idle_unwatched_session_prints_its_last_status_bar() {
         child.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
         String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned()
     };
-    // 刚说过话:照常画
+    // Just talked: drawn as usual
     assert!(bar("Opus", true).contains("Opus"));
-    // 闲了一分钟、没人连着:模型换了也还是上次那条
+    // Idle for a minute, nobody attached: even with the model changed, it's still the last one
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
     std::fs::File::options().write(true).open(&transcript).unwrap().set_modified(old).unwrap();
     let kept = bar("Sonnet", true);
     assert!(kept.contains("Opus") && !kept.contains("Sonnet"), "{kept}");
-    // 不在 tmux 里(问不到有没有人看):照常重算
+    // Not in tmux (no way to ask whether anyone is watching): recomputed as usual
     assert!(bar("Sonnet", false).contains("Sonnet"));
 }
 
-/// 根本起不来的(程序不在 PATH 里):报错说缺什么,登记撤回,列表里不留一条停着的
+/// One that can't start at all (the program isn't on PATH): the error says what's missing, the registration is withdrawn, and
+/// the list keeps no stopped row for it
 #[test]
 fn a_session_whose_program_isnt_there_leaves_nothing_behind() {
     let Some(sb) = Sandbox::new("nolaunch") else { return };
@@ -3164,8 +3313,10 @@ fn a_session_whose_program_isnt_there_leaves_nothing_behind() {
     assert!(ev.ends_with(&["session.created".to_string(), "session.removed".to_string()]), "{ev:?}");
 }
 
-/// 你自己的插件:~/.config/aca/user/ 放了清单就有(不用 link),删了就没;sync 不删它,remove 删不掉它。
-/// cwd = "session" 在会话目录里跑,input 把会话的最后一条回复 / 屏幕交给它(窗格读 ACA_INPUT_FILE)
+/// Your own plugin: it exists once ~/.config/aca/user/ has a manifest (no link needed), and is gone once that's deleted; sync
+/// doesn't delete it, remove can't delete it.
+/// cwd = "session" runs in the session directory, and input hands it the session's last reply / screen (a pane reads
+/// ACA_INPUT_FILE)
 #[test]
 fn your_own_plugin_is_there_without_linking_and_gets_the_sessions_text() {
     let Some(sb) = Sandbox::new("mine") else { return };
@@ -3189,43 +3340,44 @@ fn your_own_plugin_is_there_without_linking_and_gets_the_sessions_text() {
     let mut perm = std::fs::metadata(sb.home.join("config/user/dump.sh")).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
     std::fs::set_permissions(sb.home.join("config/user/dump.sh"), perm).unwrap();
-    // 没 link:列出来就有,标着是你自己的
+    // Not linked: it's in the list anyway, marked as your own
     let ls = sb.aca(&["plugin", "ls"]);
     assert!(ls.contains("● user") && ls.contains("你自己的"), "{ls}");
     assert!(sb.aca(&["plugin", "key"]).contains("w  user.where  在哪"));
-    // 在会话目录里跑,标准输入是最后一条回复
+    // Runs in the session directory, with the last reply on stdin
     let out = sb.aca(&["plugin", "run", "user.where", "--session", &id]);
     let lines: Vec<&str> = out.lines().collect();
     assert!(lines[0].ends_with("/proj") && lines[1] == "看 https://x.dev/a", "{out}");
-    // 屏幕上的字
+    // The text on screen
     assert!(sb.aca(&["plugin", "run", "user.screen", "--session", &id]).contains("fake agent up"));
-    // 窗格:开在会话的新窗口里,内容在 ACA_INPUT_FILE;./dump.sh 照样按插件目录找
+    // A pane: opens in a new window of the session, with the content in ACA_INPUT_FILE; ./dump.sh is still looked up in the plugin
+    // directory
     sb.aca(&["plugin", "pane", "user", "dump", "--session", &id, "--placement", "window"]);
     let dumped = sb.home.join("state/plugins/user/pane.txt");
     assert!(sb.until(|| std::fs::read_to_string(&dumped).is_ok_and(|t| t.contains("x.dev"))), "窗格没跑");
     let t = std::fs::read_to_string(&dumped).unwrap();
     assert!(t.lines().next().unwrap().ends_with("/proj"), "{t}");
-    // sync 不删它;remove 删不掉,说怎么办
+    // sync doesn't delete it; remove can't, and says what to do
     sb.aca(&["plugin", "sync"]);
     assert!(sb.aca(&["plugin", "ls"]).contains("● user"));
     let o = sb.run(&["plugin", "remove", "user"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("是你自己的"), "{}", String::from_utf8_lossy(&o.stderr));
-    // 停着:plugins.toml 里记下,菜单里没了
+    // Disabled: recorded in plugins.toml, gone from the menu
     sb.aca(&["plugin", "disable", "user"]);
     assert!(sb.aca(&["plugin", "ls"]).contains("○ user"));
     assert!(!sb.aca(&["plugin", "key"]).contains("user.where"));
     sb.aca(&["plugin", "enable", "user"]);
-    // 写坏了:列出来说哪不对
+    // Broken: the list says what's wrong
     std::thread::sleep(std::time::Duration::from_millis(20));
     write(&manifest, "[[commands]]\nid = \"x\"\n");
     let ls = sb.aca(&["plugin", "ls"]);
     assert!(ls.contains("user") && ls.contains("清单有误") && ls.contains("command"), "{ls}");
-    // 删了就没了
+    // Deleted, it's gone
     std::fs::remove_file(&manifest).unwrap();
     assert!(!sb.aca(&["plugin", "ls"]).contains("user"));
 }
 
-/// 插件能力服务列给 agent 的工具名(`aca plugin tools`,没有会话)
+/// The tool names the plugin capability server lists for agents (`aca plugin tools`, no session)
 fn agent_tools(sb: &Sandbox, call: Option<&str>) -> (Vec<String>, String) {
     use std::io::Write;
     let mut child =
@@ -3255,7 +3407,8 @@ fn agent_tools(sb: &Sandbox, call: Option<&str>) -> (Vec<String>, String) {
     (names, said)
 }
 
-/// 你说了算:写 agent? 的能力你点了名才给 agent;: 菜单里的键你能改、能去掉,两个插件抢一个键时点名
+/// You decide: capabilities written as agent? go to agents only once you name them; you can change or remove keys in the : menu,
+/// and when two plugins want one key, it's named
 #[test]
 fn agent_tools_and_menu_keys_are_yours_to_decide() {
     let Some(sb) = Sandbox::new("yours") else { return };
@@ -3275,12 +3428,12 @@ fn agent_tools_and_menu_keys_are_yours_to_decide() {
     sb.aca(&["plugin", "link", &perm.to_string_lossy()]);
     let out = sb.aca(&["plugin", "link", &other.to_string_lossy()]);
     assert!(out.contains("t.other"), "{out}");
-    // agent? 的默认不给
+    // agent? ones aren't given by default
     let (names, _) = agent_tools(&sb, None);
     assert_eq!(names, ["t-perm__ls"]);
     let choices = sb.aca(&["plugin", "allow", "t.perm"]);
     assert!(choices.contains("✓ ls") && choices.contains("○ add  需明确允许"), "{choices}");
-    // 点名给;收回 ls:写进 plugins.toml,能力服务照它列、照它调
+    // Name one to give it; take back ls: written into plugins.toml, and the capability server lists and calls accordingly
     sb.aca(&["plugin", "allow", "t.perm", "add"]);
     assert_eq!(agent_tools(&sb, None).0, ["t-perm__ls", "t-perm__add"]);
     let out = sb.aca(&["plugin", "deny", "t.perm", "ls"]);
@@ -3290,37 +3443,38 @@ fn agent_tools_and_menu_keys_are_yours_to_decide() {
     assert_eq!(names, ["t-perm__add"]);
     assert!(said.contains("没有工具 t-perm__ls"), "{said}");
     assert_eq!(agent_tools(&sb, Some("t-perm__add")).1.trim(), "add");
-    // 清单里没写给 agent 的给不了;--reset 回到清单的
+    // What the manifest doesn't offer to agents can't be given; --reset goes back to the manifest's
     let o = sb.run(&["plugin", "allow", "t.other", "x"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("不能提供给 agent"));
     sb.aca(&["plugin", "allow", "t.perm", "--reset"]);
     assert_eq!(agent_tools(&sb, None).0, ["t-perm__ls"]);
     assert!(!std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap().contains("tools ="));
 
-    // 两个插件的清单都要 m:先登记的拿到,另一个点名(列插件时也说)
+    // Both plugins' manifests want m: the one registered first gets it, the other is named (listing plugins says so too)
     let keys = sb.aca(&["plugin", "key"]);
     assert!(keys.contains("m  t.perm.ls  列") && keys.contains("⚠ 键 m 已分配给 t.perm「列」,t.other「叉」未分配到"), "{keys}");
     assert!(sb.aca(&["plugin", "ls"]).contains("⚠ 键 m 已分配给"));
-    // 给 t.other 换一个;把 t.perm 的去掉;再把 m 给 t.other
+    // Give t.other another one; remove t.perm's; then give m to t.other
     assert!(sb.aca(&["plugin", "key", "t.other", "x", "M"]).contains("按 M"));
     assert!(!sb.aca(&["plugin", "key"]).contains("⚠"));
     assert!(sb.aca(&["plugin", "key", "t.perm", "ls", "--none"]).contains("未设键"));
     sb.aca(&["plugin", "key", "t.other", "x", "m"]);
     let keys = sb.aca(&["plugin", "key"]);
     assert!(keys.contains("m  t.other.x") && !keys.contains("t.perm.ls"), "{keys}");
-    // 你写的先拿:t.perm 回到清单的 m,也拿不到
+    // What you wrote wins: t.perm, back to its manifest's m, doesn't get it either
     sb.aca(&["plugin", "key", "t.perm", "ls", "--reset"]);
     let keys = sb.aca(&["plugin", "key"]);
     assert!(keys.contains("m  t.other.x") && keys.contains("⚠ 键 m 已分配给 t.other「叉」,t.perm「列」未分配到"), "{keys}");
-    // 不能用的键、没有的目标
+    // An unusable key, a target that doesn't exist
     let o = sb.run(&["plugin", "key", "t.perm", "ls", "/"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains(": 菜单占用"));
     let o = sb.run(&["plugin", "key", "t.perm", "nope", "z"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("没有 nope"));
 }
 
-/// 热键:插件开着就绑在 tmux 上(和 Ctrl+Q 一个办法,只在 aca 的会话里拦),换键、停掉、删掉跟着变;
-/// 你自己绑的键不动;tmux 重启了,下次建会话时补上
+/// Hotkeys: while a plugin is enabled they're bound in tmux (the same way as Ctrl+Q, intercepted only in aca's sessions), and
+/// changing the key, disabling, deleting follow along;
+/// keys you bound yourself are left alone; after a tmux restart, they're restored when the next session is created
 #[test]
 fn a_plugins_hotkey_is_bound_in_tmux_while_the_plugin_is_on_and_yours_are_left_alone() {
     let Some(sb) = Sandbox::new("hotkey") else { return };
@@ -3336,7 +3490,8 @@ fn a_plugins_hotkey_is_bound_in_tmux_while_the_plugin_is_on_and_yours_are_left_a
          [[panes]]\nid = \"other\"\ncommand = [\"true\"]\n\
          [[hotkeys]]\nkey = \"C-M-y\"\nrun = \"pad\"\n",
     );
-    // 键表里 aca 替插件绑的热键:「键表:键」(aca 自己的那个键 —— 进下一个在等你的 —— 不算,它有自己的一条测试)
+    // The hotkeys aca bound for plugins in the key tables: "TABLE:KEY" (aca's own key — go to the next one that needs you — doesn't
+    // count, it has its own test)
     let bound = || {
         let mut v: Vec<String> = sb
             .tmux(&["list-keys"])
@@ -3344,7 +3499,7 @@ fn a_plugins_hotkey_is_bound_in_tmux_while_the_plugin_is_on_and_yours_are_left_a
             .filter(|l| l.contains("--hotkey") && l.contains(" plugin pane "))
             .filter_map(|l| {
                 let mut w = l.split_once("-T")?.1.split_whitespace();
-                // tmux 3.3a / 3.4 把 C-M-y 打成 M-C-y
+                // tmux 3.3a / 3.4 print C-M-y as M-C-y
                 Some(format!("{}:{}", w.next()?, w.next()?.replace("M-C-", "C-M-")))
             })
             .collect();
@@ -3353,20 +3508,22 @@ fn a_plugins_hotkey_is_bound_in_tmux_while_the_plugin_is_on_and_yours_are_left_a
     };
     let all = |k: &str| vec![format!("copy-mode-vi:{k}"), format!("copy-mode:{k}"), format!("root:{k}")];
     assert!(bound().is_empty());
-    // 链接上就绑:平常的键表,和翻着看的两张
+    // Bound once linked: the normal key table, and the two for scrolling back
     sb.aca(&["plugin", "link", dir.to_str().unwrap()]);
     assert_eq!(bound(), all("C-M-y"));
     let root = sb.tmux(&["list-keys", "-T", "root"]);
     let line = root.lines().find(|l| l.contains("--hotkey") && l.contains(" plugin pane ")).unwrap();
-    // 只在 aca 的会话里拦,别的会话里把键送进去;按了开的是这个插件的这个窗格,冲着按键的会话和终端
+    // Intercepted only in aca's sessions, the key is sent through in other sessions; pressing it opens this plugin's pane, aimed at
+    // the session and terminal it was pressed in
     assert!(line.contains("#{?@aca_id,1,0}") && line.contains("send-keys C-M-y"), "{line}");
     assert!(line.contains("plugin pane t.hot pad --hotkey C-M-y --session '#{@aca_id}' --client '#{client_name}'"), "{line}");
     assert_eq!(sb.aca(&["plugin", "hotkey"]), "C-M-y  t.hot.pad  便签");
-    // 那条命令真跑起来:窗格拿到会话的最后一条回复
+    // That command really runs: the pane gets the session's last reply
     sb.aca(&["plugin", "pane", "t.hot", "pad", "--hotkey", "C-M-y", "--session", &id, "--placement", "window"]);
     let got = sb.home.join("state/plugins/t.hot/got.txt");
     assert!(sb.until(|| std::fs::read_to_string(&got).is_ok_and(|t| t.contains("make test"))), "窗格没跑");
-    // 换键:旧的三处都解了;写进 plugins.toml。清单没给热键的窗格也能给一个;同一个键第二个拿不到,点名
+    // Change the key: the old one is unbound in all three places; written into plugins.toml. A pane the manifest gave no hotkey can
+    // get one too; a second one can't take the same key, and is named
     assert!(sb.aca(&["plugin", "hotkey", "t.hot", "pad", "C-^"]).contains("在会话中按 C-^"));
     assert_eq!(bound(), all("C-^"));
     let decl = std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap();
@@ -3375,19 +3532,20 @@ fn a_plugins_hotkey_is_bound_in_tmux_while_the_plugin_is_on_and_yours_are_left_a
     assert!(out.contains("未设热键") && out.contains("键 C-^ 已分配给 t.hot「便签」"), "{out}");
     assert!(sb.aca(&["plugin", "ls"]).contains("键 C-^ 已分配给 t.hot「便签」"));
     sb.aca(&["plugin", "hotkey", "t.hot", "other", "--reset"]);
-    // 写得不对的不收:光一个字符的、aca 自己的、不是窗格的
+    // Bad ones aren't accepted: a single bare character, aca's own, not a pane
     for (pane, key, why) in [("pad", "y", "tmux"), ("pad", "C-q", "C-q"), ("pad", "C-M-c", "C-M-c"), ("nope", "M-y", "没有窗格 nope")] {
         let o = sb.run(&["plugin", "hotkey", "t.hot", pane, key]);
         assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains(why), "{pane} {key}:{o:?}");
     }
     assert_eq!(bound(), all("C-^"));
-    // 那个键你自己在 tmux 里绑了别的:不动你的,点名;翻着看的那两张里你没绑,照绑
+    // You bound that key to something else in tmux yourself: yours is left alone and named; in the two scrolling tables you didn't
+    // bind it, so it's bound there
     sb.tmux(&["bind-key", "-n", "F5", "display-message", "mine"]);
     let out = sb.aca(&["plugin", "hotkey", "t.hot", "pad", "F5"]);
     assert!(out.contains("键 F5 已在 tmux 中绑定了其他操作,未修改"), "{out}");
     assert!(sb.tmux(&["list-keys", "-T", "root"]).lines().any(|l| l.contains("F5") && l.contains("display-message mine")));
     assert_eq!(bound(), ["copy-mode-vi:F5", "copy-mode:F5"]);
-    // 回到清单的;不要键;停掉 / 再开
+    // Back to the manifest's; no key; disable / enable again
     sb.aca(&["plugin", "hotkey", "t.hot", "pad", "--reset"]);
     assert_eq!(bound(), all("C-M-y"));
     assert!(sb.aca(&["plugin", "hotkey", "t.hot", "pad", "--none"]).contains("未设热键"));
@@ -3395,21 +3553,22 @@ fn a_plugins_hotkey_is_bound_in_tmux_while_the_plugin_is_on_and_yours_are_left_a
     sb.aca(&["plugin", "hotkey", "t.hot", "pad", "--reset"]);
     sb.aca(&["plugin", "disable", "t.hot"]);
     assert!(bound().is_empty());
-    // 停着的时候按到了上回留下的键(这里手绑一条装作没解掉的):不报错,顺手解掉
+    // While disabled, a key left over from before is pressed (bound by hand here, pretending it wasn't unbound): no error, it's
+    // unbound along the way
     sb.tmux(&["bind-key", "-n", "C-^", "run-shell", "aca plugin pane t.hot pad --hotkey C-^"]);
     let o = sb.run(&["plugin", "pane", "t.hot", "pad", "--hotkey", "C-^", "--session", &id]);
     assert!(o.status.success() && o.stdout.is_empty() && o.stderr.is_empty(), "{o:?}");
     assert!(bound().is_empty());
     sb.aca(&["plugin", "enable", "t.hot"]);
     assert_eq!(bound(), all("C-M-y"));
-    // tmux 服务重启(绑定不在 tmux.conf 里):再建一个会话就补上
+    // The tmux server restarts (the bindings aren't in tmux.conf): creating another session restores them
     sb.tmux(&["kill-server"]);
     sb.aca(&["new", "fake", &sb.proj(), "-t", "第二个"]);
     assert_eq!(bound(), all("C-M-y"));
-    // 不用了:键跟着没了
+    // No longer used: the key goes with it
     sb.aca(&["plugin", "unlink", "t.hot"]);
     assert!(bound().is_empty());
-    // 你自己的那份(不用 link):清单里写了热键,下次用到 aca 就绑上;那份删了就解掉
+    // Your own one (no link needed): a hotkey written in its manifest is bound the next time aca is used; once deleted, it's unbound
     let mine = sb.home.join("config/user/aca-plugin.toml");
     write(&mine, "[[panes]]\nid = \"lg\"\ncommand = [\"true\"]\n[[hotkeys]]\nkey = \"M-=\"\nrun = \"lg\"\n");
     assert_eq!(sb.aca(&["plugin", "hotkey"]), "M-=  user.lg  lg");
@@ -3419,9 +3578,11 @@ fn a_plugins_hotkey_is_bound_in_tmux_while_the_plugin_is_on_and_yours_are_left_a
     assert!(bound().is_empty());
 }
 
-/// 状态栏上只打有几个在等你(`!` 在问的、`●` 跑完没看的);aca 绑的那个键(config.toml 的 `[keys] next`,默认 Ctrl+Alt+N)
-/// 在会话里真按一下,这台客户端就进下一个:先在问的,再跑完没看的;都看过了在问的之间轮;一个都没有就说一句。
-/// 键能换、能不要,你自己绑了别的不动
+/// The status bar shows only how many need you (`!` asking, `●` finished and unread); the key aca binds (`[keys] next` in
+/// config.toml, Ctrl+Alt+N by default),
+/// really pressed inside a session, takes this client to the next one: asking ones first, then finished-and-unread ones; once
+/// all are seen, it cycles among the asking ones; with none at all, it says so.
+/// The key can be changed or removed, and one you bound to something else yourself is left alone
 #[test]
 fn the_next_key_takes_the_client_to_what_waits_and_the_status_bar_only_counts() {
     let Some(sb) = Sandbox::new("next") else { return };
@@ -3441,12 +3602,14 @@ fn the_next_key_takes_the_client_to_what_waits_and_the_status_bar_only_counts() 
     hook(&done, &done_pane, "Stop", ",\"last_assistant_message\":\"好\"");
     hook(&ask, &ask_pane, "UserPromptSubmit", ",\"prompt\":\"跑\"");
     hook(&ask, &ask_pane, "PermissionRequest", ",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}");
-    // 状态栏:种类和个数,在问的是红底的一块,跑完的是次要的字色;没有名字。你正看着的那个不算
+    // The status bar: kinds and counts, asking ones as a red block, finished ones in the minor text color; no names. The one you're
+    // looking at doesn't count
     let bar = |id: &str| sb.aca(&["tmux-status", id]);
     assert_eq!(bar(&here), "#[fg=red reverse bold] ◆ 1 #[default] #[fg=brightblack]◐ 1#[default]");
     assert_eq!(bar(&ask), "#[fg=brightblack]◐ 1#[default]");
 
-    // 键:建会话时就绑上了,三张键表;只在 aca 的会话里拦,别处键原样送进去
+    // The key: bound when the session is created, in three key tables; intercepted only in aca's sessions, sent through as is
+    // elsewhere
     let keys = |k: &str| sb.tmux(&["list-keys"]).lines().filter(|l| l.contains(" next --hotkey ") && l.contains(&format!(" {k} "))).count();
     assert_eq!(keys("C-M-n"), 3);
     let root = sb.tmux(&["list-keys", "-T", "root"]);
@@ -3454,7 +3617,7 @@ fn the_next_key_takes_the_client_to_what_waits_and_the_status_bar_only_counts() 
     assert!(line.contains("#{?@aca_id,1,0}") && line.contains("send-keys C-M-n"), "{line}");
     assert!(line.contains("next --hotkey C-M-n --session '#{@aca_id}' --client '#{client_name}'"), "{line}");
 
-    // 一台真的客户端:另一个 tmux 服务的窗格里连进来,键从那个窗格按进去
+    // A real client: attached from a pane of another tmux server, with keys pressed into that pane
     let outer = format!("{}-outer", sb.socket);
     let out = |args: &[&str]| {
         let mut c = Command::new("tmux");
@@ -3466,14 +3629,15 @@ fn the_next_key_takes_the_client_to_what_waits_and_the_status_bar_only_counts() 
     let at = || sb.tmux(&["list-clients", "-F", "#{@aca_id}"]);
     assert!(sb.until(|| at() == here), "客户端没连上:{}", at());
     let press = |key: &str| drop(out(&["send-keys", key]));
-    // 先在问的
+    // Asking ones first
     press("C-M-n");
     assert!(sb.until(|| at() == ask), "没进在问的那个:{}", at());
-    // 再按:跑完没看的。进去过就算看过了
+    // Press again: the finished-and-unread one. Having gone in counts as seen
     press("C-M-n");
     assert!(sb.until(|| at() == done), "没进跑完的那个:{}", at());
     assert!(sb.until(|| bar(&here) == "#[fg=red reverse bold] ◆ 1 #[default]"), "{}", bar(&here));
-    // 再按:没看过的没有了,还有一个在问,回到它;在它上面再按,一个都没有了,人不动、说一句
+    // Press again: no unread ones left, one is still asking, back to it; pressed on it again, there are none at all, so it stays put
+    // and says so
     press("C-M-n");
     assert!(sb.until(|| at() == ask), "没回到在问的那个:{}", at());
     press("C-M-n");
@@ -3481,11 +3645,11 @@ fn the_next_key_takes_the_client_to_what_waits_and_the_status_bar_only_counts() 
     assert_eq!(at(), ask);
     out(&["kill-server"]);
 
-    // 自己敲也行(不在 tmux 里、没有终端:连不上去,说进不去;不算看过)
+    // Typing it yourself works too (not in tmux, no terminal: can't attach, says it can't get in; doesn't count as seen)
     let o = sb.run(&["next", "--session", &ask]);
     assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("暂无待处理会话"), "{o:?}");
 
-    // 换键:旧的解掉、新的绑上,记在 config.toml;写得不能当热键的不收
+    // Change the key: the old one unbound, the new one bound, recorded in config.toml; one that can't serve as a hotkey isn't accepted
     let out = sb.aca(&["tmux", "key", "next", "M-n"]);
     assert!(out.contains("在会话中按 Alt+N(M-n)"), "{out}");
     assert_eq!((keys("C-M-n"), keys("M-n")), (0, 3));
@@ -3493,19 +3657,20 @@ fn the_next_key_takes_the_client_to_what_waits_and_the_status_bar_only_counts() 
     let o = sb.run(&["tmux", "key", "next", "n"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("热键应写为带 Ctrl / Alt 的 tmux 键名"), "{o:?}");
     assert_eq!(keys("M-n"), 3);
-    // 那个键你自己在 tmux 里绑了别的:不动你的,点名
+    // You bound that key to something else in tmux yourself: yours is left alone and named
     sb.tmux(&["bind-key", "-n", "F7", "display-message", "mine"]);
     let out = sb.aca(&["tmux", "key", "next", "F7"]);
     assert!(out.contains("键 F7 已在 tmux 中绑定了其他操作,未修改"), "{out}");
     assert!(sb.tmux(&["list-keys", "-T", "root"]).lines().any(|l| l.contains(" F7 ") && l.contains("display-message mine")));
-    // 不要键:都解掉,aca tmux 里说没绑;aca next 照样能敲
+    // No key: all unbound, aca tmux says it's unbound; aca next can still be typed
     let out = sb.aca(&["tmux", "key", "next", "--none"]);
     assert!(out.contains("未绑定按键"), "{out}");
     assert_eq!(sb.tmux(&["list-keys"]).lines().filter(|l| l.contains(" next --hotkey ")).count(), 0);
     assert!(sb.aca(&["tmux"]).contains("未绑定按键"));
 }
 
-/// 只在屏幕上看得出在等你的(hook 没报:没信任 hook 的 Codex、启动时的确认框):列表里是 ◐,进下一个的键也要去得了
+/// Ones that need you as seen only on screen (no hook reported it: Codex without trusted hooks, the confirmation box at start):
+/// ◐ in the list, and the next key must be able to go there too
 #[test]
 fn the_next_key_also_goes_to_a_session_only_its_screen_says_is_waiting() {
     let Some(sb) = Sandbox::new("next-screen") else { return };
@@ -3518,13 +3683,14 @@ fn the_next_key_also_goes_to_a_session_only_its_screen_says_is_waiting() {
         &pane,
         "Folder access\n  /p/api\n  Trust this folder? Codex can read, edit, and run files here.\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit",
     );
-    // 不在 tmux 里、没有终端:挑中的是它,只是连不上去
+    // Not in tmux, no terminal: it's the one picked, it just can't be attached to
     let o = sb.run(&["next", "--session", &here]);
     assert!(String::from_utf8_lossy(&o.stdout).contains("无法进入「门口」"), "{o:?}");
 }
 
-/// 从界面进一个会话,先路过刚离开的那个(进去之后 ^` 回得去):tmux 把路过记成连进去过,
-/// 跑完没看的那个不能因此变成看过。之后真的切回去看了,才算看过
+/// Entering a session from the UI passes first through the one just left (so ^` gets back to it once inside): tmux records the
+/// pass-through as attached,
+/// and the finished-and-unread one mustn't become seen because of it. Only really switching back to look at it counts as seen
 #[test]
 fn passing_through_the_session_just_left_on_the_way_in_does_not_count_as_seeing_it() {
     let Some(sb) = Sandbox::new("passby") else { return };
@@ -3539,7 +3705,7 @@ fn passing_through_the_session_just_left_on_the_way_in_does_not_count_as_seeing_
     };
     assert_eq!(state(&left), "unread");
 
-    // 一台真的客户端(另一个 tmux 服务的窗格),照界面进会话的那条命令连进来
+    // A real client (a pane of another tmux server), attaching by the same command the UI uses to enter a session
     let outer = format!("{}-outer", sb.socket);
     let out = |args: &[&str]| {
         let mut c = Command::new("tmux");
@@ -3551,11 +3717,12 @@ fn passing_through_the_session_just_left_on_the_way_in_does_not_count_as_seeing_
     out(&["new-session", "-d", "-x", "160", "-y", "40", &format!("tmux -L {} {}", sb.socket, words.join(" "))]);
     let at = || sb.tmux(&["list-clients", "-F", "#{@aca_id} #{client_last_session}"]);
     assert!(sb.until(|| at() == format!("{to} 刚离开的")), "客户端没落在要进的那个上、上一个不是路过的:{}", at());
-    // tmux 记了它连进去过;aca 认得那是路过
+    // tmux recorded it as attached; aca knows that was a pass-through
     assert!(!sb.tmux(&["display-message", "-p", "-t", &left_pane, "#{session_last_attached}"]).is_empty());
     assert_eq!(state(&left), "unread");
 
-    // 真的回去看了(^` 就是这个),再走开:看过了。tmux 的时刻按秒记,和路过错开一秒
+    // Really going back to look (that's what ^` does), then leaving: seen. tmux records times in seconds, so it's a second apart from
+    // the pass-through
     std::thread::sleep(std::time::Duration::from_millis(1100));
     sb.tmux(&["switch-client", "-l"]);
     assert!(sb.until(|| at().starts_with(&format!("{left} "))), "没切回去:{}", at());
@@ -3565,8 +3732,10 @@ fn passing_through_the_session_just_left_on_the_way_in_does_not_count_as_seeing_
     out(&["kill-server"]);
 }
 
-/// Ctrl+Q:你人在会话里时 agent-deck 又起一个会话,它那一版(不认 aca 的会话,键被吞掉)一绑上来,tmux 当场换回 aca 的 ——
-/// 挂在 `after-bind-key` 上的钩子。只占数组里自己那一格;你自己把这个键绑了别的,不动
+/// Ctrl+Q: while you're in a session, agent-deck starts another session, and as soon as its version (which doesn't know aca's
+/// sessions, so the key is swallowed) gets bound, tmux switches back to aca's on the spot —
+/// a hook on `after-bind-key`. It takes only its own slot in the array; if you bound this key to something else yourself, it's
+/// left alone
 #[test]
 fn ctrl_q_stays_acas_when_agent_deck_binds_its_own_version_over_it() {
     let Some(sb) = Sandbox::new("detachkey") else { return };
@@ -3578,25 +3747,25 @@ fn ctrl_q_stays_acas_when_agent_deck_binds_its_own_version_over_it() {
         || sb.tmux(&["show-hooks", "-g"]).lines().filter(|l| l.starts_with("after-bind-key[")).map(str::to_string).collect::<Vec<_>>();
     let deck = ["if-shell", "-F", "#{m:agentdeck_*,#{session_name}}", "detach-client", ""];
     assert!(ours(&bound()), "{}", bound());
-    // agent-deck 起会话时绑的那一条,两种写法
+    // The binding agent-deck makes when starting a session, both spellings
     for table in [&["-n"][..], &["-T", "root"]] {
         sb.tmux(&[&["bind-key"], table, &["C-q"], &deck[..]].concat());
         assert!(ours(&bound()), "{table:?}:{}", bound());
     }
-    // 别的键、aca 自己再绑一遍:不关钩子的事
+    // Another key, aca binding it again itself: none of the hook's business
     sb.tmux(&[&["bind-key", "-n", "F6"], &deck[..]].concat());
     assert!(sb.tmux(&["list-keys", "-T", "root"]).lines().any(|l| l.contains(" F6 ") && !l.contains("@aca_id")));
-    // 同一个钩子里你挂的另一格留着;aca 再来几遍还是只占一格
+    // Another slot you put on the same hook stays; aca coming again several times still takes just one slot
     sb.tmux(&["set-hook", "-g", "after-bind-key[7]", "set-option -g @mine 1"]);
     sb.aca(&["new", "fake", &sb.proj(), "-t", "第二个"]);
     let h = hooks();
     assert!(h.len() == 2 && h.iter().any(|l| l.contains("@mine")) && h.iter().any(|l| l.contains("hook_argument_0")), "{h:?}");
-    // 你自己把这个键绑了别的:钩子不抢,下次建会话也不抢
+    // You bound this key to something else yourself: the hook doesn't grab it, nor does the next session creation
     sb.tmux(&["bind-key", "-n", "C-q", "display-message", "mine"]);
     assert!(bound().contains("display-message mine"), "{}", bound());
     sb.aca(&["new", "fake", &sb.proj(), "-t", "第三个"]);
     assert!(bound().contains("display-message mine"), "{}", bound());
-    // tmux 服务重启:键和钩子都没了,再建一个会话一起补上
+    // The tmux server restarts: the key and the hook are both gone, and creating another session restores both
     sb.tmux(&["kill-server"]);
     assert!(hooks().is_empty());
     sb.aca(&["new", "fake", &sb.proj(), "-t", "第四个"]);
@@ -3605,11 +3774,12 @@ fn ctrl_q_stays_acas_when_agent_deck_binds_its_own_version_over_it() {
     assert!(ours(&bound()), "{}", bound());
 }
 
-/// aca.copy:从最后一条回复的原文里认出命令(代码块、shell 代码块里的每一条、带空格的行内代码);
-/// hook 没记到回复的会话(接管来还没重启的),aca 去它的对话记录里读
+/// aca.copy: picks commands out of the original text of the last reply (code blocks, each command in a shell code block, inline
+/// code with a space);
+/// for sessions whose reply the hook didn't record (adopted and not restarted yet), aca reads it from their transcript
 #[test]
 fn the_copy_plugin_finds_the_commands_in_the_last_reply_and_reads_the_transcript_when_no_hook_recorded_it() {
-    // 沙盒的名字里别带 copy:最后按这四个字母查删干净了没有
+    // No copy in the sandbox name: at the end, those four letters are searched for to check everything was deleted
     let Some(sb) = Sandbox::new("yank") else { return };
     if Command::new("fzf").arg("--version").output().is_err() {
         eprintln!("没有 fzf,跳过");
@@ -3622,7 +3792,7 @@ fn the_copy_plugin_finds_the_commands_in_the_last_reply_and_reads_the_transcript
     assert!(out.contains("热键:C-M-y 复制命令"), "{out}");
     assert_eq!(sb.aca(&["plugin", "hotkey"]), "C-M-y  aca.copy.pick  复制命令");
     assert!(sb.aca(&["plugin", "key"]).contains("y  aca.copy.pick  复制命令"));
-    // 还没有回复
+    // No reply yet
     let o = sb.run(&["plugin", "run", "aca.copy.list", "--session", &id]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stdout).contains("还没有回复"), "{o:?}");
     let reply = "先看 `git status`,`--apply` 不算。\n\n1. 编译:\n   ```sh\n   $ cargo build --release\n   $ cp target/release/aca ~/.local/bin/\n   ```\n\n```toml\na = 1\nb = 2\n```\n";
@@ -3642,12 +3812,13 @@ fn the_copy_plugin_finds_the_commands_in_the_last_reply_and_reads_the_transcript
         ],
         "{out}"
     );
-    // 设置:行内的都要;代码块里的不拆
+    // Settings: all inline ones wanted; code blocks not split
     sb.aca(&["plugin", "setting", "aca.copy", "inline", "all"]);
     sb.aca(&["plugin", "setting", "aca.copy", "lines", "false"]);
     let out = sb.aca(&["plugin", "run", "aca.copy.list", "--session", &id]);
     assert!(out.contains("4  --apply") && !out.contains("└"), "{out}");
-    // 换了一段对话,hook 只报了记录在哪、还没报过回复:从记录里读最后一段
+    // Switched to another conversation, and the hook only reported where the record is, no reply yet: read the last part from the
+    // record
     let t = sb.home.join("t.jsonl");
     let said = serde_json::json!({ "type": "assistant", "message": { "model": "m", "content": [{ "type": "text", "text": "装上:\n\n```sh\naca plugin install aca.copy\n```" }] } });
     write(&t, &format!("{said}\n"));
@@ -3657,12 +3828,13 @@ fn the_copy_plugin_finds_the_commands_in_the_last_reply_and_reads_the_transcript
     sb.hook(&id2, &pane2, &prompt.to_string());
     assert_eq!(sb.aca(&["output", &id2]), "");
     assert_eq!(sb.aca(&["plugin", "run", "aca.copy.list", "--session", &id2]).trim(), "1  aca plugin install aca.copy");
-    // 窗格开过一回:aca 把回复存了一份交给它
+    // A pane was opened once: aca saved a copy of the reply and handed it over
     sb.aca(&["plugin", "setting", "aca.copy", "copy", "cat > /dev/null"]);
     sb.aca(&["plugin", "pane", "aca.copy", "pick", "--session", &id2, "--placement", "window"]);
     let input = sb.home.join("state/plugin-input/aca.copy.pick.txt");
     assert!(input.exists());
-    // 删掉:键跟着没了;本机上不留它的东西(装的那份、plugins.toml 里那一段、存的那份回复、aca 替它建的空目录)
+    // Remove: the key goes with it; nothing of it is left on this machine (the installed copy, its section in plugins.toml, the
+    // saved reply, the empty directory aca made for it)
     sb.aca(&["plugin", "remove", "aca.copy"]);
     assert!(!sb.tmux(&["list-keys"]).contains(" plugin pane "));
     let left: Vec<String> =
@@ -3671,8 +3843,10 @@ fn the_copy_plugin_finds_the_commands_in_the_last_reply_and_reads_the_transcript
     assert!(!std::fs::read_to_string(sb.home.join("config/plugins.toml")).unwrap().contains("aca.copy"));
 }
 
-/// aca.notify:跑完了、在等你、出错了弹一条桌面通知。弹的那条命令换成沙盒里一个只记下来的脚本(测试里不真弹):
-/// 标题是记号加会话名,正文是去掉 markdown 记号的回复;派出去的 worker 开了设置才弹;你换的命令发不出去就用系统的
+/// aca.notify: a desktop notification when a turn finishes, when one needs you, on an error. The command it uses is replaced by
+/// a script in the sandbox that only records (tests don't really notify):
+/// the title is the mark plus the session name, the body the reply with markdown marks stripped; workers that were sent out
+/// notify only with the setting on; if your replacement command fails, the system's is used
 #[test]
 fn the_notify_plugin_shows_a_desktop_notification_for_your_sessions_and_skips_workers() {
     let Some(sb) = Sandbox::new("notify") else { return };
@@ -3692,17 +3866,18 @@ fn the_notify_plugin_shows_a_desktop_notification_for_your_sessions_and_skips_wo
     emit(&lead, "agent.waiting", "ask=要删掉 target 吗");
     emit(&lead, "turn.failed", "error=限流了");
     assert_eq!(shown(), "✓ 修登录|好了 两处都改了,跑 cargo test\n? 修登录|要删掉 target 吗\n✕ 修登录|限流了\n");
-    // 派出去的 worker:默认不弹(它跑完会告诉派它的那个),开了设置才弹
+    // A worker that was sent out: no notification by default (when it finishes it tells whoever sent it), only with the setting on
     let worker = sb.aca(&["new", "fake", &sb.proj(), "-t", "干活的", "--parent", &lead]);
     emit(&worker, "turn.done", "last=做完了");
     assert_eq!(shown().lines().count(), 3, "{}", shown());
     sb.aca(&["plugin", "setting", "aca.notify", "workers", "true"]);
     emit(&worker, "turn.done", "last=做完了");
     assert_eq!(shown().lines().last(), Some("✓ 干活的|做完了"));
-    // 菜单里的「弹一条试试」
+    // "Show a test one" in the menu
     assert!(sb.aca(&["plugin", "run", "aca.notify.test"]).contains("shown"));
     assert_eq!(shown().lines().last(), Some("aca|Notify works"));
-    // 你换的命令发不出去(退出码不是 0):照空着的办,用系统的(这里是 PATH 里排在前面的假 osascript / notify-send)
+    // Your replacement command fails (exit code not 0): treated as empty, and the system's is used (here, the fake osascript /
+    // notify-send earlier on PATH)
     let (bin, fail) = (sb.home.join("sysbin"), sb.home.join("fail.sh"));
     for prog in ["osascript", "notify-send"] {
         write(&bin.join(prog), &format!("#!/bin/sh\nfor a; do t=$b; b=$a; done\nprintf 'sys|%s|%s\\n' \"$t\" \"$b\" >> '{}'\n", log.display()));
@@ -3717,7 +3892,7 @@ fn the_notify_plugin_shows_a_desktop_notification_for_your_sessions_and_skips_wo
     assert_eq!(all.lines().rev().take(2).collect::<Vec<_>>(), ["sys|✓ 修登录|好了", "tried|✓ 修登录"], "{all}");
 }
 
-/// 目录底下所有的路径(文件和目录)
+/// Every path (files and directories) under a directory
 fn walk(dir: &Path) -> Vec<String> {
     let mut out = vec![];
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -3729,7 +3904,7 @@ fn walk(dir: &Path) -> Vec<String> {
     out
 }
 
-/// 往配置里再加一段
+/// Add one more section to the config
 fn add_config(sb: &Sandbox, more: &str) {
     let cfg = sb.home.join("config/config.toml");
     write(&cfg, &(std::fs::read_to_string(&cfg).unwrap() + more));
@@ -3738,14 +3913,14 @@ fn add_config(sb: &Sandbox, more: &str) {
 #[test]
 fn the_opening_message_goes_in_as_a_launch_argument_and_only_the_first_time() {
     let Some(sb) = Sandbox::new("opening") else { return };
-    // 假 agent:把收到的参数记下来(一个参数一段,\0 隔开),起一次记一份
+    // A fake agent: records the arguments it got (one argument per piece, separated by \0), one record per start
     let args = sb.home.join("args.bin");
     let script = sb.home.join("rec.sh");
     write(
         &script,
         &format!("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > '{}'\necho recorded\nexec sleep 600\n", args.display()),
     );
-    // rec 按 Claude 那一家起(认开场那句话当启动参数),plain 是声明式的(不认)
+    // rec is started the Claude way (takes the opening message as a start argument), plain is declarative (doesn't)
     add_config(
         &sb,
         &format!(
@@ -3758,23 +3933,24 @@ fn the_opening_message_goes_in_as_a_launch_argument_and_only_the_first_time() {
         raw.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).filter(|a| !a.is_empty()).collect()
     };
 
-    // 一份 brief:横线开头、多行、带引号,三万多字节 —— tmux 一条命令放不下这么长,所以是经文件带进去的
+    // A brief: starts with a dash, many lines, with quotes, over thirty thousand bytes — too long for one tmux command, so it goes in
+    // through a file
     let brief = format!("- 第一条 \"带引号\" 'x'\n# Task\n{}\n最后一行", "改这个文件 ".repeat(2500));
     assert!(brief.len() > 30_000);
     let t = std::time::Instant::now();
     let o = sb.run(&["new", "rec", &sb.proj(), "-t", "带话", "--say", &brief]);
     assert!(o.status.success() && o.stderr.is_empty(), "{}", String::from_utf8_lossy(&o.stderr));
-    // 不等它起来、空下来(打字进去的那条路要等)
+    // No waiting for it to start and go idle (the typing-in path has to wait)
     assert!(t.elapsed() < std::time::Duration::from_secs(10), "{:?}", t.elapsed());
     let id = String::from_utf8_lossy(&o.stdout).trim().to_string();
     let pane = sb.pane(&id);
     assert!(sb.wait_screen(&pane, "recorded").contains("recorded"));
     let a = got();
     assert_eq!(a[a.len() - 2..], ["--".to_string(), brief.clone()]);
-    // 那份文件读完就删
+    // That file is deleted once read
     assert!(walk(&sb.home.join("state/opening")).is_empty());
 
-    // 再起:不把那句话再说一遍
+    // Start again: the message isn't said a second time
     sb.aca(&["stop", &id]);
     std::fs::remove_file(&args).unwrap();
     sb.aca(&["start", &id]);
@@ -3782,21 +3958,21 @@ fn the_opening_message_goes_in_as_a_launch_argument_and_only_the_first_time() {
     assert!(sb.wait_screen(&pane, "recorded").contains("recorded"));
     assert!(got().iter().all(|x| *x != brief && x != "--"), "{:?}", got().last());
 
-    // 单独一个英文词会被当成子命令:不带,等它起来打字进去
+    // A single English word would be taken as a subcommand: not passed; typed in once it's up
     let o = sb.run(&["new", "rec", &sb.proj(), "-t", "一个词", "--say", "resume"]);
     assert!(o.status.success() && o.stderr.is_empty(), "{}", String::from_utf8_lossy(&o.stderr));
     let word = String::from_utf8_lossy(&o.stdout).trim().to_string();
     assert!(got().iter().all(|x| x != "resume" && x != "--"), "{:?}", got());
     assert!(sb.wait_screen(&sb.pane(&word), "resume").contains("resume"));
 
-    // 不认的那一家:也是打字进去
+    // The harness that doesn't take it: typed in too
     let o = sb.run(&["new", "plain", &sb.proj(), "-t", "打字", "--say", "看一下 README"]);
     assert!(o.status.success() && o.stderr.is_empty(), "{}", String::from_utf8_lossy(&o.stderr));
     let typed = String::from_utf8_lossy(&o.stdout).trim().to_string();
     assert!(got().iter().all(|x| x != "看一下 README" && x != "--"), "{:?}", got());
     assert!(sb.wait_screen(&sb.pane(&typed), "看一下 README").contains("看一下 README"));
 
-    // 只登记没启动:那句话没处带,说一声,会话照样建好
+    // Registered only, not started: the message has nowhere to go, so it says so, and the session is created anyway
     let o = sb.run(&["new", "rec", &sb.proj(), "-t", "先不起", "--hold", "--say", "两个 词"]);
     assert!(o.status.success() && String::from_utf8_lossy(&o.stderr).contains("开场消息未发送"), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(sb.json(&["show", "先不起", "--json"])["state"], "stopped");
@@ -3805,7 +3981,7 @@ fn the_opening_message_goes_in_as_a_launch_argument_and_only_the_first_time() {
 #[test]
 fn the_folder_trust_question_is_answered_at_launch_only_when_the_switch_is_on() {
     let Some(sb) = Sandbox::new("trust") else { return };
-    // 假 agent:摆出 Claude 问「信不信任这个目录」的框(光标停在 No 上),读到回车为止,把按的键记下来
+    // A fake agent: shows Claude's "do you trust this directory" box (cursor on No), reads until Enter, and records the keys pressed
     let keys = sb.home.join("keys.txt");
     let script = sb.home.join("gate.sh");
     write(
@@ -3822,7 +3998,7 @@ fn the_folder_trust_question_is_answered_at_launch_only_when_the_switch_is_on() 
     );
     add_config(&sb, &format!("[tools.gate]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{}\"]\n", script.display()));
 
-    // 开关没开:停在那等你
+    // Switch off: it stops there, waiting for you
     let off = sb.aca(&["new", "gate", &sb.proj(), "-t", "没开"]);
     assert!(sb.wait_screen(&sb.pane(&off), "Enter to confirm").contains("Yes, I trust this folder"));
     std::thread::sleep(std::time::Duration::from_millis(1200));
@@ -3830,7 +4006,7 @@ fn the_folder_trust_question_is_answered_at_launch_only_when_the_switch_is_on() 
     assert_eq!(sb.json(&["show", &off, "--json"])["state"], "ask");
     sb.aca(&["rm", &off]);
 
-    // 开了:起来之后替你从 No 走到 Yes 再回车
+    // On: once it's up, it goes from No to Yes and presses Enter for you
     add_config(&sb, "[trust]\nfolder = true\n");
     let on = sb.aca(&["new", "gate", &sb.proj(), "-t", "开了"]);
     assert!(sb.until(|| keys.exists()), "{}", sb.tmux(&["capture-pane", "-p", "-t", &sb.pane(&on)]));
@@ -3838,7 +4014,7 @@ fn the_folder_trust_question_is_answered_at_launch_only_when_the_switch_is_on() 
     let pane = sb.pane(&on);
     assert!(sb.wait_screen(&pane, "trusted").contains("trusted"));
 
-    // 再起(同一格原地):一样替你答
+    // Start again (in place, same pane): answered for you the same way
     sb.aca(&["stop", &on]);
     std::fs::remove_file(&keys).unwrap();
     sb.aca(&["start", &on]);
@@ -3850,10 +4026,11 @@ fn the_folder_trust_question_is_answered_at_launch_only_when_the_switch_is_on() 
 fn a_typed_opening_message_waits_until_the_screen_has_settled_after_a_startup_gate() {
     let Some(sb) = Sandbox::new("settle") else { return };
     sb.screen_tools();
-    // 单独一个英文词:scr(按 Claude 那一家)也只能打字进去。`aca new` 要等到打进去才回,放到一边跑
+    // A single English word: scr (the Claude way) can only type it in too. `aca new` returns only after it's typed in, so it runs on
+    // the side
     let mut new =
         sb.cmd().args(["new", "scr", &sb.proj(), "-t", "等画稳", "--say", "resume"]).stderr(std::process::Stdio::piped()).spawn().unwrap();
-    // 那一头正在写登记表时这边会读不到(锁着):当成还没有,再问
+    // While the other side is writing the registry, this side can't read it (locked): treat it as not there yet, ask again
     let listed = || {
         let rows: Value = serde_json::from_slice(&sb.run(&["ls", "--json"]).stdout).unwrap_or_default();
         rows.as_array().and_then(|a| a.first()).and_then(|r| r["id"].as_str()).unwrap_or("").to_string()
@@ -3861,16 +4038,17 @@ fn a_typed_opening_message_waits_until_the_screen_has_settled_after_a_startup_ga
     assert!(sb.until(|| !listed().is_empty()));
     let id = listed();
     let pane = sb.pane(&id);
-    // 启动时的那道关:算「在等你」,不打
+    // The gate at start: counts as needing you, nothing typed
     sb.set_screen(&id, &pane, " Accessing workspace:\n\n ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel");
     std::thread::sleep(std::time::Duration::from_millis(1500));
     assert!(new.try_wait().unwrap().is_none());
-    // 有人答掉了:它不在问了,界面却还在一帧一帧往外画。这时候打进去的字没人收(这里:下一帧一画就被擦掉)
+    // Someone answered it: it's no longer asking, but the UI is still drawing frame after frame. Text typed in now reaches nobody
+    // (here: erased as soon as the next frame is drawn)
     for i in 0..14 {
         write(&sb.home.join("screens").join(&id), &format!("Loading… {i}"));
         std::thread::sleep(std::time::Duration::from_millis(120));
     }
-    // 画稳了、空着:这才打
+    // Drawn and settled, empty: only now type
     write(&sb.home.join("screens").join(&id), "● ready\n\n❯ ");
     let o = new.wait_with_output().unwrap();
     assert!(o.status.success() && o.stderr.is_empty(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -3881,7 +4059,7 @@ fn a_typed_opening_message_waits_until_the_screen_has_settled_after_a_startup_ga
 #[test]
 fn restart_as_another_account_carries_the_conversation_over_and_back() {
     let Some(sb) = Sandbox::new("rehome") else { return };
-    // 假 agent:起来时把配置目录和参数一行一个写进 run-<会话 id>
+    // A fake agent: at start, writes its config directory and arguments into run-<SESSION-ID>, one per line
     let script = sb.home.join("rec.sh");
     write(
         &script,
@@ -3905,7 +4083,7 @@ fn restart_as_another_account_carries_the_conversation_over_and_back() {
             s = script.display()
         );
     write(&cfg, &text);
-    // 这次起来时的配置目录、参数;先删掉旧的,等新起的那个写
+    // The config directory and arguments of this start; delete the old one first and wait for the new start to write it
     let relaunch = |id: &str, args: &[&str]| -> (String, Vec<String>, String) {
         let f = sb.home.join(format!("run-{id}"));
         let _ = std::fs::remove_file(&f);
@@ -3925,7 +4103,7 @@ fn restart_as_another_account_carries_the_conversation_over_and_back() {
     let after = |args: &[String], flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
     let read = |p: &Path| std::fs::read_to_string(p).unwrap();
 
-    // Claude:对话记录、子代理的记录、/rewind 的检查点都在 a 的配置目录里
+    // Claude: the transcript, the subagents' records and the /rewind checkpoints are all in a's config directory
     let id = sb.aca(&["new", "rc:a", &sb.proj()]);
     let pane = sb.json(&["show", &id, "--json"])["pane"].as_str().unwrap().to_string();
     let rel = Path::new("projects/-proj/c1.jsonl");
@@ -3936,7 +4114,7 @@ fn restart_as_another_account_carries_the_conversation_over_and_back() {
         |t: &Path| format!("{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"c1\",\"transcript_path\":\"{}\"}}", t.display());
     sb.hook(&id, &pane, &start(&ca.join(rel)));
 
-    // 换到 b:三样拷到 b 的同一位置,在原地带着 b 的目录接着 c1 起
+    // Switch to b: the three are copied to the same place under b, and it starts in place with b's directory, resuming c1
     let (home, args, said) = relaunch(&id, &["restart", &id, "--as", "b"]);
     assert!(said.contains("已切换到 rc:b") && said.contains("3 个文件"), "{said}");
     assert_eq!((home.as_str(), after(&args, "--resume").as_deref()), (cb.to_str().unwrap(), Some("c1")), "{args:?}");
@@ -3946,7 +4124,7 @@ fn restart_as_another_account_carries_the_conversation_over_and_back() {
     assert_eq!((row["tool"].as_str(), row["account"].as_str(), row["pane"].as_str()), (Some("rc"), Some("b"), Some(pane.as_str())));
     assert!(sb.event_names().iter().any(|e| e == "session.rehomed"));
 
-    // 在 b 上又聊了一轮,换回 a:a 那份是 b 那份的开头一段,直接盖掉,不留备份
+    // One more turn on b, then back to a: a's copy is the beginning of b's, so it's overwritten directly, no backup kept
     write(&cb.join(rel), "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n");
     sb.hook(&id, &pane, &start(&cb.join(rel)));
     let (home, _, _) = relaunch(&id, &["restart", &id, "--as", "rc:a"]);
@@ -3956,13 +4134,13 @@ fn restart_as_another_account_carries_the_conversation_over_and_back() {
         |d: &Path| std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
     assert!(!names(&ca.join("projects/-proj")).iter().any(|n| n.contains(".bak-")), "{:?}", names(&ca.join("projects/-proj")));
 
-    // b 那份对不上(不是从这边拷过去的):先留一份备份再盖
+    // b's copy doesn't match (not copied over from here): keep a backup first, then overwrite
     write(&cb.join(rel), "{\"type\":\"别的\"}\n");
     relaunch(&id, &["restart", &id, "--as", "b"]);
     assert_eq!(read(&cb.join(rel)), read(&ca.join(rel)));
     assert!(names(&cb.join("projects/-proj")).iter().any(|n| n.starts_with("c1.jsonl.bak-")), "{:?}", names(&cb.join("projects/-proj")));
 
-    // 换不了的:别家的工具、已经是的、和 --fresh 一起
+    // Ones that can't switch: another harness's tool, already on it, together with --fresh
     let fails = |args: &[&str]| {
         let o = sb.run(args);
         assert!(!o.status.success(), "{args:?}");
@@ -3972,7 +4150,7 @@ fn restart_as_another_account_carries_the_conversation_over_and_back() {
     assert!(fails(&["restart", &id, "--as", "b"]).contains("已是 rc:b"));
     assert!(fails(&["restart", &id, "--as", "a", "--fresh"]).contains("--fresh"));
 
-    // Codex:记录在 sessions/<日期>/ 底下;两个账号默认模型不一样,带上原来用的那个
+    // Codex: records are under sessions/<DATE>/; the two accounts' default models differ, so the one used before is passed
     let cx = sb.aca(&["new", "rx:x", &sb.proj()]);
     let cpane = sb.json(&["show", &cx, "--json"])["pane"].as_str().unwrap().to_string();
     let rollout = Path::new("sessions/2026/10/14/rollout-2026-10-14T09-00-00-th-1.jsonl");
@@ -3992,15 +4170,18 @@ fn restart_as_another_account_carries_the_conversation_over_and_back() {
     assert_eq!(read(&xb.join(rollout)), read(&xa.join(rollout)));
     assert_eq!(sb.json(&["show", &cx, "--json"])["args"], serde_json::json!(["-m", "m-a"]));
 
-    // 换回原来的账号:那边默认就是它,-m 拿掉
+    // Back to the original account: that's its default, so -m is dropped
     let (home, args, _) = relaunch(&cx, &["restart", &cx, "--as", "x"]);
     assert_eq!((home.as_str(), after(&args, "-m")), (xa.to_str().unwrap(), None));
     assert_eq!(sb.json(&["show", &cx, "--json"])["args"], serde_json::json!([]));
 }
 
-/// 界面开在一个 shell 底下(sh 不理挂断,和 kitty 里 zsh 底下开的一样),窗格整个关掉 = kitty 关了那个窗口。
-/// 以前:往没了的终端打印出错,出错时的善后再打印、再出错,程序被中止(134),什么也没留下(2026-10-14 那次)。
-/// 现在:正常退出(0),exit.log 记着终端没了;终端关掉是常事,下次打开界面不再提
+/// The UI opened under a shell (sh ignores hangups, the same as under zsh in kitty), and the whole pane closed = kitty closed
+/// that window.
+/// Before: printing to the gone terminal failed, the cleanup after the failure printed and failed again, and the program was
+/// aborted (134), leaving nothing behind (the 2026-10-14 incident).
+/// Now: a normal exit (0), with exit.log noting the terminal was gone; a closed terminal is common, so the next UI start doesn't
+/// mention it
 #[test]
 fn closing_the_terminal_under_the_interface_quits_quietly() {
     let Some(sb) = Sandbox::new("hangup") else { return };
@@ -4021,7 +4202,7 @@ fn closing_the_terminal_under_the_interface_quits_quietly() {
             status = q(&status),
         ),
     );
-    // 开一个界面,等屏幕上出现 want
+    // Open a UI and wait for want to appear on screen
     let open = |name: &str, want: &str| {
         sb.tmux(&["new-session", "-d", "-s", name, "-x", "120", "-y", "30", "/bin/sh", script.to_str().unwrap()]);
         let mut screen = String::new();
@@ -4034,7 +4215,7 @@ fn closing_the_terminal_under_the_interface_quits_quietly() {
         }
         panic!("没等到「{want}」:\n{screen}");
     };
-    // 关掉后 aca 的退出码(一行一次)
+    // aca's exit codes after closing (one line each time)
     let codes = |n: usize| {
         assert!(sb.until(|| std::fs::read_to_string(&status).is_ok_and(|s| s.lines().count() >= n)), "aca 没退出");
         std::fs::read_to_string(&status).unwrap()
@@ -4048,7 +4229,7 @@ fn closing_the_terminal_under_the_interface_quits_quietly() {
     assert!(log.contains("终端已关闭,界面随之退出(终端)"), "{log}");
     assert!(!ui.join("last-exit").exists());
 
-    // 下次打开:底栏不提
+    // Opened next time: the bottom bar doesn't mention it
     open("second", "快捷键");
     let screen = sb.tmux(&["capture-pane", "-p", "-t", "second"]);
     assert!(!screen.contains("上次界面"), "{screen}");
@@ -4057,8 +4238,10 @@ fn closing_the_terminal_under_the_interface_quits_quietly() {
     assert_eq!(std::fs::read_to_string(ui.join("exit.log")).unwrap().matches("终端已关闭").count(), 2);
 }
 
-/// 开着的界面放到后台不等的(起会话时的 trust-watch、订了事件的插件),退了要收掉。
-/// 以前丢下就不管:界面一开好几天,底下每起 / 删一个会话就多挂一个僵尸(2026-10-25 看到 37 个)
+/// What an open UI sends to the background without waiting (trust-watch at session start, plugins subscribed to events) must be
+/// reaped when it exits.
+/// Before, it was left alone: with a UI open for days, each session started / deleted under it added one more zombie (37 seen
+/// on 2026-10-25)
 #[test]
 fn the_interface_reaps_what_it_leaves_running_in_the_background() {
     let Some(sb) = Sandbox::new("reap") else { return };
@@ -4093,16 +4276,17 @@ fn the_interface_reaps_what_it_leaves_running_in_the_background() {
     assert!(sb.until(|| sb.tmux(&["capture-pane", "-p", "-t", "ui"]).contains("快捷键")), "界面没打开");
     let ui = sb.tmux(&["display-message", "-p", "-t", "ui", "#{pane_pid}"]);
 
-    // 界面里重启它:放出去一个 trust-watch、一个插件的事件钩子(起的时候 aca new 已经听到过一次)。
-    // 刚打开那一下的按键界面不收(见 ui.rs 的 STARTUP_QUIET)
+    // Restart it from the UI: that sends out a trust-watch and a plugin event hook (aca new already heard one at start).
+    // The UI ignores keys in the first moment after opening (see STARTUP_QUIET in ui.rs)
     std::thread::sleep(std::time::Duration::from_secs(1));
     sb.tmux(&["send-keys", "-t", "ui", "R"]);
     let started = || std::fs::read_to_string(&heard).unwrap_or_default().matches("session.started").count() == 2;
     assert!(sb.until(started), "{}", sb.tmux(&["capture-pane", "-p", "-t", "ui"]));
-    // trust-watch 见 agent 报了 hook 就退,不用干等半分钟
+    // trust-watch exits once the agent reports a hook, no need to wait half a minute
     sb.hook(&id, &sb.pane(&id), r#"{"hook_event_name":"SessionStart","session_id":"r1"}"#);
 
-    // 界面底下的子进程(状态):还在跑的等它退,剩下的都退了(Z)就该看得出收没收
+    // The child processes under the UI (state): wait for running ones to exit; once all the rest have exited (Z), whether they were
+    // reaped shows
     let kids = || -> Vec<String> {
         let o = Command::new("ps").args(["-axo", "ppid=,stat="]).output().unwrap();
         String::from_utf8_lossy(&o.stdout)
@@ -4124,11 +4308,12 @@ fn the_interface_reaps_what_it_leaves_running_in_the_background() {
     assert!(!left.iter().any(|s| s.starts_with('Z')), "界面底下挂着僵尸:{left:?}");
 }
 
-/// 打到管道里、对面先走了(`aca ls | head -1`、`aca help | less` 没翻完就退):不打 panic,141 退出(同被 SIGPIPE 带走的)
+/// Printing into a pipe whose reader has left (`aca ls | head -1`, quitting `aca help | less` before the end): no panic, exit
+/// 141 (the same as being killed by SIGPIPE)
 #[test]
 fn printing_into_a_pipe_nobody_reads_any_more_exits_quietly() {
     let Some(sb) = Sandbox::new("epipe") else { return };
-    // 读的那头先关掉:一写就是 EPIPE,不靠赶时间
+    // The reading end is closed first: any write is EPIPE, no racing against time
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
     let o = sb.cmd().arg("help").stdout(writer).output().unwrap();

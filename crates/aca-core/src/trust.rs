@@ -1,13 +1,15 @@
-//! 起会话时替你答「信不信任这个目录」(`[trust] folder = true`,默认不替你答)。
+//! Answer "do you trust this folder?" for you when a session starts (`[trust] folder = true`; by default it isn't answered for you).
 //!
-//! Claude、Codex 头一回进一个目录都会先问这一句,`--dangerously-skip-permissions` / `--yolo` 都不管它;
-//! 没人答,会话就停在那,派出去的 worker 也一样。两家都没有「这个目录我信」的启动参数(Claude 的文档只说手改
-//! `.claude.json`,那个文件同账号开着的会话一直在重写),所以照人的做法来:认出那个框,按键选「信任」,
-//! 记账的事还是它自己做 —— 同一个账号下次进这个目录不再问。
+//! Claude and Codex both ask this first thing the first time in a folder, and neither `--dangerously-skip-permissions` nor
+//! `--yolo` skips it; with nobody to answer, the session just sits there, and so does a delegated worker. Neither tool has a
+//! launch argument for "I trust this folder" (Claude's docs only say to edit `.claude.json` by hand, a file that open sessions of
+//! the same account keep rewriting), so do what a person does: recognize the prompt and press the key to choose "trust", leaving
+//! the bookkeeping to the tool itself — the same account doesn't ask again next time in this folder.
 //!
-//! aca 没有常驻进程:[`crate::session`] 每起一次 agent 就放一个不等它的 [`spawn`],盯这个窗格半分钟,
-//! 答完、或者 agent 已经报了 hook(启动那几道关过了)、或者到时间就退。只认 [`Agent::trust_keys`] 认得的那一个框,
-//! 别的关(审 hook、更新)不碰。
+//! aca has no resident process: each time [`crate::session`] starts an agent, it puts out a [`spawn`] it doesn't wait for, which
+//! watches the pane for half a minute and exits once it has answered, or the agent has reported a hook (the startup gates are
+//! past), or time is up. It only recognizes the one prompt [`Agent::trust_keys`] knows; other gates (reviewing hooks, updates)
+//! are left alone.
 //!
 //! [`Agent::trust_keys`]: crate::agent::Agent::trust_keys
 
@@ -19,10 +21,11 @@ use crate::paths::{self, Res};
 use crate::store::{Session, Store};
 use crate::{agent, runtime, tmux};
 
-/// 盯多久:慢的机器上 agent 画出那个框要几秒
+/// How long to watch: on a slow machine the agent takes a few seconds to draw the prompt
 const WATCH: Duration = Duration::from_secs(30);
 
-/// 开关开着就放一个 `aca trust-watch <会话>` 在后台(不等它,起不来也不算启动失败)
+/// With the switch on, put an `aca trust-watch <session>` in the background (not waited for; failing to start doesn't count as
+/// the start failing)
 pub fn spawn(cfg: &Config, id: &str) {
     if !cfg.trust.folder {
         return;
@@ -32,8 +35,10 @@ pub fn spawn(cfg: &Config, id: &str) {
     );
 }
 
-/// 这个会话现在停在「信不信任这个目录」上,而且 [`spawn`] 放的那个后手还在盯着:马上有人替你答,不算在等你。
-/// `aca wait` 问这个 —— 起完会话紧接着就等的(派活都这么写),不然会在框出来到被答掉的那半秒里等到一个「在等确认」
+/// This session is sitting at "do you trust this folder?" right now, and the follow-up [`spawn`] put out is still watching: someone
+/// will answer for you in a moment, so it doesn't count as needing you. `aca wait` asks this — waiting right after starting a
+/// session (delegating is always written that way) would otherwise catch "waiting for a confirmation" in the half second between
+/// the prompt appearing and it being answered
 pub fn answering(cfg: &Config, s: &Session) -> bool {
     if !cfg.trust.folder || paths::now().saturating_sub(runtime::load(&s.id).started) > WATCH.as_secs() {
         return false;
@@ -42,18 +47,18 @@ pub fn answering(cfg: &Config, s: &Session) -> bool {
     agent::of(cfg, s).is_ok_and(|(agent, _)| agent.trust_keys(&tmux::capture(&p.pane)).is_some())
 }
 
-/// `aca trust-watch <会话>`:那个框出来就按键。返回按没按
+/// `aca trust-watch <session>`: press the key once that prompt appears. Returns whether it pressed
 pub fn watch(store: &Store, cfg: &Config, key: &str) -> Res<bool> {
     let s = store.get(key)?;
     let (agent, _) = agent::of(cfg, &s)?;
     let (t, since) = (Instant::now(), paths::now());
     while t.elapsed() < WATCH {
         std::thread::sleep(Duration::from_millis(250));
-        // 窗格还没换成 agent(占位的那一下)也接着等
+        // Keep waiting while the pane hasn't switched to the agent yet (the placeholder moment)
         let Some(p) = tmux::find(&s.id).filter(|p| !p.dead) else { continue };
         let screen = tmux::capture(&p.pane);
         if let Some(keys) = agent.trust_keys(&screen) {
-            // 画到一半的框不按:隔一会儿再看还是它才按
+            // Don't press on a half-drawn prompt: only press if it's still the same a moment later
             std::thread::sleep(Duration::from_millis(200));
             if tmux::capture(&p.pane) != screen {
                 continue;
@@ -63,7 +68,7 @@ pub fn watch(store: &Store, cfg: &Config, key: &str) -> Res<bool> {
             }
             return Ok(true);
         }
-        // 它已经报过 hook 了:启动那几道关过了,这个框不会再出来
+        // It has already reported a hook: the startup gates are past, and this prompt won't show again
         let r = runtime::load(&s.id);
         if !r.event.is_empty() && r.ts >= since {
             break;

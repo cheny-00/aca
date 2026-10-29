@@ -1,8 +1,10 @@
-//! 登记表:有哪些会话、各在哪个分组、用什么工具和账号、接着哪段对话。一个 SQLite 文件。
+//! The registry: which sessions there are, which group each is in, which tool and account it uses, which conversation it resumes.
+//! One SQLite file.
 //!
-//! 这里只放**人和命令行改的东西**(建、改名、挪组、排序、归档)。agent 每一轮都在变的状态
-//! (在跑 / 等你 / 跑完、当前对话 id、自动起的标题)不进库,由 hook 写各会话自己的文件(runtime.rs):
-//! hook 每个事件都要跑,十几个会话同时写一个库会互相等锁。
+//! Only **what people and the CLI change** goes here (create, rename, move groups, order, archive). State the agent changes every
+//! turn (running / needs you / finished, the current conversation id, the auto title) stays out of the database; hooks write it
+//! to each session's own file (runtime.rs): hooks run on every event, and a dozen sessions writing one database would wait on
+//! each other's locks.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -14,21 +16,23 @@ use crate::{t, tr};
 pub struct Session {
     pub id: String,
     pub title: String,
-    /// 人改过名:不再跟着 agent 自己起的标题变
+    /// Renamed by a person: no longer follows the title the agent sets
     pub title_locked: bool,
     pub group: String,
     pub order: i64,
-    /// claude / codex / shell,或 config.toml 里 `[tools.<名>]` 定义的
+    /// claude / codex / shell, or one defined by `[tools.<name>]` in config.toml
     pub tool: String,
     pub account: String,
     pub dir: String,
-    /// 每次启动都带上的额外参数
+    /// Extra arguments added at every start
     pub args: Vec<String>,
-    /// 登记时的对话 id;之后变了(/clear、压缩)以 runtime 里 hook 报的为准
+    /// The conversation id at registration; if it changes later (/clear, compaction), what the hook reports in runtime wins
     pub conv: String,
-    /// 谁派的它(在某个会话里 `aca new` 的、`--parent` 指定的):通知、代答、列表里挂在谁下面都按这个
+    /// Who delegated it (`aca new` run inside some session, or named with `--parent`): notices, answering for it, and what it hangs
+    /// under in the list all go by this
     pub parent: String,
-    /// 分叉出来的:分自哪个会话。不是 `parent` —— 分叉是你自己接着聊的另一条路,和原会话平级
+    /// Forked: which session it was forked from. Not `parent` — a fork is another path you continue yourself, a peer of the original
+    /// session
     pub fork_of: String,
     pub created: u64,
     pub archived: u64,
@@ -72,7 +76,7 @@ create table if not exists groups(
 const COLS: &str =
     "id, title, title_locked, group_path, sort_order, tool, account, dir, args, conv, parent, created_at, archived_at, fork_of";
 
-/// 登记表的版本(`pragma user_version`)。2:多了 `fork_of`
+/// Registry version (`pragma user_version`). 2: adds `fork_of`
 const VERSION: i64 = 2;
 
 fn e(err: rusqlite::Error) -> String {
@@ -111,7 +115,7 @@ impl Store {
 
     fn at(conn: Connection) -> Res<Store> {
         conn.busy_timeout(std::time::Duration::from_secs(3)).map_err(e)?;
-        // 已经是这一版的库就不再跑建表:平常的一次打开只剩一条 pragma
+        // A database already at this version doesn't run the table creation again: an ordinary open is just one pragma
         let v: i64 = conn.query_row("pragma user_version", [], |r| r.get(0)).map_err(e)?;
         if v < 1 {
             conn.execute_batch(&format!("pragma journal_mode = wal; {SCHEMA} pragma user_version = {VERSION};")).map_err(e)?;
@@ -119,8 +123,8 @@ impl Store {
         }
         let store = Store { conn };
         if v < VERSION {
-            // 以前分叉出来的记在 parent 上,和派出去的 worker 分不开;认得出来的是 runtime 里记着从哪段对话分的那些
-            // (`Run::fork_from`,分叉时写的,一直留着)
+            // Forks used to be recorded in parent, indistinguishable from delegated workers; the recognizable ones are those whose runtime
+            // records which conversation they forked from (`Run::fork_from`, written at fork time and kept)
             let moved = add_fork_of(&store.conn, |id| !crate::runtime::load(id).fork_from.is_empty())?;
             for (id, from) in moved {
                 let _ = store.place_after(&id, &from);
@@ -129,7 +133,7 @@ impl Store {
         Ok(store)
     }
 
-    /// 没归档的,按分组里的先后
+    /// Not archived, in their order within the group
     pub fn sessions(&self, archived: bool) -> Res<Vec<Session>> {
         let sql =
             format!("select {COLS} from sessions {} order by sort_order, created_at", if archived { "" } else { "where archived_at = 0" });
@@ -138,7 +142,7 @@ impl Store {
         Ok(v)
     }
 
-    /// 按 id 找:完整的、开头几位(只对上一个)、或者标题一模一样的
+    /// Find by id: the full id, its first few characters (matching only one), or an identical title
     pub fn get(&self, key: &str) -> Res<Session> {
         let one = |sql: &str, k: &str| -> Res<Vec<Session>> {
             let mut st = self.conn.prepare_cached(sql).map_err(e)?;
@@ -204,7 +208,7 @@ impl Store {
         self.set(id, "conv", &conv)
     }
 
-    /// 换账号(连工具一起:同一家的另一个工具也行)
+    /// Change the account (with the tool: another tool of the same kind works too)
     pub fn set_account(&self, id: &str, tool: &str, account: &str) -> Res<()> {
         self.set(id, "tool", &tool)?;
         self.set(id, "account", &account)
@@ -222,7 +226,7 @@ impl Store {
         self.set(id, "archived_at", &(at as i64))
     }
 
-    /// 挪到别的分组(没有就建),排到那一组的最后
+    /// Move to another group (created if missing), placed last in that group
     pub fn set_group(&self, id: &str, group: &str) -> Res<()> {
         if !group.is_empty() {
             self.group_create(group, "")?;
@@ -235,7 +239,8 @@ impl Store {
         self.set(id, "sort_order", &last)
     }
 
-    /// 排到 `by` 紧后面:这一组整个重新编号(归档的也算在里面,保持相对位置)。不在同一组的不动
+    /// Place right after `by`: the whole group is renumbered (archived ones included, keeping relative positions). Nothing moves if
+    /// they aren't in the same group
     pub fn place_after(&self, id: &str, by: &str) -> Res<()> {
         let (me, it) = (self.get(id)?, self.get(by)?);
         if me.group != it.group || me.id == it.id {
@@ -256,7 +261,7 @@ impl Store {
         self.conn.execute("delete from sessions where id = ?1", [id]).map(|_| ()).map_err(e)
     }
 
-    /// 新会话在它那一组里排最后
+    /// A new session goes last in its group
     pub fn next_order(&self, group: &str) -> i64 {
         self.conn
             .query_row("select coalesce(max(sort_order), 0) + 1 from sessions where group_path = ?1", [group], |r| r.get(0))
@@ -273,7 +278,7 @@ impl Store {
         Ok(v)
     }
 
-    /// 已经有就不动(给了默认目录的补上);`a/b` 连上级 `a` 一起建
+    /// Left alone if it exists (a missing default directory gets filled in); `a/b` creates the parent `a` too
     pub fn group_create(&self, path: &str, default_path: &str) -> Res<()> {
         let mut upto = String::new();
         for part in path.split('/').filter(|p| !p.is_empty()) {
@@ -299,7 +304,7 @@ impl Store {
         if n == 1 { Ok(()) } else { Err(tr!("没有分组 {path}", "no group {path}")) }
     }
 
-    /// 删分组:里面的会话(连下级分组的)挪到上一级
+    /// Remove a group: its sessions (including those in subgroups) move up one level
     pub fn group_remove(&self, path: &str) -> Res<usize> {
         let exists: Option<i64> =
             self.conn.query_row("select 1 from groups where path = ?1", [path], |r| r.get(0)).optional().map_err(e)?;
@@ -316,21 +321,23 @@ impl Store {
         Ok(moved)
     }
 
-    /// 只删分组(连子分组)的登记,里面的会话不动(界面删分组时会话已经一起归档了,见 aca-tui 的 trash.rs)。返回删了几个组
+    /// Only drop the group's registration (with subgroups); its sessions are untouched (when the interface removes a group, its sessions
+    /// are already archived along with it, see aca-tui's trash.rs). Returns how many groups were dropped
     pub fn group_drop(&self, path: &str) -> Res<usize> {
-        // 不用 like:组名里的 _ % 会被当成通配
+        // No like: _ and % in a group name would be taken as wildcards
         self.conn
             .execute("delete from groups where path = ?1 or substr(path, 1, length(?2)) = ?2", params![path, format!("{path}/")])
             .map_err(e)
     }
 
-    /// 按目录定分组(`-g .`),只看不建。规则见 [`group_by_dir`]
+    /// Decide the group by directory (`-g .`), only looking, not creating. Rules in [`group_by_dir`]
     pub fn dir_group(&self, dir: &str) -> Res<(String, bool)> {
         let groups: Vec<(String, String)> = self.groups()?.into_iter().map(|g| (g.path, paths::real(&g.default_path))).collect();
         group_by_dir(&groups, &paths::real(dir))
     }
 
-    /// 按目录定分组(见 [`Store::dir_group`]),没有就建;组还没记默认目录的,记成这个目录
+    /// Decide the group by directory (see [`Store::dir_group`]), creating it if missing; a group with no default directory yet gets
+    /// this directory
     pub fn group_claim(&self, dir: &str) -> Res<(String, bool)> {
         let (g, new) = self.dir_group(dir)?;
         self.group_create(&g, "")?;
@@ -340,8 +347,8 @@ impl Store {
         Ok((g, new))
     }
 
-    /// 改分组的路径(改名,或者挪到别的上级下面):子分组、里面的会话(连归档的)一起跟过去,
-    /// 默认目录、先后不变;新路径的上级没有就建。返回挪了几个会话
+    /// Change a group's path (rename it, or move it under another parent): subgroups and its sessions (archived ones too) follow,
+    /// default directory and order unchanged; a missing parent of the new path is created. Returns how many sessions moved
     pub fn group_rename(&self, from: &str, to: &str) -> Res<usize> {
         let (from, to) = (from.trim_matches('/'), to.trim_matches('/'));
         let groups = self.groups()?;
@@ -357,11 +364,11 @@ impl Store {
         if to.strip_prefix(from).is_some_and(|r| r.starts_with('/')) {
             return Err(tr!("{from} 不能移到它自己下面", "{from} can't move under itself"));
         }
-        // 大小写不同也算有了;只改大小写的(Work → work)不算撞
+        // A case difference still counts as existing; changing only the case (Work → work) isn't a clash
         if let Some(g) = groups.iter().find(|g| g.path.eq_ignore_ascii_case(to) && g.path != from) {
             return Err(tr!("分组 {} 已存在", "group {} already exists", g.path));
         }
-        // 它自己和「它/…」;不用 like:分组名里的 _ % 会被当成通配符
+        // Itself and "it/…"; no like: _ and % in a group name would be taken as wildcards
         let tx = self.conn.unchecked_transaction().map_err(e)?;
         tx.execute(
             "update groups set path = ?2 || substr(path, length(?1) + 1)
@@ -377,12 +384,13 @@ impl Store {
             )
             .map_err(e)?;
         tx.commit().map_err(e)?;
-        // 挪到了还没有的上级下面:上级补上
+        // Moved under a parent that doesn't exist yet: create the parent
         self.group_create(to, "")?;
         Ok(moved)
     }
 
-    /// 改分组的默认目录(空 = 不记了)。一个目录只当一个组的默认目录:`-g .` 按它找组
+    /// Change a group's default directory (empty = no longer recorded). A directory is the default of only one group: `-g .` finds
+    /// the group by it
     pub fn group_set_dir(&self, path: &str, dir: &str) -> Res<()> {
         if !dir.is_empty() {
             let real = paths::real(dir);
@@ -397,8 +405,9 @@ impl Store {
     }
 }
 
-/// 第 1 版的库升到第 2 版:加上 `fork_of`,`is_fork` 认出来的那些会话把 `parent` 挪过去(它们不是谁派的)。
-/// 返回挪了的:(会话, 分自谁)。两个进程一起升的,后到的等前一个写完,看到已经升过就什么都不做
+/// Upgrade a version 1 database to version 2: add `fork_of`, and move `parent` there for the sessions `is_fork` recognizes (nobody
+/// delegated them). Returns the ones moved: (session, forked from). When two processes upgrade at once, the later waits for the
+/// first to finish writing, sees it's already upgraded and does nothing
 fn add_fork_of(conn: &Connection, is_fork: impl Fn(&str) -> bool) -> Res<Vec<(String, String)>> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(e)?;
     let v: i64 = tx.query_row("pragma user_version", [], |r| r.get(0)).map_err(e)?;
@@ -419,15 +428,19 @@ fn add_fork_of(conn: &Connection, is_fork: impl Fn(&str) -> bool) -> Res<Vec<(St
     Ok(moved)
 }
 
-/// 按目录定分组:`aca new -g .`、`aca move <id> .`、`aca group add`、接管、界面的 `N` 都用这一份,只看不建。
-/// `groups` 是 (分组路径, 默认目录),`dir` 和默认目录都先过 [`paths::real`]。返回 (分组, 现在还没有这个组):
-/// 1. 哪个组的默认目录就是它 → 那个组
-/// 2. 目录名已经是分组:顶层同名的,或者唯一一个以它结尾的嵌套组(…/目录名)→ 那个组
-/// 3. 上一级目录名是分组(顶层同名,或者唯一一个以它结尾的嵌套组)→ 嵌套成「那个组/目录名」
-/// 4. 都不是 → 顶层的「目录名」
-/// 5. 2–4 定下的组记着别的目录:往后编号,「…-2」「…-3」(同一个上级下面);没有就新建,有、没记目录就用它
+/// Decide the group by directory: `aca new -g .`, `aca move <id> .`, `aca group add`, adopting and the interface's `N` all use this
+/// one, only looking, not creating. `groups` is (group path, default directory); `dir` and the default directories both go
+/// through [`paths::real`] first. Returns (group, the group doesn't exist yet):
+/// 1. A group whose default directory is this one → that group
+/// 2. The directory name is already a group: a top-level one with that name, or the only nested group ending in it (…/dirname)
+///    → that group
+/// 3. The parent directory's name is a group (top-level with that name, or the only nested group ending in it) → nested as
+///    "that group/dirname"
+/// 4. None of these → a top-level "dirname"
+/// 5. The group decided by 2–4 records another directory: number onward, "…-2", "…-3" (under the same parent); create it if
+///    missing, and use one that exists without a directory
 ///
-/// 大小写不同也算同一个组(和挪分组一样);目录名里的空白换成 -
+/// A case difference still counts as the same group (as when moving groups); whitespace in the directory name becomes -
 pub fn group_by_dir(groups: &[(String, String)], dir: &str) -> Res<(String, bool)> {
     if let Some((g, _)) = groups.iter().find(|(_, d)| !d.is_empty() && d == dir) {
         return Ok((g.clone(), false));
@@ -441,7 +454,7 @@ pub fn group_by_dir(groups: &[(String, String)], dir: &str) -> Res<(String, bool
     }
     let parent = name(path.parent().and_then(|p| p.file_name()));
     let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
-    // 顶层同名的,或者唯一一个「…/名字」的嵌套组
+    // A top-level one with that name, or the only nested group "…/name"
     let named = |n: &str| -> Option<String> {
         if n.is_empty() {
             return None;
@@ -492,7 +505,7 @@ mod tests {
         assert_eq!(st.get("修登录").unwrap().id, "ab12cd34");
         assert!(st.get("ab").unwrap_err().contains("2 个"));
         assert!(st.get("zz").unwrap_err().contains("没有"));
-        // 建会话时分组连上级一起有了
+        // Creating a session also created the group along with its parents
         let g: Vec<String> = st.groups().unwrap().into_iter().map(|g| g.path).collect();
         assert_eq!(g, ["work", "work/app"]);
     }
@@ -521,7 +534,7 @@ mod tests {
     #[test]
     fn placing_after_another_renumbers_the_group_and_keeps_the_rest_in_order() {
         let st = Store::memory();
-        // a、b 的 sort_order 一样(接管来的会这样):先后看创建时间
+        // a and b have the same sort_order (adopted ones can): ordered by creation time
         for (id, order, created) in [("a1", 1, 1), ("b2", 1, 2), ("c3", 2, 3), ("d4", 3, 4)] {
             st.insert(&Session { order, created, ..s(id, id, "g") }).unwrap();
         }
@@ -533,7 +546,7 @@ mod tests {
         assert_eq!(order(&st), ["a1", "d4", "b2", "c3"]);
         st.place_after("a1", "c3").unwrap();
         assert_eq!(order(&st), ["d4", "b2", "c3", "a1"]);
-        // 不在同一组、挪到自己后面:不动
+        // Not in the same group, or after itself: nothing moves
         st.place_after("d4", "x9").unwrap();
         st.place_after("d4", "d4").unwrap();
         assert_eq!(order(&st), ["d4", "b2", "c3", "a1"]);
@@ -541,7 +554,8 @@ mod tests {
         assert!(st.place_after("d4", "nope").is_err());
     }
 
-    /// 第 1 版的库(没有 fork_of):分叉出来的记在 parent 上。升上来:认得出是分叉的挪到 fork_of,派出去的 worker 不动
+    /// A version 1 database (no fork_of): forks were recorded in parent. Upgrading: the ones recognized as forks move to fork_of,
+    /// delegated workers stay
     #[test]
     fn an_older_registry_gains_fork_of_and_forks_stop_being_children() {
         let v1 = SCHEMA.replace(",\n  fork_of text not null default ''", "");
@@ -560,19 +574,19 @@ mod tests {
         add("worker", "lead", 3);
         add("fork", "lead", 4);
         assert_eq!(add_fork_of(&conn, |id| id == "fork").unwrap(), [("fork".to_string(), "lead".to_string())]);
-        // 升过了:再来一次什么都不做
+        // Already upgraded: running it again does nothing
         assert!(add_fork_of(&conn, |_| true).unwrap().is_empty());
         let st = Store::at(conn).unwrap();
         let of = |id: &str| st.get(id).map(|x| (x.parent, x.fork_of)).unwrap();
         assert_eq!(of("fork"), (String::new(), "lead".into()));
         assert_eq!(of("worker"), ("lead".into(), String::new()));
         assert_eq!(of("lead"), (String::new(), String::new()));
-        // 新写进去的带着这一列
+        // Newly written rows carry this column
         st.insert(&Session { fork_of: "other".into(), ..s("f2", "f2", "g") }).unwrap();
         assert_eq!(st.get("f2").unwrap().fork_of, "other");
     }
 
-    /// 没有分叉、没有子会话的旧库:打开就升好了(不用去读谁的 runtime)
+    /// An old database with no forks and no children: upgraded on open (nobody's runtime needs reading)
     #[test]
     fn opening_an_older_registry_upgrades_it_in_place() {
         let conn = Connection::open_in_memory().unwrap();
@@ -602,14 +616,14 @@ mod tests {
             st.group_create(g, "").unwrap();
         }
         st.insert(&s("a1", "a", "my_app/deep")).unwrap();
-        // 子分组一起删;名字里的 _ 不当通配
+        // Subgroups are dropped too; _ in a name isn't a wildcard
         assert_eq!(st.group_drop("my_app").unwrap(), 2);
         assert_eq!(st.groups().unwrap().into_iter().map(|g| g.path).collect::<Vec<_>>(), ["myXapp", "my_apple"]);
         assert_eq!(st.get("a1").unwrap().group, "my_app/deep");
         assert_eq!(st.group_drop("my_app").unwrap(), 0);
     }
 
-    /// 测试用的目录:真建出来(按目录定组会解析成真实路径)
+    /// Directories for the test: really created (grouping by directory resolves to real paths)
     fn dirs(names: &[&str]) -> (std::path::PathBuf, Vec<String>) {
         let root = std::env::temp_dir().join(format!("aca-store-dirs-{}-{}", std::process::id(), paths::short_id()));
         let v = names
@@ -631,20 +645,20 @@ mod tests {
     fn a_dir_gets_the_group_named_after_it_numbered_when_taken() {
         let st = Store::memory();
         let (root, d) = dirs(&["a/aca", "b/aca", "c/aca", "My Proj"]);
-        // 没有 → 新建,目录记成默认目录;再来一次还是它
+        // Missing → created, with the directory as its default; again gives the same one
         assert_eq!(st.group_claim(&d[0]).unwrap(), ("aca".into(), true));
         assert_eq!(default_dir(&st, "aca"), d[0]);
         assert_eq!(st.group_claim(&format!("{}/", d[0])).unwrap(), ("aca".into(), false));
-        // 同名的记着别的目录 → 往后编号
+        // One with the same name records another directory → numbered onward
         assert_eq!(st.dir_group(&d[1]).unwrap(), ("aca-2".into(), true));
         assert_eq!(st.group_claim(&d[1]).unwrap(), ("aca-2".into(), true));
         assert_eq!(st.group_claim(&d[2]).unwrap(), ("aca-3".into(), true));
         assert_eq!(st.group_claim(&d[1]).unwrap(), ("aca-2".into(), false));
-        // 同名的没记目录(大小写不同也算):用它,记上
+        // One with the same name and no directory (a case difference counts too): use it and record it
         st.group_create("My-proj", "").unwrap();
         assert_eq!(st.group_claim(&d[3]).unwrap(), ("My-proj".into(), false));
         assert_eq!(default_dir(&st, "My-proj"), d[3]);
-        // 只看不建
+        // Only looks, doesn't create
         let n = st.groups().unwrap().len();
         let (_, more) = dirs(&["z/fresh"]);
         assert_eq!(st.dir_group(&more[0]).unwrap(), ("fresh".into(), true));
@@ -653,8 +667,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// 界面的 N 和 -g . 是同一套:目录名、上一级目录名是已有的分组(顶层的或唯一的嵌套组)就进它 / 嵌在它下面,
-    /// 定下的组记着别的目录就往后编号
+    /// The interface's N and -g . are the same logic: if the directory name or the parent directory's name is an existing group (top
+    /// level, or the only nested one), join it / nest under it; if the group decided on records another directory, number onward
     #[test]
     fn a_dir_joins_or_nests_under_an_existing_group_and_is_numbered_when_taken() {
         let g = |v: &[(&str, &str)], dir: &str| {
@@ -673,21 +687,21 @@ mod tests {
             ("aca-2", "/w/b/aca"),
             ("Tools", "/w/t/tools"),
         ];
-        // 1 默认目录:比同名的组优先
+        // 1 default directory: wins over a group with the same name
         assert_eq!(g(&h, "/w/my-notes"), ("notes".into(), false));
         assert_eq!(g(&h, "/w/b/aca"), ("aca-2".into(), false));
-        // 2 目录名已是分组:顶层同名 / 唯一的「…/名字」
+        // 2 the directory name is already a group: top level with that name / the only "…/name"
         assert_eq!(g(&h, "/w/anywhere/fun"), ("fun".into(), false));
         assert_eq!(g(&h, "/w/code/api"), ("work/api".into(), false));
         assert_eq!(g(&h, "/w/code/FUN"), ("fun".into(), false));
-        // 3 上一级目录名是分组 → 嵌套
+        // 3 the parent directory's name is a group → nested
         assert_eq!(g(&h, "/w/work/newthing"), ("work/newthing".into(), true));
         assert_eq!(g(&h, "/w/x/deeper"), ("lab/x/deeper".into(), true));
-        // 同名的嵌套组不止一个:不算,往下走
+        // More than one nested group with that name: doesn't count, move on
         assert_eq!(g(&h, "/w/code/dup"), ("dup".into(), true));
-        // 4 都不是:顶层目录名(空白换成 -)
+        // 4 none of these: the top-level directory name (whitespace becomes -)
         assert_eq!(g(&h, "/w/code/my brand"), ("my-brand".into(), true));
-        // 5 同名的组记着别的目录:往后编号,嵌套的也一样
+        // 5 a group with that name records another directory: numbered onward, nested ones too
         assert_eq!(g(&h, "/w/c/aca"), ("aca-3".into(), true));
         assert_eq!(g(&h, "/w/u/tools"), ("Tools-2".into(), true));
         assert_eq!(g(&[("work", ""), ("work/api", "/w/work/api")], "/w/code/api"), ("work/api-2".into(), true));
@@ -713,11 +727,11 @@ mod tests {
         assert_eq!(default_dir(&st, "tools/deck"), "/w/app");
         let group = |id: &str| st.get(id).unwrap().group;
         assert_eq!((group("a1"), group("b2"), group("c3")), ("tools/deck".into(), "tools/deck/old".into(), "fun/apple".into()));
-        // _ 不是通配符
+        // _ isn't a wildcard
         st.insert(&s("e5", "e", "fan")).unwrap();
         assert_eq!(st.group_rename("f_n", "fx").unwrap(), 1);
         assert_eq!(group("e5"), "fan");
-        // 只改大小写可以;撞上已有的、挪到自己下面、没有这个组:不改
+        // Changing only the case is fine; a clash with an existing one, moving under itself, a missing group: not changed
         assert_eq!(st.group_rename("fx", "FX").unwrap(), 1);
         assert!(st.group_rename("fun", "Tools").unwrap_err().contains("分组 tools 已存在"));
         assert!(st.group_rename("tools", "tools/x").unwrap_err().contains("自己下面"));

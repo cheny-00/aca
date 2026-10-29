@@ -1,14 +1,17 @@
-//! 你对插件的决定。插件在清单里说它想要什么,你在 plugins.toml 里说了算(像 kitty:kitten 不自己绑键,
-//! 远程控制每个口令能用哪些命令由你列):
+//! Your decisions about plugins. A plugin says in its manifest what it would like; you decide in plugins.toml (as in
+//! kitty: a kitten doesn't bind its own keys, and you list which commands each remote-control password may use):
 //!
-//! - **给 agent 哪些工具**:`tools = ["list"]`。没写 = 清单里 `expose` 写 `agent` 的那些;写 `agent?` 的
-//!   (会动你机器上东西的)要你点了名才给。aca 列工具、真去调的时候都照这个查。
-//!   这是给 agent 的工具清单,不是沙箱:agent 有 shell 的话照样能敲 `aca` 命令。
-//! - **`:` 菜单里的键**:`keys = { tasks = "T", run = "" }`(能力 / 窗格 / 视图的 id → 一个字符,空的 = 不要键)。
-//!   没写的照清单的 `[[keys]]`。两个插件要同一个键:你写的先拿;都是清单写的,先登记的那个拿。
-//!   没拿到的点名出来(插件页、`aca plugin ls`),不再悄悄没了。
-//! - **会话里面的热键**:`hotkeys = { pick = "M-c", pad = "" }`(窗格的 id → tmux 的键名,空的 = 不要)。
-//!   没写的照清单的 `[[hotkeys]]`;清单没给热键的窗格你也能给一个。分法和上面一样。
+//! - **Which tools agents get**: `tools = ["list"]`. Not written = the commands whose `expose` says `agent` in the manifest;
+//!   `agent?` ones (that change things on your machine) are given only when you name them. aca checks this both when it
+//!   lists tools and when one is actually called. This is the list of tools for agents, not a sandbox: an agent with a
+//!   shell can still type `aca` commands.
+//! - **Keys in the `:` menu**: `keys = { tasks = "T", run = "" }` (command / pane / view id → one character, empty = no key).
+//!   The rest follow the manifest's `[[keys]]`. When two plugins want the same key: yours wins; if both come from manifests,
+//!   the one registered first gets it. The one left without is named (plugins page, `aca plugin ls`), instead of quietly
+//!   losing it.
+//! - **Hotkeys inside sessions**: `hotkeys = { pick = "M-c", pad = "" }` (pane id → a tmux key name, empty = none).
+//!   The rest follow the manifest's `[[hotkeys]]`; you can give one to a pane the manifest gave none. Settled the same way
+//!   as above.
 
 use serde_json::json;
 
@@ -18,7 +21,7 @@ use super::{Entry, MENU_KEYS_TAKEN, registry};
 use crate::paths::Res;
 use crate::tr;
 
-/// 这个插件现在给 agent 的工具(能力 id,清单里的顺序)
+/// The tools this plugin gives agents now (command ids, in manifest order)
 pub fn agent_tools(e: &Entry, w: Option<&Want>) -> Vec<String> {
     match w.and_then(|w| w.tools.as_ref()) {
         None => e.tools.clone(),
@@ -26,7 +29,7 @@ pub fn agent_tools(e: &Entry, w: Option<&Want>) -> Vec<String> {
     }
 }
 
-/// 能给 agent 的全部:(能力 id, 现在给没给, 要不要你点名)
+/// Everything that can go to agents: (command id, given now, needs you to name it)
 pub fn tool_choices(id: &str) -> Res<Vec<(String, bool, bool)>> {
     let e = find(id)?;
     let now = agent_tools(&e, Some(&decl::want(id)));
@@ -38,7 +41,8 @@ fn find(id: &str) -> Res<Entry> {
     registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有插件 {id}", "no plugin {id}"))
 }
 
-/// 给 / 不给 agent 一个能力当工具(写进 plugins.toml 的 `tools`;跟清单默认的一样就不写)。返回现在给的
+/// Give / don't give agents a command as a tool (written to `tools` in plugins.toml; not written when it's the same as
+/// the manifest's default). Returns what's given now
 pub fn allow(id: &str, tool: &str, on: bool) -> Res<Vec<String>> {
     let e = find(id)?;
     if !e.tools.iter().chain(&e.tools_ask).any(|t| t == tool) {
@@ -60,7 +64,7 @@ pub fn allow(id: &str, tool: &str, on: bool) -> Res<Vec<String>> {
     Ok(now)
 }
 
-/// 回到清单默认的那些
+/// Back to the manifest's defaults
 pub fn reset_tools(id: &str) -> Res<Vec<String>> {
     let e = find(id)?;
     decl::set(id, "tools", None)?;
@@ -68,13 +72,14 @@ pub fn reset_tools(id: &str) -> Res<Vec<String>> {
     Ok(e.tools)
 }
 
-/// 工具清单变了:gateway 下面那个能力服务下次有人要时重起,连着的 agent 重新拉列表(Claude 当场换,Codex 重启才换)
+/// The tool list changed: the commands server under the gateway restarts the next time someone needs it, and connected agents
+/// fetch the list again (Claude switches at once, Codex only after a restart)
 fn tools_changed() {
     let _ = crate::gateway::ctl(json!({ "cmd": "restart", "server": "tools" }));
     let _ = crate::gateway::ctl(json!({ "cmd": "changed" }));
 }
 
-/// 菜单里的一项(或者一个窗格的热键)要什么键:清单写的,和你写的(None = 没写;Some("") = 不要键)
+/// What key a menu entry (or a pane's hotkey) wants: the manifest's, and yours (None = not written; Some("") = no key)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct KeyWant<K = char> {
     pub plugin: String,
@@ -84,17 +89,19 @@ pub struct KeyWant<K = char> {
     pub mine: Option<String>,
 }
 
-/// 分键:你写的先拿,再是清单写的(都按登记的顺序)。返回每一项拿到的键,和没拿到 / 写得不对的(插件 id, 一句话)
+/// Hands out keys: yours first, then the manifests' (each in registration order). Returns the key each entry got, and
+/// the ones that got none / were written wrong (plugin id, one sentence)
 pub fn settle(wants: &[KeyWant]) -> (Vec<Option<char>>, Vec<(String, String)>) {
     settle_by(wants, key_ok, "keys")
 }
 
-/// 分热键,一样的分法
+/// Hands out hotkeys, the same way
 pub fn settle_hotkeys(wants: &[KeyWant<String>]) -> (Vec<Option<String>>, Vec<(String, String)>) {
     settle_by(wants, |k| hotkey_ok(k).map(|_| k.to_string()), "hotkeys")
 }
 
-/// `ok`:你写的那个键行不行;`field`:plugins.toml 里这种键写在哪个字段(提醒里告诉你去哪改)
+/// `ok`: whether the key you wrote works; `field`: which field of plugins.toml this kind of key goes in (the note tells
+/// you where to change it)
 fn settle_by<K: Clone + Eq + std::hash::Hash + std::fmt::Display>(
     wants: &[KeyWant<K>],
     ok: impl Fn(&str) -> Res<K>,
@@ -143,7 +150,7 @@ fn settle_by<K: Clone + Eq + std::hash::Hash + std::fmt::Display>(
     (got, notes)
 }
 
-/// 一个能在 `:` 菜单里用的键
+/// A key usable in the `:` menu
 fn key_ok(k: &str) -> Res<char> {
     let mut cs = k.chars();
     match (cs.next(), cs.next()) {
@@ -153,7 +160,8 @@ fn key_ok(k: &str) -> Res<char> {
     }
 }
 
-/// 改一个的键(写进 plugins.toml 的 `keys`):Some("M") 换成 M,Some("") 不要键,None 回到清单的
+/// Changes one entry's key (written to `keys` in plugins.toml): Some("M") switches to M, Some("") no key, None back to
+/// the manifest's
 pub fn set_key(id: &str, target: &str, key: Option<&str>) -> Res<()> {
     let e = find(id)?;
     let (m, _) = super::read_manifest(std::path::Path::new(&e.path))?;
@@ -178,8 +186,8 @@ pub fn set_key(id: &str, target: &str, key: Option<&str>) -> Res<()> {
     decl::set(id, "keys", value)
 }
 
-/// 改一个窗格的热键(写进 plugins.toml 的 `hotkeys`):Some("M-n") 换成它,Some("") 不要,None 回到清单的。
-/// 清单没给热键的窗格也能给。改完 tmux 上跟着换
+/// Changes a pane's hotkey (written to `hotkeys` in plugins.toml): Some("M-n") switches to it, Some("") none, None back
+/// to the manifest's. A pane the manifest gave no hotkey can get one too. tmux follows the change
 pub fn set_hotkey(id: &str, pane: &str, key: Option<&str>) -> Res<()> {
     let e = find(id)?;
     let (m, _) = super::read_manifest(std::path::Path::new(&e.path))?;
@@ -214,14 +222,15 @@ mod tests {
                 manifest: manifest.map(String::from),
                 mine: mine.map(String::from),
             };
-            // 两个插件的清单要同一个键:先登记的拿,后面那个点名,告诉它去 hotkeys 里换
+            // Two plugins' manifests want the same key: the one registered first gets it, the other is named and told to change it
+            // in hotkeys
             let (got, notes) = settle_hotkeys(&[h("a", "pick", Some("C-]"), None), h("b", "pad", Some("C-]"), None)]);
             assert_eq!(got, [Some("C-]".to_string()), None]);
             assert!(
                 notes[0].1.contains("键 C-] 已分配给 a「pick」,b「pad」未分配到") && notes[0].1.contains("hotkeys = { pad = "),
                 "{notes:?}"
             );
-            // 你写的先拿;不要;清单没给的你给一个;写得不对的点名,键不给
+            // Yours first; none; you give one the manifest didn't; a wrongly written one is named and gets no key
             let (got, notes) = settle_hotkeys(&[
                 h("a", "pick", Some("C-]"), Some("")),
                 h("b", "pad", None, Some("C-]")),
@@ -239,7 +248,7 @@ mod tests {
     #[test]
     fn your_keys_win_then_the_manifests_in_order_and_whoever_loses_is_named() {
         crate::i18n::with(crate::i18n::Lang::Zh, || {
-            // 两个插件的清单都要 m:先登记的拿到,后面那个点名
+            // Both plugins' manifests want m: the one registered first gets it, the other is named
             let (got, notes) = settle(&[w("a", "mounts", Some('m'), None), w("b", "mail", Some('m'), None)]);
             assert_eq!(got, [Some('m'), None]);
             assert_eq!(notes.len(), 1);
@@ -248,10 +257,10 @@ mod tests {
                 notes[0].1.contains("键 m 已分配给 a「mounts」,b「mail」未分配到") && notes[0].1.contains("keys = { mail = "),
                 "{notes:?}"
             );
-            // 你给 b 写了 m:你写的先拿,a 的清单默认没拿到
+            // You wrote m for b: yours first, a's manifest default gets nothing
             let (got, notes) = settle(&[w("a", "mounts", Some('m'), None), w("b", "mail", Some('m'), Some("m"))]);
             assert_eq!((got, notes[0].0.as_str()), (vec![None, Some('m')], "a"));
-            // 换一个、不要键、写错了
+            // Changed, no key, written wrong
             let (got, notes) = settle(&[
                 w("a", "mounts", Some('m'), Some("M")),
                 w("a", "tasks", Some('t'), Some("")),

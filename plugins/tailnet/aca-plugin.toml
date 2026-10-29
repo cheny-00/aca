@@ -5,11 +5,13 @@ api = 1
 description = "查看 tailscale serve 的挂载:复制地址、撤销挂载、挂载本机端口;仅限 tailnet 内"
 description_en = "What tailscale serve exposes: copy an address, take one down, serve a port; tailnet only."
 
-# 整个功能在 tailnet.sh 里(sh + jq,问 tailscale / netstat / tpub),aca 里没有挂载的代码:写插件可以照着它来。
-# 露给界面(插件菜单里的「挂载」,键 m)和 agent:列出来随便用;挂端口是 agent?,你点了名才给
-# (aca plugin allow aca.tailnet add,或者插件页里 ⏎ 进去勾上)。命令行:aca plugin run aca.tailnet.list
+# The whole feature is in tailnet.sh (sh + jq, asking tailscale / netstat / tpub); aca has no mount code: a model to follow when
+# writing a plugin.
+# Exposed to the UI ("Mounts" in the plugin menu, key m) and to agents: listing is free to use; serving a port is agent?,
+# given only once you name it (aca plugin allow aca.tailnet add, or ⏎ into it on the plugins page and tick it).
+# CLI: aca plugin run aca.tailnet.list
 
-# tailscale 不写在这:没装时列表上照样打开,写着「没装 tailscale」
+# tailscale isn't listed here: without it the list still opens, saying "tailscale isn't installed"
 needs = ["jq"]
 
 [[views]]

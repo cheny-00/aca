@@ -1,9 +1,10 @@
-//! hook 事件 → 会话状态。这就是 aca 的 **hook 协议**:Claude Code 和 Codex 的 hook 天生是这个形状
-//! (事件名、`session_id`、`transcript_path`、`prompt`、`last_assistant_message`、`tool_name` / `tool_input` …),
-//! 别的 agent 写个转发按这个形状报就行。
-//! 哪家没有的事件(Claude 没有 Interrupt)自然走不到那一支。问你的题 Claude 是 AskUserQuestion、Codex 是 request_user_input,
-//! 载荷是同一个形状(`tool_input.questions[0].question`、`options[].label`)。
-//! 协议比 Claude 多一个字段:`title`,任何事件上都能带,是 agent 自己起的标题。
+//! Hook event → session state. This is aca's **hook protocol**: Claude Code and Codex hooks already have this shape (event
+//! name, `session_id`, `transcript_path`, `prompt`, `last_assistant_message`, `tool_name` / `tool_input` …), and other
+//! agents only need a forwarder that reports in this shape.
+//! Events a tool doesn't have (Claude has no Interrupt) simply never reach that branch. A question to you is
+//! AskUserQuestion in Claude and request_user_input in Codex, with the same payload shape
+//! (`tool_input.questions[0].question`, `options[].label`).
+//! The protocol has one field Claude doesn't: `title`, allowed on any event, the title the agent came up with itself.
 
 use serde_json::{Value, json};
 
@@ -11,7 +12,7 @@ use super::Events;
 use crate::runtime::{Run, clip};
 use crate::t;
 
-/// 工具调用给人看的一句:命令 / 文件 / 网址,哪个有用哪个
+/// One line about a tool call for people: the command / file / URL, whichever is there
 fn tool_brief(v: &Value) -> String {
     let input = &v["tool_input"];
     let what = ["command", "file_path", "url", "pattern", "description"].iter().find_map(|k| input[*k].as_str()).unwrap_or("");
@@ -19,7 +20,8 @@ fn tool_brief(v: &Value) -> String {
     clip(&if what.is_empty() { name.to_string() } else { format!("{name}:{what}") }, 200)
 }
 
-/// 进「在等你」;同一句已经报过就不再发事件。`kind`:choice / permission(见 [`Run::ask_kind`])
+/// Go to "needs you"; if the same question was already reported, emit no event. `kind`: choice / permission (see
+/// [`Run::ask_kind`])
 fn waiting(r: &mut Run, ask: String, kind: &str, out: &mut Events) {
     let already = r.status == "waiting" && r.ask == ask;
     r.status = "waiting".into();
@@ -34,7 +36,8 @@ fn waiting(r: &mut Run, ask: String, kind: &str, out: &mut Events) {
     }
 }
 
-/// AskUserQuestion / request_user_input 的题:记下第一题的选项(`aca answer` 按数字答),一次问好几题或者能多选的标出来
+/// An AskUserQuestion / request_user_input question: record the first question's options (`aca answer` answers by number),
+/// and flag several questions at once or multi-select
 fn choice(r: &mut Run, input: &Value) {
     let qs = input["questions"].as_array().map(Vec::as_slice).unwrap_or_default();
     let first = qs.first().unwrap_or(&Value::Null);
@@ -46,8 +49,9 @@ fn choice(r: &mut Run, input: &Value) {
     r.ask_multi = qs.len() > 1 || first["multiSelect"].as_bool() == Some(true);
 }
 
-/// Claude 的 `StopFailure`:`error` 是错误的类型,屏幕上那句原话在 `last_assistant_message`(官方文档)。
-/// 类型说得清的照类型;订阅额度用完报的也是 `rate_limit`,和真的限流分不开,再看原话
+/// Claude's `StopFailure`: `error` is the error type, and the exact words shown on screen are in `last_assistant_message`
+/// (official docs). Go by the type when it's clear; running out of subscription limits is also reported as `rate_limit`,
+/// indistinguishable from real rate limiting, so check the words too
 fn claude_kind(kind: &str, text: &str) -> Option<&'static str> {
     Some(match kind {
         "authentication_failed" | "oauth_org_not_allowed" | "account_on_hold" | "billing_error" | "cloud_credential_error" => "account",
@@ -58,14 +62,16 @@ fn claude_kind(kind: &str, text: &str) -> Option<&'static str> {
     })
 }
 
-/// 一轮失败是哪一类,看错误原文(报了类别的那家用它报的,见 Codex 的 `unreported_end`):
-/// - transient:限流、过载、断流、5xx、超时,过一会儿再说一句「继续」多半就好了
-/// - account:额度用完、没登录、欠费,得人去处理
-/// - fatal:别的(上下文爆了、请求不对、内容策略),再试也一样
+/// Which kind a failed turn is, from the raw error text (a tool that reports a kind uses the one it reports; see Codex's
+/// `unreported_end`):
+/// - transient: rate limits, overload, dropped stream, 5xx, timeouts; saying "continue" a bit later usually works
+/// - account: usage limits used up, logged out, unpaid bills; a person has to deal with it
+/// - fatal: anything else (context overflow, bad request, content policy); retrying won't change it
 pub fn error_kind(text: &str) -> &'static str {
     let t = text.to_lowercase();
     let has = |ws: &[&str]| ws.iter().any(|w| t.contains(w));
-    // 订阅额度用完:Claude 屏幕上是「You've hit your session limit · resets 2:40pm」(2.1.29x),也有 weekly、5-hour 的
+    // Subscription limits used up: Claude's screen says "You've hit your session limit · resets 2:40pm" (2.1.29x); there are
+    // weekly and 5-hour ones too
     let plan = has(&["hit your", "session limit", "weekly limit", "-hour limit", "opus limit", "out of extra usage"]);
     if plan || has(&["401", "403", "unauthorized", "authentication", "usage limit", "quota", "credit", "billing", "payment", "budget"]) {
         "account"
@@ -93,15 +99,15 @@ pub fn error_kind(text: &str) -> &'static str {
     }
 }
 
-/// 它用 AskUserQuestion / request_user_input 问你:第一题的那句就是「它问的」
+/// It asks you with AskUserQuestion / request_user_input: the first question's text is "what it asks"
 fn question(r: &mut Run, v: &Value, out: &mut Events) {
     let q = v["tool_input"]["questions"][0]["question"].as_str().unwrap_or("").to_string();
-    // 选项先记上:「在等你」的那个事件里带着它们
+    // Record the options first: the "needs you" event carries them
     choice(r, &v["tool_input"]);
     waiting(r, clip(&q, 200), "choice", out);
 }
 
-/// 一个事件 → 状态怎么变、要发哪些事件。纯函数
+/// One event → how the state changes and which events to emit. A pure function
 pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
     let s = |k: &str| v[k].as_str().unwrap_or("");
     let ev = s("hook_event_name");
@@ -122,12 +128,13 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
     if r.conv != from && !from.is_empty() {
         out.push(("conversation.changed", json!({ "conv": r.conv, "from": from })));
     }
-    // 压完(压完接着干的 SessionStart 也算)、这一轮结束、退出:不在压了。状态照下面各自的规矩走
+    // Compaction finished (including the SessionStart that carries on after it), turn ended, exited: no longer compacting.
+    // The state follows each case's own rules below
     if matches!(ev, "PostCompact" | "SessionStart" | "Stop" | "StopFailure" | "SessionEnd") {
         r.compacting = 0;
     }
     match ev {
-        // 压缩完接着干的那次 SessionStart 不是「空下来了」
+        // The SessionStart that carries on after compaction isn't "now idle"
         "SessionStart" if s("source") != "compact" => {
             r.status = "idle".into();
             r.clear_ask();
@@ -141,17 +148,18 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
             r.clear_error();
             out.push(("turn.started", json!({ "prompt": r.prompt })));
         }
-        // 只挂了问你的那个工具(Claude 的 AskUserQuestion、Codex 的 request_user_input):它在问你
+        // Only the tool that asks you is hooked (Claude's AskUserQuestion, Codex's request_user_input): it's asking you
         "PreToolUse" => question(r, v, &mut out),
         "PostToolUse" if r.status == "waiting" => {
             r.status = "running".into();
             r.clear_ask();
         }
-        // 要确认的权限模式下,AskUserQuestion 还会再报一个 PermissionRequest:屏幕上是同一道选择题,不是权限框(2.1.295 实测)
+        // In permission modes that ask, AskUserQuestion also reports a PermissionRequest: on screen it's the same choice question,
+        // not a permission prompt (tested on 2.1.295)
         "PermissionRequest" if s("tool_name") == "AskUserQuestion" => question(r, v, &mut out),
         "PermissionRequest" => waiting(r, tool_brief(v), "permission", &mut out),
         "Notification" if matches!(s("notification_type"), "permission_prompt" | "elicitation_dialog") => {
-            // 权限框通常已经由 PermissionRequest 报过,问的那句、是哪种框都留它的
+            // A permission prompt is usually already reported by PermissionRequest; keep its question and prompt kind
             let known = r.status == "waiting" && !r.ask.is_empty();
             let ask = if known { r.ask.clone() } else { clip(s("message"), 200) };
             let kind = match (known, s("notification_type")) {
@@ -173,7 +181,7 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
         "StopFailure" => {
             r.status = "error".into();
             r.done = now;
-            // 原话在 last_assistant_message 里的(Claude),error 只是类型
+            // The exact words are in last_assistant_message (Claude); error is just the type
             let said = v["last_assistant_message"].as_str().filter(|t| !t.trim().is_empty());
             let kind = v["error"].as_str().unwrap_or("");
             r.error = clip(said.or(v["error"].as_str()).or(v["message"].as_str()).unwrap_or(t!("本轮失败", "this turn failed")), 400);
@@ -184,15 +192,16 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
             };
             out.push(("turn.failed", json!({ "error": r.error, "kind": r.error_kind })));
         }
-        // 你按 Esc 打断的(Codex 会报,Claude 不报):人就在跟前,不算「跑完没看」
+        // You interrupted it with Esc (Codex reports this, Claude doesn't): you're right there, so it's not "unread"
         "Interrupt" => {
             r.status = "idle".into();
             r.clear_ask();
             out.push(("turn.interrupted", json!({})));
         }
-        // 开始压缩:状态不动(闲着自己压的那种前后都没有一轮,一直是「跑完」),只记下正在压
+        // Compaction started: the state stays (when it compacts on its own while idle there's no turn before or after, it stays
+        // "done"); just record that it's compacting
         "PreCompact" => r.compacting = now,
-        // 手动 /compact 结束时不发 Stop
+        // A manual /compact sends no Stop when it finishes
         "PostCompact" if s("trigger") == "manual" && r.status == "running" => {
             r.status = "done".into();
             r.done = now;
@@ -200,7 +209,7 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
         "SessionEnd" => {
             r.status = "ended".into();
             r.clear_ask();
-            // /clear、/resume 也发 SessionEnd,紧跟着就是新对话的 SessionStart:那不是退出
+            // /clear and /resume also send SessionEnd, followed right away by the new conversation's SessionStart: that's not exiting
             if !matches!(s("reason"), "clear" | "resume") {
                 out.push(("agent.exited", json!({ "reason": s("reason") })));
             }
@@ -246,7 +255,7 @@ mod tests {
             ["agent.waiting"]
         );
         assert_eq!((r.status.as_str(), r.ask.as_str()), ("waiting", "Bash:rm -rf build"));
-        // 紧跟着的通知说的是同一件事
+        // The notification right after is about the same thing
         assert!(
             ev(
                 &mut r,
@@ -256,14 +265,14 @@ mod tests {
             .is_empty()
         );
         assert_eq!(r.ask, "Bash:rm -rf build");
-        // 空闲提醒不算在等你
+        // An idle reminder doesn't count as waiting for you
         let mut idle = Run { status: "done".into(), ..Default::default() };
         assert!(
             ev(&mut idle, r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"waiting for your input"}"#, 3)
                 .is_empty()
         );
         assert_eq!(idle.status, "done");
-        // 它问你的问题
+        // A question it asks you
         let mut q = Run { status: "running".into(), ..Default::default() };
         ev(
             &mut q,
@@ -277,7 +286,7 @@ mod tests {
 
     #[test]
     fn what_kind_of_question_it_is_and_its_options_are_kept_for_answering() {
-        // 2.1.294 的 AskUserQuestion:选项在 questions[0].options 里,「在等你」的事件带着它们
+        // AskUserQuestion on 2.1.294: the options are in questions[0].options, and the "needs you" event carries them
         let mut r = Run { status: "running".into(), ..Default::default() };
         let pre = r#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"选 A 还是 B?","header":"测试","multiSelect":false,"options":[{"label":"A","description":"a"},{"label":"B","description":"b"}]}]}}"#;
         let out = apply(&mut r, &serde_json::from_str(pre).unwrap(), 1);
@@ -286,23 +295,23 @@ mod tests {
             ("choice", ["A".to_string(), "B".to_string()].as_slice(), false)
         );
         assert_eq!(out[0].1["options"], json!(["A", "B"]));
-        // 要确认的模式下跟着来的 PermissionRequest:还是这道选择题,也不再报一次
+        // The PermissionRequest that follows in modes that ask: still the same choice question, not reported again
         let perm = pre.replace("PreToolUse", "PermissionRequest");
         assert!(apply(&mut r, &serde_json::from_str(&perm).unwrap(), 2).is_empty());
         assert_eq!((r.ask.as_str(), r.ask_kind.as_str(), r.ask_opts.len()), ("选 A 还是 B?", "choice", 2));
-        // 回答完:一起清掉
+        // Once answered: all cleared together
         ev(&mut r, r#"{"hook_event_name":"PostToolUse","tool_name":"AskUserQuestion"}"#, 2);
         assert!(r.ask_kind.is_empty() && r.ask_opts.is_empty());
-        // 一次问两题:按一个数字答不了
+        // Two questions at once: one number can't answer them
         let two = r#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"一?","options":[{"label":"x"}]},{"question":"二?","options":[{"label":"y"}]}]}}"#;
         ev(&mut r, two, 3);
         assert!(r.ask_multi);
-        // 权限框:后面跟着的通知不改它是哪种框
+        // Permission prompt: a notification after it doesn't change which kind of prompt it is
         let mut p = Run { status: "running".into(), ..Default::default() };
         ev(&mut p, r#"{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"touch x"}}"#, 1);
         ev(&mut p, r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"needs permission"}"#, 2);
         assert_eq!((p.ask_kind.as_str(), p.ask_opts.len()), ("permission", 0));
-        // 只有通知、没有 PermissionRequest 的(MCP 要你填东西):看不出是哪种
+        // Only a notification, no PermissionRequest (an MCP server wants you to fill something in): can't tell which kind
         let mut e = Run::default();
         ev(&mut e, r#"{"hook_event_name":"Notification","notification_type":"elicitation_dialog","message":"填一下"}"#, 1);
         assert_eq!((e.status.as_str(), e.ask_kind.as_str()), ("waiting", ""));
@@ -319,13 +328,14 @@ mod tests {
             ["conversation.changed"]
         );
         assert_eq!((r.status.as_str(), r.conv.as_str(), r.convs.len()), ("idle", "c2", 2));
-        // 手动压缩结束没有 Stop
+        // A manual compaction ends without a Stop
         r.status = "running".into();
         ev(&mut r, r#"{"hook_event_name":"PreCompact","trigger":"manual","session_id":"c2"}"#, 3);
         assert_eq!((r.status.as_str(), r.compacting), ("running", 3));
         ev(&mut r, r#"{"hook_event_name":"PostCompact","trigger":"manual","session_id":"c2"}"#, 3);
         assert_eq!((r.status.as_str(), r.done, r.compacting), ("done", 3, 0));
-        // 闲着快一小时它自己压(trigger 是 auto):前后都没有一轮,一直是跑完,只是记着正在压;压完接着的 SessionStart 也清掉
+        // After nearly an hour idle it compacts on its own (trigger is auto): no turn before or after, it stays done, just recorded
+        // as compacting; the SessionStart after it clears that too
         ev(&mut r, r#"{"hook_event_name":"PreCompact","trigger":"auto","session_id":"c2"}"#, 5);
         assert_eq!((r.status.as_str(), r.compacting), ("done", 5));
         ev(&mut r, r#"{"hook_event_name":"PostCompact","trigger":"auto","session_id":"c2"}"#, 6);
@@ -340,7 +350,7 @@ mod tests {
 
     #[test]
     fn an_interrupted_turn_is_idle_not_unread() {
-        // Codex 0.159 实际发来的两条(去掉了路径)
+        // Two events Codex 0.159 actually sent (paths removed)
         let mut r = Run::default();
         ev(
             &mut r,
@@ -353,7 +363,7 @@ mod tests {
 
     #[test]
     fn codex_asks_with_request_user_input_and_reports_its_compaction_like_claude() {
-        // Codex 0.163 实际发来的(去掉了路径、id):Plan 模式里问你一道题,答完;手动 /compact
+        // What Codex 0.163 actually sent (paths and ids removed): a question to you in Plan mode, answered; a manual /compact
         let mut r = Run { status: "running".into(), ..Default::default() };
         let pre = r#"{"session_id":"01a1","hook_event_name":"PreToolUse","permission_mode":"default","tool_name":"request_user_input","tool_input":{"questions":[{"header":"Choice","id":"choice","question":"Choose option A or option B.","options":[{"label":"Option A","description":"Select option A."},{"label":"Option B","description":"Select option B."}]}]},"tool_use_id":"call_05"}"#;
         assert_eq!(ev(&mut r, pre, 1), ["agent.waiting"]);
@@ -364,7 +374,7 @@ mod tests {
         let post = r#"{"session_id":"01a1","hook_event_name":"PostToolUse","tool_name":"request_user_input","tool_response":"{\"answers\":{\"choice\":{\"answers\":[\"Option B\"]}}}"}"#;
         ev(&mut r, post, 2);
         assert_eq!((r.status.as_str(), r.ask_kind.as_str()), ("running", ""));
-        // 权限框:Bash 加一句为什么要
+        // Permission prompt: Bash with a line on why it's needed
         let perm = r#"{"session_id":"01a1","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"touch made.txt","description":"Allow creating made.txt in the current directory?"}}"#;
         assert_eq!(ev(&mut r, perm, 3), ["agent.waiting"]);
         assert_eq!((r.ask.as_str(), r.ask_kind.as_str()), ("Bash:touch made.txt", "permission"));
@@ -385,13 +395,14 @@ mod tests {
         assert_eq!(error_kind("API Error: Rate limit reached"), "transient");
         assert_eq!(error_kind("401 Unauthorized"), "account");
         assert_eq!(error_kind("prompt is too long"), "fatal");
-        // 报了类别的(Codex 那边补的)用它报的;没报的看原文
+        // One that reports a kind (filled in on the Codex side) uses it; otherwise go by the raw text
         let mut r = Run { status: "running".into(), ..Default::default() };
         let out = apply(&mut r, &json!({"hook_event_name": "StopFailure", "error": "boom", "error_kind": "transient"}), 5);
         assert_eq!((r.status.as_str(), r.error_kind.as_str(), out[0].1["kind"].as_str()), ("error", "transient", Some("transient")));
         apply(&mut r, &json!({"hook_event_name": "StopFailure", "error": "rate limit reached"}), 6);
         assert_eq!(r.error_kind, "transient");
-        // Claude:error 是类型,原话在 last_assistant_message。订阅额度用完也报 rate_limit,看原话分出来
+        // Claude: error is the type, the exact words are in last_assistant_message. Used-up subscription limits are also reported
+        // as rate_limit; the words tell them apart
         let claude = |kind: &str, said: &str| {
             let mut r = Run::default();
             apply(&mut r, &json!({"hook_event_name": "StopFailure", "error": kind, "last_assistant_message": said}), 6);
@@ -404,7 +415,7 @@ mod tests {
         assert_eq!(claude("rate_limit", "API Error: Rate limit reached").1, "transient");
         assert_eq!(claude("authentication_failed", "API Error: 401").1, "account");
         assert_eq!(claude("max_output_tokens", "API Error: output too long").1, "fatal");
-        // 下一轮开始:原文和类别一起清掉
+        // Next turn starts: raw text and kind cleared together
         apply(&mut r, &json!({"hook_event_name": "UserPromptSubmit", "prompt": "继续"}), 7);
         assert!(r.error.is_empty() && r.error_kind.is_empty());
     }
@@ -414,7 +425,7 @@ mod tests {
         let mut r = Run::default();
         ev(&mut r, r#"{"hook_event_name":"Stop","session_id":"p1","title":" 修登录 ","last_assistant_message":"好"}"#, 1);
         assert_eq!((r.hook_title.as_str(), r.status.as_str()), ("修登录", "done"));
-        // 没带就不动
+        // Not given: unchanged
         ev(&mut r, r#"{"hook_event_name":"UserPromptSubmit","session_id":"p1","prompt":"再来"}"#, 2);
         assert_eq!(r.hook_title, "修登录");
     }

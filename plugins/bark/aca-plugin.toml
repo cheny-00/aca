@@ -6,7 +6,7 @@ needs = ["curl", "jq"]
 description = "会话完成一轮、等待回应或出错时推送到手机(Bark);有人正在查看该会话时不推送"
 description_en = "Pushes to your phone (Bark) when a session finishes, waits or fails; not while someone is watching it."
 
-# 地址在 plugins.toml 里填:[plugins."aca.bark"] settings = { url = "https://api.day.app/<你的 key>" }
+# The address goes in plugins.toml: [plugins."aca.bark"] settings = { url = "https://api.day.app/<your key>" }
 
 [settings.url]
 default = ""
@@ -41,6 +41,6 @@ id = "test"
 title = "发送一条测试推送"
 title_en = "Push a test one"
 desc = "Push a test notification to check the Bark URL."
-# 诊断用的,不进 : 菜单(那里是对着高亮那一行做事的);aca plugin run aca.bark.test
+# For diagnosis, kept out of the : menu (that one acts on the highlighted row); aca plugin run aca.bark.test
 expose = ["cli"]
 command = ["sh", "push.sh", "test"]

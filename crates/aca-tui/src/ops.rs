@@ -1,6 +1,9 @@
-//! 对选中会话的操作:`R` 重启、`X` 换账号接着跑、`r` 改名、`m` 挪分组、`⇧↑` `⇧↓` 组内挪位置(分组上是挪分组的先后)、`f` / `F` 分叉、`H` 交接、`M` 挂 MCP、`d` 删除(分组上是删分组)、`A` 接管,
-//! 还有 `^Z` 撤回删掉 / 停掉的、回收站里拿回来 / 真删的,都是 aca-core 里的函数(`session::*`、登记表);`s` 发便签走 tmux。
-//! 停、删要等进程退干净(最长几秒),由 run 循环放进后台线程跑,界面不卡。
+//! Actions on the selected session: `R` restart, `X` carry on under another account, `r` rename, `m` move to another group,
+//! `⇧↑` `⇧↓` move within the group (on a group, reorder groups), `f` / `F` fork, `H` hand off, `M` attach MCP, `d` delete
+//! (on a group, delete the group), `A` adopt, plus `^Z` undoing a delete / stop and bringing back from / deleting for good in
+//! the trash; all are functions in aca-core (`session::*`, the registry). `s` sends the note through tmux.
+//! Stop and delete wait for the processes to exit cleanly (a few seconds at most), so the run loop runs them on a background
+//! thread and the interface doesn't stall.
 
 use aca_core::session;
 use aca_core::store::Store;
@@ -10,64 +13,68 @@ use crate::create::{NewReq, Removed, fzf};
 use crate::data::Agent;
 use crate::handoff::Source;
 
-/// 要操作的会话
+/// The session to act on
 #[derive(Clone, Debug, PartialEq)]
 pub struct Target {
-    /// 会话的键(登记的是 id,普通 tmux 会话是会话名)
+    /// The session's key (id for a registered one, session name for an ordinary tmux session)
     pub name: String,
     pub title: String,
     pub profile: String,
-    /// 登记的会话 id,空 = 普通 tmux 会话
+    /// Registered session id; empty = ordinary tmux session
     pub id: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Job {
-    /// force:现在不用(留着确认框那条路)
+    /// force: unused for now (kept for the confirmation path)
     Restart { t: Target, force: bool },
-    /// unlock:改完解开标题锁(`^Z` 改回一个原来没锁的标题;改名总是锁上)
+    /// unlock: unlock the title afterwards (`^Z` back to a title that wasn't locked; renaming always locks)
     Rename { t: Target, to: String, unlock: bool },
-    /// from:它现在的分组(`^Z` 挪回去用);groups:已有的分组(大小写不同也算同一个),要挪进的分组没有就建
+    /// from: its current group (for `^Z` to move it back); groups: the existing groups (differing only in case counts as the
+    /// same one); the target group is created if missing
     Move { t: Target, from: String, to: String, groups: Vec<String> },
-    /// D:停掉 agent(窗格连最后的画面留着),登记留着
+    /// D: stop the agent (the pane stays with its last screen), the registration stays
     Stop { t: Target },
-    /// 会话里另开的窗口 / 窗格上的 D:只停这一格(见 park.rs)
+    /// D on a window / pane opened inside a session: stop only that pane (see park.rs)
     Park { t: Target, p: crate::park::Pane },
-    /// ⏎ 停着的那格、^Z 撤回上面那个:在原地再启动这一格
+    /// ⏎ on such a stopped pane, ^Z undoing the above: start that pane again in place
     Respawn { t: Target, p: crate::park::Pane },
-    /// s:把便签发给它(粘进 pane 的输入框再回车);key 是便签的键,发出去就删掉
+    /// s: send it the note (pasted into the pane's input box, then Enter); key is the note's key, deleted once sent
     Send { t: Target, pane: String, text: String, key: String },
-    /// f / F:带着对话分叉出一个新会话。title 空 = 默认的「标题 (分叉)」,不锁标题(Claude 之后还能自己起);给了就锁
+    /// f / F: fork a new session carrying the conversation. Empty title = the default "<title> (fork)", unlocked (Claude can
+    /// still name it later); a given one is locked
     Fork { t: Target, title: Option<String> },
-    /// M:挂上 / 卸下项目一层的 MCP(写 dir 下的 .mcp.json),dir 是登记目录,做完收拾它
+    /// M: attach / detach project-level MCPs (writes .mcp.json under dir); dir is the registered directory, tidied up afterwards
     Mcp { t: Target, dir: String, on: Vec<String>, off: Vec<String> },
-    /// d:删会话(见 `create::remove`);pane 有 = 只关会话里另开的窗口 / 分出来的窗格
+    /// d: delete the session (see `create::remove`); with pane = only close a window opened inside the session / a split-off pane
     Remove { t: Target, pane: Option<String> },
-    /// ⇧↑ ⇧↓:组内挪到另一个会话(id 是 by)紧前面 / 紧后面(after)
+    /// ⇧↑ ⇧↓: move within the group to just before / just after (after) another session (whose id is by)
     Order { t: Target, by: String, after: bool },
-    /// 分组上 ⇧↑ ⇧↓:分组(连着子分组)挪到同级的 by 紧前面 / 紧后面。不对着哪个会话
+    /// ⇧↑ ⇧↓ on a group: move the group (with its subgroups) to just before / after its sibling by. Not aimed at any session
     GroupOrder { group: String, by: String, after: bool },
-    /// H:照 req 新建一个会话(to 是它哪家),把 from 的交接说明发过去(见 `handoff`)。
-    /// note:from 的便签带过去了,新会话建成就删(它的键)
+    /// H: create a new session per req (to is its agent), send it from's handoff note (see `handoff`).
+    /// note: from's note was carried over; delete it once the new session is created (its key)
     Handoff { t: Target, from: Box<Source>, req: NewReq, to: Agent, note: Option<String> },
-    /// X 的框里挑了一个账号:换成它,在原地重启、接着这段对话(见 `session::rehome`)。
-    /// to 是「工具:账号」,label 是菜单里那个名字
+    /// An account picked in X's box: switch to it, restart in place, resume this conversation (see `session::rehome`).
+    /// to is "tool:account", label is the name shown in the menu
     Rehome { t: Target, to: String, label: String },
-    /// A:接管一个普通 tmux 会话(不是 aca 起的),照确认框里给人看过的那份登记(见 `aca_core::adopt`)
+    /// A: adopt an ordinary tmux session (not started by aca), registering it as shown in the confirmation (see `aca_core::adopt`)
     Adopt { t: Target, plan: Box<aca_core::adopt::Plan> },
-    /// `^Z`:撤销停掉的(再启动)
+    /// `^Z`: undo a stop (start it again)
     Revive { t: Target },
-    /// 回收站里的一条拿回来(`b` 那一页 ⏎、`^Z` 撤删除,见 trash.rs);start:这些会话再启动(^Z 撤的,删之前在跑)。不对着哪个会话
+    /// Bring an entry back from the trash (⏎ on the `b` page, `^Z` undoing a delete, see trash.rs); start: these sessions start
+    /// again (undone with ^Z, they were running before the delete). Not aimed at any session
     Restore { item: Box<crate::trash::Item>, start: Vec<String> },
-    /// 回收站里的一条现在就真删(`b` 那一页 d y)。不对着哪个会话
+    /// Delete a trash entry for good now (d y on the `b` page). Not aimed at any session
     Purge { item: Box<crate::trash::Item> },
-    /// 建分组、删分组、改分组(见 groups.rs)。不对着哪个会话
+    /// Create, delete, edit a group (see groups.rs). Not aimed at any session
     Group(crate::groups::Act),
-    /// 远端任务:测一下 server(见 hooks.rs)。不对着哪个会话
-    /// L 那一页:装 / 更新 / 删 / 开停一个插件(见 plugins.rs)。不对着哪个会话
+    /// Remote tasks: test the server (see hooks.rs). Not aimed at any session
+    /// The L page: install / update / remove / enable or disable a plugin (see plugins.rs). Not aimed at any session
     Plugins(crate::plugins::Act),
-    /// v 多选后一起做的:同一种活对着几个会话(删、停、重启、挪分组,^Z 撤回它们的再启动、挪回去),
-    /// 或者回收站里的几条(恢复、真删),见 `many`。不对着哪个会话
+    /// Done together after selecting several with v: the same job on several sessions (delete, stop, restart, move group; ^Z
+    /// undoing them starts them again / moves them back), or on several trash entries (restore, delete for good), see `many`.
+    /// Not aimed at any session
     Many(Vec<Job>),
 }
 
@@ -75,28 +82,28 @@ pub enum Job {
 pub enum Outcome {
     Done(String),
     Failed(String),
-    /// 新建出来一个会话(分叉、交接):高亮跟过去。id 是它的会话 id
+    /// A new session was created (fork, handoff): the highlight follows. id is its session id
     Made {
         msg: String,
         id: String,
     },
-    /// 交接:新会话建好了,说明没发出去,留在它的便签里(note)
+    /// Handoff: the new session is created but the handoff note wasn't sent; it's left in its note (note)
     Handed {
         msg: String,
         id: String,
         note: String,
     },
-    /// d 删的会话 / 分组进了回收站(见 trash.rs):界面记下这一条,^Z 能撤回
+    /// A session / group deleted with d went to the trash (see trash.rs): the interface records this entry so ^Z can undo it
     Binned {
         msg: String,
         item: Box<crate::trash::Item>,
     },
-    /// `Job::Many`:各个的结果,和它的活一一对应(删除的不走这里,并成一条 `Binned`)
+    /// `Job::Many`: each one's outcome, matching its jobs one to one (deletes don't come here; they merge into one `Binned`)
     Many(Vec<Outcome>),
 }
 
 impl Job {
-    /// 对着的会话;挪分组的先后没有
+    /// The session it's aimed at; reordering groups has none
     pub fn target(&self) -> Option<&Target> {
         Some(match self {
             Job::Restart { t, .. }
@@ -120,7 +127,7 @@ impl Job {
         })
     }
 
-    /// 跑的时候底栏显示的
+    /// What the bottom bar shows while it runs
     pub fn doing(&self) -> String {
         match self {
             Job::Restart { t, .. } => tr!("正在重启「{}」…", "restarting “{}”…", short(&t.title)),
@@ -163,7 +170,8 @@ impl Job {
     }
 }
 
-/// 几个会话合起来怎么称呼:一个是「标题」,几个是「第一个」等 n 个。前面不用空一格(「已删除{}」)
+/// What to call several sessions together: one is "<title>", several are "<first>" and n-1 more. In Chinese no space goes
+/// before it (「已删除{}」 (deleted {}))
 pub fn named(first: &str, n: usize) -> String {
     let more = n.saturating_sub(1);
     match n {
@@ -172,7 +180,7 @@ pub fn named(first: &str, n: usize) -> String {
     }
 }
 
-/// `Job::Many` 做完底栏说的:做成了几个,没成的说第一个为什么
+/// What the bottom bar says when `Job::Many` is done: how many worked, and why the first failed one didn't
 pub fn many_msg(jobs: &[Job], outs: &[Outcome]) -> String {
     let ok = outs.iter().filter(|o| matches!(o, Outcome::Done(_))).count();
     let bad: Vec<&str> = outs.iter().filter_map(|o| if let Outcome::Failed(e) = o { Some(e.as_str()) } else { None }).collect();
@@ -229,7 +237,7 @@ pub fn run(job: &Job) -> Outcome {
             Err(e) => Outcome::Failed(tr!("改名失败:{e}", "rename failed: {e}")),
         },
         Job::Move { t, to, groups, .. } => {
-            // 大小写不同也算同一个:挪进已有的那个
+            // Differing only in case counts as the same: move into the existing one
             let (path, made) = match groups.iter().find(|g| g.eq_ignore_ascii_case(to)) {
                 Some(g) => (g.clone(), false),
                 None => (to.clone(), true),
@@ -266,7 +274,8 @@ pub fn run(job: &Job) -> Outcome {
         },
         Job::Mcp { dir, on, off, .. } => crate::mcp::apply(dir, on, off),
         Job::Remove { t, pane } => {
-            // 关的是窗格(会话还在)还是删会话:英文的动词变形不一样,整句分开写
+            // Closing a pane (the session stays) or deleting the session: the English verbs inflect differently, so the
+            // sentences are written separately
             let close = pane.is_some();
             match crate::create::remove(t, pane.as_deref()) {
                 Ok(Removed::Archived { was, group }) => {
@@ -297,7 +306,7 @@ pub fn run(job: &Job) -> Outcome {
             Err(e) => Outcome::Failed(tr!("换账号失败:{e}", "switching accounts failed: {e}")),
         },
         Job::Adopt { plan, .. } => match aca_core::adopt::apply(&store, plan) {
-            // 进程没动过,还没带 aca 的 hook:重启一次才有「跑完没看」
+            // The process was left alone and doesn't carry aca's hooks yet: only a restart gives it unread (finished, not seen)
             Ok((s, _)) => Outcome::Made {
                 msg: tr!(
                     "已接管「{}」 · R 重启后才能识别任务完成",
@@ -326,8 +335,10 @@ pub fn run(job: &Job) -> Outcome {
     }
 }
 
-/// v 多选的一批:各做各的、一起等(停、删要等进程退干净,一个个来要等好几轮);挪分组一个接一个(要新建的分组只建一次),
-/// 回收站里的几条也一个接一个(恢复要建回分组、排先后,一起写会写乱)。删除的并成回收站里的一条,^Z 一起回来
+/// A batch selected with v: each does its own, all waited on together (stop and delete wait for processes to exit cleanly; one
+/// by one would take several rounds); moves go one after another (a group to be created is created once), trash entries one
+/// after another too (restoring recreates groups and their order; writing together would garble it). Deletes merge into one
+/// trash entry and ^Z brings them back together
 fn many(jobs: &[Job]) -> Outcome {
     if !jobs.is_empty() && jobs.iter().all(|j| matches!(j, Job::Remove { pane: None, .. })) {
         return remove_many(jobs);
@@ -341,7 +352,8 @@ fn many(jobs: &[Job]) -> Outcome {
     }))
 }
 
-/// 一起删的几个会话:各自归档(一起等进程退干净),删掉了的记成回收站里的一条;没删掉的照实说,还在列表里
+/// Several sessions deleted together: each archived (waiting together for processes to exit cleanly), the deleted ones recorded
+/// as one trash entry; the ones not deleted are reported as such and stay in the list
 fn remove_many(jobs: &[Job]) -> Outcome {
     let ts: Vec<&Target> = jobs.iter().filter_map(Job::target).collect();
     let got: Vec<Result<Removed, String>> = std::thread::scope(|sc| {
@@ -375,8 +387,9 @@ fn remove_many(jobs: &[Job]) -> Outcome {
     Outcome::Binned { msg, item: Box::new(item) }
 }
 
-/// 回收站里的一条拿回来:照记的建回分组(同名的期间又建了就进它,不改它的设置),取消归档(删之前就归档着的不动),
-/// start 里的再启动。期间在别处真删掉的跳过,照实说
+/// Bring a trash entry back: recreate the groups as recorded (if one of the same name was created meanwhile, go into it without
+/// changing its settings), unarchive (ones already archived before the delete stay so), start the ones in start again. Ones
+/// deleted for good elsewhere meanwhile are skipped and reported
 fn restore(store: &Store, item: &crate::trash::Item, start: &[String]) -> Outcome {
     let had: Vec<String> = store.groups().unwrap_or_default().into_iter().map(|g| g.path).collect();
     for g in &item.groups {
@@ -387,7 +400,7 @@ fn restore(store: &Store, item: &crate::trash::Item, start: &[String]) -> Outcom
             return Outcome::Failed(tr!("恢复失败:{e}", "restore failed: {e}"));
         }
         let _ = store.group_order(&g.path, g.order);
-        // 目录期间成了别的组的默认目录:不抢
+        // If the directory became another group's default meanwhile: don't take it
         if !g.dir.is_empty() {
             let _ = store.group_set_dir(&g.path, &g.dir);
         }
@@ -398,7 +411,7 @@ fn restore(store: &Store, item: &crate::trash::Item, start: &[String]) -> Outcom
             lost += 1;
             continue;
         }
-        // 单删的会话:它的组期间删掉了,建回来(不然排不上位置)
+        // A session deleted on its own: if its group was deleted meanwhile, recreate it (otherwise it has no place to go)
         if !s.group.is_empty() && !had.contains(&s.group) && !item.groups.iter().any(|g| g.path == s.group) {
             let _ = store.group_create(&s.group, "");
         }
@@ -418,23 +431,23 @@ fn restore(store: &Store, item: &crate::trash::Item, start: &[String]) -> Outcom
         (true, _) | (false, 0) => tr!("已恢复{what}", "restored {what}"),
         (false, n) => tr!("已恢复{what} · {n} 个会话", "restored {what} · {n} sessions"),
     };
-    // 分组、一起删的几个:有的期间真删了,照实说
+    // A group, or several deleted together: some were deleted for good meanwhile; say so
     if lost > 0 && (!item.group.is_empty() || item.sessions.len() > 1) {
         msg += &tr!(" · {lost} 个已被永久删除", " · {lost} already gone for good");
     }
-    // 登记已经回来了,只是没起来:算恢复了(再撤一次也还是起不来),照实说
+    // The registration is back, it just didn't start: counts as restored (undoing again wouldn't start it either); say so
     if let Some(e) = cold.first() {
         msg += &tr!(" · 启动失败:{e}", " · didn't start: {e}");
     }
     Outcome::Done(msg)
 }
 
-/// 把 ids 按给的先后重新编号(1、2、3…):组内顺序、分组的先后都是这么记的
+/// Renumber ids in the given order (1, 2, 3...): order within a group and the order of groups are both kept this way
 fn renumber(ids: &[String], set: impl Fn(&str, i64) -> Result<(), String>) -> Result<(), String> {
     ids.iter().enumerate().try_for_each(|(i, id)| set(id, i as i64 + 1))
 }
 
-/// `me` 挪到 `by` 紧前面 / 紧后面之后的先后;两个里有一个不在里面 = None
+/// The order after moving `me` to just before / after `by`; either one missing = None
 fn moved(mut v: Vec<String>, me: &str, by: &str, after: bool) -> Option<Vec<String>> {
     let at = v.iter().position(|x| x == me)?;
     let x = v.remove(at);
@@ -443,7 +456,8 @@ fn moved(mut v: Vec<String>, me: &str, by: &str, after: bool) -> Option<Vec<Stri
     Some(v)
 }
 
-/// ⇧↑ ⇧↓:挪到 by 紧前面 / 紧后面,这一组整个重新编号(归档的也算在里面,保持相对位置)。做成了不说话,列表已经挪好了
+/// ⇧↑ ⇧↓: move to just before / after by and renumber the whole group (archived ones included, keeping their relative places).
+/// Says nothing on success: the list has already moved
 fn order(store: &Store, t: &Target, by: &str, after: bool) -> Outcome {
     let run = || -> Result<(), String> {
         let (me, it) = (store.get(&t.id)?, store.get(by)?);
@@ -462,8 +476,9 @@ fn order(store: &Store, t: &Target, by: &str, after: bool) -> Outcome {
     }
 }
 
-/// 分组上 ⇧↑ ⇧↓:挪到同级的 by 紧前面 / 紧后面,子分组跟着走(子分组排在哪只看上级)。
-/// 同级的整个重新编号;别的层级的编号不动(它们只和自己的同级比)。做成了不说话
+/// ⇧↑ ⇧↓ on a group: move to just before / after its sibling by; subgroups follow (where a subgroup sits depends only on its
+/// parent). All siblings are renumbered; other levels keep their numbers (they only compare with their own siblings). Says
+/// nothing on success
 fn group_order(store: &Store, group: &str, by: &str, after: bool) -> Outcome {
     let Some(sibs) = crate::data::group_siblings(group) else {
         return Outcome::Failed(tr!("移动分组失败:分组 {group} 不存在", "moving group failed: no group {group}"));
@@ -480,26 +495,29 @@ fn group_order(store: &Store, group: &str, by: &str, after: bool) -> Outcome {
     }
 }
 
-/// 手打的分组名规整一下:两头的 / 和空白去掉,空白换成 -(分组名要能在命令行里直接打),空的一级去掉。什么都不剩 = None
+/// Tidy a typed group name: trim / and whitespace at both ends, whitespace becomes - (a group name must be typeable as is on
+/// the command line), empty levels go. Nothing left = None
 pub fn clean_group(name: &str) -> Option<String> {
     let parts: Vec<String> =
         name.split('/').map(|p| p.split_whitespace().collect::<Vec<_>>().join("-")).filter(|p| !p.is_empty()).collect();
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-/// `m` 列表里的一个分组
+/// A group in the `m` list
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupRow {
     pub group: String,
-    /// 这个组在哪干活:记着的默认目录,没记就是组里会话最多的那个目录;都没有 = 空
+    /// Where this group works: its recorded default directory, else the directory most of its sessions are in; neither = empty
     pub dir: String,
-    /// 和要挪的会话是同一个目录
+    /// Same directory as the session being moved
     pub same: bool,
 }
 
-/// `m`:用 fzf 挑要挪进的分组。挪只换分组,会话还在原来的目录跑,所以每行带上那个组的目录,对不上的一眼看得出。
-/// 只按分组名搜(打个新名字不会被别的组的目录匹配走),输入的名字一个都匹配不上时回车 = 用这个名字新建。
-/// what:挪的是谁(见 `named`);here:它的目录(多选挪的几个不在同一个目录 = 空)
+/// `m`: pick the group to move into with fzf. Moving changes only the group, the session keeps running in its directory, so
+/// each row carries that group's directory and a mismatch shows at a glance.
+/// Searches group names only (a typed new name won't get matched by another group's directory); when the typed name matches
+/// nothing, Enter = create a group with that name.
+/// what: what is being moved (see `named`); here: its directory (empty when the several being moved aren't in one directory)
 pub fn pick_group(rows: &[GroupRow], what: &str, here: &str) -> Result<Option<String>, String> {
     let header = if here.is_empty() {
         tr!("--header=移动{what}", "--header=move {what}")
@@ -523,7 +541,8 @@ pub fn pick_group(rows: &[GroupRow], what: &str, here: &str) -> Result<Option<St
     fzf(&group_lines(rows), &args)
 }
 
-/// 每行三个字段,用 Tab 分开:分组名(选中后输出)、显示的名字(补到一样宽,后面的 Tab 才对得齐)、目录
+/// Three fields per line, Tab-separated: the group name (printed when selected), the displayed name (padded to one width so
+/// the Tab after it lines up), the directory
 fn group_lines(rows: &[GroupRow]) -> Vec<String> {
     use unicode_width::UnicodeWidthStr;
     let w = rows.iter().map(|r| r.group.width()).max().unwrap_or(0);
@@ -581,7 +600,7 @@ mod tests {
             [
                 "fun/aca\t\x1b[1mfun/aca\x1b[0m  \t\x1b[32m/x/aca  同目录\x1b[0m",
                 "w\t\x1b[1mw\x1b[0m        \t\x1b[2m/x/w\x1b[0m",
-                // 中文占两格,补的空格少一个
+                // A Chinese character takes two columns: one space less padding
                 "空\t\x1b[1m空\x1b[0m       \t",
             ]
         );
@@ -595,7 +614,7 @@ mod tests {
         assert_eq!(moved(v("a b S c d"), "S", "a", false).unwrap(), v("S a b c d"));
         assert_eq!(moved(v("a b S c d"), "S", "c", true).unwrap(), v("a b c S d"));
         assert_eq!(moved(v("a b S c d"), "S", "d", true).unwrap(), v("a b c d S"));
-        // 已经在那了:不变
+        // Already there: unchanged
         assert_eq!(moved(v("a b S c d"), "S", "b", true).unwrap(), v("a b S c d"));
         assert_eq!(moved(v("a b S c d"), "S", "c", false).unwrap(), v("a b S c d"));
         assert!(moved(v("a b"), "x", "a", false).is_none());
@@ -622,7 +641,7 @@ mod tests {
         assert_eq!(order(&store, &t, "a", false), Outcome::Done(String::new()));
         let got: Vec<(String, i64)> = ["c", "a", "b", "x"].iter().map(|id| (id.to_string(), store.get(id).unwrap().order)).collect();
         assert_eq!(got, [("c".to_string(), 1), ("a".to_string(), 2), ("b".to_string(), 3), ("x".to_string(), 1)]);
-        // 不在同一组:不挪
+        // Not in the same group: no move
         assert_eq!(order(&store, &t, "x", false), Outcome::Failed("移动失败:已不在同一分组".into()));
     }
 }

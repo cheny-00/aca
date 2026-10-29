@@ -1,4 +1,5 @@
-//! 界面:会话列表 + 高亮会话的实时画面预览。每 2 秒后台刷新,attach 时让出终端,detach 回来接着显示。
+//! The interface: session list + live screen preview of the highlighted session. Refreshes in the background every 2 s; gives up the
+//! terminal on attach and resumes drawing after detach.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::stdout;
@@ -50,75 +51,82 @@ use crate::trash::Trash;
 use crate::undo::{self, Undo};
 use crate::workdir::Where;
 
-/// 「近几天」可选的天数,`*` 按这个顺序轮换(到头绕回来;全部归 `a`)。默认一天
+/// Day counts offered for "recent days"; `*` cycles through them in this order (wraps around at the end; all is `a`). One day by default
 pub const DAYS: [u64; 3] = [1, 3, 7];
 
 const REFRESH: Duration = Duration::from_secs(2);
-/// 底栏那句话留多久
+/// How long the bottom bar's message stays
 const FLASH: Duration = Duration::from_secs(3);
-/// 上次的界面怎么没的、后台出了错:开界面那一下人可能还没看过来,留久一点
+/// How the last interface went away, background errors: right when the interface opens you may not be looking yet, so keep it longer
 const NOTICE: Duration = Duration::from_secs(12);
-/// 多久照 `[idle]` 看一次:stop_after 停闲着的,remove_after 删停了很久的;界面刚开时先等 IDLE_FIRST(见 `idle_watch`)
+/// How often to apply `[idle]`: stop_after stops idle ones, remove_after removes long-stopped ones; a freshly opened interface first waits
+/// IDLE_FIRST (see `idle_watch`)
 const IDLE_EVERY: Duration = Duration::from_secs(300);
 const IDLE_FIRST: Duration = Duration::from_secs(30);
-/// 多久看一眼事件流的文件变没变(一次 stat);变了就不等 REFRESH,马上重读
+/// How often to check whether the event stream file changed (one stat); if it did, reload right away instead of waiting for REFRESH
 const EVENT_TICK: Duration = Duration::from_millis(150);
-/// 事件触发的刷新最密隔这么久
+/// Event-triggered refreshes are at least this far apart
 const EVENT_GAP: Duration = Duration::from_millis(400);
-/// d 删掉的,做完后再藏这么久:删之前开始的那次后台刷新可能晚到,别让它又冒出来一下
+/// Ones removed with d stay hidden this long after it's done: a background refresh started before the removal may arrive late; don't let
+/// them flash back
 const GONE_LINGER: Duration = Duration::from_secs(5);
-/// 连按数字的间隔超过这个就重新开始(按 1 再按 2 = 12 号)
+/// Digits typed further apart than this start over (1 then 2 = number 12)
 const DIGIT_GAP: Duration = Duration::from_millis(1200);
-/// 启动后这段时间内的按键一律丢掉:Moshi 连上后代敲命令就发生在这时,而人不可能这么快操作。
-/// 自己按键打开的不用(见 startup_quiet)
+/// Keys within this time after startup are all dropped: that's when Moshi types commands on your behalf after connecting, and no human
+/// acts this fast. Not when opened by your own keypress (see startup_quiet)
 const STARTUP_QUIET: Duration = Duration::from_millis(800);
-/// 从会话退回来后这么久的按键丢掉:退出那一下连按的键、终端的回话还在路上。再长就吞掉紧跟着按的键了
+/// Keys within this long after coming back from a session are dropped: keys pressed in a burst when leaving, and the terminal's replies,
+/// are still in flight. Any longer would swallow keys pressed right after
 const BACK_QUIET: Duration = Duration::from_millis(100);
-/// 计费面板开着时多久重读一次(每次都是读完全部记录,一两秒)
+/// How often to reread while the billing panel is open (each time reads all the records, a second or two)
 const BILL_EVERY: Duration = Duration::from_secs(300);
-/// 预览顶上的改动统计、x 看的改动(高亮那个仓库的 git):高亮没换、它也没新动静时最多隔这么久再数一次(别处改了文件也能看到)
+/// The diff stats atop the preview and the diff x shows (the git of the highlighted repo): when the highlight hasn't changed and it has no
+/// new activity, recount at most this often (so changes made elsewhere show up too)
 const GLANCE_EVERY: Duration = Duration::from_secs(30);
-/// 丢掉一段自动输入后再静默这么久:命令和结尾的回车可能分两次到,回车单独到达会被当成「进入」
+/// Stay quiet this long after dropping a burst of automatic input: a command and its trailing Enter may arrive separately, and an Enter
+/// arriving on its own would be taken as "enter"
 const BURST_QUIET: Duration = Duration::from_millis(500);
-/// 连着快速挪高亮(手机上滑动、按住方向键,两下之间不到这么久)时预览先不换,停下来这么久再换。
-/// 每挪一格就换一次预览的话,屏幕变化是只挪高亮的三倍(实测 ~800 对 ~270 字节),mosh 传不过来,画面跟不上手指
+/// While the highlight moves fast (swiping on a phone, holding an arrow key: less than this between two moves), don't switch the preview
+/// yet; switch once it has stopped this long. Switching the preview at every step changes three times as much screen as moving the
+/// highlight alone (measured ~800 vs ~270 bytes); mosh can't carry that, and the picture lags behind the finger
 const SETTLE: Duration = Duration::from_millis(180);
-/// 挪完这么久之内,后台刷新来的新数据先攒着、视图也先不存:滑动途中不插进一次整屏重画
+/// Within this long after a move, new data from background refreshes is held and the view isn't saved yet: no full-screen redraw mid-swipe
 const HOLD: Duration = Duration::from_millis(600);
-/// 看完回来后这么多秒内的输出不算「有新动静」(detach 时可能重画一下)
+/// Output within this many seconds after coming back from viewing doesn't count as "new activity" (detach may redraw once)
 pub(crate) const SEEN_SLACK: u64 = 3;
 
-/// 列多久以内的会话。「开着的」(`w`)是叠在上面的另一层(见 `App::open`)
+/// How far back sessions are listed. "Open ones" (`w`) is another layer on top (see `App::open`)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Scope {
-    /// 近几天内动过的(默认一天,`*` 换天数)
+    /// Active within recent days (one by default, `*` changes the number of days)
     Recent,
     All,
 }
 
-/// 让了位的那个(见 `App::yielded`)
+/// The one that yielded (see `App::yielded`)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Yielded {
-    /// 挑着的 ^ / %:按 w 进了「开着的」
+    /// The ^ / % that was picked: w was pressed, entering "open ones"
     Stopped(Pick),
-    /// 「开着的」:在里面挑了 ^ / %
+    /// "Open ones": ^ / % was picked inside it
     Open,
 }
 
-/// 只看某种状态(`!` `@` `#` `&` `^`,键同 agent-deck;`%` 是 aca 自己的):和分组、范围叠加,搜索时不管。不存,关掉就没了
+/// Show only one state (`!` `@` `#` `&` `^`, same keys as agent-deck; `%` is aca's own): stacks with group and range, ignored while
+/// searching. Not saved; gone once turned off
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pick {
-    /// ● 在跑
+    /// ● running
     Run,
-    /// ◐ 在等你:待确认、未读都算
+    /// ◐ waiting for you: awaiting confirmation and unread both count
     Wait,
-    /// ○ 空闲
+    /// ○ idle
     Idle,
-    /// ✕ 出错:会话还开着、卡在出错上的(要你动手)
+    /// ✕ error: the session is still open, stuck on an error (needs you to act)
     Err,
-    /// ■ 没在跑:已退出、停掉的、关掉的、归档的;没在跑的出错(✕,多半是关掉的)也算。☾ 也在里面
+    /// ■ not running: exited, stopped, closed, archived; errors that aren't running (✕, mostly closed ones) count too. ☾ is included
     Off,
-    /// ☾ 闲着被 aca 自动停的(`[idle] stop_after`)
+    /// ☾ idle, auto-stopped by aca (`[idle] stop_after`)
     Reaped,
 }
 
@@ -130,7 +138,7 @@ impl Pick {
         }
     }
 
-    /// 光看状态就认得出的那几种;☾ 还要看是不是闲着被停的,这里不算
+    /// The ones recognizable from the state alone; ☾ also needs to know whether it was stopped for being idle, so not here
     fn covers(self, st: State) -> bool {
         match self {
             Pick::Run => st == State::Running,
@@ -142,12 +150,12 @@ impl Pick {
         }
     }
 
-    /// 停着的那两种:「开着的」里没有
+    /// The two stopped kinds: "open ones" has none
     fn stopped(self) -> bool {
         matches!(self, Pick::Off | Pick::Reaped)
     }
 
-    /// 键和列表空了时的那句(「没有运行中的 · ! 返回」)
+    /// The key, and the line shown when the list is empty ("nothing running · ! back")
     fn label(self) -> (char, &'static str) {
         match self {
             Pick::Run => ('!', t!("暂无运行中的会话", "nothing running")),
@@ -160,20 +168,21 @@ impl Pick {
     }
 }
 
-/// `F` 的小单里的顺序(同顶栏右边计数的顺序)
+/// Order in `F`'s small list (same as the counts on the right of the top bar)
 const PICKS: [Pick; 6] = [Pick::Run, Pick::Wait, Pick::Idle, Pick::Err, Pick::Off, Pick::Reaped];
 
-/// 布局(预览放哪)。宽屏(桌面)和窄屏(手机)各记各的,`v` 只在当前这类屏幕放得下的几种里轮换:
-/// 宽屏 右侧预览 → 下方预览 → 只看列表;窄屏 分屏 → 预览为主 → 只看列表
+/// Layout (where the preview goes). Wide screens (desktop) and narrow ones (phone) remember theirs separately; `v` cycles only through
+/// the ones that fit the current kind of screen:
+/// wide: preview right → preview below → list only; narrow: split → mostly preview → list only
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Preview {
-    /// 默认:宽屏放右边,窄屏上下分屏
+    /// Default: on the right on wide screens, split top/bottom on narrow ones
     Auto,
-    /// 宽屏放下面
+    /// Below, on wide screens
     Below,
-    /// 窄屏「预览为主」:列表只留高亮附近几行,其余都给预览
+    /// Narrow screens' "mostly preview": the list keeps only a few rows around the highlight, the rest goes to the preview
     Focus,
-    /// 只看列表(底下一行写着高亮的那个在干什么)
+    /// List only (a line at the bottom says what the highlighted one is doing)
     Off,
 }
 
@@ -184,11 +193,11 @@ enum Side {
     Focus,
 }
 
-/// 这么宽算宽屏:预览放右边(列表 40 列 + 预览 60 列)。窄于这个是手机(竖屏 / 横屏)
+/// This wide counts as a wide screen: preview on the right (list 40 columns + preview 60). Narrower is a phone (portrait / landscape)
 const AUTO_RIGHT_W: u16 = 100;
-/// 放下面至少要这么高
+/// Below needs at least this height
 const BELOW_MIN_H: u16 = 16;
-/// 「预览为主」时列表只留这么几行
+/// Rows the list keeps in "mostly preview"
 const FOCUS_ROWS: u16 = 4;
 
 fn narrow(w: u16) -> bool {
@@ -205,7 +214,7 @@ fn preview_side(mode: Preview, w: u16, h: u16) -> Option<Side> {
     }
 }
 
-/// 这类屏幕上 `L` 轮换的几种布局,按顺序
+/// The layouts `L` cycles through on this kind of screen, in order
 fn layouts(narrow: bool) -> [(Preview, &'static str); 3] {
     if narrow {
         [
@@ -222,18 +231,18 @@ fn layouts(narrow: bool) -> [(Preview, &'static str); 3] {
     }
 }
 
-/// 开着的(w):没在跑的(^)以外都算
+/// Open ones (w): everything except not running (^)
 fn open(s: &Session) -> bool {
     !Pick::Off.covers(s.state)
 }
 
-/// 闲着被 aca 停掉的(☾,`[idle] stop_after`);停了之后又起来、人又停一次的不算
+/// Stopped by aca for being idle (☾, `[idle] stop_after`); not if it came back up afterwards and you stopped it again
 fn reaped(s: &Session) -> bool {
     s.idle_stopped > 0 && matches!(s.state, State::Dead | State::Stopped)
 }
 
-/// 采集给的状态,叠上界面自己记的已读 / 未读(见 reads.rs):
-/// 看过之后没再出输出的不算未读;按 u 标成未读的,闲着也算
+/// The state from collection, overlaid with the read / unread the interface keeps itself (see reads.rs):
+/// not unread if it has had no output since you looked; marked unread with u counts even when idle
 fn read_state(s: &Session, reads: &Reads) -> State {
     if s.sub.is_some() {
         return s.state;
@@ -246,7 +255,7 @@ fn read_state(s: &Session, reads: &Reads) -> State {
     }
 }
 
-/// 在等你:要你审批 / 选择(`!`),或者跑完了等你下一句(`●`)。出错的不算
+/// Waiting for you: wants your approval / choice (`!`), or finished and waiting for your next message (`●`). Errors don't count
 fn waiting(s: &Session) -> bool {
     matches!(s.state, State::Ask | State::Unread)
 }
@@ -255,20 +264,21 @@ fn epoch() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// 次要的字。不用终端的 DIM:浅底上淡到看不清(见 theme.rs)
+/// Secondary text. Not the terminal's DIM: it fades to unreadable on a light background (see theme.rs)
 pub fn dim() -> Style {
     theme::minor()
 }
 
-/// 按键提示里「键」的样式:粗体,说明是暗的,一眼扫到键
+/// Style of the "key" in key hints: bold, the description dim, so the keys catch the eye
 pub fn key_style() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
 
-/// 按键提示之间的分隔
+/// Separator between key hints
 const SEP: &str = " • ";
 
-/// 一串「键 说明」,用 • 隔开,从前往后排到 room 宽为止(越往后越不常用,放不下的就不放);返回片段和占了多宽
+/// A run of "key description" items separated by •, laid out front to back until room is used up (later ones are less common; what
+/// doesn't fit is left out); returns the spans and the width taken
 fn key_spans(items: &[(&str, &str)], room: usize) -> (Vec<Span<'static>>, usize) {
     let mut spans = vec![];
     let mut used = 0;
@@ -287,16 +297,16 @@ fn key_spans(items: &[(&str, &str)], room: usize) -> (Vec<Span<'static>>, usize)
     (spans, used)
 }
 
-/// 底栏的一项:键、说明、放不下时丢的先后(大的先丢,0 = 不丢)
+/// One bottom bar item: key, description, drop order when it doesn't fit (higher drops first, 0 = never)
 type MenuItem<'a> = (&'a str, &'a str, u8);
 
-/// 底栏:几组按键,组内用 • 隔开、组间用 │;第 action 组是主操作,用强调色。整行居中。
-/// 放不下时按优先级从低到高丢,直到放得下
+/// Bottom bar: several groups of keys, • within a group, │ between groups; group number action is the main action, in the accent color.
+/// The whole line is centered. When it doesn't fit, drop by priority from low to high until it does
 fn menu_bar(groups: &[Vec<MenuItem>], action: Option<usize>, w: usize) -> Line<'static> {
     menu_bar_in(groups, action, w, theme::pal().accent)
 }
 
-/// 同 `menu_bar`,主操作那组用 main 这个颜色(多选时是绿的)
+/// Same as `menu_bar`, with the main action's group in color main (green in multi-select)
 fn menu_bar_in(groups: &[Vec<MenuItem>], action: Option<usize>, w: usize, main: Color) -> Line<'static> {
     let gap = if w >= 60 { "  │  " } else { " │ " };
     let mut keep: Vec<Vec<MenuItem>> = groups.to_vec();
@@ -337,9 +347,11 @@ fn menu_bar_in(groups: &[Vec<MenuItem>], action: Option<usize>, w: usize, main: 
     Line::from(spans).centered()
 }
 
-/// 状态图标:● 在跑、◆ 要你答(屏幕上在问你)、◐ 没看(跑完了等你下一句)、○ 空闲、✕ 出错、■ 停了。
-/// 要你答和没看用两个字形(agent-deck 两个都是 ◐,只靠红黄分),单色终端、色弱也分得开
-/// 颜色见 theme.rs;有颜色的都加粗,灰的不加(字形本身就和别的不一样)
+/// State icons: ● running, ◆ needs you (the screen is asking you), ◐ unread (finished, waiting for your next message), ○ idle,
+/// ✕ error, ■ stopped.
+/// Needs you and unread get two glyphs (agent-deck uses ◐ for both, told apart only by red vs yellow), so monochrome terminals
+/// and color-blind users can tell them apart.
+/// Colors are in theme.rs; colored ones are bold, gray ones aren't (the glyph alone already differs from the rest)
 pub fn icon(s: State) -> (&'static str, Style) {
     let p = theme::pal();
     let bold = |c| Style::new().fg(c).add_modifier(Modifier::BOLD);
@@ -349,13 +361,13 @@ pub fn icon(s: State) -> (&'static str, Style) {
         State::Unread => ("◐", bold(p.amber)),
         State::Idle => ("○", Style::new().fg(p.muted)),
         State::Error => ("✕", bold(p.red)),
-        // 没在跑的出错:红,不加粗 —— 不算开着的,别抢在跑的出错的眼
+        // An error that isn't running: red, not bold — it doesn't count as open; don't steal the eye from errors that are running
         State::Crashed => ("✕", Style::new().fg(p.red)),
         State::Exited | State::Stopped | State::Dead => ("■", Style::new().fg(p.muted)),
     }
 }
 
-/// 一个会话的图标:闲着被 aca 停掉的画 ☾(灰的,和 ■ 一样不抢眼;`[idle] stop_after`),别的照状态
+/// One session's icon: ☾ if aca stopped it for being idle (gray, unobtrusive like ■; `[idle] stop_after`), otherwise by state
 pub fn session_icon(s: &Session) -> (&'static str, Style) {
     if reaped(s) {
         return (aca_core::status::IDLE_STOPPED, Style::new().fg(theme::pal().muted));
@@ -363,7 +375,8 @@ pub fn session_icon(s: &Session) -> (&'static str, Style) {
     icon(s.state)
 }
 
-/// 子代理那一行的图标:在跑和会话一个样;跑完的打勾(会话没有这个),出错、被停的照会话的画
+/// Icon of a subagent row: running looks the same as a session; finished gets a check mark (sessions have none), errored and stopped
+/// ones are drawn like a session's
 fn agent_icon(p: Phase) -> (&'static str, Style) {
     let pal = theme::pal();
     match p {
@@ -374,12 +387,13 @@ fn agent_icon(p: Phase) -> (&'static str, Style) {
     }
 }
 
-/// 子代理那一行的键:「会话的键 \u{2} 子代理 id」(窗格行是 \u{1})
+/// Key of a subagent row: "session key \u{2} subagent id" (pane rows use \u{1})
 const AGENT_SEP: char = '\u{2}';
 
-/// 会话 parent 派出去的第 k 个子代理拼成一行(`l` 展开才有,见 `App::lay_agents`)。它没有窗格、不是会话:
-/// `sub` 记着它挂在谁下面(于是不算会话、跟着那一家进出、`h` 回得去),别的照父会话的抄(分组、工作区、置顶跟着走);
-/// 最后一列两个数都填它跑了多久 —— 在跑的是跑到现在,跑完的是一共用了多久
+/// The k-th subagent sent out by session parent, made into a row (only there after `l` unfolds, see `App::lay_agents`). It has no pane
+/// and isn't a session: `sub` records whom it hangs under (so it doesn't count as a session, comes and goes with that family, and `h`
+/// gets back); the rest is copied from the parent session (group, workspace, pinned follow it);
+/// both numbers in the last column hold how long it has run — up to now if running, the total if finished
 fn agent_row(parent: &Session, k: usize, a: &Subagent) -> Session {
     let secs = (a.dur.max(0) / 1000) as u64;
     Session {
@@ -408,7 +422,7 @@ fn agent_row(parent: &Session, k: usize, a: &Subagent) -> Session {
     }
 }
 
-/// 账号名的颜色:Claude 橙、Codex 蓝(见 theme.rs)
+/// Color of the account name: Claude orange, Codex blue (see theme.rs)
 pub fn agent_style(a: Agent) -> Style {
     match a {
         Agent::Claude => Style::new().fg(theme::pal().claude),
@@ -420,10 +434,10 @@ pub fn agent_style(a: Agent) -> Style {
     }
 }
 
-/// 列表里账号那一列最多这么宽,再长截断
+/// The account column in the list is at most this wide; longer gets cut
 const WHO_MAX: usize = 8;
 
-/// 按显示宽度截断并补齐(中文占两格)
+/// Cut and pad to a display width (Chinese takes two cells)
 pub fn clip(s: &str, w: usize) -> String {
     if s.width() <= w {
         return format!("{s}{}", " ".repeat(w - s.width()));
@@ -440,7 +454,7 @@ pub fn clip(s: &str, w: usize) -> String {
     format!("{out}…{}", " ".repeat(w.saturating_sub(1 + n)))
 }
 
-/// 从左边截(路径留住最后几级:…/fun/app),不补齐
+/// Cut from the left (a path keeps its last few levels: …/fun/app), no padding
 fn clip_left(s: &str, w: usize) -> String {
     if s.width() <= w {
         return s.to_string();
@@ -457,19 +471,19 @@ fn clip_left(s: &str, w: usize) -> String {
     format!("…{}", tail.into_iter().rev().collect::<String>())
 }
 
-/// 列表里的一项:会话(可见列表里第几个)或分区标题(pos = None)
+/// One list item: a session (its index in the visible list) or a section header (pos = None)
 pub struct Row {
     pub pos: Option<usize>,
-    /// 展开的分组标题:组里第一个会话在可见列表里第几个(高亮能停在标题上,见 `App::head`)
+    /// Unfolded group header: index in the visible list of the group's first session (the highlight can stop on headers, see `App::head`)
     pub head: Option<usize>,
     pub lines: Vec<Vec<(String, Style)>>,
 }
 
-/// 跳转模式的提示字母,和 agent-deck 一样(Vimium 默认,主键区)
+/// Hint letters for jump mode, same as agent-deck (Vimium's default, home row)
 const HINT_CHARS: &str = "sadfjklewcmpgh";
 
-/// n 行各自的提示,照搬 agent-deck(Vimium)的算法:尽量一个字母,13 行以内全是单字母;
-/// 两个字母的插在单字母中间。同样的行数给出和 agent-deck 一模一样的提示
+/// Hints for n rows, copying agent-deck's (Vimium's) algorithm: one letter where possible, all single letters up to 13 rows;
+/// two-letter ones are inserted among the single letters. The same row count gives exactly agent-deck's hints
 fn jump_hints(n: usize) -> Vec<String> {
     if n == 0 {
         return vec![];
@@ -486,15 +500,16 @@ fn jump_hints(n: usize) -> Vec<String> {
     r.into_iter().map(|s| s.chars().rev().collect()).collect()
 }
 
-/// 高亮能停的地方(跳转、j / k 都按这个走):会话(可见列表第几个),或展开的分组标题(记组里第一个会话)
+/// Where the highlight can stop (jumps and j / k all go by this): a session (index in the visible list), or an unfolded group header
+/// (recorded as the group's first session)
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Jump {
     Row(usize),
     Head(usize),
 }
 
-/// 跳转目标,按屏幕上从上到下排:分区时展开的分组标题排在它的会话前面。
-/// 置顶块的标题不算;折叠行本来就是一项(跳过去是展开)
+/// Jump targets, ordered top to bottom as on screen: in sections, an unfolded group header comes before its sessions.
+/// The pinned block's header doesn't count; a fold row is an item anyway (jumping to it unfolds)
 fn jump_targets(view: &[&Session], sections: bool, folds: &Folds) -> Vec<Jump> {
     let mut v = vec![];
     let mut cur = None;
@@ -505,7 +520,7 @@ fn jump_targets(view: &[&Session], sections: bool, folds: &Folds) -> Vec<Jump> {
                 v.push(Jump::Head(pos));
             }
         }
-        // 空分组只有标题(折起来的是折叠行)
+        // An empty group has only its header (a folded one has the fold row)
         if !s.blank || folds.contains_key(&s.group) {
             v.push(Jump::Row(pos));
         }
@@ -514,9 +529,9 @@ fn jump_targets(view: &[&Session], sections: bool, folds: &Folds) -> Vec<Jump> {
 }
 
 enum HintMatch {
-    /// 唯一对上第几行
+    /// Matches exactly one row
     Hit(usize),
-    /// 还是某个提示的开头,等下一个字母
+    /// Still the start of some hint; wait for the next letter
     Prefix,
     Miss,
 }
@@ -530,16 +545,19 @@ fn match_hint(hints: &[String], typed: &str) -> HintMatch {
     }
 }
 
-/// 折叠的分区在列表里只剩一行(由该区第一个会话占位):分组 → (折起来几个, 其中几个在问你)
+/// A folded section is a single row in the list (held by the section's first session):
+/// group → (how many folded, how many of them asking you)
 pub type Folds = HashMap<String, (usize, usize)>;
 
-/// 列表够宽才写编号(手机上省下这 3 格给标题;数字照样能按,跳转也有提示字母)
+/// Numbers are written only if the list is this wide (on a phone those 3 cells go to the title; digits still work, and jumps have hint
+/// letters)
 const NUM_MIN_W: usize = 56;
 
-/// 整个列表。分区时每个分组前插一行标题(置顶的在最上面,标题「★ 置顶」);一个会话一行,在问你的下面跟一行它问的。
-/// desk = 桌面:总写编号,组和组之间空一行(目录、分支在预览头上,列表里不写)。
-/// 跳转模式(jump = 已经按了的字母)下,对得上的会话把编号换成提示,分组标题的 ▾ 前面也写上。
-/// TUI 和 `aca -l` 共用,保证两边长得一样。
+/// The whole list. In sections, each group gets a header row first (pinned ones at the very top, header 「★ 置顶」 ("★ Pinned"));
+/// one row per session, and one asking you gets a row below with what it asks.
+/// desk = desktop: always write numbers, a blank line between groups (directory and branch are in the preview header, not in the list).
+/// In jump mode (jump = letters already typed), matching sessions show the hint in place of the number, and so does the ▾ of group headers.
+/// Shared by the TUI and `aca -l`, so both look the same.
 pub fn list_rows(view: &[&Session], sections: bool, width: usize, jump: Option<&str>, folds: &Folds, who_w: usize, desk: bool) -> Vec<Row> {
     let mut rows = vec![];
     let mut counts: HashMap<&str, usize> = HashMap::new();
@@ -548,7 +566,7 @@ pub fn list_rows(view: &[&Session], sections: bool, width: usize, jump: Option<&
     }
     let nums = desk || width >= NUM_MIN_W;
     let trees = tree_marks(view, sections);
-    // 桌面上标题那一栏按最长的标题定宽,账号和时间紧跟着,不被推到列表最右边
+    // On the desktop the title column is as wide as the longest title, with account and time right after it, not pushed to the far right
     let now = epoch();
     let fit = if desk {
         view.iter()
@@ -561,7 +579,7 @@ pub fn list_rows(view: &[&Session], sections: bool, width: usize, jump: Option<&
     } else {
         usize::MAX
     };
-    // 子代理那些行不编号:它们来来去去,编了号别的会话的号跟着跳
+    // Subagent rows get no number: they come and go, and numbering them would make other sessions' numbers jump
     let mut n = 0;
     let numbers: Vec<Option<usize>> = view
         .iter()
@@ -619,21 +637,23 @@ pub fn list_rows(view: &[&Session], sections: bool, width: usize, jump: Option<&
     rows
 }
 
-/// 分区的键:置顶块一段,别的按分组
+/// Section key: the pinned block is one section, the rest go by group
 fn section_key(s: &Session) -> (bool, &str) {
     (s.pinned, if s.pinned { "" } else { s.group.as_str() })
 }
 
-/// 树枝最多画这么多层(一层两格),再深的和这一层并排着画:窄屏上标题不至于被挤没
+/// Tree branches are drawn at most this many levels deep (two cells each); deeper ones are drawn level with this one: titles on narrow
+/// screens don't get squeezed out
 const TREE_DEEP: usize = 4;
 
-/// 每行图标前的树枝和它续行(它问的那句)上的竖线,像 tree 命令那样连起来:
-/// 0 层 = 顶格的会话;会话的窗口 / 子代理 / 子会话比它深一层(「├ 」「└ 」),前面带着上面各层的「│ 」。几层都一样,最多画 TREE_DEEP 层。
-/// 父会话就在上面那一串里才挂上去(父会话被过滤掉 / 在置顶块里时顶格)
+/// The branch before each row's icon and the vertical bar on its continuation line (what it asks), joined like the tree command:
+/// level 0 = a top-level session; a session's windows / subagents / child sessions are one level deeper ("├ " "└ "), preceded by "│ " for
+/// each level above. Any depth works the same, drawn up to TREE_DEEP levels.
+/// Hung under the parent session only if the parent is in that chain above (top level if the parent is filtered out / in the pinned block)
 fn tree_marks(view: &[&Session], sections: bool) -> Vec<(String, String)> {
     let mut levels = Vec::with_capacity(view.len());
     let mut secs = Vec::with_capacity(view.len());
-    // 上一行所在的那一串:从顶格的会话一层层到它所在的会话
+    // The chain the previous row is in: from the top-level session down, level by level, to its own session
     let mut chain: Vec<&str> = vec![];
     let (mut cur, mut sec): (Option<(bool, &str)>, usize) = (None, 0);
     for s in view {
@@ -644,14 +664,14 @@ fn tree_marks(view: &[&Session], sections: bool) -> Vec<(String, String)> {
         }
         let at = |n: &str| chain.iter().rposition(|c| *c == n);
         let lvl = match &s.sub {
-            // 会话:父会话在这一串里就挂在它下面,不在就顶格
+            // A session: hangs under its parent if the parent is in this chain, otherwise top level
             None => {
                 let lvl = s.under().and_then(at).map_or(0, |p| p + 1);
                 chain.truncate(lvl);
                 chain.push(&s.name);
                 lvl
             }
-            // 窗口 / 子代理:比自己的会话深一层
+            // A window / subagent: one level deeper than its session
             Some(x) => {
                 let lvl = at(&x.parent).map_or(1, |p| p + 1);
                 chain.truncate(lvl);
@@ -661,10 +681,10 @@ fn tree_marks(view: &[&Session], sections: bool) -> Vec<(String, String)> {
         levels.push(lvl.min(TREE_DEEP));
         secs.push(sec);
     }
-    // pos 后面、回到更浅的一层之前,还有没有 lvl 层的(有就画 ├,没有就 └)
+    // After pos, before going back to a shallower level, is there another one at level lvl (if so draw ├, otherwise └)
     let more =
         |pos: usize, lvl: usize| (pos + 1..view.len()).take_while(|&j| secs[j] == secs[pos] && levels[j] >= lvl).any(|j| levels[j] == lvl);
-    // 下一行挂在它下面
+    // The next row hangs under it
     let kids = |pos: usize| pos + 1 < view.len() && secs[pos + 1] == secs[pos] && levels[pos + 1] > levels[pos];
     let bar = |on: bool| if on { "│ " } else { "  " };
     let fork = |on: bool| if on { "├ " } else { "└ " };
@@ -672,7 +692,7 @@ fn tree_marks(view: &[&Session], sections: bool) -> Vec<(String, String)> {
         .map(|pos| match levels[pos] {
             0 => (String::new(), bar(kids(pos)).to_string()),
             lvl => {
-                // 上面各层的竖线:那一层后面还有兄弟才画
+                // Vertical bars for the levels above: only where that level has more siblings after it
                 let ups: String = (1..lvl).map(|l| bar(more(pos, l))).collect();
                 let on = more(pos, lvl);
                 (format!("{ups}{}", fork(on)), format!("{ups}{}{}", bar(on), bar(kids(pos))))
@@ -681,12 +701,12 @@ fn tree_marks(view: &[&Session], sections: bool) -> Vec<(String, String)> {
         .collect()
 }
 
-/// 分区标题上分组名的样式:粗体,不上色(颜色留给状态)
+/// Style of the group name in section headers: bold, uncolored (color is kept for states)
 fn group_style() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
 
-/// 折起来的分区:" ▸ work  3 ◆1 ✎",和展开的标题一个样子、只是 ▾ 换成 ▸;可以选中,回车 / o 展开
+/// A folded section: " ▸ work  3 ◆1 ✎", same as an unfolded header except ▾ becomes ▸; selectable, Enter / o unfolds
 fn folded_line(group: &str, n: usize, asks: usize, noted: bool, width: usize, hint: Option<Vec<(String, Style)>>) -> Vec<(String, Style)> {
     let mut v = hint.unwrap_or_else(|| vec![(" ".into(), Style::new())]);
     let count = format!("  {n}");
@@ -697,12 +717,12 @@ fn folded_line(group: &str, n: usize, asks: usize, noted: bool, width: usize, hi
     v
 }
 
-/// 分组标题、折叠行最后的 ✎:这个组有便签
+/// The ✎ at the end of group headers and fold rows: the group has a note
 fn note_mark(noted: bool) -> (String, Style) {
     (if noted { " ✎" } else { "" }.into(), theme::warn())
 }
 
-/// 提示字母:已经按了的灰底,还要按的黄底(同 agent-deck),补够两格
+/// Hint letters: already typed on gray, still to type on yellow (as in agent-deck), padded to two cells
 fn hint_badge(hint: &str, typed: &str) -> Vec<(String, Style)> {
     let p = theme::pal();
     let badge = |bg| Style::new().fg(p.on_hint).bg(bg).add_modifier(Modifier::BOLD);
@@ -716,9 +736,10 @@ fn hint_badge(hint: &str, typed: &str) -> Vec<(String, Style)> {
     v
 }
 
-/// 分区标题上的名字:普通 tmux 会话的分组记成 "-"
-/// 会话在哪个工作区:自己分过的 → 子会话跟父会话(父会话也没分过就再往上,几层都一样)→ 跟最上面那个的组 → 1。窗口跟着自己的会话。
-/// mine = false 不看它自己分过的,就是「不记的话会在哪」
+/// Name in the section header: a plain tmux session's group is recorded as "-"
+/// Which workspace a session is in: its own assignment → a child session follows its parent (if the parent has none either, keep going
+/// up, any depth) → the topmost one's group → 1. Windows follow their own session.
+/// mine = false ignores its own assignment, i.e. "where it would be if not recorded"
 fn space_of(all: &[Session], sp: &Spaces, s: &Session, mine: bool) -> char {
     let head = |n: &str| all.iter().find(|x| x.sub.is_none() && x.name == n);
     let mut s = head(s.family()).unwrap_or(s);
@@ -735,8 +756,10 @@ fn space_of(all: &[Session], sp: &Spaces, s: &Session, mine: bool) -> char {
     sp.group_of(&s.profile, &s.group).unwrap_or(spaces::HOME)
 }
 
-/// 分组列表里每组按哪个字母:组名(最后一级优先)里第一个还没被占的字母,没有就按跳转的字母表顺着给;
-/// q 留着关列表,空格是全部分组。组的顺序不变,字母就不变,按熟了不用看
+/// Which letter each group gets in the group list: the first not-yet-taken letter of the group name (last level first), else the next one
+/// in the jump alphabet;
+/// q is kept for closing the list, space is all groups. As long as the group order doesn't change, neither do the letters; once learned,
+/// no need to look
 fn group_keys(groups: &[String]) -> Vec<char> {
     let mut used = vec!['q'];
     groups
@@ -766,7 +789,8 @@ pub(crate) fn group_label(group: &str) -> &str {
     }
 }
 
-/// " ▾ 分组名  4":这一区有几个跟在名字后面,组有便签再跟个 ✎。跳转模式下提示字母写在 ▾ 前面(同折叠行)
+/// " ▾ group name  4": the section's count follows the name, then a ✎ if the group has a note. In jump mode the hint letters go before ▾
+/// (as on fold rows)
 fn section_line(group: &str, n: usize, noted: bool, width: usize, hint: Option<Vec<(String, Style)>>) -> Vec<(String, Style)> {
     let mut v = match hint {
         Some(h) => [h, vec![("▾ ".into(), theme::faint())]].concat(),
@@ -779,15 +803,16 @@ fn section_line(group: &str, n: usize, noted: bool, width: usize, hint: Option<V
     v
 }
 
-/// 置顶那一块的标题
+/// Header of the pinned block
 fn pinned_line() -> Vec<(String, Style)> {
     vec![(" ★ ".into(), theme::warn()), (t!("置顶", "Pinned").into(), group_style())]
 }
 
-/// 一个会话:(文字, 样式) 片段,一行;在问你的下面再挂一行它问的,和标题对齐。lead = 行首的编号 / 缩进(或跳转提示)
-/// `who_w`:账号列宽,0 = 不显示(一个登记的会话都没有时)
-/// `tree` / `cont`:图标前的树枝、续行上的竖线(见 tree_marks)
-/// `fit`:标题栏最多这么宽(连树枝、窗口号),usize::MAX = 占满
+/// One session: (text, style) spans, one row; one asking you gets another row below with what it asks, aligned with the title.
+/// lead = the number / indent at the start of the row (or the jump hint)
+/// `who_w`: account column width, 0 = not shown (when there isn't a single registered session)
+/// `tree` / `cont`: the branch before the icon, the vertical bar on the continuation line (see tree_marks)
+/// `fit`: the title column is at most this wide (branch and window number included), usize::MAX = take it all
 fn row_segments(
     lead: Vec<(String, Style)>,
     s: &Session,
@@ -799,7 +824,7 @@ fn row_segments(
 ) -> Vec<Vec<(String, Style)>> {
     let lead_w: usize = lead.iter().map(|(t, _)| t.width()).sum();
     let (ic, ic_style) = s.subagent.as_ref().map_or_else(|| session_icon(s), |a| agent_icon(a.phase));
-    // 子代理那一行:不是会话,没有便签、账号,字写灰的
+    // A subagent row: not a session, no note or account, text in gray
     let own = s.subagent.is_none();
     let flags: String = [(s.noted, '✎'), (s.attached, '⇄')].iter().filter(|f| f.0 && own).map(|f| f.1).collect();
     let flag_style = if s.noted { theme::warn() } else { dim() };
@@ -811,7 +836,8 @@ fn row_segments(
     let loc = row_loc(s);
     let badge = agents_badge(s);
     let due = due_badge(s, epoch());
-    // 至少 8 格只管屏幕太窄;按最长标题定的宽度不再各行各自撑开,不然窗口号长的那行时间会错开
+    // The minimum of 8 cells only matters on very narrow screens; the width set by the longest title isn't stretched per row any more,
+    // or else the row with a long window number would have its time out of line
     let title_w =
         width.saturating_sub(lead_w + pre.width() + 2 + tail_w + loc.width()).max(8).min(fit.saturating_sub(pre.width() + loc.width()));
     let mut first = lead;
@@ -819,7 +845,8 @@ fn row_segments(
         first.push((pre.into(), theme::faint()));
     }
     first.extend([(ic.to_string(), ic_style), (" ".into(), Style::new()), (loc, dim())]);
-    // 标题后面紧跟三样:子代理的 +N(绿)、定时的 ◷(强调色)、插件挂的字(灰);标题先占,至少留它三分之二
+    // Three things follow the title: a subagent +N (green), scheduled ◷ (accent color), plugin text (gray); the title comes first,
+    // keeping at least two thirds
     let marks = marks(s);
     let tail = badge.width() + due.width() + marks.width();
     if tail == 0 {
@@ -829,14 +856,14 @@ fn row_segments(
         let shown = clip(&s.title, tw).trim_end().to_string();
         let room = title_w.saturating_sub(shown.width());
         let badge = clip(&badge, room).trim_end().to_string();
-        // 放不下整个「◷ 08:57」就只留 ◷:截一半的时间会看错
+        // If the whole "◷ 08:57" doesn't fit, keep only ◷: a half-cut time would be misread
         let left = room.saturating_sub(badge.width());
         let due = match due.width() {
             w if w <= left => due,
             _ if left >= 2 => format!(" {DUE}"),
             _ => String::new(),
         };
-        // 插件的字补满这一栏(没有就是空格),后面的时间才对得齐
+        // Plugin text fills this column (spaces if none), so the times after it line up
         let marks = clip(&marks, room.saturating_sub(badge.width() + due.width()));
         first.extend([
             (shown, if own { Style::new() } else { dim() }),
@@ -857,7 +884,7 @@ fn row_segments(
         let q = clip(&s.question, width.saturating_sub(lead_w + cont.width() + 1)).trim_end().to_string();
         lines.push(vec![(" ".repeat(lead_w), Style::new()), (cont.into(), theme::faint()), (q, Style::new().fg(theme::pal().red))]);
     }
-    // 额度用完 / 没登录停下的:原话,后面写能干什么
+    // Stopped for running out of quota / not being logged in: the original message, followed by what you can do
     if can_rehome(s) {
         let hint = t!("  X 换账号", "  X switch account");
         let room = width.saturating_sub(lead_w + cont.width() + 1 + hint.width());
@@ -872,7 +899,8 @@ fn row_segments(
     lines
 }
 
-/// 因为账号(额度用完、没登录、欠费)停下的登记的 Claude / Codex 会话:换个账号就能接着跑(`X`)
+/// A registered Claude / Codex session stopped because of its account (out of quota, not logged in, unpaid): switching accounts lets it
+/// carry on (`X`)
 fn can_rehome(s: &Session) -> bool {
     s.state == State::Error
         && s.error_kind == "account"
@@ -881,7 +909,8 @@ fn can_rehome(s: &Session) -> bool {
         && matches!(s.agent, Agent::Claude | Agent::Codex)
 }
 
-/// 标题前面那一小段:窗口 / 窗格写 tmux 的编号(#2 / #2.1);子代理没有编号,是别的子代理再起的写个 ↳
+/// The short bit before the title: windows / panes get their tmux number (#2 / #2.1); subagents have no number, one started by another
+/// subagent gets a ↳
 fn row_loc(s: &Session) -> String {
     match (&s.subagent, &s.sub) {
         (Some(a), _) if a.depth > 0 => format!("{}↳ ", "  ".repeat(a.depth as usize - 1)),
@@ -890,7 +919,8 @@ fn row_loc(s: &Session) -> String {
     }
 }
 
-/// 会话那行标题后面的「 +2」:它派出去的子代理有几个还在跑(没有在跑的不写;`l` 展开看是哪几个)
+/// The " +2" after a session's title: how many of the subagents it sent out are still running (nothing if none are; unfold with `l` to
+/// see which)
 fn agents_badge(s: &Session) -> String {
     match s.subagents.iter().filter(|a| a.running()).count() {
         0 => String::new(),
@@ -898,7 +928,8 @@ fn agents_badge(s: &Session) -> String {
     }
 }
 
-/// 标题后面的 ◷:它给自己定了还没到点的(见 `Session::due`),写最先到点的那个几点;几样的再写 +N
+/// The ◷ after the title: things it scheduled for itself that aren't due yet (see `Session::due`), with the time of the earliest one;
+/// +N if there are several
 fn due_badge(s: &Session, now: u64) -> String {
     let Some(first) = s.due.first() else { return String::new() };
     let when = first.next.map_or_else(|| t!("定时", "scheduled").to_string(), |t| local_when(t, now));
@@ -906,20 +937,19 @@ fn due_badge(s: &Session, now: u64) -> String {
     format!(" {DUE} {when}{more}")
 }
 
-/// 给自己定了还没到点的(列表的标题后面、预览里、图例)
+/// Scheduled for itself and not due yet (after the title in the list, in the preview, in the legend)
 const DUE: &str = "◷";
 
-/// 本地时间:今天的写「08:57」,别的日子写「10/16 08:57」
+/// Local time: today's as "08:57", other days as "10/16 08:57"
 fn local_when(t: u64, now: u64) -> String {
-    let (a, b) = (aca_core::schedule::local(t), aca_core::schedule::local(now));
-    let hm = format!("{:02}:{:02}", a.h, a.mi);
-    if (a.y, a.m, a.d) == (b.y, b.m, b.d) { hm } else { format!("{}/{} {hm}", a.m, a.d) }
+    aca_core::schedule::clock(t, now)
 }
 
-/// 预览里一样一行:哪种、cron、下次几点、到点交给它的那句话
+/// One line each in the preview: kind, cron, next time, the message handed to it when it's due
 fn due_line(d: &aca_core::schedule::Due, now: u64) -> String {
     let when = d.next.map_or_else(|| t!("无法识别时间", "time unknown").to_string(), |t| local_when(t, now));
     let what = match (d.cron.is_empty(), d.recurring) {
+        _ if d.inbox => tr!("定时消息 {when}", "scheduled message at {when}"),
         (true, _) => tr!("/loop 下一次 {when}", "/loop next at {when}"),
         (false, true) => tr!("循环定时 {} · 下次 {when}", "recurring {} · next {when}", d.cron),
         (false, false) => tr!("一次性定时 {} · {when}", "one-shot {} · at {when}", d.cron),
@@ -928,8 +958,8 @@ fn due_line(d: &aca_core::schedule::Due, now: u64) -> String {
     if prompt.is_empty() { format!("{DUE} {what}") } else { format!("{DUE} {what} · {prompt}") }
 }
 
-/// 标题后面灰色的字:分叉出来的先写「 分自 X」,再是插件挂的(`aca meta set`):" [pr #12] [ci ✓]"。
-/// 标题里已经带着原会话的名字(默认起的「X (分叉)」)就不再写一遍
+/// Gray text after the title: a fork first gets " fork of X", then what plugins attach (`aca meta set`): " [pr #12] [ci ✓]".
+/// Not repeated if the title already contains the original session's name (the default 「X (分叉)」 ("X (fork)"))
 fn marks(s: &Session) -> String {
     let fork = match &s.fork {
         Fork::Of(t) if s.sub.is_none() && !s.title.contains(t.as_str()) => tr!(" 分叉自 {t}", " fork of {t}"),
@@ -938,12 +968,12 @@ fn marks(s: &Session) -> String {
     s.tokens.iter().fold(fork, |out, (k, v)| out + " " + &mark(k, v))
 }
 
-/// worktree 会话的分支(info 里的 Branch 那一行)
+/// A worktree session's branch (the Branch line in info)
 fn branch_of(s: &Session) -> Option<&str> {
     s.info.lines().find_map(|l| l.strip_prefix("Branch: ")).filter(|b| !b.is_empty())
 }
 
-/// 预览画哪个会话:高亮的那个;正滑动时先停在上一个画的(见 SETTLE)
+/// Which session the preview draws: the highlighted one; while swiping, stay on the last one drawn (see SETTLE)
 fn preview_name(app: &mut App) -> Option<String> {
     let cur = app.current().map(|s| s.name.clone());
     let keep = app.sliding() && app.shown.as_ref().is_some_and(|n| app.all.iter().any(|s| &s.name == n));
@@ -953,12 +983,12 @@ fn preview_name(app: &mut App) -> Option<String> {
     app.shown.clone()
 }
 
-/// 多久以前:刚刚 / 5 分钟前
+/// How long ago: just now / 5 min ago
 fn ago(sec: u64) -> String {
     if sec == 0 { t!("刚刚", "just now").into() } else { tr!("{}前", "{} ago", crate::data::dur(sec)) }
 }
 
-/// 状态写成字:要你答 / 在跑 · 12 分钟 / 没看 · 5 分钟前 …
+/// State in words: needs you / running · 12 min / unread · 5 min ago …
 fn state_word(s: &Session) -> String {
     if let Some(a) = &s.subagent {
         let took = crate::data::dur((a.dur.max(0) / 1000) as u64);
@@ -986,7 +1016,7 @@ fn state_word(s: &Session) -> String {
     }
 }
 
-/// 未提交的改动:「  3 个文件 +12 −4」;干净的不写
+/// Uncommitted changes: 「  3 个文件 +12 −4」 ("  3 files +12 −4"); nothing when clean
 fn stat_spans(r: &diff::Stat) -> Vec<(String, Style)> {
     if r.files == 0 {
         return vec![];
@@ -1002,7 +1032,7 @@ fn stat_spans(r: &diff::Stat) -> Vec<(String, Style)> {
     v
 }
 
-/// 片段依次排进一行,超过 w 的截掉
+/// Spans laid one after another into a line, cut beyond w
 fn fit_line(pieces: Vec<(String, Style)>, w: usize) -> Line<'static> {
     let (mut v, mut used) = (vec![], 0);
     for (t, st) in pieces {
@@ -1016,12 +1046,14 @@ fn fit_line(pieces: Vec<(String, Style)>, w: usize) -> Line<'static> {
     Line::from(v)
 }
 
-/// 目录里的东西最宽排这么多格一栏(再长的截)
+/// Directory entries get columns at most this many cells wide (longer ones are cut)
 const LS_COL: usize = 28;
 
-/// 高亮停在分组上时的预览:组的路径、分支、改动;路径借的是哪个会话的(组没设默认路径时);组的便签;再空一行,目录里有什么
-/// (子目录在前、带 /,排成几栏;放不下的只数个数,点开头的不列)。g 还没读回来时只有路径和便签。
-/// 便签比目录要紧:平时也能占到预览的一半,写的时候同会话的
+/// Preview when the highlight is on a group: the group's path, branch, changes; which session the path is borrowed from (when the group
+/// has no default path); the group's note; then a blank line and what's in the directory
+/// (subdirectories first, with /, laid out in columns; what doesn't fit is only counted, dotfiles aren't listed). Before g is read back,
+/// only the path and note.
+/// The note matters more than the directory: it can take up to half the preview even when not editing; while editing, same as a session's
 fn group_pane(sp: &Spot, g: Option<&Glance>, note: Option<&str>, editing: bool, w: usize, h: usize) -> Vec<Line<'static>> {
     let repo = g.and_then(|g| g.repo.as_ref());
     let mut tail: Vec<(String, Style)> = vec![];
@@ -1031,7 +1063,7 @@ fn group_pane(sp: &Spot, g: Option<&Glance>, note: Option<&str>, editing: bool, 
         }
         tail.extend(stat_spans(r));
     }
-    // 放得下分支和改动,路径就用剩下的地方,从左边截
+    // Once the branch and changes fit, the path gets the remaining room, cut from the left
     let room = w.saturating_sub(tail.iter().map(|(t, _)| t.width()).sum::<usize>());
     let dir = create::tilde(&sp.dir);
     let dir = if room >= 8 { clip_left(&dir, room) } else { dir };
@@ -1059,7 +1091,7 @@ fn group_pane(sp: &Spot, g: Option<&Glance>, note: Option<&str>, editing: bool, 
     }
     let cw = items.iter().map(|(t, _)| t.width()).max().unwrap_or(1).min(LS_COL) + 2;
     let cols = (w / cw).max(1);
-    // 最后一行留给「还有几个」
+    // The last line is kept for "how many more"
     let room = h.saturating_sub(out.len());
     let need = items.len().div_ceil(cols);
     let rows = if need <= room { need } else { room.saturating_sub(1) };
@@ -1074,13 +1106,14 @@ fn group_pane(sp: &Spot, g: Option<&Glance>, note: Option<&str>, editing: bool, 
     out
 }
 
-/// 分组的便签(预览里上面已经有 used 行):写的时候和平时都最多到预览的一半
+/// The group's note (the preview already has used rows above it): up to half the preview, both while editing and otherwise
 fn group_note(text: &str, editing: bool, w: usize, h: usize, used: usize) -> Vec<Line<'static>> {
     let room = (h / 2).saturating_sub(used);
     note_lines(text, editing, w, room, room.saturating_sub(1).max(3))
 }
 
-/// 预览顶上第二行:它派出去的子代理几个在跑、几个完了,后面跟着这时候能按的键(收着写 l 展开,展开了写 h 收起)。没派的 = None
+/// The preview's second line from the top: how many of the subagents it sent out are running and how many finished, followed by the keys
+/// that work right now (folded: l unfolds; unfolded: h folds). None if it sent none
 fn agents_line(s: &Session, open: bool, w: usize) -> Option<Line<'static>> {
     if s.subagent.is_some() || s.subagents.is_empty() {
         return None;
@@ -1097,11 +1130,14 @@ fn agents_line(s: &Session, open: bool, w: usize) -> Option<Line<'static>> {
     Some(Line::styled(clip(&text, w).trim_end().to_string(), dim()))
 }
 
-/// 预览顶上几行:状态(照图标的颜色)、改动、目录、分支;便签;再空一行接屏幕内容。
-/// 便签只在写了的时候占地方(最多三行,多的写还有几行);正在写的时候整段显示,带光标,最多占预览的一半(屏幕内容总要露出来)
-/// g:后台读好的真正干活的目录、分支、未提交的改动(见 `diff::glance`),还没读到时用登记的目录和分支
+/// The preview's top lines: state (in the icon's color), changes, directory, branch; the note; then a blank line before the screen content.
+/// The note only takes room when written (at most three lines, the rest summed up as how many more lines); while editing it's shown whole,
+/// with a cursor, taking at most half the preview (the screen content must always show)
+/// g: the directory it really works in, branch, uncommitted changes, read in the background (see `diff::glance`); until read, use the
+/// registered directory and branch
 fn preview_head(s: &Session, g: Option<&Glance>, note: Option<&str>, editing: bool, w: usize, h: usize) -> Vec<Line<'static>> {
-    // 子代理那一行:状态和用了几个工具;第二行说它是谁派的、怎么细看。它没有目录、改动、便签
+    // A subagent row: state and how many tools it used; the second line says who sent it and how to look closer. It has no directory,
+    // changes or note
     if let (Some(a), Some(x)) = (&s.subagent, &s.sub) {
         let (n, steps) = (a.tools, noun(a.tools as u64, "step", "steps"));
         let steps = if n == 0 { String::new() } else { tr!("   {n} 步", "   {n} {steps}") };
@@ -1121,14 +1157,14 @@ fn preview_head(s: &Session, g: Option<&Glance>, note: Option<&str>, editing: bo
     let dir = create::tilde(g.map(|g| g.work.dir.as_str()).filter(|d| !d.is_empty()).unwrap_or(&s.dir));
     let repo = g.and_then(|g| g.repo.as_ref());
     let branch = repo.map(|r| r.branch.clone()).filter(|b| !b.is_empty()).or_else(|| branch_of(s).map(String::from));
-    // 改动统计紧跟状态(窄了也留得住),目录在它后面
+    // The diff stats follow the state right away (so they survive when narrow), the directory after them
     let stats = repo.map(stat_spans).unwrap_or_default();
     let mut tail: Vec<(String, Style)> = vec![];
     if let Some(b) = branch {
         tail.push((format!("  {b}"), dim()));
     }
     let width = |v: &[(String, Style)]| v.iter().map(|(t, _)| t.width()).sum::<usize>();
-    // 放得下别的,目录就用剩下的地方,从左边截(最后一级最有用:…/app)
+    // Once the rest fits, the directory gets the remaining room, cut from the left (the last level is the most useful: …/app)
     let room = w.saturating_sub(used + width(&stats) + 3 + width(&tail));
     let mut pieces = stats;
     if room >= 5 {
@@ -1158,7 +1194,7 @@ fn preview_head(s: &Session, g: Option<&Glance>, note: Option<&str>, editing: bo
             Fork::No => {}
         }
     }
-    // 给自己定了还没到点的:一样一行(最多三行),再说一句停了会怎样 —— D、R 之前看得见
+    // Scheduled for itself and not due yet: one line each (at most three), then a line on what stopping it would do — visible before D, R
     if !s.due.is_empty() {
         let now = epoch();
         for d in s.due.iter().take(3) {
@@ -1172,7 +1208,7 @@ fn preview_head(s: &Session, g: Option<&Glance>, note: Option<&str>, editing: bo
             out.push(Line::styled(tr!("  还有 {} 项", "  and {} more", s.due.len() - 3), dim()));
         }
     }
-    // 出错停下的:原话(最多两行);因为账号停下的,给出 X
+    // Stopped on an error: the original message (at most two lines); stopped because of the account: offer X
     if s.state == State::Error && !s.error.is_empty() {
         let red = Style::new().fg(theme::pal().red);
         for (i, l) in wrap_width(&s.error, w.saturating_sub(2)).into_iter().take(2).enumerate() {
@@ -1194,8 +1230,9 @@ fn preview_head(s: &Session, g: Option<&Glance>, note: Option<&str>, editing: bo
     out
 }
 
-/// 预览里的便签:正在写的时候整段显示,带光标,连「✎ 便签」那行占 room 行(多的留住最后几行,光标在那);
-/// 平时最多 cap 行,多的写还有几行
+/// The note in the preview: while editing it's shown whole, with a cursor, taking room lines including the 「✎ 便签」 ("✎ Note") line
+/// (if longer, the last lines are kept, where the cursor is);
+/// otherwise at most cap lines, the rest summed up as how many more lines
 fn note_lines(text: &str, editing: bool, w: usize, room: usize, cap: usize) -> Vec<Line<'static>> {
     let warn = theme::warn();
     let mut body: Vec<String> = text.split('\n').flat_map(|l| wrap_width(l, w.saturating_sub(2))).collect();
@@ -1203,7 +1240,7 @@ fn note_lines(text: &str, editing: bool, w: usize, room: usize, cap: usize) -> V
     if editing {
         out.push(Line::styled(t!("✎ 便签", "✎ Note"), warn.add_modifier(Modifier::BOLD)));
         let room = room.saturating_sub(1).max(1);
-        // 光标在最后
+        // The cursor is at the end
         match body.last_mut() {
             Some(l) if l.width() < w.saturating_sub(2) => l.push('▏'),
             _ => body.push("▏".into()),
@@ -1230,14 +1267,15 @@ fn note_lines(text: &str, editing: bool, w: usize, room: usize, cap: usize) -> V
     out
 }
 
-/// 按显示宽度折行(中文占两格);空行保留成一行空的
+/// Wrap by display width (Chinese takes two cells); an empty line stays an empty line
 pub fn wrap_width(s: &str, w: usize) -> Vec<String> {
     let mut out = vec![String::new()];
     for c in s.chars() {
         let cw = c.width().unwrap_or(0);
         let cur = out.last_mut().unwrap();
         if cur.width() + cw > w.max(1) {
-            // 英文的词不从中间断:正写到一个词的半截,就把这半截带到下一行(一个词比一行还宽时照样硬断)
+            // English words aren't broken in the middle: when halfway through a word, carry that half to the next line (a word wider than a
+            // line is still broken hard)
             let word = |x: char| x.is_ascii_alphanumeric() || matches!(x, '-' | '_' | '.' | ',' | ';' | ':' | ')' | '\'' | '/');
             let half = match cur.rfind(' ') {
                 Some(i) if word(c) && i > 0 && cur[i + 1..].chars().all(word) => cur.split_off(i + 1),
@@ -1256,9 +1294,10 @@ pub fn wrap_width(s: &str, w: usize) -> Vec<String> {
     out
 }
 
-/// 预览里去掉 Claude 的输入框和底部状态栏,只留对话内容。等你操作时不裁:那个框正是要看的。
+/// The preview drops Claude's input box and bottom status bar, keeping only the conversation. Not cut while it waits for you: that box is
+/// exactly what to look at.
 fn preview_lines(s: &Session) -> Vec<Styled> {
-    // 子代理的「屏幕」是照它的记录写的几行(见 subagent.rs),没有输入框可裁
+    // A subagent's "screen" is a few lines written from its record (see subagent.rs); there's no input box to cut
     if s.subagent.is_some() {
         return ansi::parse_lines(&s.screen);
     }
@@ -1266,11 +1305,13 @@ fn preview_lines(s: &Session) -> Vec<Styled> {
     if s.agent == Agent::Claude { quiet_claude(lines) } else { lines }
 }
 
-/// Claude 屏幕上给它自己的终端用的那些行,预览里没用、又常常正好占着最显眼的最后几行:
-/// 「(ctrl+o to expand)」这种在预览里按不了的提示;闲着压缩上下文的那句(「Compacted while idle …」,
-/// 窄了折成两行,第二行只剩 settings.json);压缩后列出来带回去的文件和 skill(「⎿  Referenced file …」
-/// 「⎿  Read 路径 (12 lines)」「⎿  Skills restored (…)」,读文件的工具自己的结果是「⎿  Read 12 lines」,不带路径和括号,不碰);
-/// hook 跑成了的那句(「PostCompact […aca hook claude] completed successfully」,多半是 aca 自己的 hook)
+/// Lines on Claude's screen meant for its own terminal, useless in the preview, yet often taking the most visible last lines:
+/// hints like "(ctrl+o to expand)" that can't be pressed in the preview; the compacted-while-idle line ("Compacted while idle …",
+/// folded into two lines when narrow, the second holding only settings.json); files and skills listed as brought back after compaction
+/// ("⎿  Referenced file …"
+/// "⎿  Read <path> (12 lines)" "⎿  Skills restored (…)"; the file-reading tool's own result is "⎿  Read 12 lines", without path and
+/// parentheses, left alone);
+/// a hook's success line ("PostCompact […aca hook claude] completed successfully", mostly aca's own hook)
 fn quiet_claude(lines: Vec<Styled>) -> Vec<Styled> {
     const HINTS: [&str; 3] = ["(ctrl+o to expand)", "(ctrl+r to expand)", "(ctrl+o to see full summary)"];
     let mut out: Vec<Styled> = Vec::with_capacity(lines.len());
@@ -1284,7 +1325,7 @@ fn quiet_claude(lines: Vec<Styled>) -> Vec<Styled> {
                 || (r.starts_with("Read ") && r.ends_with(" lines)") && r.contains(" ("))
         });
         let hook_ok = t.ends_with("] completed successfully") && t.contains(" [");
-        // 「⎿  Tip: Run /install-github-app …」:给它自己的终端的小贴士,预览里按不了
+        // "⎿  Tip: Run /install-github-app …": a tip for its own terminal, can't be acted on in the preview
         let tip = t.strip_prefix("⎿").map(str::trim_start).is_some_and(|r| r.starts_with("Tip: "));
         let tail_of_note = std::mem::take(&mut idle_note) && t.ends_with("settings.json") && !t.contains(' ');
         if t.contains("Compacted while idle") {
@@ -1295,7 +1336,8 @@ fn quiet_claude(lines: Vec<Styled>) -> Vec<Styled> {
             continue;
         }
         for h in HINTS {
-            // 提示常常自成一段(灰的),前面的空格在上一段里:去掉提示后把前面的空格也收掉
+            // The hint is often a span of its own (gray), with the space before it in the previous span: after removing the hint, also
+            // drop that space
             if let Some(i) = l.iter().rposition(|g| g.text.contains(h)) {
                 l[i].text = l[i].text.replacen(h, "", 1);
                 for j in (0..=i).rev() {
@@ -1316,12 +1358,13 @@ fn quiet_claude(lines: Vec<Styled>) -> Vec<Styled> {
     out
 }
 
-/// 去掉底部的输入框和它下面的状态栏;等你操作时不去(那个框正是要看的)
+/// Drop the input box at the bottom and the status bar below it; not while it waits for you (that box is exactly what to look at)
 fn strip_prompt(mut styled: Vec<Styled>, asking: bool) -> Vec<Styled> {
     let lines: Vec<String> = styled.iter().map(ansi::plain).collect();
     if !asking {
-        // 输入框 = 分隔线 + "❯ …";它下面还可能挂着状态栏、后台任务 / agent 列表,所以往上找 20 行
-        // 上边框可能嵌着会话名:"────── 项目-主会话 ─"
+        // Input box = separator line + "❯ …"; below it there may also be a status bar or a background task / agent list, so search up
+        // 20 lines
+        // The top border may have the session name embedded: "────── project-main-session ─"
         let is_bar = |l: &str| {
             let t = l.trim();
             t.starts_with("───") && t.chars().filter(|&c| c == '─').count() * 2 > t.chars().count()
@@ -1337,78 +1380,80 @@ fn strip_prompt(mut styled: Vec<Styled>, asking: bool) -> Vec<Styled> {
     styled
 }
 
-/// 要复制什么(run 循环去取内容、写剪贴板)
+/// What to copy (the run loop fetches the content and writes the clipboard)
 #[derive(Debug, PartialEq)]
 pub enum Clip {
-    /// c:最后一条回复;登记的会话取 hook 记下的,拿不到就用屏幕上的字
+    /// c: the last reply; for a registered session the one the hook recorded, falling back to the text on screen
     Last { profile: String, id: String, title: String, screen: String },
-    /// B:路径 / 分支 / 会话 id
+    /// B: path / branch / session id
     Info { title: String, text: String },
-    /// 弹窗交回来的一段字(`Fx::copy`):一个地址之类,底栏照原样说
+    /// A piece of text handed back by a popup (`Fx::copy`): an address or such; the bottom bar says it as is
     Text(String),
 }
 
-/// 全屏阅读(`z`):不进会话,只看它的输出,能往上翻历史
+/// Full-screen reading (`z`): doesn't go into the session, just shows its output, can scroll back through history
 struct Reader {
-    /// tmux 会话名
+    /// tmux session name
     name: String,
-    /// 历史 + 屏幕,已去掉输入框
+    /// History + screen, input box already removed
     lines: Vec<Styled>,
-    /// 离底部几行(折行后算),0 = 跟着最新
+    /// Rows from the bottom (after wrapping), 0 = follow the latest
     scroll: usize,
-    /// 折行结果缓存,按 wrap_w 宽折的;内容换了就 dirty
+    /// Cached wrap result, wrapped at wrap_w; dirty when the content changes
     wrapped: Vec<Styled>,
     wrap_w: usize,
     dirty: bool,
-    /// `?` 打开的按键说明,不是会话
+    /// The key help opened by `?`, not a session
     help: bool,
-    /// 上次画出来一屏几行(快捷键弹窗翻页按这个翻)
+    /// Rows per screen when last drawn (the keys popup pages by this)
     view_h: usize,
-    /// `x`:看的是改动(git diff),不是输出
+    /// `x`: showing changes (git diff), not output
     diff: Option<DiffView>,
-    /// 快捷键弹窗里刚按的键:亮起说明它的行
+    /// The key just pressed in the keys popup: lights up its description row
     hit: Option<crate::help::Hit>,
-    /// 看的是插件的输出(视图、能力跑完的):`r` 重跑它
+    /// Showing a plugin's output (a view, or a finished capability run): `r` reruns it
     plugin: Option<crate::caps::Req>,
 }
 
 impl Reader {
-    /// 一屏 h 行时最顶上是折好的第几行(按键改过 scroll 还没重画也算得对)
+    /// Which wrapped row is at the very top when a screen holds h rows (correct even if a key changed scroll before the redraw)
     fn top(&self, h: usize) -> usize {
         let total = self.wrapped.len();
         (total - self.scroll.min(total.saturating_sub(h))).saturating_sub(h)
     }
 }
 
-/// `$` 计费面板(内容见 `bill`,数据见 `usage`)
+/// `$` billing panel (content in `bill`, data in `usage`)
 #[derive(Default)]
 struct BillView {
-    /// 选中的时段(usage::RANGES 的下标)
+    /// Selected period (index into usage::RANGES)
     sel: usize,
-    /// 离顶部几行
+    /// Rows from the top
     scroll: usize,
-    /// 上次画出来一屏几行(翻页按这个翻)
+    /// Rows per screen when last drawn (pages by this)
     view_h: usize,
-    /// a 挑账号的浮窗开着
+    /// The a account-picker float is open
     pick: Option<BillPick>,
-    /// m:收着的那几块(用量、星期 × 钟点、按目录)摆出来了
+    /// m: the folded-away blocks (usage, weekday × hour, by directory) are laid out
     more: bool,
 }
 
-/// 挑账号的浮窗:第 0 行是「全部」,往下是各账号(见 `usage::Report::accounts`)
+/// The account-picker float: row 0 is 「全部」 ("all"), then each account (see `usage::Report::accounts`)
 #[derive(Default)]
 struct BillPick {
     sel: usize,
-    /// 勾上的(多选);没勾就是只看高亮的那个
+    /// Checked ones (multi-select); none checked means only the highlighted one
     marked: Vec<String>,
-    /// 按了 v / V 在连选:从这一行连到高亮那行(同主列表:Esc 定下,并进 marked;再按 v / V 从高亮那行重新起)
+    /// v / V pressed, range-selecting: from this row to the highlighted one (as in the main list: Esc settles it into marked; v / V again
+    /// starts over from the highlighted row)
     anchor: Option<usize>,
-    /// 这一段是 V 连着去掉勾
+    /// This range is V unchecking
     unpick: bool,
 }
 
 impl BillPick {
-    /// 选上的账号:勾上的加上连选着的(去掉勾的那种连选:减去),按浮窗里的顺序(花得多的在前)
+    /// The chosen accounts: the checked ones plus the range being selected (minus it for an unchecking range), in the float's order
+    /// (bigger spenders first)
     fn chosen(&self, accts: &[crate::usage::Row]) -> Vec<String> {
         let range = self.anchor.map(|a| a.min(self.sel)..=a.max(self.sel));
         let ranged = |i: usize| range.as_ref().is_some_and(|r| r.contains(&(i + 1)));
@@ -1424,46 +1469,50 @@ impl BillPick {
     }
 }
 
-/// 全屏阅读换成看改动(见 `diff`)。git 由 run 循环在后台跑,跑完 `set_diff` 送回来
+/// Full-screen reading switched to showing changes (see `diff`). git runs in the background in the run loop and `set_diff` sends the
+/// result back when done
 struct DiffView {
     mode: Mode,
-    /// 去哪儿找它真正干活的目录(见 `workdir`)
+    /// Where to find the directory it really works in (see `workdir`)
     w: Where,
-    /// 每个文件的标题在 lines 里的下标,和折好行后的位置(n / p 跳)
+    /// Index in lines of each file's header, and its position after wrapping (n / p jump)
     files: Vec<usize>,
     rows: Vec<usize>,
-    /// lines 每行从折好的第几行开始(e 找屏幕顶上是哪一行)
+    /// Which wrapped row each line of lines starts at (e finds which line is at the top of the screen)
     starts: Vec<usize>,
-    /// 每行对应的 (第几个文件, 行号)、各文件的路径、仓库根:见 `diff::Diff`
+    /// (file number, line number) for each line, each file's path, repo root: see `diff::Diff`
     at: Vec<Option<(usize, usize)>>,
     paths: Vec<Option<String>>,
     top: String,
-    /// 还没拿到结果
+    /// No result yet
     loading: bool,
-    /// 要重新读:刚打开 / 换了模式(定时刷新另算)
+    /// Needs a reread: just opened / mode changed (timed refresh is separate)
     want: bool,
-    /// 上次读时会话最后有动静的时刻、读的时刻:定时刷新只在有新动静 / 隔了 GLANCE_EVERY 时重读(同 `glance_request`)
+    /// When the session last had activity and when it was read, as of the last read: timed refresh only rereads on new activity /
+    /// after GLANCE_EVERY (as `glance_request`)
     seen: Option<(u64, Instant)>,
 }
 
-/// d 确认过、先藏起来的一行(删分组:组里的都藏)
+/// A row confirmed with d and hidden ahead of time (removing a group: everything in it is hidden)
 #[derive(Debug)]
 struct Vanish {
     job: Job,
-    /// 删完了,藏到这时候为止;None = 还在删
+    /// Removal finished, hidden until this time; None = still removing
     until: Option<Instant>,
-    /// 删之前在跑的会话(登记 id;^Z 撤回后再启动,藏起来以后列表里就查不到了)
+    /// Sessions running before the removal (registered ids; restarted after ^Z undoes it, since once hidden they can't be found in the
+    /// list)
     running: Vec<String>,
 }
 
 impl Vanish {
-    /// 会话连同它的窗口一起藏;只关一格的只藏那一格(按窗格 id:会话名是整个会话的)。
-    /// 关的是会话头一格时不藏:窗口不能没了头,关完一刷新,接着当头的那格就顶到会话那行上
+    /// A session is hidden along with its windows; closing a single pane hides just that pane (by pane id: the session name is the whole
+    /// session's). Not hidden when it's the session's first pane being closed: windows can't lose their head; after a refresh, the pane
+    /// that becomes the head moves up onto the session's row
     fn hides(&self, s: &Session) -> bool {
         hides(&self.job, s)
     }
 
-    /// 撤回了这一条(回收站里的 item):不用再藏
+    /// This one was undone (the item in the Trash): no need to keep hiding it
     fn undone_by(&self, item: &crate::trash::Item) -> bool {
         undone_by(&self.job, item)
     }
@@ -1488,15 +1537,16 @@ fn undone_by(job: &Job, item: &crate::trash::Item) -> bool {
     }
 }
 
-/// 对着这个会话做的活要的(登记的会话键是 id)
+/// What a job on this session needs (a registered session's key is its id)
 fn target_of(s: &Session) -> Target {
     Target { name: s.name.clone(), title: s.title.clone(), profile: s.profile.clone(), id: s.deck_id.clone() }
 }
 
-/// 做成了的活能撤回的那一步(删会话进回收站的另记,见 `job_done`)。locked:改名之前标题锁没锁
+/// The step of a done job that can be undone (removing sessions into the Trash is recorded separately, see `job_done`). locked: whether
+/// the title lock was on before the rename
 fn undo_of(job: &Job, locked: bool) -> Option<Undo> {
     match job {
-        // 关掉的窗格 / 普通 tmux 会话:撤不回,也记一步(见 undo.rs)
+        // A closed pane / plain tmux session: can't be undone, but still recorded as a step (see undo.rs)
         Job::Remove { t, .. } => Some(Undo::Gone { title: t.title.clone() }),
         Job::Stop { t } => Some(Undo::Stop { t: t.clone() }),
         Job::Park { t, p } => Some(Undo::Park { t: t.clone(), p: p.clone() }),
@@ -1508,7 +1558,8 @@ fn undo_of(job: &Job, locked: bool) -> Option<Undo> {
     }
 }
 
-/// 删东西的活:先从列表里藏起来,不等后台删完;好几个可以一起删(见 `Vanish`)
+/// Jobs that remove things: hide from the list first, without waiting for the background removal; several can be removed together (see
+/// `Vanish`)
 fn deleting(job: &Job) -> bool {
     match job {
         Job::Remove { .. } | Job::Group(groups::Act::Delete { .. }) => true,
@@ -1517,55 +1568,58 @@ fn deleting(job: &Job) -> bool {
     }
 }
 
-/// `Z` 会话记录(见 `trace`)。桌面两栏:左边是对话(一轮一块:你说的、Claude 最后说的、一行数字),
-/// 右边是选中那一轮的中间过程(每次调用、每个工具一块);`→` 进右边一步步看,`←` 回来。
-/// 手机放不下两栏:整屏是对话,`⏎` 整屏看这一轮的过程。记录由 run 循环在后台读,之后每次刷新只读新增的那截。
-/// 起了子代理的那一步 `⏎` 进去,同样的两栏看它自己的记录,`Esc` 回来接着看
+/// `Z` session record (see `trace`). Desktop, two panes: the conversation on the left (one block per turn: what you said, what Claude
+/// said last, a line of numbers),
+/// the selected turn's steps on the right (one block per call, per tool); `→` goes into the right side step by step, `←` comes back.
+/// Phones don't fit two panes: the whole screen is the conversation, `⏎` shows this turn's steps full screen. The record is read in the
+/// background by the run loop; each later refresh reads only the newly added part.
+/// `⏎` on a step that started a subagent goes in to view its own record in the same two panes; `Esc` comes back to carry on
 struct TraceView {
-    /// tmux 会话名
+    /// tmux session name
     name: String,
     t: Option<crate::trace::Trace>,
-    /// 读不出来的原因
+    /// Why it couldn't be read
     err: Option<String>,
-    /// 要去后台读:刚打开 / 换了会话
+    /// Needs a background read: just opened / session changed
     want: bool,
     loading: bool,
-    /// 左边展开的:看全文的轮、抄过来的那一块
+    /// Unfolded on the left: turns shown in full, the block being copied
     open: HashSet<usize>,
-    /// 右边展开的:调用(想的、说的全文)、工具(改动带上下文、文件内容、输出前 200 行)
+    /// Unfolded on the right: calls (full thinking and text), tools (diffs with context, file content, first 200 lines of output)
     unfold: HashSet<usize>,
-    /// unfold 改过几回(右边排好的过程跟着它重排)
+    /// How many times unfold changed (the steps laid out on the right are relaid with it)
     unfold_gen: u64,
-    /// 左边的对话
+    /// The conversation on the left
     chat: Blocks,
-    /// 右边的过程
+    /// The steps on the right
     steps: Blocks,
-    /// 在按右边(手机上 = 整屏是过程)
+    /// Keys go to the right side (on a phone = the whole screen is steps)
     in_steps: bool,
-    /// 右边是哪一项的过程(换了就从头看)
+    /// Whose steps the right side shows (start from the top when it changes)
     steps_of: Option<usize>,
     detail: Option<TraceDetail>,
-    /// 上次画的是两栏还是手机的
+    /// Whether the last draw was two panes or phone
     wide: bool,
-    /// 左边那栏到哪一列为止(鼠标在哪边滚)
+    /// Which column the left pane ends at (which side the mouse scrolls)
     split: u16,
-    /// 排好的对话:轮 → 排好的行
+    /// Laid-out conversation: turn → laid-out rows
     chat_cache: HashMap<usize, ChatLaid>,
-    /// 排好的过程(右边那一项的)
+    /// Laid-out steps (of the item on the right)
     steps_cache: Option<StepsLaid>,
-    /// 排的时候用的哪套颜色(`theme::pal()` 的地址):换了主题,排好的行里的颜色都旧了
+    /// Which palette was used for layout (address of `theme::pal()`): after a theme change, the colors in laid-out rows are stale
     pal: usize,
-    /// 进了哪个子代理:一路上起它的那些工具(空 = 会话自己的记录)
+    /// Which subagent we're in: the tools along the way that started it (empty = the session's own record)
     path: Vec<usize>,
-    /// 进子代理之前每一层看到哪了(回来接着看)
+    /// How far each level had been viewed before entering a subagent (to carry on when back)
     saved: Vec<Level>,
-    /// 从列表里子代理那一行开的:读好了直接进到这个子代理(它的 id)
+    /// Opened from a subagent row in the list: once read, go straight into this subagent (its id)
     goto: Option<String>,
-    /// 那样进来时落在第几层(0 = 不是那样进来的):在这一层按 Esc 直接回列表,不用一层层退
+    /// Which level we landed on when entering that way (0 = didn't enter that way): Esc at this level goes straight back to the list,
+    /// without backing out level by level
     home: usize,
 }
 
-/// 进子代理之前那一层的样子
+/// What the level looked like before entering a subagent
 struct Level {
     open: HashSet<usize>,
     unfold: HashSet<usize>,
@@ -1578,20 +1632,20 @@ struct Level {
     steps_cache: Option<StepsLaid>,
 }
 
-/// 对话里排好的一轮。先不上色地排(量高度),露出来了再上色(见 `hl::plain`)
+/// One laid-out turn of the conversation. Laid out uncolored first (to measure height), colored once it's visible (see `hl::plain`)
 struct ChatLaid {
     w: usize,
     ver: u64,
-    /// 全文(o)
+    /// Full text (o)
     full: bool,
     lines: Vec<Styled>,
-    /// 收着的时候截没截(没截的 o 了也一样)
+    /// Whether it was cut while folded (if not, o makes no difference)
     clipped: bool,
-    /// 上了色的有几行(从头数;上色是从一段代码的头喂起的,只能省后面的)
+    /// How many rows are colored (from the top; coloring is fed from the start of a code block, so only the later part can be skipped)
     colored: usize,
 }
 
-/// 右边排好的过程:哪一项、宽度、版本、展开改过几回,一块块的
+/// Laid-out steps on the right: which item, width, version, how many times unfold changed, block by block
 struct StepsLaid {
     item: usize,
     w: usize,
@@ -1603,21 +1657,21 @@ struct StepsLaid {
 struct StepLaid {
     node: usize,
     lines: Vec<Styled>,
-    /// 能不能 o
+    /// Whether o works
     fold: bool,
-    /// 上了色的有几行(同 ChatLaid)
+    /// How many rows are colored (same as ChatLaid)
     colored: usize,
-    /// 排出来取决于的东西(trace::step_sig):重排整轮时一样的就照旧用
+    /// What the layout depends on (trace::step_sig): when relaying a whole turn, identical ones are reused
     sig: u64,
 }
 
-/// 整屏看一项(⏎)
+/// One item full screen (⏎)
 struct TraceDetail {
     node: usize,
     lines: Vec<crate::trace::Para>,
     wrapped: Vec<Styled>,
     wrap_w: usize,
-    /// 离顶部几行
+    /// Rows from the top
     scroll: usize,
     view_h: usize,
 }
@@ -1628,18 +1682,19 @@ impl TraceDetail {
     }
 }
 
-/// 一列能选的块(左边的对话、右边的过程)。按键照上次画的走:每块 (节点, 从第几行起, 到第几行前)
+/// A column of selectable blocks (the conversation on the left, the steps on the right). Keys go by the last draw: each block is
+/// (node, first row, row it ends before)
 #[derive(Default)]
 struct Blocks {
     items: Vec<(usize, usize, usize)>,
-    /// 选中的节点
+    /// Selected node
     sel: usize,
-    /// 最顶上是第几行
+    /// Row at the very top
     top: usize,
     view_h: usize,
-    /// 贴着最新:新的来了选最后一块、贴底
+    /// Sticking to the latest: when new ones arrive, select the last block, stuck to the bottom
     follow: bool,
-    /// 选中的块刚展开:下回排好了尽量整块露出来(头不出屏)
+    /// The selected block was just unfolded: after the next layout, show the whole block if possible (head not off screen)
     reveal: bool,
 }
 
@@ -1652,7 +1707,8 @@ impl Blocks {
         self.items.last().map_or(0, |x| x.2)
     }
 
-    /// ↑↓:一块比一屏高时先在块里滚,滚到头了才换块;最后一块看完了接着跟最新
+    /// ↑↓: a block taller than the screen scrolls inside first, and moves to the next block only at its end; after the last block,
+    /// go on following the latest
     fn go(&mut self, down: bool) {
         let Some(k) = self.at() else { return };
         let h = self.view_h.max(1);
@@ -1680,7 +1736,7 @@ impl Blocks {
         }
     }
 
-    /// 整列滚 d 行;选中的滚出去了就换成屏幕里的第一块
+    /// Scroll the whole column d rows; if the selected one scrolls out, select the first block on screen
     fn scroll(&mut self, d: isize) {
         let h = self.view_h.max(1);
         self.top = self.top.saturating_add_signed(d).min(self.total().saturating_sub(h));
@@ -1700,7 +1756,7 @@ impl Blocks {
         }
     }
 
-    /// 选中某一块,它的头放在最上面
+    /// Select a block and put its head at the very top
     fn jump(&mut self, n: usize) {
         self.sel = n;
         if let Some(k) = self.at() {
@@ -1709,7 +1765,8 @@ impl Blocks {
         self.follow = false;
     }
 
-    /// 排好了:记下每块在哪;跟着最新就选最后一块、贴底;选中的没了(被折起来)就选它的上一层;整块在屏外就让它的头露出来
+    /// Laid out: record where each block is; when following the latest, select the last block, stuck to the bottom; if the selected one
+    /// is gone (folded away), select the level above it; if the whole block is off screen, bring its head into view
     fn lay(&mut self, t: &crate::trace::Trace, sizes: &[(usize, usize)], h: usize) {
         let mut y = 0;
         self.items = sizes
@@ -1778,17 +1835,18 @@ impl TraceView {
         }
     }
 
-    /// 在看的那一层的记录(进了子代理就是子代理的)
+    /// The record of the level being viewed (a subagent's, once inside one)
     fn tr(&self) -> Option<&crate::trace::Trace> {
         self.t.as_ref().map(|t| t.at(&self.path))
     }
 
-    /// 这一层在不在跑(子代理:会话在跑、它也还没干完)
+    /// Whether this level is running (subagent: the session is running and it hasn't finished)
     fn live(&self, live: bool, now: i64) -> bool {
         self.t.as_ref().is_some_and(|t| t.live_at(&self.path, live, now))
     }
 
-    /// ⏎ 在起了子代理的那一步上:进去看它的记录(同样的两栏,停在最新),这一层看到哪了记下
+    /// ⏎ on a step that started a subagent: go in and view its record (same two panes, at the latest), noting how far this level was
+    /// viewed
     fn enter_sub(&mut self, tool: usize) -> bool {
         if self.tr().and_then(|t| t.sub_of(tool)).is_none() {
             return false;
@@ -1813,7 +1871,7 @@ impl TraceView {
         true
     }
 
-    /// 回到上一层,接着看进来之前的那一处
+    /// Back to the level above, carrying on where we were before going in
     fn leave_sub(&mut self) -> bool {
         let Some(lv) = self.saved.pop() else { return false };
         self.path.pop();
@@ -1830,7 +1888,7 @@ impl TraceView {
         true
     }
 
-    /// 读好了:贴着最新
+    /// Read: stick to the latest
     fn set(&mut self, t: crate::trace::Trace) {
         let name = std::mem::take(&mut self.name);
         let goto = self.goto.take();
@@ -1843,7 +1901,8 @@ impl TraceView {
         }
     }
 
-    /// 进到 id 那个子代理:一路上起它的工具一层层进去(嵌套的要过它上面那几层),每一层停在起它的那一轮,Esc 回来就在那
+    /// Go into subagent id: level by level through the tools along the way that started it (nested ones go through the levels above),
+    /// each level stopping at the turn that started it, so Esc comes back there
     fn enter_to(&mut self, id: &str) {
         fn path(t: &crate::trace::Trace, id: &str) -> Option<Vec<usize>> {
             (0..t.nodes.len()).find_map(|i| {
@@ -1866,30 +1925,31 @@ impl TraceView {
                 break;
             }
         }
-        // 停在左边(派给它的话、它交回来的话),右边照样是它的过程;Esc 一下就回列表
+        // Stop on the left (what was sent to it, what it handed back); the right side shows its steps as usual; one Esc goes back to the
+        // list
         self.in_steps = false;
         self.home = self.path.len();
     }
 
-    /// 读新增的那截(跟着最新的,画的时候自己会选到最后)
+    /// Read the newly added part (when following the latest, the draw selects the end by itself)
     fn tail(&mut self) {
         let Some(t) = self.t.as_mut() else { return };
         if !matches!(t.tail(), Ok(true)) {
             return;
         }
         if let Some(d) = self.detail.as_mut() {
-            // 整屏开着:内容可能长了(工具有了结果),下次画的时候重读
+            // Full screen is open: the content may have grown (a tool got its result); reread on the next draw
             d.wrap_w = 0;
             d.lines.clear();
         }
     }
 
-    /// 在按的那一列
+    /// The column keys go to
     fn cur(&mut self) -> &mut Blocks {
         if self.in_steps { &mut self.steps } else { &mut self.chat }
     }
 
-    /// 左边换到下一轮 / 上一轮(压缩那行不停)
+    /// Move the left side to the next / previous turn (not stopping at the compaction row)
     fn turn_step(&mut self, next: bool) -> bool {
         let Some(t) = self.t.as_ref().map(|t| t.at(&self.path)) else { return false };
         let Some(k) = self.chat.at() else { return false };
@@ -1898,14 +1958,15 @@ impl TraceView {
         let to = if next { items.iter().skip(k + 1).find(turnish) } else { items[..k].iter().rev().find(turnish) };
         let Some(&(n, ..)) = to else { return false };
         self.chat.jump(n);
-        // 右边换成这一轮的过程,从头看
+        // The right side switches to this turn's steps, from the top
         self.steps = Blocks { sel: n, ..Blocks::default() };
         self.steps_of = Some(n);
         true
     }
 
-    /// 内容会不会变:在最后一轮里的(还在长)跟着记录读到哪、会话在不在跑变;前面的轮一般不会变,
-    /// 除非它起的后台子代理还在长,或者后来被回退了
+    /// Whether the content can change: in the last turn (still growing) it changes with how far the record is read and whether the
+    /// session is running; earlier turns usually don't change,
+    /// unless a background subagent they started is still growing, or they were rolled back later
     fn version(&self, i: usize, live: bool) -> u64 {
         let Some(t) = self.tr() else { return 0 };
         let turn = crate::trace::turn_of(t, i);
@@ -1927,24 +1988,24 @@ impl TraceView {
     }
 }
 
-/// 等 y 确认的事
+/// Things waiting for y to confirm
 enum Confirm {
     Remove(Removal),
-    /// 分组上 d:删这个组,连子分组、里面的会话
+    /// d on a group: remove the group, with its subgroups and the sessions in it
     Group(GroupRemoval),
-    /// why:为什么要问(正在跑 / 在等你选);force:现在不用
+    /// why: why ask (running / waiting for your choice); force: not used now
     Restart {
         t: Target,
         why: String,
         force: bool,
     },
-    /// D:attached = 别处正连着,会被断开
+    /// D: attached = connected from elsewhere, will be disconnected
     Stop {
         t: Target,
         attached: bool,
     },
-    /// 会话里不止一格时的 D / R:只停(挪到队尾)/ 在原地重启这一格,见 park.rs。
-    /// restart:是 R;why:为什么要问(正在跑…);next:停的是头一格,接着当头的那格
+    /// D / R when a session has more than one pane: only stop (move to the end of the queue) / restart this pane in place, see park.rs.
+    /// restart: it's R; why: why ask (running…); next: when the head pane is stopped, the pane that becomes the head
     Pane {
         t: Target,
         p: crate::park::Pane,
@@ -1953,19 +2014,21 @@ enum Confirm {
         why: String,
         next: Option<String>,
     },
-    /// s:把便签发给它。pane:发到哪一格;key:便签的键
+    /// s: send the note to it. pane: which pane to send to; key: the note's key
     Send {
         t: Target,
         pane: String,
         key: String,
         text: String,
     },
-    /// A:接管这个普通 tmux 会话。plan:认出来的、打算怎么登记(给人看的就是它,y 之后照它做)
+    /// A: adopt this plain tmux session. plan: what was recognized and how it will be registered (that's what's shown, and what y
+    /// carries out)
     Adopt {
         t: Target,
         plan: Box<aca_core::adopt::Plan>,
     },
-    /// v 多选后的 d / D / R:对着这几个会话(按列表里的先后)。notes:框里写的要留意的(几个在跑会被打断…)
+    /// d / D / R after v multi-select: on these sessions (in list order). notes: what to watch out for, written in the box (how many
+    /// running ones will be interrupted…)
     Many {
         act: Batch,
         ts: Vec<Target>,
@@ -1973,7 +2036,7 @@ enum Confirm {
     },
 }
 
-/// v 多选后要问一句的那几种
+/// The kinds after v multi-select that ask first
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Batch {
     Remove,
@@ -1991,122 +2054,125 @@ impl Batch {
     }
 }
 
-/// 分组上 d 的确认框里写的:一起删掉什么
+/// What the confirm box for d on a group says: what gets removed along with it
 struct GroupRemoval {
     profile: String,
     group: String,
-    /// 子分组几个
+    /// Number of subgroups
     kids: usize,
-    /// 会话几个(连子分组里的、归档着的;回收站里的不算)
+    /// Number of sessions (including those in subgroups and archived ones; ones in the Trash don't count)
     sessions: usize,
-    /// 其中归档着的几个
+    /// How many of them are archived
     archived: usize,
-    /// 其中这一轮还在跑的几个(删了就打断)
+    /// How many of them are still running this turn (removing interrupts them)
     busy: usize,
-    /// 其中开着的(登记 id;^Z 撤回后再启动)
+    /// The open ones among them (registered ids; restarted after ^Z undoes it)
     running: Vec<String>,
 }
 
-/// 底栏里的单行输入
+/// Single-line input in the bottom bar
 struct Prompt {
     ask: Ask,
     text: String,
-    /// 输入框下面那行的提示(出错时),空 = 显示说明
+    /// Hint on the line below the input box (on error); empty = show the description
     hint: String,
 }
 
 enum Ask {
-    /// `r`:新标题
+    /// `r`: new title
     Rename(Target),
-    /// `G`:新分组名,回车后接着填路径
+    /// `G`: new group name; after Enter, go on to fill in the path
     NewGroup,
-    /// `e`:便签(键见 `notes::key`);orig:打开时的便签,写完改了就记一步撤销
+    /// `e`: the note (key in `notes::key`); orig: the note when opened, if it changed when done, record an undo step
     Note { key: String, title: String, orig: String },
-    /// `f`:分叉出来的会话叫什么(后面是 Claude 会话分叉前要核对的,见 `Job::Fork`)
+    /// `f`: what to call the forked session (what follows is what a Claude session must check before forking, see `Job::Fork`)
     Fork(Target),
-    /// S 里 ^R:工作区的新名字
+    /// ^R in S: the workspace's new name
     Space(char),
-    /// 设置页:`^N` 的默认目录
+    /// Settings page: the default directory of `^N`
     GroupDir,
-    /// 分组上 `r`:新的分组名(可以带上级),回车后接着改默认目录
+    /// `r` on a group: the new group name (may include parents); after Enter, go on to change the default directory
     GroupName(String),
-    /// 接着填它的默认目录:group 改名成 to,was 是原来的默认目录(空 = 没记)
+    /// Then fill in its default directory: group is renamed to to, was is the old default directory (empty = none recorded)
     GroupHome { group: String, to: String, was: String },
 }
 
-/// 按了 q / Q,等下一个键
+/// q / Q pressed, waiting for the next key
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Pending {
-    /// q:切到哪个工作区
+    /// q: which workspace to switch to
     Switch,
-    /// Q:把高亮的会话送到哪个工作区
+    /// Q: which workspace to send the highlighted session to
     Send,
 }
 
-/// 让出终端跑的外部程序(看改动里的 `l` / `e`,列表里的 `y`)
+/// External programs run after giving up the terminal (`l` / `e` in the diff view, `y` in the list)
 #[derive(Debug, PartialEq)]
 pub enum External {
-    /// lazygit,开在这个仓库
+    /// lazygit, opened in this repo
     Lazygit(String),
-    /// $EDITOR 打开文件,停在这一行
+    /// $EDITOR opens the file at this line
     Edit { path: String, line: usize },
-    /// 会话记录里的 e:编辑器只读地看,停在这一行;temp = 看完删掉的临时文件
+    /// e in a session record: view read-only in the editor at this line; temp = a temporary file deleted afterwards
     View { path: String, line: usize, temp: bool },
-    /// 设置页用编辑器打开的配置文件(config.toml):还没有就先写上模板
+    /// The config file (config.toml) the settings page opens in the editor: written from the template first if missing
     Config { path: String, template: String },
-    /// yazi,开在这个会话真正干活的目录(让出终端时再找,和 T 一样)。
-    /// tmux 弹窗里改成在会话里分一格放大的跑它(见 run 循环);`target` 空 = 会话没在跑,只能原地开
+    /// yazi, opened in the directory the session really works in (looked up when giving up the terminal, as with T).
+    /// In a tmux popup it's instead run in a zoomed pane split off in the session (see the run loop); empty `target` = the session isn't
+    /// running, so it can only open in place
     Yazi(Split),
-    /// 插件的窗格,界面不在 tmux 里:在前台跑(见 caps.rs)
+    /// A plugin's pane while the interface isn't in tmux: run in the foreground (see caps.rs)
     Plugin(crate::caps::Req),
 }
 
-/// ^G 交给编辑器写的便签
+/// A note handed to the editor with ^G
 pub struct NoteEdit {
     key: String,
     title: String,
-    /// 开始写之前的便签(见 `Ask::Note`)
+    /// The note before editing started (see `Ask::Note`)
     orig: String,
     pub text: String,
-    /// 从底栏的便签编辑里按的:写完回到那里接着写
+    /// Pressed from the note editing in the bottom bar: go back there to keep writing when done
     from_prompt: bool,
 }
 
-/// T:在它的会话里新开一个窗口跑 shell(同 prefix c);弹窗里的 y:在它那格旁边分一格跑 yazi。
-/// 目录是它真正干活的目录(run 循环去找目录、开窗口 / 分屏,再进去落在新的那格)
+/// T: open a new window running a shell in its session (like prefix c); y in a popup: split a pane next to its pane to run yazi.
+/// The directory is the one it really works in (the run loop finds the directory, opens the window / split, then goes in landing on the
+/// new pane)
 #[derive(Debug, PartialEq)]
 pub struct Split {
-    /// 分一格跑 yazi(放大占满,退出就关);否则新开窗口跑 shell
+    /// Split a pane to run yazi (zoomed to fill, closed on exit); otherwise open a new window running a shell
     pub yazi: bool,
-    /// 进哪个 tmux 会话
+    /// Which tmux session to go into
     pub name: String,
-    /// 分哪一格(yazi):窗格 id,没有就是那个会话当前那格
+    /// Which pane to split (yazi): pane id, or that session's current pane if none
     pub target: String,
     pub w: Where,
-    /// 左右分(桌面);手机上上下分(yazi)
+    /// Split side by side (desktop); top and bottom on a phone (yazi)
     pub side: bool,
-    /// 新的一格带的账号(`data::shell_env`)
+    /// The account the new pane carries (`data::shell_env`)
     pub env: Vec<(String, String)>,
 }
 
-/// t:给这一行开临时终端(run 循环去找目录、开 shell)
+/// t: open a temporary terminal for this row (the run loop finds the directory and opens the shell)
 #[derive(Debug, PartialEq)]
 pub struct TermReq {
-    /// 按行记:再按 t 回到同一个
+    /// Keyed by row: t again goes back to the same one
     pub key: String,
-    /// 它的 tmux 会话(取账号的环境)
+    /// Its tmux session (to take the account's environment)
     pub family: String,
     pub title: String,
     pub w: Where,
-    /// 另外要带的环境(新账号登录时的配置目录);有就不按 family 取
+    /// Extra environment to bring (config directory when logging in a new account); if given, not taken from family
     pub env: Vec<(String, String)>,
-    /// 不开 shell,直接跑这条命令(新账号登录),它退出终端就关
+    /// Run this command instead of a shell (logging in a new account); the terminal closes when it exits
     pub run: Option<String>,
-    /// 登录终端:登录链接出来了弹出来挑浏览器(见 browser.rs)
+    /// Login terminal: when the login link shows up, pop up a browser picker (see browser.rs)
     pub link: Option<crate::term::Catch>,
 }
 
-/// 高亮停在分组上时预览里写的:哪个组、它的路径;路径不是组的默认路径时,是跟着组里哪个会话(标题)
+/// What the preview shows when the highlight is on a group: which group, its path; when the path isn't the group's default path, which
+/// session in the group (title) it follows
 #[derive(Clone, Debug, PartialEq)]
 pub struct Spot {
     pub group: String,
@@ -2114,40 +2180,41 @@ pub struct Spot {
     pub from: Option<String>,
 }
 
-/// `H` 按下、还没挑工具时:交接谁、新会话照什么建(照它的目录、分组),菜单关掉就丢
+/// `H` pressed, tool not picked yet: whom to hand off, what to build the new session from (its directory, group); dropped when the
+/// menu closes
 struct Pass {
     t: Target,
     from: Box<Source>,
     draft: Draft,
-    /// 它的便签带过去了:便签的键(新会话建成就删)
+    /// Its note was brought along: the note's key (removed once the new session is created)
     note: Option<String>,
-    /// 它还在跑 / 在等你选:菜单里提一句,两边会一起动同一处
+    /// It's still running / waiting for your choice: the menu mentions it, since both sides would touch the same place at once
     busy: bool,
 }
 
-/// `m` 挑分组要的
+/// What `m` needs to pick a group
 pub struct GroupPick {
     pub t: Target,
-    /// 它现在的分组
+    /// Its current group
     from: String,
-    /// 它的目录(挪了也不变,fzf 顶上写着)
+    /// Its directory (unchanged by moving, shown at the top of fzf)
     here: String,
-    /// fzf 的候选:和它同目录的分组,再是列表里的分区顺序,再是列表里没有的分组;不含它现在的
+    /// fzf candidates: groups in the same directory, then the list's section order, then groups not in the list; its current one excluded
     pub rows: Vec<ops::GroupRow>,
-    /// 这个 profile 已有的全部分组(挪进没有的要先建)
+    /// All groups this profile already has (moving into a missing one creates it first)
     groups: Vec<String>,
-    /// v 多选一起挪的另外几个,和它们现在的分组;空 = 只挪 t
+    /// The others moved along after v multi-select, with their current groups; empty = only move t
     more: Vec<(Target, String)>,
 }
 
 impl GroupPick {
-    /// fzf 顶上写挪的是谁
+    /// The top of fzf says what's being moved
     pub fn what(&self) -> String {
         ops::named(&self.t.title, 1 + self.more.len())
     }
 }
 
-/// `^S` 设置页的一行
+/// One row of the `^S` settings page
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SetRow {
     Theme,
@@ -2157,14 +2224,14 @@ enum SetRow {
     Tools,
     GroupDir,
     Config,
-    /// 功能自己加的(`App::with_setting`):`Settings::extra` 里第几个
+    /// Added by a feature itself (`App::with_setting`): index in `Settings::extra`
     Extra(usize),
-    /// 写错了的(没有就不列)
+    /// The broken ones (not listed if none)
     Problems,
 }
 
 impl SetRow {
-    /// 行首的键;写错那行没有,↑↓ 挪过去。功能自己加的问 `Settings::key`
+    /// The key at the start of the row; the broken row has none, reach it with ↑↓. For rows added by a feature, ask `Settings::key`
     fn key(self) -> Option<char> {
         match self {
             SetRow::Theme => Some('t'),
@@ -2198,11 +2265,12 @@ enum SetPage {
     Problems,
 }
 
-/// `^S` 的设置页。显示的值打开时现读(改了、config.toml 被改了再读),不每帧读文件
+/// The `^S` settings page. Values shown are read fresh on open (and reread after a change, or when config.toml was changed), not read
+/// from file every frame
 #[derive(Clone, Debug)]
 struct Settings {
     page: SetPage,
-    /// 主页高亮第几行
+    /// Highlighted row on the main page
     sel: usize,
     theme: String,
     lang: Lang,
@@ -2210,11 +2278,11 @@ struct Settings {
     group_dir: String,
     bad: Vec<String>,
     accts: Vec<crate::accounts::Account>,
-    /// 功能自己加的行,打开时问来的
+    /// Rows added by features, asked for on open
     extra: Vec<ExtraRow>,
 }
 
-/// 功能自己加的一行(`overlay::Setting`)打开设置页时的样子
+/// What a row added by a feature (`overlay::Setting`) looks like when the settings page opens
 #[derive(Clone, Debug)]
 struct ExtraRow {
     key: char,
@@ -2226,7 +2294,8 @@ struct ExtraRow {
 impl Settings {
     fn rows(&self) -> Vec<SetRow> {
         let mut v = vec![SetRow::Theme, SetRow::Lang];
-        // 切输入法只在 macOS 上做得到(ime.rs):别处不列,免得摆着一个按了也没用的「开」
+        // Switching input method is only possible on macOS (ime.rs): not listed elsewhere, so there's no 「开」 ("on") that does nothing
+        // when pressed
         if cfg!(target_os = "macos") {
             v.push(SetRow::Ime);
         }
@@ -2253,8 +2322,9 @@ impl Settings {
     }
 }
 
-/// 配色列表(`^S` 里的「主题」,见 `open_themes`):所有主题(每套的颜色先备好,移到哪套就把整个界面换成哪套)、高亮第几个、
-/// 打开前用的那套(Esc 换回去)、记在 config 里的那套(打 ●)
+/// The palette list (「主题」 ("theme") in `^S`, see `open_themes`): all themes (each one's colors prepared up front; moving onto one
+/// switches the whole interface to it), which one is highlighted,
+/// the one in use before opening (Esc switches back), the one saved in config (marked ●)
 struct ThemeMenu {
     list: Vec<(theme::Theme, &'static theme::Pal)>,
     sel: usize,
@@ -2266,234 +2336,251 @@ pub struct App {
     all: Vec<Session>,
     view: Vec<usize>,
     hidden: usize,
-    /// 选中的是可见列表(view)里第几个;画的时候换算成含分区标题的行号,放进 disp
+    /// Which one in the visible list (view) is selected; at draw time converted to a row number including section headers, kept in disp
     list: ListState,
-    /// 实际画出来的列表(含分区标题)的滚动位置
+    /// Scroll position of the list as actually drawn (with section headers)
     disp: ListState,
-    /// 画出来的每一项:对应 view 里第几个(标题 = None)、是哪个组的标题(见 `Row::head`)、占几行。点击时用
+    /// Each drawn item: which index in view it corresponds to (header = None), which group's header it is (see `Row::head`), how many
+    /// rows it takes. Used for clicks
     drawn: Vec<(Option<usize>, Option<usize>, u16)>,
     selected: Option<String>,
     scope: Scope,
-    /// w:只看开着的,和天数、状态叠着
+    /// w: only open ones, stacked with the day count and state
     open: bool,
-    /// 按 w 之前的范围:w 先换成「全部」,再按 w 回到这里。在开着的里按过 * / a 就是 None,出来时留在挑的
+    /// The range before w: w first switches to 「全部」 ("All"), and w again comes back here. None if * / a was pressed inside open ones;
+    /// on leaving, stay with what was picked
     back: Option<Scope>,
-    /// ! @ # & ^ % 挑的状态
+    /// The state picked with ! @ # & ^ %
     status: Option<Pick>,
-    /// w 和 ^ / % 对不上(开着的里没有停着的),后按的让先挑的让了位;后按的走了,让位的回来
+    /// w and ^ / % don't go together (open ones has no stopped ones): the one pressed later makes the earlier pick yield; when the later
+    /// one goes away, the yielded one comes back
     yielded: Option<Yielded>,
-    /// 只看这个分组(None = 全部分组)
+    /// Only this group (None = all groups)
     group: Option<String>,
-    /// 当前分组里一共几个(顶栏的分母)
+    /// Total in the current group (the top bar's denominator)
     base_len: usize,
-    /// 「近几天」一个都没有,退回显示了全部 —— 顶栏要如实写「全部」
+    /// Nothing in "recent days", so it fell back to showing everything — the top bar must honestly say 「全部」 ("All")
     fell_back: bool,
-    /// 出错了的插件(钩子、定时上次没跑成,gateway 的服务停下了):顶栏右边一格 ⚠,P 里看是哪个。后台跟着列表一起重读
+    /// Plugins in error (a hook, a scheduled run that failed last time, a gateway service that stopped): a ⚠ cell on the right of the top
+    /// bar, P shows which one. Reread in the background along with the list
     pub plugin_alerts: Vec<aca_core::plugin::health::Problem>,
     filter: String,
     filtering: bool,
     digits: String,
     digits_at: Instant,
-    /// 宽屏 / 窄屏各自的布局(见 Preview)
+    /// The layouts for wide / narrow screens (see Preview)
     preview: Preview,
     preview_narrow: Preview,
-    /// 刚按过 L:底栏亮一会儿「布局 分屏 → 预览为主 → 只看列表」
+    /// L was just pressed: the bottom bar briefly lights up "layout split → mostly preview → list only"
     layout_at: Option<Instant>,
     msg: Option<(String, Instant)>,
-    /// msg 在底栏留多久(一般 3 秒;上次界面怎么没的那句留久一点)
+    /// How long msg stays in the bottom bar (usually 3 seconds; the line about how the last interface went away stays longer)
     msg_ttl: Duration,
-    /// 上一帧的屏幕大小,`V` 的提示里说「自动」现在落在哪边
+    /// Screen size of the last frame, for `V`'s hint to say which side "auto" falls on now
     screen: Rect,
-    /// 上一帧画出去的样子:下一帧对着它补写 ratatui 漏掉的格子(见 `mark_torn_tails`)
+    /// What the last frame drew: the next frame checks against it to rewrite the cells ratatui missed (see `mark_torn_tails`)
     last_frame: Buffer,
     pins: Pins,
     notes: Notes,
-    /// 会话都分在哪个工作区、工作区的名字(见 spaces.rs)
+    /// Which workspace each session is in, and the workspaces' names (see spaces.rs)
     spaces: Spaces,
-    /// 现在看的工作区
+    /// The workspace being viewed
     space: char,
-    /// 切到现在这个之前待的工作区:` 回那
+    /// The workspace before switching to this one: ` goes back there
     last_space: Option<char>,
-    /// 按了 q / Q,等下一个键(工作区的键)
+    /// q / Q pressed, waiting for the next key (a workspace's key)
     pending: Option<Pending>,
-    /// S 打开的工作区列表:高亮的第几个
+    /// The workspace list opened by S: index of the highlighted one
     space_menu: Option<usize>,
-    /// Tab 打开的分组列表:高亮的第几行(第 0 行是全部分组)
+    /// The group list opened by Tab: highlighted row (row 0 is all groups)
     group_menu: Option<usize>,
-    /// `F` 只看一种状态的小单:高亮在第几行(0 = 全部)
+    /// `F`'s small one-state list: highlighted row (0 = all)
     only_menu: Option<usize>,
-    /// 配色列表(见 `open_themes`)
+    /// The palette list (see `open_themes`)
     theme_menu: Option<ThemeMenu>,
-    /// `^S` 的设置页
+    /// The `^S` settings page
     settings: Option<Settings>,
-    /// 从设置页进去的(主题列表、改目录、加账号、编辑器):做完回到设置页的这里
+    /// Entered from the settings page (theme list, changing a directory, adding an account, editor): when done, come back here on the
+    /// settings page
     settings_back: Option<Settings>,
-    /// 打开 aca 时 config.toml 读不了的原因(设置页的写错里列出来,那时再拼成一句)
+    /// Why config.toml couldn't be read when aca opened (listed under the settings page's broken entries, joined into a sentence then)
     pub sync_failed: Vec<String>,
-    /// 设置页改了输入法:run 循环按新设置重新决定管不管
+    /// The settings page changed the input method: the run loop decides afresh whether to manage it
     pub ime_changed: bool,
-    /// 要在后台跑的插件能力 / 视图 / 窗格(`:` 菜单、阅读页里的 r):run 循环取走,一个一个线程
+    /// Plugin capabilities / views / panes to run in the background (`:` menu, r in the reading page): the run loop takes them, one
+    /// thread each
     pub plugin_q: Vec<crate::caps::Req>,
-    /// 换到现在这个分组之前看的(None = 全部分组):分组列表打开时高亮停在它,Tab ⏎ 就是换回去
+    /// What was viewed before switching to the current group (None = all groups): the group list's highlight starts on it when opened,
+    /// so Tab ⏎ switches back
     prev_group: Option<Option<String>>,
-    /// 每个工作区最后高亮的会话:切回去时停在那
+    /// The last highlighted session in each workspace: switching back stops there
     space_sel: HashMap<char, String>,
-    /// E:进会话前要粘进它输入框的便签(键, 内容)
+    /// E: the note to paste into its input box before entering the session (key, content)
     pub fill: Option<(String, String)>,
-    /// 高亮上一次被挪动的时刻,和它离前一次挪动隔了多久(见 SETTLE)
+    /// When the highlight last moved, and how long that was after the move before it (see SETTLE)
     moved: Option<(Instant, Duration)>,
-    /// 预览现在画的是哪个会话
+    /// Which session the preview is drawing now
     shown: Option<String>,
-    /// ^G:要交给编辑器写的便签
+    /// ^G: the note to hand to the editor for writing
     pub edit_note: Option<NoteEdit>,
-    /// 已读 / 未读(见 reads.rs):从 aca 进去看过的记下时刻,之后没有新输出的不算 ◐,`i` 也跳过
+    /// Read / unread (see reads.rs): records when a session was looked at from aca; no new output since then = not ◐, and `i` skips it
     reads: Reads,
-    /// 跳转模式(空格进入)下已经按了的提示字母;None = 不在跳转模式
+    /// Hint letters already typed in jump mode (entered with Space); None = not in jump mode
     jump: Option<String>,
-    /// v 多选勾上的会话(登记的 id),见 `on_pick_key`。和它连选着的(anchor)都空 = 没在多选
+    /// Sessions ticked in v multi-select (registered ids), see `on_pick_key`. Both this and the range anchor empty = not multi-selecting
     picked: Vec<String>,
-    /// v 连选(同 yazi 的 visual):从这个会话(登记的 id)连到高亮那行;Esc 定下
+    /// v range select (like yazi's visual): from this session (registered id) to the highlighted row; Esc fixes it
     anchor: Option<String>,
-    /// 这一段是 V 连着去掉勾(同 yazi 的 V)
+    /// This range is a V range unticking (like yazi's V)
     unpick: bool,
-    /// 高亮停在这个分组的标题上(跳转跳过去的),不在它第一个会话上:t / N / n 对着组做。
-    /// 这时 `list` 选的还是组里第一个会话(滚动、刷新都跟着它);挪高亮就回到会话上
+    /// The highlight is on this group's heading (jumped there), not on its first session: t / N / n act on the group.
+    /// `list` still selects the group's first session then (scrolling and refresh follow it); moving the highlight goes back to sessions
     head: Option<String>,
     reader: Option<Reader>,
     trace: Option<TraceView>,
-    /// `$` 计费面板开着时:选中的时段、滚到哪
+    /// While the `$` billing panel is open: the selected period, the scroll position
     bill: Option<BillView>,
-    /// 计费的数(后台读的):最近一份和拿到的时刻,关了再开先显示它
+    /// Billing numbers (read in the background): the latest copy and when it came; shown first when the panel reopens
     bill_data: Option<crate::usage::Report>,
     bill_got: Option<Instant>,
-    /// 已经请后台去读、还没回来;按了 r 要立即重读
+    /// Asked the background to read, not back yet; pressing r rereads at once
     bill_loading: bool,
     bill_want: bool,
-    /// 只看哪些账号(空 = 全部),关了面板再开还是它
+    /// Which accounts to show (empty = all); still the same after closing and reopening the panel
     bill_only: Vec<String>,
-    /// 看改动看的是未提交的还是连同提交的(`m` 换,换会话时沿用)
+    /// Whether the diff shows uncommitted changes or includes commits (`m` switches, kept across sessions)
     diff_mode: Mode,
-    /// 看改动里按了 l / e:run 循环让出终端去跑
+    /// l / e pressed in the diff: the run loop gives up the terminal to run it
     pub external: Option<External>,
-    /// 按了 T(弹窗里的 y):run 循环去开窗口(分屏)
+    /// T pressed (y in the popup): the run loop opens a window (split)
     pub split: Option<Split>,
-    /// t 开的临时终端,按行;Esc 收起后留着,里面 exit 了才去掉
+    /// Temporary terminals opened with t, per row; kept after Esc hides them, removed only once `exit` runs inside
     pub terms: HashMap<String, crate::term::Term>,
-    /// 正显示在列表下面、按键都给它的那个
+    /// The one shown below the list that gets all keys
     pub term_on: Option<String>,
-    /// 按了 t、还没开的:run 循环去开
+    /// t pressed but not opened yet: the run loop opens it
     pub term_req: Option<TermReq>,
-    /// 预览顶上的改动统计,按会话名(后台读,见 `glance_request`)
+    /// Diff stats at the top of the preview, by session name (read in the background, see `glance_request`)
     glances: HashMap<String, Glance>,
-    /// 上次去读统计的是哪个会话、它那时最后有动静的时刻、什么时候读的(见 `glance_request`)
+    /// Which session the stats were last read for, its last activity time then, and when they were read (see `glance_request`)
     glance_for: Option<(String, u64, Instant)>,
-    /// 高亮停着的分组的路径(见 `spot`)
+    /// Paths of the group the highlight is on (see `spot`)
     spot: Option<Spot>,
     pub clip: Option<Clip>,
-    /// 折起来的分组(记进视图)
+    /// Folded groups (saved in the view)
     folded: BTreeSet<String>,
-    /// 这次 rebuild 真正折起来的:分组 → (几个, 几个待确认);过滤时不折,就是空的
+    /// What this rebuild actually folded: group → (how many, how many need you); nothing folds while filtering, so it's empty
     folds: Folds,
-    /// `l` 展开了子代理的会话(键):它派出去的各占一行(见 subagent.rs)。默认都收着,只在会话那行写个 +N
+    /// Sessions (keys) whose subagents `l` unfolded: each one it sent out gets a row (see subagent.rs). All folded by default,
+    /// the session row just shows +N
     agents_open: HashSet<String>,
-    /// 全屏阅读换了会话 / 刚打开,要去 tmux 抓历史(抓取由 run 循环做,单元测试里没有 tmux)
+    /// The full-screen reader switched session / just opened, so fetch history from tmux (the run loop fetches; unit tests have no tmux)
     pub reader_load: bool,
-    /// 按了 N,正在编辑新会话的路径
+    /// N pressed, editing the new session's path
     new_draft: Option<Draft>,
     list_area: Rect,
     preview_area: Rect,
-    /// 预览往回翻了几行(滚轮)、翻的是哪个会话的、最多能翻几行(画的时候算):换了会话回到最新
+    /// Preview scrolled back: how many lines, for which session, the most possible (computed when drawing); a new session goes to latest
     preview_up: usize,
     preview_for: String,
     preview_max: usize,
-    /// 顶栏左边的标签:点一下开分组列表
+    /// The tab at the left of the top bar: click it to open the group list
     chip_area: Rect,
     pub quit: bool,
-    /// 跟随着(`--follow`,见 follow.rs):高亮挪到哪,这台客户端就切到哪
+    /// Following (`--follow`, see follow.rs): wherever the highlight goes, this client switches there
     pub following: Option<Follow>,
-    /// ^L:退出界面后换成(新装的)自己接着跑,见 `relaunch`
+    /// ^L: after leaving the interface, replace ourselves with the (newly installed) one and carry on, see `relaunch`
     pub relaunch: bool,
     pub attach: Option<String>,
-    /// attach 前先切到这一格(窗格 id):会话本身落在主窗格,子行落在那个窗口 / 窗格
+    /// Switch to this cell (pane id) before attaching: a session itself lands in its main pane, a child row in that window / pane
     pub focus: Option<String>,
-    /// ⏎ 在停掉的会话上:run 循环先启动它,起来了再 attach。bool = 它是 shell 会话(不用等程序起来)
+    /// ⏎ on a stopped session: the run loop starts it first, attaches once it's up. bool = it's a shell session (no waiting for a program)
     pub start: Option<Target>,
-    /// ⏎ 在 D 停着的那一格上:run 循环先在原地再启动它(见 park.rs),再 attach 过去
+    /// ⏎ on a cell stopped with D: the run loop first restarts it in place (see park.rs), then attaches to it
     pub respawn: Option<(String, crate::park::Pane)>,
-    /// 每个会话最后一次有动静的时刻(活着时看到的)。停掉后 tmux 活动时间没了,拿这个接着算「多久没动」,
-    /// 免得刚按 D 就因为「超过 1 天」被藏起来
+    /// When each session last had activity (seen while it was alive). After a stop tmux's activity time is gone, so this keeps
+    /// counting "idle for how long", so a session isn't hidden for "over 1 day" right after D
     last_live: HashMap<String, u64>,
     pub create: Option<NewReq>,
-    /// 新建时按了 ↓ / ^F:run 循环去开 fzf 找目录(要让出终端,单元测试里没有)
+    /// ↓ / ^F pressed while creating: the run loop opens fzf to find a directory (gives up the terminal; not in unit tests)
     pub pick: bool,
-    /// `n` 的工具菜单从哪读(`with_tools`);默认是空的,单元测试不碰真实文件
+    /// Where `n`'s tool menu reads from (`with_tools`); empty by default, unit tests don't touch real files
     tools_loader: fn() -> Result<Vec<Tool>, String>,
-    /// 账号页(`with_accounts`,见 acctpage.rs;给 true = 一开就进加账号);单元测试里没有,不碰真实的配置
+    /// The accounts page (`with_accounts`, see acctpage.rs; true = open straight into adding an account); absent in unit tests,
+    /// which don't touch the real config
     accounts_page: Option<fn(bool) -> Box<dyn Overlay>>,
-    /// `n` 打开的工具菜单、高亮的第几个
+    /// The tool menu opened by `n`, and which entry is highlighted
     tool_menu: Option<(Vec<Tool>, usize)>,
-    /// 工具菜单打开时读的各账号额度(两家都有),菜单里每个账号后面写
+    /// Each account's quota, read when the tool menu opens (both providers), shown after each account in the menu
     tool_quotas: Vec<crate::usage::Quota>,
-    /// `H` 打开的工具菜单是给交接挑的
+    /// The tool menu opened by `H` is for picking where to hand off
     handoff: Option<Pass>,
-    /// `H` 从哪认出要交接的对话(`with_handoff`);默认认不出,单元测试不碰真实文件
+    /// Where `H` recognizes the conversation to hand off (`with_handoff`); recognizes nothing by default, unit tests don't touch real files
     source_loader: fn(&Session) -> Result<Source, String>,
-    /// `X` 换账号的框:各账号的额度、问登录着没有(`with_rehome`);默认什么都没有、问不出,单元测试不碰真实文件
+    /// The `X` switch-account box: each account's quota, asking whether it's logged in (`with_rehome`); nothing and no asking by default,
+    /// unit tests don't touch real files
     rehome_quotas: fn(Agent) -> Vec<crate::usage::Quota>,
     rehome_ask: fn(Agent, &str) -> crate::accounts::Login,
     rehome_background: bool,
-    /// 等 y 确认的:删除(`d`)/ 重启(`R`)/ 停止 / 发便签。确认了放进 `job`,由 run 循环放到后台去做
+    /// Waiting for y to confirm: delete (`d`) / restart (`R`) / stop / send note. Once confirmed it goes into `job`,
+    /// and the run loop runs it in the background
     confirm: Option<Confirm>,
-    /// 底栏里正在输入的:`r` 新标题 / `G` 新分组名
+    /// Being typed in the bottom bar: `r` new title / `G` new group name
     prompt: Option<Prompt>,
-    /// 要在后台做的(重启 / 改名 / 挪分组 / 删除…),run 循环放进后台线程
+    /// Work to do in the background (restart / rename / move group / delete…), the run loop puts it on a background thread
     pub job: Option<Job>,
-    /// 后台正在做的,底栏一直显示;做完才能再来一个(删除不算,见 `vanish`)
+    /// What the background is doing, shown in the bottom bar the whole time; another
+    /// can start only when it's done (deleting doesn't count, see `vanish`)
     busy: Option<String>,
-    /// d 确认了就先从列表里拿掉(`drop_vanished`),后台再删;可以接着删别的。删失败放回来
+    /// Once d is confirmed it's taken off the list first (`drop_vanished`) and deleted in the background; you can go on deleting others.
+    /// Put back if the delete fails
     vanish: Vec<Vanish>,
-    /// 后台在重启的正是高亮的会话(它的 tmux 名会变,做完让高亮跟过去)
+    /// The session being restarted in the background is the highlighted one (its tmux name changes; the highlight follows when done)
     follow: bool,
-    /// ⇧↑ ⇧↓ 挪过、还没写进登记表的:`Job::Order`(会话)/ `Job::GroupOrder`(分组)。列表先照着挪好(见 `apply_reorders`),
-    /// 空下来就按先后一个个交给后台写,写完一个去掉一个
+    /// Moved with ⇧↑ ⇧↓ but not yet written to the registry: `Job::Order` (sessions) / `Job::GroupOrder` (groups). The list is
+    /// moved first (see `apply_reorders`); when idle, they go to the background one at a time in order, each removed once written
     reorders: VecDeque<Job>,
-    /// 排头那个正在写
+    /// The one at the front is being written
     reorder_writing: bool,
-    /// 按了 m:run 循环开 fzf 挑分组(要让出终端,单元测试里没有)
+    /// m pressed: the run loop opens fzf to pick a group (gives up the terminal; not in unit tests)
     pub pick_group: Option<GroupPick>,
-    /// 「近几天」的几天(DAYS 里的一个)
+    /// The number of days for "recent days" (one of DAYS)
     days: u64,
-    /// 新建时按路径定分组的线索从哪来(`with_group_hints`);默认没有,单元测试不碰真实的库
+    /// Where the hints for picking a group from a path come from when creating (`with_group_hints`); none by default,
+    /// unit tests don't touch the real database
     group_hints: fn() -> crate::data::GroupHints,
-    /// `A` 接管前怎么认这个 tmux 会话(`with_adopt`):给 `$会话号` / `%窗格号`;默认认不了,单元测试不碰真实的 tmux 和进程
+    /// How `A` identifies the tmux session before adopting (`with_adopt`): given `$session` / `%pane`; can't by default,
+    /// unit tests don't touch real tmux or processes
     adopt_planner: fn(&str) -> Result<aca_core::adopt::Plan, String>,
-    /// `^N` 的默认目录从哪来(`with_new_group_dir`);默认 ~/workspace,单元测试不碰真实的配置
+    /// Where `^N`'s default directory comes from (`with_new_group_dir`); ~/workspace by default, unit tests don't touch the real config
     new_group_dir: fn() -> String,
-    /// 设置页读写的(`with_settings`):输入法开没开、写错的、改一项、账号;默认不读不写,单元测试不碰真实的配置
+    /// What the settings page reads and writes (`with_settings`): whether the input method switch is on, config errors, changing an item,
+    /// accounts; reads and writes nothing by default, unit tests don't touch the real config
     ime_auto: fn() -> bool,
     config_bad: fn() -> Vec<String>,
     config_set: fn(&str, &str, toml::Value) -> Result<(), String>,
     accounts_lister: fn() -> Vec<crate::accounts::Account>,
-    /// 功能自己的弹窗(见 overlay.rs),键给最上面那层;`M` 的 MCP 是第一个
+    /// Feature popups (see overlay.rs), keys go to the top one; `M`'s MCP is the first
     overlays: Vec<Box<dyn Overlay>>,
-    /// 设置页里功能自己加的行(`with_setting`);默认没有,单元测试不碰真实的系统
+    /// Rows features add to the settings page (`with_setting`); none by default, unit tests don't touch the real system
     setting_rows: Vec<Box<dyn Setting>>,
-    /// `M` 从哪读 MCP(`with_mcp`);默认是空的,单元测试不碰真实文件
+    /// Where `M` reads MCP from (`with_mcp`); empty by default, unit tests don't touch real files
     mcp_loader: fn(&Session) -> mcp::Info,
-    /// `P` 开的插件页(`with_plugins`,见 plugins.rs);单元测试里没有,不碰真实的登记表
+    /// The plugins page opened by `P` (`with_plugins`, see plugins.rs); absent in unit tests, which don't touch the real registry
     plugins_page: Option<fn() -> Box<dyn Overlay>>,
-    /// 分组上 `d` 的确认框从哪读登记表里的分组(子分组、归档着的会话)(`with_groups`);默认是空的,单元测试不碰真实的库
+    /// Where the confirm box of `d` on a group reads the registry's groups from (subgroups, archived sessions) (`with_groups`);
+    /// empty by default, unit tests don't touch the real database
     groups_loader: fn() -> Vec<groups::Row>,
     pub refresh: bool,
-    /// ^Z 能撤的,最近做的在最后(见 undo.rs)
+    /// What ^Z can undo, most recent last (see undo.rs)
     undo: Vec<Undo>,
-    /// 回收站(见 trash.rs):里面的会话列表里不列
+    /// The trash (see trash.rs): sessions in it aren't listed
     pub trash: Trash,
-    /// 后台在跑的是 ^Z 的撤销:(那个活, 撤的哪步, 做成了说什么;None = 用它自己的话)。失败了那步放回去
+    /// The background job is a ^Z undo: (the job, the undone step, what to say on success; None = its own words). Step put back on failure
     reverting: Option<(Job, Undo, Option<String>)>,
-    /// 后台在删的是自动清理的那一批(见 `sweep`)和 remove_after:做完底栏说是自动删的
+    /// The background is deleting the auto-cleanup batch (see `sweep`) and remove_after: when done the bottom bar says it was automatic
     swept: Option<(Job, u64)>,
-    /// 回收站里有到期的:run 循环去真删
+    /// Something in the trash has expired: the run loop deletes it for real
     pub purge: bool,
 }
 
@@ -2635,7 +2722,7 @@ impl App {
         app
     }
 
-    /// 接上置顶文件(不接 = 置顶只在内存里,单元测试用)
+    /// Hook up the pins file (not hooked up = pins live only in memory, for unit tests)
     pub fn with_tools(mut self, f: fn() -> Result<Vec<Tool>, String>) -> Self {
         self.tools_loader = f;
         self
@@ -2672,7 +2759,7 @@ impl App {
         self
     }
 
-    /// 设置页加一行(排在自带的后面)
+    /// Add a row to the settings page (after the built-in ones)
     pub fn with_setting(mut self, row: Box<dyn Setting>) -> Self {
         self.setting_rows.push(row);
         self
@@ -2698,7 +2785,7 @@ impl App {
         self
     }
 
-    /// `X` 换账号的框:额度从哪读、登录怎么问、放不放到后台问
+    /// The `X` switch-account box: where quotas are read, how login is checked, whether to check in the background
     pub fn with_rehome(
         mut self,
         quotas: fn(Agent) -> Vec<crate::usage::Quota>,
@@ -2716,7 +2803,7 @@ impl App {
         self
     }
 
-    /// 接上便签文件(不接 = 只在内存里)
+    /// Hook up the notes file (not hooked up = memory only)
     pub fn with_notes(mut self, notes: Notes) -> Self {
         self.notes = notes;
         let v = std::mem::take(&mut self.all);
@@ -2724,14 +2811,14 @@ impl App {
         self
     }
 
-    /// 只看这个工作区(`aca -l` 用上次停在的那个)
+    /// Show only this workspace (`aca -l` uses the one it was last on)
     pub fn in_space(mut self, c: char) -> Self {
         self.space = c;
         self.rebuild();
         self
     }
 
-    /// `aca 关键词` / `-n`:标题、分组、tmux 名里带这个词的,和 / 一样只找这个工作区的
+    /// `aca keyword` / `-n`: ones with this word in the title, group or tmux name; like /, only searches this workspace
     pub fn matching(&self, kw: &str) -> Vec<&Session> {
         let k = kw.to_lowercase();
         self.all
@@ -2740,7 +2827,7 @@ impl App {
             .collect()
     }
 
-    /// 接上删了等真删的记录(不接 = 只在内存里)
+    /// Hook up the record of deleted sessions awaiting real deletion (not hooked up = memory only)
     pub fn with_trash(mut self, trash: Trash) -> Self {
         self.trash = trash;
         let v = std::mem::take(&mut self.all);
@@ -2748,7 +2835,7 @@ impl App {
         self
     }
 
-    /// 接上已读 / 工作区的文件(不接 = 只在内存里)
+    /// Hook up the read / workspace files (not hooked up = memory only)
     pub fn with_marks(mut self, reads: Reads, spaces: Spaces) -> Self {
         (self.reads, self.spaces) = (reads, spaces);
         let v = std::mem::take(&mut self.all);
@@ -2757,7 +2844,7 @@ impl App {
     }
 
     pub fn set_sessions(&mut self, mut v: Vec<Session>) {
-        // 回收站里的(这个或另一个 aca 删的)不列;有到期的,顺手去真删
+        // Ones in the trash (deleted by this or another aca) aren't listed; if any have expired, delete them for real while at it
         self.trash.reload();
         if self.trash.due(epoch()) {
             self.purge = true;
@@ -2779,11 +2866,11 @@ impl App {
         self.all = v;
         self.lay_agents();
         self.drop_vanished();
-        // 勾上的会话没了(删了、归档了):不再算选上
+        // A ticked session is gone (deleted, archived): no longer counts as selected
         let live = |id: &String, all: &[Session]| all.iter().any(|s| s.sub.is_none() && s.deck_id == *id);
         self.picked.retain(|id| live(id, &self.all));
         self.anchor = self.anchor.take().filter(|id| live(id, &self.all));
-        self.pins.reload(); // 另一个 aca(手机 / 桌面)可能刚改过
+        self.pins.reload(); // another aca (phone / desktop) may have just changed it
         self.notes.reload();
         self.spaces.reload();
         self.reads.reload();
@@ -2791,16 +2878,16 @@ impl App {
             s.state = read_state(s, &self.reads);
         }
         self.apply_pins();
-        // 选中的分组里(这个工作区的)会话都没了 → 回到全部分组
+        // The selected group has no sessions left (in this workspace) → back to all groups
         if self.group.as_ref().is_some_and(|g| !self.all.iter().any(|s| &s.group == g && s.space == self.space && !s.blank)) {
             self.group = None;
         }
         self.rebuild();
     }
 
-    /// 展开了的会话(`agents_open`):它派出去的子代理各拼一行,挂在它下面(排在哪由 `sort_sessions` 定,之后要 `apply_pins`)。
-    /// 先把上回拼的去掉再拼,所以展开 / 收起之后再调一次就行。子代理都不列了的会话(跑完、换了一轮)不再记着展开:
-    /// 下回再派,还是先收着
+    /// Unfolded sessions (`agents_open`): each subagent it sent out gets a row hung under it (where it sorts is up to `sort_sessions`,
+    /// then `apply_pins`). The last round's rows are removed before adding, so just call it again after folding / unfolding.
+    /// A session with no subagents listed any more (done, new turn) is no longer remembered as unfolded: the next ones start folded
     fn lay_agents(&mut self) {
         self.all.retain(|s| s.subagent.is_none());
         let all = &self.all;
@@ -2812,7 +2899,7 @@ impl App {
             .flat_map(|s| s.subagents.iter().enumerate().map(move |(k, a)| agent_row(s, k, a)))
             .collect();
         self.all.extend(rows);
-        // 高亮停着的那个子代理不列了:回到它的会话上
+        // The subagent the highlight was on is no longer listed: back to its session
         if let Some(n) = self.selected.as_ref().filter(|n| n.contains(AGENT_SEP))
             && !self.all.iter().any(|s| &s.name == n)
         {
@@ -2820,7 +2907,7 @@ impl App {
         }
     }
 
-    /// 列表里编号 n 的那一行在可见列表第几个(子代理那些行、空分组不编号)
+    /// Where the row numbered n is in the visible list (subagent rows and empty groups aren't numbered)
     fn numbered(&self, n: usize) -> Option<usize> {
         self.view
             .iter()
@@ -2830,8 +2917,9 @@ impl App {
             .map(|(p, _)| p)
     }
 
-    /// 高亮停在子代理那一行:它没有窗格、不是会话,只能看。⏎ / Z 看它的记录;走动、换范围、开面板的键照常
-    /// (返回 false,接着走列表的键);对着会话做的键(改名、删除、便签、看输出……)不理,说一声
+    /// The highlight is on a subagent row: it has no pane and isn't a session, so it's view-only. ⏎ / Z show its record; moving,
+    /// changing scope and opening panels work as usual (returns false, falls through to list keys); keys aimed at a session
+    /// (rename, delete, note, view output…) are ignored with a message
     fn on_agent_row_key(&mut self, k: KeyEvent) -> bool {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
@@ -2854,7 +2942,7 @@ impl App {
         !pass
     }
 
-    /// 这个工作区里有会话的分组,按分区的顺序(和列表里从上到下一致)
+    /// Groups in this workspace that have sessions, in section order (same as top to bottom in the list)
     fn groups(&self) -> Vec<String> {
         let mut v: Vec<(usize, &str)> =
             self.all.iter().filter(|s| s.space == self.space && !s.blank).map(|s| (s.slot.0, s.group.as_str())).collect();
@@ -2863,12 +2951,12 @@ impl App {
         v.into_iter().map(|(_, g)| g.to_string()).collect()
     }
 
-    /// 全部分组时按分组分区(插标题);只看一个分组时不用
+    /// With all groups shown, sections by group (headings inserted); not when showing a single group
     pub fn sectioned(&self) -> bool {
         self.group.is_none()
     }
 
-    /// 轮换:全部分组 → 各分组(按分区顺序)→ 全部分组
+    /// Cycle: all groups → each group (in section order) → all groups
     fn cycle_group(&mut self, d: isize) {
         let gs = self.groups();
         let cur = self.group.as_ref().and_then(|g| gs.iter().position(|n| n == g)).map_or(0, |p| p as isize + 1);
@@ -2876,7 +2964,7 @@ impl App {
         self.set_group(if next == 0 { None } else { Some(gs[next as usize - 1].clone()) });
     }
 
-    /// ⇧Tab:换回刚才看的分组(同 Tab ⏎),再按又换回来
+    /// ⇧Tab: switch back to the group just looked at (same as Tab ⏎); again switches back
     fn back_group(&mut self) {
         match self.prev_group.clone() {
             Some(Some(g)) if !self.groups().contains(&g) => {
@@ -2887,7 +2975,7 @@ impl App {
         }
     }
 
-    /// 换成只看这个分组(None = 全部分组),记下换之前看的
+    /// Switch to showing only this group (None = all groups), remembering the one shown before
     fn set_group(&mut self, to: Option<String>) {
         if to != self.group {
             self.prev_group = Some(std::mem::replace(&mut self.group, to));
@@ -2900,7 +2988,7 @@ impl App {
         self.rebuild();
     }
 
-    /// 开着弹窗 / 输入框 / 全屏的页面(键都给它,顶栏标签没画出来)
+    /// A popup / input box / full-screen page is open (it gets all keys; the top bar tab isn't drawn)
     fn modal_open(&self) -> bool {
         self.bill.is_some()
             || self.reader.is_some()
@@ -2918,21 +3006,22 @@ impl App {
             || self.pick_group.is_some()
     }
 
-    /// 分组列表的行:(字母, 分组),第 0 行是全部分组(按空格)
+    /// Rows of the group list: (letter, group); row 0 is all groups (Space)
     fn group_rows(&self) -> Vec<(char, Option<String>)> {
         let gs = self.groups();
         let keys = group_keys(&gs);
         std::iter::once((' ', None)).chain(keys.into_iter().zip(gs.into_iter().map(Some))).collect()
     }
 
-    /// Tab:这个工作区的分组列表,高亮停在上一个看的分组(没换过就停在现在这个)
-    /// `F`:只看一种状态的小单。高亮停在现在挑着的那种上(没挑是「全部」)
+    /// Tab: this workspace's group list, the highlight on the group last looked at (on the current one if never switched)
+    /// `F`: the small only-one-state list. The highlight is on the state picked now ("All" if none)
     fn open_only_menu(&mut self) {
         self.digits.clear();
         self.only_menu = Some(self.status.and_then(|p| PICKS.iter().position(|&x| x == p)).map_or(0, |i| i + 1));
     }
 
-    /// 只看的小单里:↑↓ j k 挑、⏎ 只看它(停在已经挑着的那种上 = 取消),行首的键直接挑,空格 = 全部;Esc / F / q 关
+    /// In the only-state list: ↑↓ j k pick, ⏎ shows only it (on the one already picked = cancel), the key at the start of a row picks
+    /// directly, Space = all; Esc / F / q close
     fn on_only_menu_key(&mut self, k: KeyEvent) {
         let Some(sel) = self.only_menu else { return };
         let n = PICKS.len() + 1;
@@ -2959,7 +3048,8 @@ impl App {
         }
     }
 
-    /// 这个工作区里这种状态的有几个(不算子代理、占位的空行;同顶栏右边的计数)
+    /// How many in this workspace are in this state (not counting subagents or
+    /// placeholder empty rows; same as the count at the right of the top bar)
     fn pick_count(&self, p: Option<Pick>) -> usize {
         self.all.iter().filter(|s| s.subagent.is_none() && !s.blank && s.space == self.space && p.is_none_or(|p| p.hit(s))).count()
     }
@@ -2970,7 +3060,7 @@ impl App {
         self.group_menu = Some(self.prev_group.as_ref().and_then(at).or_else(|| at(&self.group)).unwrap_or(0));
     }
 
-    /// 分组列表里:↑↓ 挑、⏎ 换过去,直接按字母也换,空格 = 全部分组;Esc / Tab / q 关
+    /// In the group list: ↑↓ pick, ⏎ switches there, typing a letter switches too, Space = all groups; Esc / Tab / q close
     fn on_group_menu_key(&mut self, k: KeyEvent) {
         let Some(sel) = self.group_menu else { return };
         let rows = self.group_rows();
@@ -2995,12 +3085,14 @@ impl App {
         }
     }
 
-    /// 置顶的按置顶先后排在最上面,其余照常排。先整体重排一遍,刚取消置顶的才会回到原位
+    /// Pinned ones go on top in pin order, the rest sort as usual. Everything is
+    /// re-sorted first, so a just-unpinned one goes back to its place
     fn apply_pins(&mut self) {
         self.apply_group_reorders();
         sort_sessions(&mut self.all);
         self.apply_reorders();
-        // 子窗格跟着自己的会话走(一起置顶);挂着的子会话自己没置顶的,跟着上面最近一个置顶了的走(父会话、再上一层……)
+        // Child panes go with their own session (pinned together); hanging child sessions that aren't pinned themselves go with the
+        // nearest pinned one above (the parent, the one above that…)
         let hangs = hangs(&self.all);
         let rank = |pins: &Pins, s: &Session| pins.rank(s.family()).or_else(|| s.ancestors(&hangs).find_map(|p| pins.rank(p)));
         let space: Vec<char> = self.all.iter().map(|s| space_of(&self.all, &self.spaces, s, true)).collect();
@@ -3014,8 +3106,9 @@ impl App {
         self.all.sort_by_key(|s| rank(pins, s).unwrap_or(usize::MAX));
     }
 
-    /// 还没写进登记表的 ⇧↑ ⇧↓ 先在列表里挪好:整家(窗口、挂在下面的各层子会话)搬到那个会话整家的紧前面 / 紧后面。
-    /// 写完之前每次刷新读到的还是旧顺序,照样再挪一遍;已经写进去的再挪一遍也不变
+    /// ⇧↑ ⇧↓ moves not yet written to the registry are applied to the list first: the whole family (windows, all levels of child
+    /// sessions hanging below) moves to right before / right after that session's family.
+    /// Until written, every refresh reads the old order, so move it again; moving one already written again changes nothing
     fn apply_reorders(&mut self) {
         let hangs = hangs(&self.all);
         let row = |all: &[Session], t: &Target| -> Option<String> {
@@ -3034,8 +3127,9 @@ impl App {
         }
     }
 
-    /// 还没写进登记表的分组上 ⇧↑ ⇧↓:改分组的先后(slot 的第一格),排的时候跟着走。
-    /// 分组连着子分组搬到 by 那一家的紧前面 / 紧后面;「其他 tmux 会话」一直沉底。再挪一遍也不变
+    /// ⇧↑ ⇧↓ on a group not yet written to the registry: changes group order (the first field of slot), followed when sorting.
+    /// A group moves with its subgroups to right before / right after the `by` family; "Other tmux sessions" always sinks to the bottom.
+    /// Moving again changes nothing
     fn apply_group_reorders(&mut self) {
         let within = |g: &str, top: &str| g == top || g.strip_prefix(top).is_some_and(|r| r.starts_with('/'));
         for job in &self.reorders {
@@ -3057,8 +3151,9 @@ impl App {
         }
     }
 
-    /// ⇧↑ ⇧↓:和同一组里上 / 下一个会话换位置(子会话在同一个父会话下面换),写进登记表里的组内顺序。
-    /// 只看列表里看得到的:中间隔着的(归档的、别的工作区的、筛掉的)留在另一边
+    /// ⇧↑ ⇧↓: swap with the previous / next session in the same group (child sessions swap under the same parent), written to the
+    /// registry's in-group order. Only what's visible in the list counts: ones in between (archived, other workspaces', filtered
+    /// out) stay on the other side
     fn reorder(&mut self, d: isize) {
         if let Some(g) = self.group_row().map(String::from) {
             return self.reorder_group(&g, d);
@@ -3080,7 +3175,8 @@ impl App {
         if let Some(m) = m {
             return self.flash(&m);
         }
-        // 能换的:同一个 profile、同一组、同一层(顶格的和顶格的,子会话和同一个父会话下面的),自己没置顶
+        // Swappable: same profile, same group, same level (top level with top
+        // level, child sessions under the same parent), not pinned itself
         let peer = |o: &Session| {
             o.sub.is_none()
                 && !o.deck_id.is_empty()
@@ -3089,7 +3185,8 @@ impl App {
                 && o.under() == s.under()
                 && self.pins.rank(&o.name).is_none()
         };
-        // 出了这一组(子会话:出了父会话那一家)就不往下找了;兄弟下面挂着的各层子会话还在这一家里,跳过去接着找
+        // Stop searching once out of this group (child sessions: out of the parent's family); child sessions at any level hanging
+        // under a sibling are still in that family, skip over them and keep looking
         let hangs = hangs(&self.all);
         let inside = |o: &Session| match s.under() {
             Some(up) => o.family() == up || o.ancestors(&hangs).any(|p| p == up),
@@ -3113,8 +3210,8 @@ impl App {
         self.queue_reorder(Job::Order { t, by, after: d > 0 });
     }
 
-    /// 分组上 ⇧↑ ⇧↓:和上 / 下一个看得到的同级分组换位置(连着各自的子分组),写进登记表里的分组先后。
-    /// 子分组出不了父分组;中间隔着看不到的(别的工作区的、筛掉的)留在另一边
+    /// ⇧↑ ⇧↓ on a group: swap with the previous / next visible sibling group (each with its subgroups), written to the registry's
+    /// group order. A subgroup can't leave its parent group; invisible ones in between (other workspaces', filtered out) stay put
     fn reorder_group(&mut self, g: &str, d: isize) {
         if g == "-" {
             return self.flash(t!("普通 tmux 会话区域不能移动", "the ordinary tmux sessions section can't be moved"));
@@ -3124,7 +3221,7 @@ impl App {
         let Some(cur) = secs.iter().position(|h| *h == g) else { return };
         let depth = g.split('/').count();
         let parent = |p: &str| p.rsplit_once('/').map(|x| x.0.to_string());
-        // 分区 h 在 g 这一层上是哪个分组(g 自己 = h 是它的子分组);出了 g 的父分组 = None
+        // Which group section h is at g's level (g itself = h is its subgroup); outside g's parent group = None
         let peer = |h: &str| -> Option<String> {
             let parts: Vec<&str> = h.split('/').collect();
             let at = parts.get(..depth)?.join("/");
@@ -3147,8 +3244,8 @@ impl App {
         self.queue_reorder(Job::GroupOrder { group: g.to_string(), by, after: d > 0 });
     }
 
-    /// ⇧↑ ⇧↓ 记下来,列表马上照着挪。连着挪同一个(会话 / 分组)只留最后一下(只动它自己,别的之间的先后不变);
-    /// 正在写的那个不能改
+    /// Record a ⇧↑ ⇧↓; the list moves at once. Consecutive moves of the same one (session / group) keep only the last (only it
+    /// moves; the order among the others stays); the one being written can't be changed
     fn queue_reorder(&mut self, job: Job) {
         let same = |a: &Job, b: &Job| match (a, b) {
             (Job::Order { t: x, .. }, Job::Order { t: y, .. }) => x.profile == y.profile && x.id == y.id,
@@ -3164,7 +3261,8 @@ impl App {
         self.rebuild();
     }
 
-    /// p:子窗格上按 = 置顶它所在的会话;跟着上面的会话置顶的子会话上按 = 取消那个会话的置顶(父会话,或者再上面置顶了的那一层)
+    /// p: on a child pane = pin the session it's in; on a child session pinned along with a session above = unpin that session
+    /// (the parent, or the pinned level further up)
     fn toggle_pin(&mut self) {
         let Some(s) = self.current() else { return };
         let hangs = hangs(&self.all);
@@ -3189,11 +3287,11 @@ impl App {
         };
         self.flash(&m);
         self.apply_pins();
-        self.rebuild(); // 高亮跟着会话走,一起挪到上面
+        self.rebuild(); // the highlight follows the session up
     }
 
-    /// 进可见列表里最近一个在等你的(红 / 黄 `◐`)。进去看过、之后没新输出的跳过 ——
-    /// 看完 prefix+d 回来再按 `i` 就是下一个,挨个过一遍
+    /// Go into the nearest one in the visible list that needs you (red / yellow `◐`). Ones looked at with no new output since are
+    /// skipped — come back with prefix+d and press `i` again for the next one, going through them one by one
     fn jump_waiting(&mut self) {
         let pick = (0..self.view.len())
             .filter(|&p| !self.is_fold_row(p))
@@ -3211,8 +3309,8 @@ impl App {
         }
     }
 
-    /// 跳转模式下的按键,同 agent-deck:小写字母拼提示,对上就进那个会话(分组标题就停在标题上);Esc 退出;
-    /// 别的键退出跳转并照常处理(返回 false)
+    /// Keys in jump mode, like agent-deck: lowercase letters spell a hint, a match goes into that session (a group heading: the
+    /// highlight stays on the heading); Esc leaves. Other keys leave jump mode and are handled as usual (returns false)
     fn on_jump_key(&mut self, k: KeyEvent) -> bool {
         match k.code {
             KeyCode::Esc => {
@@ -3247,19 +3345,20 @@ impl App {
         }
     }
 
-    /// 在多选:勾上了几个,或者正连选着
+    /// Multi-selecting: some are ticked, or a range is in progress
     fn picking(&self) -> bool {
         !self.picked.is_empty() || self.anchor.is_some()
     }
 
-    /// 可见列表第 p 行能不能多选:登记的会话才行(窗口、子代理、普通 tmux 会话、空分组、折叠行不行)
+    /// Whether row p of the visible list can be multi-selected: only registered sessions (not windows, subagents, plain tmux
+    /// sessions, empty groups or fold rows)
     fn pickable(&self, p: usize) -> bool {
         let s = &self.all[self.view[p]];
         s.sub.is_none() && !s.blank && !s.deck_id.is_empty() && !self.is_fold_row(p)
     }
 
-    /// 连选着的那一段(可见列表里的位置):从起点那行到高亮这行。起点没列出来 = None。
-    /// 高亮停在分组标题上时 list 选的是标题下面那个会话:往下拉到标题为止,不连上它
+    /// The range being selected (positions in the visible list): from the start row to the highlighted row. Start not listed = None.
+    /// With the highlight on a group heading `list` selects the session below it: the range stops at the heading, not including it
     fn range(&self) -> Option<std::ops::RangeInclusive<usize>> {
         let a = self.anchor.as_deref()?;
         let at = self.view.iter().position(|&i| self.all[i].sub.is_none() && self.all[i].deck_id == a)?;
@@ -3267,8 +3366,8 @@ impl App {
         Some(if self.head.is_some() && at < cur { at..=cur - 1 } else { at.min(cur)..=at.max(cur) })
     }
 
-    /// 选上的会话(登记的 id):勾上的加上连选着的(去掉勾的那种连选:减去),按列表里的先后;
-    /// 勾上了、现在没列出来的(筛掉的、折起来的)排在后面
+    /// Selected sessions (registered ids): ticked plus the range in progress (an unticking range: minus), in list order;
+    /// ticked ones not listed now (filtered out, folded) come last
     fn chosen(&self) -> Vec<String> {
         let id = |p: usize| &self.all[self.view[p]].deck_id;
         let ranged: Vec<&String> = self.range().map_or(vec![], |r| r.filter(|&p| self.pickable(p)).map(id).collect());
@@ -3285,7 +3384,7 @@ impl App {
         v
     }
 
-    /// 选上的会话本身,顺序同 `chosen`
+    /// The selected sessions themselves, in `chosen` order
     fn chosen_rows(&self) -> Vec<&Session> {
         self.chosen().iter().filter_map(|id| self.all.iter().find(|s| s.sub.is_none() && s.deck_id == *id)).collect()
     }
@@ -3296,7 +3395,8 @@ impl App {
         self.unpick = false;
     }
 
-    /// 只选上了一个、它也列着:高亮挪过去、不再多选,按键照对着它按的做(确认框、提示都和平时一样)
+    /// Only one selected and it's listed: the highlight moves to it, multi-select ends, and the key acts as if pressed on it
+    /// (confirm boxes and messages as usual)
     fn only_one(&mut self) -> bool {
         let ids = self.chosen();
         let [id] = &ids[..] else { return false };
@@ -3306,8 +3406,8 @@ impl App {
         true
     }
 
-    /// v:从高亮这行连选(↑↓ 拉一段);V(unpick)是连着去掉勾。连选着再按:没定下的那段不要了,从这行重新起(同 yazi)。
-    /// 停在分组标题上从组里第一个起
+    /// v: range select from the highlighted row (↑↓ extends it); V (unpick) unticks a range. v again while ranging: the unfixed
+    /// range is dropped and starts again from this row (like yazi). On a group heading it starts from the group's first session
     fn start_pick(&mut self, unpick: bool) {
         if self.on_fold_row() {
             return self.flash(t!("先展开再多选", "unfold first, then select"));
@@ -3326,8 +3426,9 @@ impl App {
         self.anchor = Some(self.all[self.view[p]].deck_id.clone());
     }
 
-    /// 多选时的键(底栏上写着),照 yazi:v / V 从这行重新连一段,连选着 Esc 把这一段定下、没在连选 Esc 全不选;
-    /// 空格勾上 / 去掉一个、往下走(连选着也是,这一段跟着拉长)。返回 false = 不归这里管,照常(挪高亮、看、搜、⏎…)
+    /// Keys while multi-selecting (shown in the bottom bar), like yazi: v / V start a new range from this row; Esc while ranging
+    /// fixes the range, otherwise unselects all; Space ticks / unticks one and moves down (also while ranging, extending the range).
+    /// Returns false = not handled here, as usual (move highlight, view, search, ⏎…)
     fn on_pick_key(&mut self, k: KeyEvent) -> bool {
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             return false;
@@ -3353,7 +3454,8 @@ impl App {
         true
     }
 
-    /// 空格:勾上 / 去掉高亮这个会话,往下走一行。停在分组标题上:组里列着的会话一起勾上(都勾着就都去掉)
+    /// Space: tick / untick the highlighted session and move down a row. On a group heading: tick the group's listed sessions
+    /// together (all ticked = untick all)
     fn tick(&mut self) {
         let Some(p) = self.list.selected() else { return };
         let ids: Vec<String> = match &self.head {
@@ -3376,9 +3478,10 @@ impl App {
         self.move_by(1);
     }
 
-    /// 多选后的 d / D / R:先问一句再一起做(重启没有在跑的就不问,同 R)。只选上一个就和对着它按一样
+    /// d / D / R after multi-select: ask first, then do them together (restart doesn't ask when none is running, same as R).
+    /// With only one selected it's like pressing on it
     fn ask_many(&mut self, act: Batch) {
-        // 别的删除还在删不碍事,接着删(同 d);别的活要等
+        // Other deletes still running don't matter, delete on (same as d); other work must wait
         let busy = match act {
             Batch::Remove => self.busy.clone().or_else(|| self.job.as_ref().map(Job::doing)),
             _ => self.doing(),
@@ -3447,7 +3550,8 @@ impl App {
         }
     }
 
-    /// 确认过的 d / D / R:放进后台一起做,多选清掉。删的先从列表里藏起来(同 d),删之前在跑的记下,^Z 撤回后再启动
+    /// Confirmed d / D / R: run together in the background, multi-select cleared. Deleted ones are hidden from the list first
+    /// (same as d); ones running before deletion are noted, to start again after ^Z undo
     fn run_many(&mut self, act: Batch, ts: Vec<Target>) {
         self.drop_picks();
         let live = |t: &Target| self.all.iter().any(|s| s.sub.is_none() && s.deck_id == t.id && s.profile == t.profile && !s.state.gone());
@@ -3464,8 +3568,9 @@ impl App {
         }
     }
 
-    /// `[idle] remove_after`:停着太久的(见 `stale`)和 v 多选一起删一样进回收站,算一条、^Z 撤回,底栏说是自动删的。
-    /// archived 是归档着的会话(列表里不列)和它们最后动的时刻。手上有活、正在多选时这一轮先不动
+    /// `[idle] remove_after`: ones stopped too long (see `stale`) go to the trash like a v multi-select delete, as one entry,
+    /// ^Z brings them back, the bottom bar says it was automatic. `archived` is archived sessions (not listed) and their last
+    /// activity time. Skips this round while busy or multi-selecting
     fn sweep(&mut self, after: u64, now: u64, archived: Vec<(Target, u64)>) {
         if self.job.is_some() || self.doing().is_some() || !self.picked.is_empty() || self.anchor.is_some() {
             return;
@@ -3483,9 +3588,9 @@ impl App {
         self.rebuild();
     }
 
-    /// 能自动删的:停着(■ ☾、关掉的 ✕)超过 after 秒没动的登记会话,不是置顶的、没有便签、没人连着,
-    /// 挂在它下面的子会话、它里面另开的窗口都没在跑;再加上归档着的里面同样久没动、没有便签、没置顶的
-    /// (归档不清置顶,拿回来还在原来的位置)。回收站里的不算
+    /// Auto-deletable: registered sessions stopped (■ ☾, closed ✕) with no activity for over `after` seconds, not pinned, no note,
+    /// nobody attached, with no child session hanging under them and no extra window inside still running; plus archived ones
+    /// equally long idle, with no note, not pinned (archiving doesn't clear pins; restored they're back in place). Not ones in the trash
     fn stale(&self, after: u64, now: u64, archived: Vec<(Target, u64)>) -> Vec<Target> {
         let hangs = hangs(&self.all);
         let needed: HashSet<&str> =
@@ -3510,7 +3615,7 @@ impl App {
         listed.map(target_of).chain(hidden.map(|(t, _)| t)).collect()
     }
 
-    /// 多选后的 m:fzf 挑一个分组,选上的一起挪进去(已经在里面的不动)
+    /// m after multi-select: pick a group in fzf, the selected ones move into it together (ones already in it stay)
     fn ask_move_many(&mut self) {
         if let Some(b) = self.doing() {
             return self.flash(&tr!("请稍候:{b}", "still busy: {b}"));
@@ -3529,7 +3634,7 @@ impl App {
         self.pick_group = Some(self.group_pick(t, from, here, all));
     }
 
-    /// 多选后的 p:有没置顶的就都置顶,都置顶着就都取消
+    /// p after multi-select: pin all if any is unpinned, unpin all if all are pinned
     fn pin_many(&mut self) {
         if self.only_one() {
             return self.toggle_pin();
@@ -3566,7 +3671,8 @@ impl App {
         self.rebuild();
     }
 
-    /// 多选后的 u:有没看的(◐)就都标成已读,不然闲着的都标成未读;在跑的、要你答的不动
+    /// u after multi-select: if any is unread (◐) mark all read, otherwise mark the idle ones unread; running ones and ones
+    /// needing your answer are left alone
     fn read_many(&mut self) {
         if self.only_one() {
             return self.toggle_read();
@@ -3599,10 +3705,10 @@ impl App {
             self.drop_picks();
         }
         self.flash(&m);
-        self.rebuild(); // 挑着 @ 时标成已读的就不列了
+        self.rebuild(); // with @ picked, ones marked read drop off the list
     }
 
-    /// 现在这块屏幕用的布局
+    /// The layout in use for this screen size
     fn mode(&self) -> Preview {
         match &self.following {
             Some(f) => f.layout,
@@ -3611,7 +3717,7 @@ impl App {
         }
     }
 
-    /// L:在这类屏幕的几种布局里轮换,底栏亮一会儿轮到了哪个
+    /// L: cycle through the layouts for this kind of screen; the bottom bar shows which for a moment
     fn cycle_preview(&mut self) {
         let n = narrow(self.screen.width);
         let order = layouts(n);
@@ -3629,7 +3735,7 @@ impl App {
         }
     }
 
-    /// 全屏阅读高亮的会话:先用已有的屏幕内容顶上,历史由 run 循环接着抓
+    /// Full-screen reader on the highlighted session: show the screen content we already have, the run loop fetches history next
     fn open_reader(&mut self) {
         if self.on_group(t!("查看全文", "read in full")) {
             return;
@@ -3653,7 +3759,7 @@ impl App {
         self.reader_load = true;
     }
 
-    /// `x`:全屏看高亮会话目录的改动,从顶上看起;模式沿用上次的
+    /// `x`: full-screen diff of the highlighted session's directory, from the top; the mode carries over from last time
     fn open_diff(&mut self) {
         if self.on_group(t!("查看改动", "view the diff")) {
             return;
@@ -3690,7 +3796,8 @@ impl App {
         });
     }
 
-    /// 看改动时要不要跑 git:刚打开、换了模式,或者到了定时刷新。给 run 循环 (会话名, 目录, 模式)
+    /// Whether the diff needs a git run: just opened, mode switched, or the periodic refresh is due. Gives the run loop
+    /// (session name, directory, mode)
     pub fn diff_request(&mut self, refreshed: bool) -> Option<(String, Where, Mode)> {
         let act = self.reader.as_ref().and_then(|r| self.all.iter().find(|s| s.name == r.name)).map_or(0, |s| s.active_at);
         let r = self.reader.as_mut()?;
@@ -3703,7 +3810,7 @@ impl App {
         Some((r.name.clone(), d.w.clone(), d.mode))
     }
 
-    /// 跑完的 diff。已经换了会话 / 模式的不要;和上次一样的不动(免得重折行)
+    /// A finished diff. Dropped if the session / mode has changed since; left alone if same as last time (no re-wrapping)
     pub fn set_diff(&mut self, name: &str, mode: Mode, d: diff::Diff) {
         let Some(r) = self.reader.as_mut().filter(|r| r.name == name) else { return };
         let Some(v) = r.diff.as_mut().filter(|v| v.mode == mode) else { return };
@@ -3719,13 +3826,13 @@ impl App {
         r.dirty = true;
     }
 
-    /// `Z`:高亮会话的记录(见 `trace`)
+    /// `Z`: the highlighted session's record (see `trace`)
     fn open_trace(&mut self) {
         if self.on_fold_row() {
             return self.flash(t!("先按回车展开", "press Enter to unfold first"));
         }
         let Some(s) = self.current().filter(|s| !s.blank) else { return };
-        // 子代理那一行:开它所在会话的记录,读好了直接进到它那一层(Esc 回到起它的那一轮)
+        // Subagent row: open its session's record, and once read go straight into its level (Esc goes back to the turn that started it)
         let (name, goto) = match &s.subagent {
             Some(a) => (s.family().to_string(), Some(a.id.clone())),
             None => (s.name.clone(), None),
@@ -3734,7 +3841,7 @@ impl App {
         self.trace = Some(TraceView { goto, ..TraceView::new(name) });
     }
 
-    /// 要不要去后台读记录:刚打开 / 换了会话。给 run 循环那个会话
+    /// Whether to read the record in the background: just opened / session switched. Gives the run loop that session
     pub fn trace_request(&mut self) -> Option<Session> {
         let v = self.trace.as_mut()?;
         if !std::mem::take(&mut v.want) {
@@ -3748,7 +3855,7 @@ impl App {
         s
     }
 
-    /// 后台读完了。已经换了会话的不要
+    /// The background read is done. Dropped if the session has changed since
     pub fn set_trace(&mut self, name: &str, r: Result<crate::trace::Trace, String>) {
         let Some(v) = self.trace.as_mut().filter(|v| v.name == name) else { return };
         v.loading = false;
@@ -3758,19 +3865,20 @@ impl App {
         }
     }
 
-    /// 定时刷新:记录变长了读新增的那截(平时就几 KB,几毫秒)
+    /// Periodic refresh: if the record grew, read the new tail (usually a few KB, a few ms)
     pub fn trace_tail(&mut self) {
         if let Some(v) = self.trace.as_mut() {
             v.tail();
         }
     }
 
-    /// 记录的会话在不在跑(在跑的一轮、还没回结果的工具算到现在)
+    /// Whether the record's session is running (a running turn and tools with no result yet count up to now)
     fn trace_live(&self) -> bool {
         self.trace.as_ref().is_some_and(|v| self.all.iter().any(|s| s.name == v.name && matches!(s.state, State::Running | State::Ask)))
     }
 
-    /// e:用编辑器只读地看选中的这一项 —— 读 / 改文件的工具看文件本身,别的写成一份临时的 Markdown
+    /// e: view the selected item read-only in the editor — tools that read / change a file show the file itself, others are
+    /// written to a temporary Markdown file
     fn trace_open_view(&mut self) {
         let live = self.trace_live();
         let Some(v) = self.trace.as_ref() else { return };
@@ -3795,7 +3903,7 @@ impl App {
     }
 
     fn on_trace_key(&mut self, k: KeyEvent) {
-        // Ctrl 组合键不当字母用(^Z 不是 z 看输出):^L 原地重启(同列表、计费面板),别的不理
+        // Ctrl combos aren't letters (^Z isn't z for output): ^L restarts in place (same as the list and billing panel), others are ignored
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             if k.code == KeyCode::Char('l') {
                 self.ask_relaunch();
@@ -3813,9 +3921,9 @@ impl App {
                 KeyCode::PageUp | KeyCode::Char('b') => d.scroll = d.scroll.saturating_sub(page),
                 KeyCode::PageDown | KeyCode::Char(' ') => d.scroll = d.scroll.saturating_add(page),
                 KeyCode::Home | KeyCode::Char('g') => d.scroll = 0,
-                KeyCode::End | KeyCode::Char('G') => d.scroll = usize::MAX, // 画的时候收到最底
+                KeyCode::End | KeyCode::Char('G') => d.scroll = usize::MAX, // clamped to the bottom when drawn
                 KeyCode::Char(c @ ('n' | 'p')) => {
-                    // 同一列里的下一块 / 上一块
+                    // Next / previous block in the same column
                     let b = v.cur();
                     let at = b.at().unwrap_or(0);
                     let to = if c == 'n' { b.items.get(at + 1) } else { at.checked_sub(1).and_then(|a| b.items.get(a)) };
@@ -3830,8 +3938,9 @@ impl App {
         }
         match k.code {
             KeyCode::Char('q' | 'Z') => return self.trace = None,
-            // 在子代理里:回上一层
-            // 从列表里子代理那一行直接进来的:Esc 回列表(← / h 还是往上一层,看是谁起的它)
+            // In a subagent: back up a level
+            // Entered straight from a subagent row in the list: Esc goes back to
+            // the list (← / h still go up a level, to whoever started it)
             KeyCode::Esc if !v.in_steps && v.home > 0 && v.path.len() == v.home => return self.trace = None,
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') if !v.in_steps && v.leave_sub() => return,
             KeyCode::Esc if !v.in_steps => return self.trace = None,
@@ -3860,14 +3969,14 @@ impl App {
                     v.steps_of = None;
                 }
             }
-            // 右边:⏎ 整屏看这一步(起了子代理的:进去看它的记录);← / Esc 回对话
+            // Right side: ⏎ views this step full screen (one that started a subagent: go into its record); ← / Esc back to the conversation
             KeyCode::Enter if v.in_steps => {
                 if !v.enter_sub(sel) {
                     v.detail = Some(TraceDetail::new(sel));
                 }
             }
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Esc if v.in_steps => v.in_steps = false,
-            // 左边:抄过来的那一块 ⏎ / → 展开;一轮 ⏎ / → 看它的过程
+            // Left side: ⏎ / → unfolds a copied block; ⏎ / → on a turn shows its steps
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if kind == Some(crate::trace::Kind::Copied) => {
                 if !v.open.remove(&sel) {
                     v.open.insert(sel);
@@ -3889,7 +3998,7 @@ impl App {
                     v.chat.reveal = true;
                 }
             }
-            // 右边:o 展开 / 收起这一步,O 这一轮的全部
+            // Right side: o folds / unfolds this step, O the whole turn
             KeyCode::Char('o') => {
                 let fold = v.steps_cache.as_ref().and_then(|c| c.blocks.iter().find(|x| x.node == sel)).is_some_and(|x| x.fold);
                 if !fold {
@@ -3932,7 +4041,7 @@ impl App {
         }
     }
 
-    /// J / K:换到列表里下一个 / 上一个会话接着看记录
+    /// J / K: switch to the next / previous session in the list and keep viewing records
     fn trace_step(&mut self, d: isize) {
         let cur = self.list.selected().unwrap_or(0) as isize;
         let mut next = cur + d;
@@ -3946,9 +4055,10 @@ impl App {
         self.open_trace();
     }
 
-    /// 预览顶上的改动统计要不要读:高亮的会话换了;定时刷新时它有了新动静(在跑时是窗格有输出,闲着时是 hook 报了事,
-    /// 见 `Session::active_at`),或者隔了 GLANCE_EVERY。每次刷新都数的话,停在一个大仓库上就是每两秒五个 git 进程。
-    /// 预览关着、在看全屏时不读
+    /// Whether to read the diff stats at the top of the preview: the highlighted session changed; on a periodic refresh it has new
+    /// activity (running: the pane has output; idle: a hook reported something, see `Session::active_at`), or GLANCE_EVERY passed.
+    /// Counting on every refresh would mean five git processes every two seconds while sitting on a big repository.
+    /// Not read while the preview is off or a full-screen view is open
     pub fn glance_request(&mut self, refreshed: bool) -> Option<(String, Where)> {
         if self.reader.is_some() || self.trace.is_some() || self.mode() == Preview::Off {
             return None;
@@ -3956,7 +4066,8 @@ impl App {
         if refreshed {
             self.spot = None;
         }
-        // 停在分组上:读组的路径(键见 group_key,run 循环据此连目录里的东西一起读);动静看组里最近动的那个
+        // On a group: read the group's paths (key from group_key; by it the run loop also reads what's in the directories);
+        // activity is the group's most recently active session
         let (key, w, act) = if self.on_group_row() {
             let sp = self.spot()?;
             let act = self.all.iter().filter(|s| s.group == sp.group && s.sub.is_none()).map(|s| s.active_at).max().unwrap_or(0);
@@ -3980,7 +4091,7 @@ impl App {
         self.glances.insert(name, g);
     }
 
-    /// lazygit / 编辑器回来了:改动可能变了(提交了、改了文件),重读;没起来就说一声
+    /// Back from lazygit / the editor: the diff may have changed (committed, files changed), reread; say so if it didn't start
     pub fn external_done(&mut self, err: Option<String>) {
         if let Some(d) = self.reader.as_mut().and_then(|r| r.diff.as_mut()) {
             d.want = true;
@@ -3995,13 +4106,13 @@ impl App {
             top.returned(&mut fx);
             self.apply(fx);
         }
-        // 弹窗里开的编辑器:回到弹窗;它关了再回设置页
+        // An editor opened from a popup: back to the popup; once that closes, back to the settings page
         if self.overlays.is_empty() {
             self.back_to_settings();
         }
     }
 
-    /// l:在这个仓库开 lazygit
+    /// l: open lazygit in this repository
     fn diff_lazygit(&mut self) {
         let Some(v) = self.reader.as_ref().and_then(|r| r.diff.as_ref()) else { return };
         match () {
@@ -4011,7 +4122,8 @@ impl App {
         }
     }
 
-    /// e:用编辑器打开屏幕最顶上那一处(顶上是清单 / 空行就往下找第一个有位置的)
+    /// e: open the spot at the very top of the screen in the editor (top is the
+    /// file list / a blank line: look down for the first one with a position)
     fn diff_edit(&mut self) {
         let Some(r) = self.reader.as_ref() else { return };
         let Some(v) = r.diff.as_ref() else { return };
@@ -4037,7 +4149,7 @@ impl App {
         }
     }
 
-    /// n / p:下一个 / 上一个文件的标题放到最顶上(p 翻过第一个就回到清单)
+    /// n / p: put the next / previous file's heading at the very top (p past the first goes back to the file list)
     fn diff_jump(&mut self, d: isize) {
         let Some(r) = self.reader.as_mut() else { return };
         let Some(v) = r.diff.as_ref() else { return };
@@ -4054,9 +4166,11 @@ impl App {
         }
     }
 
-    /// ?:按键速查(见 `help`),借全屏阅读的翻页,从顶上开始。按屏幕宽度排栏,所以画的时候再排
-    /// $:计费面板,默认看近 7 天。数在后台读(第一次要读完全部对话记录),读好之前先显示上次的
-    /// ^L:重启 aca(换上新装的程序)。后台还有活在跑就先不重启 —— 重启了它做完的结果就没人收了
+    /// ?: key reference (see `help`), paged like the full-screen reader, from the top. Columns follow screen width, so laid out when drawn
+    /// $: the billing panel, last 7 days by default. Numbers read in the background (the first time reads every conversation record);
+    /// shows last time's until ready
+    /// ^L: restart aca (switching to the newly installed program). Not while background work is still running — after a restart
+    /// nobody would collect its result
     fn ask_relaunch(&mut self) {
         if let Some(b) = self.doing() {
             let m = tr!("请稍候:{b}", "still busy: {b}");
@@ -4069,14 +4183,14 @@ impl App {
         self.quit = true;
     }
 
-    /// 重启时记下开到哪,交给新的那个(`--restarted`):计费面板开着就是 bill:时段,不然 list;
-    /// 只看着哪些账号的,后面接着 Tab 分开的账号名
+    /// On restart, note what was open and pass it to the new one (`--restarted`): with the billing panel open it's bill:period,
+    /// otherwise list; the accounts being shown, if any, follow as Tab-separated names
     pub fn relaunch_state(&self) -> String {
         let Some(b) = &self.bill else { return "list".into() };
         std::iter::once(format!("bill:{}", b.sel)).chain(self.bill_only.iter().cloned()).collect::<Vec<_>>().join("\t")
     }
 
-    /// 刚被 ^L 重启:说一声这个 aca 是什么时候装的(看得出新版换上了没有),计费面板开着的接着开
+    /// Just restarted by ^L: say when this aca was installed (shows whether the new version took), reopen the billing panel if it was open
     pub fn resume(&mut self, state: &str, installed: Option<String>) {
         let mut parts = state.split('\t');
         if let Some(sel) = parts.next().and_then(|x| x.strip_prefix("bill:")).and_then(|x| x.parse::<usize>().ok()) {
@@ -4096,7 +4210,8 @@ impl App {
         self.bill_want = true;
     }
 
-    /// run 循环问:要不要让后台读一份新的(要的话给出只看哪些账号)。开着面板时一分钟一次,按 r、换了账号立即;同时只读一份
+    /// Asked by the run loop: whether the background should read a fresh copy (if so, which accounts to show). Once a minute
+    /// while the panel is open, at once on r or an account switch; only one read at a time
     pub fn bill_request(&mut self) -> Option<Vec<String>> {
         if self.bill.is_none() || self.bill_loading {
             return None;
@@ -4109,7 +4224,7 @@ impl App {
         None
     }
 
-    /// 后台读完了;读失败时留着上次的数,底栏说一声
+    /// The background read is done; on failure keep the last numbers and say so in the bottom bar
     pub fn set_bill(&mut self, r: Result<crate::usage::Report, String>) {
         self.bill_got = Some(Instant::now());
         self.bill_loading = false;
@@ -4119,12 +4234,12 @@ impl App {
         }
     }
 
-    /// 挑账号浮窗里的账号(第 1 行起):最近一份数里所有账号,花得多的在前
+    /// Accounts in the account picker (from row 1): every account in the latest numbers, biggest spenders first
     fn bill_accounts(&self) -> Vec<crate::usage::Row> {
         self.bill_data.as_ref().map(|r| r.accounts.clone()).unwrap_or_default()
     }
 
-    /// a:打开挑账号的浮窗,高亮停在现在只看的第一个上(全部就停在「全部」)
+    /// a: open the account picker, the highlight on the first account shown now ("All" if all)
     fn open_bill_pick(&mut self) {
         let accts = self.bill_accounts();
         if accts.is_empty() {
@@ -4136,7 +4251,7 @@ impl App {
         }
     }
 
-    /// 换成只看这些账号(空 = 全部):关浮窗,回到顶上,让后台按它重读
+    /// Switch to showing only these accounts (empty = all): close the picker, back to the top, have the background reread for it
     fn set_bill_only(&mut self, only: Vec<String>) {
         if let Some(b) = self.bill.as_mut() {
             b.pick = None;
@@ -4150,15 +4265,15 @@ impl App {
         }
     }
 
-    /// 挑账号浮窗里的键:↑↓ 挑,⏎ / 数字 只看它(选了几个就看选上的),空格 勾上 / 去掉,
-    /// v 连选、V 连着去掉勾(↑↓ 拉,Esc 定下,同主列表),0 全部,Esc / a / q 关
+    /// Keys in the account picker: ↑↓ pick, ⏎ / a digit shows only it (with some ticked, shows the ticked ones), Space ticks / unticks,
+    /// v range select, V range untick (↑↓ extends, Esc fixes, same as the main list), 0 all, Esc / a / q close
     fn on_bill_pick_key(&mut self, k: KeyEvent) {
         let accts = self.bill_accounts();
         let Some(p) = self.bill.as_mut().and_then(|b| b.pick.as_mut()) else { return };
         let n = accts.len() + 1;
         let ranging = p.anchor.is_some();
         match k.code {
-            // 连选着:只在账号里上下(不绕回「全部」)
+            // While ranging: only move among accounts (don't wrap to "All")
             KeyCode::Up | KeyCode::Char('k') if ranging => p.sel = (p.sel - 1).max(1),
             KeyCode::Down | KeyCode::Char('j') if ranging => p.sel = (p.sel + 1).min(n - 1),
             KeyCode::Esc if ranging => {
@@ -4234,7 +4349,7 @@ impl App {
             KeyCode::PageUp | KeyCode::Char('b') => b.scroll = b.scroll.saturating_sub(page),
             KeyCode::PageDown | KeyCode::Char(' ') => b.scroll = b.scroll.saturating_add(page),
             KeyCode::Home | KeyCode::Char('g') => b.scroll = 0,
-            KeyCode::End | KeyCode::Char('G') => b.scroll = usize::MAX, // 画的时候收到最底
+            KeyCode::End | KeyCode::Char('G') => b.scroll = usize::MAX, // clamped to the bottom when drawn
             _ => {}
         }
     }
@@ -4255,14 +4370,15 @@ impl App {
         });
     }
 
-    /// 全屏阅读正在看的那一格(run 循环据此抓历史):窗格 id,停掉的会话没有就按会话名
+    /// The cell the full-screen reader is showing (the run loop fetches history from
+    /// it): the pane id, or the session name for a stopped session without one
     pub fn reader_target(&self) -> Option<String> {
         let r = self.reader.as_ref().filter(|r| !r.help && r.diff.is_none() && r.plugin.is_none())?;
         let pane = self.all.iter().find(|s| s.name == r.name).map(|s| s.pane.clone()).filter(|p| !p.is_empty());
         Some(pane.unwrap_or_else(|| format!("={}:", r.name)))
     }
 
-    /// 抓回来的历史。往上翻着的时候,底下长出来的新内容不把画面顶走
+    /// History fetched back. While scrolled up, new content growing at the bottom doesn't push the view away
     pub fn set_reader_lines(&mut self, lines: Vec<String>) {
         let Some(r) = self.reader.as_mut().filter(|r| r.diff.is_none() && r.plugin.is_none()) else { return };
         let asking = self.all.iter().any(|s| s.name == r.name && s.state == State::Ask);
@@ -4277,7 +4393,8 @@ impl App {
         let diff = r.diff.is_some();
         let page = if help && r.view_h > 0 { r.view_h } else { page };
         if help {
-            // 快捷键弹窗:Esc / ? / q 关,方向键、翻页键滚;别的键都是「查它」—— 亮起说明它的行,滚过去
+            // Keys popup: Esc / ? / q close, arrows and paging keys scroll; any other key
+            // "looks it up" — lights up the row explaining it and scrolls there
             match k.code {
                 KeyCode::Esc | KeyCode::Char('?' | 'q') if !k.modifiers.contains(KeyModifiers::CONTROL) => self.reader = None,
                 KeyCode::Up => r.scroll = r.scroll.saturating_add(1),
@@ -4291,7 +4408,7 @@ impl App {
             return;
         }
         if let Some(req) = r.plugin.clone() {
-            // 插件的输出:能翻、能复制、r 重跑;它不是会话,进不去、换不了别的会话看
+            // Plugin output: can page, copy, r reruns; it's not a session, so you can't go in or switch to another session
             match k.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | '?') => self.reader = None,
                 KeyCode::Char('r') => {
@@ -4315,7 +4432,7 @@ impl App {
             return;
         }
         match k.code {
-            // z 看输出、x 看改动:按的是正在看的那个就是返回
+            // z for output, x for the diff: pressing the one already shown goes back
             KeyCode::Char('z') if diff => self.open_reader(),
             KeyCode::Char('x') if !diff => self.open_diff(),
             KeyCode::Tab if diff => self.open_trace(),
@@ -4340,7 +4457,7 @@ impl App {
             KeyCode::PageDown | KeyCode::Char(' ') => r.scroll = r.scroll.saturating_sub(page),
             KeyCode::Char('u') => r.scroll = r.scroll.saturating_add(page / 2),
             KeyCode::Char('d') => r.scroll = r.scroll.saturating_sub(page / 2),
-            KeyCode::Home | KeyCode::Char('g') => r.scroll = usize::MAX, // 画的时候收到最顶
+            KeyCode::Home | KeyCode::Char('g') => r.scroll = usize::MAX, // clamped to the top when drawn
             KeyCode::End | KeyCode::Char('G') => r.scroll = 0,
             KeyCode::Char('J') => self.reader_step(1),
             KeyCode::Char('K') => self.reader_step(-1),
@@ -4350,11 +4467,11 @@ impl App {
         }
     }
 
-    /// J / K:换到列表里下一个 / 上一个会话接着看
+    /// J / K: switch to the next / previous session in the list and keep viewing
     fn reader_step(&mut self, d: isize) {
         let cur = self.list.selected().unwrap_or(0) as isize;
         let mut next = cur + d;
-        // 折叠行不是会话,跳过
+        // Fold rows aren't sessions, skip them
         while next >= 0 && next < self.view.len() as isize && self.is_fold_row(next as usize) {
             next += d;
         }
@@ -4369,7 +4486,7 @@ impl App {
         }
     }
 
-    /// 现在的视图(要存下来的那部分)
+    /// The current view (the part to save)
     pub fn view_state(&self) -> View {
         View {
             group: self.group.clone(),
@@ -4386,7 +4503,7 @@ impl App {
         }
     }
 
-    /// 恢复上次的视图。那个分组已经没有会话了就回到全部分组,那个会话不在了就高亮第一个
+    /// Restore the last view. If that group has no sessions any more, back to all groups; if that session is gone, highlight the first
     pub fn restore(mut self, v: View) -> Self {
         self.group = v.group;
         self.scope = v.scope;
@@ -4404,8 +4521,8 @@ impl App {
         self
     }
 
-    /// 会话的键 → tmux 的会话号(`$3`,进会话、分屏都按它找:tmux 的会话名就是标题,会变)。
-    /// 给的已经是会话号(^` 回上一个会话)就原样;刚建 / 刚启动的还没读进列表,现查
+    /// Session key → tmux session id (`$3`; going in and splitting look it up by this: the tmux session name is the title, which changes).
+    /// Already a session id (^` back to the previous session) = as is; just created / started ones not yet in the list are looked up now
     pub fn tmux_of(&self, key: &str) -> String {
         if key.starts_with('$') {
             return key.to_string();
@@ -4414,16 +4531,17 @@ impl App {
         listed.or_else(|| aca_core::tmux::find(key).map(|p| p.sid)).unwrap_or_default()
     }
 
-    /// 进了 / 刚从这个会话回来:算看过了
+    /// Went into / just back from this session: counts as seen
     pub fn mark_seen(&mut self, name: &str) {
         let Some(s) = self.all.iter().find(|s| s.sub.is_none() && (s.name == name || s.tmux == name)) else { return };
         let key = notes::key(s);
         let _ = self.reads.mark_read(&key, epoch(), &self.keep_marks());
     }
 
-    /// 从会话里回来(name 是进去的那个,left 是最后停在的会话号,见 `data::go_in`):待过的都算看过。
-    /// 高亮停在最后待的那个:里面切到别的会话(点了通知、^`)的是切到的那个,不然是进去的那个
-    /// (新建的、交接出来的还没被选中过);本来就停在它或它的窗口上的不动。还没读进列表的,后台重读的送到了才挪过去
+    /// Back from a session (name is the one gone into, left is the session id last on, see `data::go_in`): all visited count as seen.
+    /// The highlight goes to the last one visited: the one switched to inside (a clicked notification, ^`), otherwise the one gone into
+    /// (newly created / handed-off ones were never selected yet); already on it or its window = left alone. One not in the list yet
+    /// gets the highlight when the background reread arrives
     fn came_back(&mut self, name: &str, left: &str) {
         self.mark_seen(name);
         let last = self.all.iter().find(|s| !left.is_empty() && s.sub.is_none() && s.tmux == left).map(|s| s.name.clone());
@@ -4439,7 +4557,8 @@ impl App {
         }
     }
 
-    /// 已读文件里留哪些:还列着的会话,和删了还能撤回的。一个都没读到(采集失败)时全留
+    /// What the read file keeps: sessions still listed, and deleted ones that can
+    /// still be undone. Nothing read at all (collection failed) = keep all
     fn keep_marks(&self) -> impl Fn(&str) -> bool + use<> {
         let mut keys: HashSet<String> = self.all.iter().filter(|s| s.sub.is_none() && !s.blank).map(notes::key).collect();
         let none = keys.is_empty();
@@ -4447,7 +4566,7 @@ impl App {
         move |k: &str| none || keys.contains(k)
     }
 
-    /// u:未读的标成已读,闲着的标成未读(进去之前一直 ◐)
+    /// u: mark unread as read, idle as unread (◐ until you go in)
     fn toggle_read(&mut self) {
         if self.on_group(t!("标记", "mark")) {
             return;
@@ -4464,13 +4583,14 @@ impl App {
                     self.flash(&tr!("{what}「{title}」", "marked {what} “{title}”"));
                 }
                 self.remember(u);
-                self.rebuild(); // 挑着 @ 时标成已读的就不列了
+                self.rebuild(); // with @ picked, ones marked read drop off the list
             }
             Some(Err(e)) => self.flash(&tr!("保存失败:{e}", "not saved: {e}")),
         }
     }
 
-    /// 标一个会话(all 里第 i 个):未读的标成已读,闲着的标成未读,列表里的状态跟着改;返回撤销那一步。别的状态 = None
+    /// Mark one session (index i in all): unread → read, idle → unread, the
+    /// list's state follows; returns the undo step. Other states = None
     fn mark_one(&mut self, i: usize) -> Option<Result<Undo, String>> {
         let s = &self.all[i];
         let (key, title, name, state) = (notes::key(s), s.title.clone(), s.name.clone(), s.state);
@@ -4485,7 +4605,8 @@ impl App {
         Some(match r {
             Ok((st, what)) => {
                 self.all[i].state = st;
-                // 登记的会话「看过」记到核心那份上(同 `aca seen`):已读文件里的时刻是拿窗口最后有输出的时刻比的,屏幕一重画就又算未读了
+                // A registered session's "seen" goes into the core's copy (same as `aca seen`): the read file's time is compared with the
+                // window's last output time, so the session turns unread again as soon as the screen redraws
                 let seen = (st == State::Idle && registered && self.reads.live())
                     .then(|| aca_core::runtime::update(&name, |r| r.seen = epoch()).0.seen);
                 Ok(Undo::Read { key, name, title, what: what.into(), mark, state, seen })
@@ -4494,7 +4615,7 @@ impl App {
         })
     }
 
-    /// 列得出来的工作区(有会话的,再加上现在这个),h 不算;按键排(数字在字母前)
+    /// Workspaces that can be listed (ones with sessions, plus the current one), not h; sorted by key (digits before letters)
     fn space_list(&self) -> Vec<char> {
         let mut v: Vec<char> = self.all.iter().map(|s| s.space).chain([self.space]).filter(|&c| c != spaces::HIDDEN).collect();
         v.sort_unstable();
@@ -4502,7 +4623,7 @@ impl App {
         v
     }
 
-    /// 顶栏 / 列表里怎么称呼现在这个工作区:只用着 1、也没改过名时就是「会话」,和以前一样
+    /// What to call the current workspace in the top bar / list: with only 1 in use and never renamed it's "sessions", as before
     fn space_label(&self) -> String {
         if self.space == spaces::HOME && !self.spaces.renamed(spaces::HOME) && self.space_list().len() <= 1 {
             t!("全部分组", "All groups").into()
@@ -4511,7 +4632,7 @@ impl App {
         }
     }
 
-    /// q+键 / [ ] / ` / S 里选:切到这个工作区,高亮停在上次在那高亮的会话
+    /// Picked with q+key / [ ] / ` / S: switch to this workspace, highlight the session last highlighted there
     fn switch_space(&mut self, c: char) {
         self.space_menu = None;
         if c != self.space {
@@ -4531,7 +4652,7 @@ impl App {
         self.flash(&m);
     }
 
-    /// [ ]:前 / 后一个工作区(h 跳过),到头绕回来
+    /// [ ]: previous / next workspace (h skipped), wrapping around at the ends
     fn cycle_space(&mut self, d: isize) {
         let v = self.space_list();
         let next = if d > 0 {
@@ -4545,7 +4666,7 @@ impl App {
         }
     }
 
-    /// `:回到刚才待的工作区(h 也算),再按一次回来
+    /// `: back to the workspace just visited (h counts), again comes back
     fn back_space(&mut self) {
         match self.last_space.filter(|&c| c != self.space) {
             Some(c) => self.switch_space(c),
@@ -4553,7 +4674,7 @@ impl App {
         }
     }
 
-    /// ^`(弹窗里):这台客户端切回上一个会话,落在它离开时的那一格;切走 aca 就退了
+    /// ^` (in the popup): this client switches back to the previous session, landing in the cell it left from; switching away quits aca
     fn back_session(&mut self) {
         match crate::data::last_session() {
             Some(name) => {
@@ -4564,18 +4685,19 @@ impl App {
         }
     }
 
-    /// Q+键:把高亮的会话送到那个工作区(子行 = 它所在的会话),自己没分过的子会话跟着走(它们的子会话也一样);
-    /// 折叠行上 = 这个工作区里的整组,连组一起记,以后这个组里新开的(终端里 `aca new` 开的也算)直接落在那边。人留在这里
+    /// Q+key: send the highlighted session to that workspace (child row = the session it's in); child sessions never placed on their
+    /// own go along (and theirs too). On a fold row = this workspace's whole group, recording the group too, so new ones opened in it
+    /// later (including `aca new` in a terminal) land there directly. You stay here
     fn send_to_space(&mut self, c: char) {
         if c == self.space {
             return self.flash(t!("已在该工作区", "already in this workspace"));
         }
-        // v 多选着:送选上的那几个
+        // v multi-selecting: send the selected ones
         let many = self.picking().then(|| self.chosen());
         let fold = many.is_none() && self.on_group_row();
         let cur = self.current().filter(|_| many.is_none());
         let (fam, group) = cur.map(|s| (s.family().to_string(), s.group.clone())).unwrap_or_default();
-        // 空分组:没有会话可送,只记组
+        // Empty group: no sessions to send, just record the group
         let blank = cur.filter(|s| s.blank);
         let heads = || self.all.iter().filter(|x| x.sub.is_none() && !x.blank);
         let go: Vec<&Session> = match &many {
@@ -4590,7 +4712,7 @@ impl App {
             _ => tr!("「{}」", "“{}”", first.title),
         };
         let mut names: HashSet<&str> = go.iter().map(|x| x.name.as_str()).collect();
-        // 自己没分过的子会话一层层加进来,加到不再多为止
+        // Add child sessions never placed on their own, level by level, until no more are added
         loop {
             let more: Vec<&str> = heads()
                 .filter(|x| !names.contains(x.name.as_str()) && self.spaces.of(&notes::key(x)).is_none())
@@ -4603,7 +4725,7 @@ impl App {
             names.extend(more);
         }
         let want: HashMap<String, char> = heads().filter(|x| names.contains(x.name.as_str())).map(|x| (notes::key(x), c)).collect();
-        // 同名的组可能在几个 profile 里,各记一条;送回 1 = 组不记
+        // A group of the same name may be in several profiles, one record each; sending back to 1 = group not recorded
         let mut groups: Vec<(spaces::Group, Option<char>)> = vec![];
         if fold {
             for x in go.iter().chain(blank.as_ref()) {
@@ -4615,7 +4737,7 @@ impl App {
         }
         let sessions = self.settle(&self.all, &want, &groups);
         let keep = self.keep_marks();
-        // 撤销时放回去的:这些会话、组原来记的
+        // Put back on undo: what these sessions and groups had recorded before
         let before = (
             sessions.iter().map(|(k, _)| (k.clone(), self.spaces.of(k))).collect(),
             groups.iter().map(|(g, _)| (g.clone(), self.spaces.group_of(&g.0, &g.1))).collect(),
@@ -4636,8 +4758,9 @@ impl App {
         self.rebuild();
     }
 
-    /// 让每个会话落在 want 写的工作区(没写的留在现在的地方)要改哪些会话的记录;groups 是同时要改的组的记录。
-    /// after = 改完之后的会话(挪分组时分组已经换了)。记录尽量少:和不记也会在的地方一样就不记
+    /// Which sessions' records must change so each session lands in the workspace `want` says (ones not given stay where they are);
+    /// groups are group records to change at the same time. after = the sessions after the change (when moving groups, the group has
+    /// already changed). Records kept minimal: not recorded if it would be there anyway without one
     fn settle(
         &self,
         after: &[Session],
@@ -4650,8 +4773,9 @@ impl App {
         }
         let heads: Vec<&Session> = after.iter().filter(|s| s.sub.is_none() && !s.blank).collect();
         let goal = |s: &Session| want.get(&notes::key(s)).copied().unwrap_or(s.space);
-        // 不在该在的地方就记上。子会话跟着父会话,父会话的记录变了子会话也变,所以算到不再变为止
-        // (几层都是两遍就够:上面的记录一变,下面跟着变了的第二遍各自记上,不再牵动别人)
+        // Record it if it's not where it should be. Child sessions follow their parent, and a parent's record change changes them, so
+        // repeat until nothing changes (any depth takes two passes: once a record above changes, the ones below that moved with it
+        // record themselves in the second pass, affecting no one else)
         for _ in 0..3 {
             let mut changed = false;
             for s in &heads {
@@ -4673,7 +4797,7 @@ impl App {
         heads.iter().map(|s| notes::key(s)).filter(|k| next.of(k) != self.spaces.of(k)).map(|k| (k.clone(), next.of(&k))).collect()
     }
 
-    /// 新建 / 分叉出来的会话落在现在这个工作区(它的组记在别处也一样)
+    /// A newly created / forked session lands in the current workspace (even if its group is recorded elsewhere)
     pub fn adopt(&mut self, id: &str) {
         if id.is_empty() {
             return;
@@ -4682,13 +4806,13 @@ impl App {
         let sessions = if self.all.iter().any(|s| s.sub.is_none() && notes::key(s) == id) {
             self.settle(&self.all, &HashMap::from([(id.to_string(), self.space)]), &[])
         } else {
-            // 列表里还没有它:先记上,多余的下次送别的会话时顺手去掉
+            // Not in the list yet: record it first; the extra record is cleared next time another session is sent
             vec![(id.to_string(), Some(self.space))]
         };
         let _ = self.spaces.assign(&sessions, &[], &keep);
     }
 
-    /// q / Q 之后的那个键:工作区的键就切 / 送;q 之后再按 q 退出;别的键(Esc 等)取消
+    /// The key after q / Q: a workspace key switches / sends; q after q quits; other keys (Esc etc.) cancel
     fn on_pending_key(&mut self, p: Pending, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match (p, k.code) {
@@ -4699,7 +4823,7 @@ impl App {
         }
     }
 
-    /// S 的工作区列表:↑↓ 挑、⏎ 切过去,直接按键也切(h 这样不列的也行);^R 改名
+    /// S's workspace list: ↑↓ pick, ⏎ switches, typing a key switches too (even unlisted ones like h); ^R renames
     fn on_space_menu_key(&mut self, k: KeyEvent) {
         let Some(sel) = self.space_menu else { return };
         let v = self.space_list();
@@ -4725,7 +4849,7 @@ impl App {
         self.space_menu = Some(v.iter().position(|&c| c == self.space).unwrap_or(0));
     }
 
-    /// 配色列表(设置页的「主题」):列出主题,高亮停在现在用的那套
+    /// The color list (the settings page's "theme"): lists themes, the highlight on the one in use
     fn open_themes(&mut self) {
         let now = theme::current();
         let list: Vec<(theme::Theme, &'static theme::Pal)> = theme::list()
@@ -4739,7 +4863,8 @@ impl App {
         self.theme_menu = Some(ThemeMenu { list, sel, was: theme::pal(), now });
     }
 
-    /// 配色列表:↑↓ 移到哪套整个界面就换成哪套,⏎ 用它(记进 config.toml),Esc 换回打开前的
+    /// Color list: moving ↑↓ switches the whole interface to that theme, ⏎ uses it
+    /// (saved to config.toml), Esc switches back to the one before opening
     fn on_theme_key(&mut self, k: KeyEvent) {
         let Some(m) = self.theme_menu.as_mut() else { return };
         let n = m.list.len();
@@ -4767,12 +4892,12 @@ impl App {
         theme::set(m.list[m.sel].1);
     }
 
-    /// `^S`:设置页。不常用的都在这,不占单键
+    /// `^S`: the settings page. Everything rarely used lives here, taking no single key
     fn open_settings(&mut self) {
         self.settings = Some(self.load_settings(SetPage::Main, 0));
     }
 
-    /// 设置页显示的值,现读
+    /// Values shown by the settings page, read fresh
     fn load_settings(&self, page: SetPage, sel: usize) -> Settings {
         let mut bad = (self.config_bad)();
         bad.extend(
@@ -4798,17 +4923,18 @@ impl App {
         s
     }
 
-    /// 换了语言(设置页里按 l、别的 aca 改了 config.toml):按旧语言写好存着的字作废,该重读的马上重读。
-    /// 列表、弹窗的字每帧现拼,不用管;这里管的是后台读回来、打开时算好的
+    /// Language changed (l on the settings page, another aca changed config.toml): text written and stored in the old language is
+    /// void, what needs rereading is reread at once. List and popup text is built every frame, nothing to do; this handles what was
+    /// read in the background or computed on opening
     pub fn lang_changed(&mut self) {
-        // 预览顶上的改动统计(分支「没在分支上」、目录读不了的原因)
+        // Diff stats at the top of the preview (the branch's "detached", why a directory can't be read)
         self.glances.clear();
         self.glance_for = None;
-        // 计费:额度的说明是子进程按当时的语言写的;开着就马上重读,关着的下次打开再读
+        // Billing: quota descriptions are written by a subprocess in the language of the time; reread at once if open, next open if closed
         self.bill_data = None;
         self.bill_got = None;
         self.bill_want = self.bill.is_some();
-        // 记录:节点的标签是读的时候定的,整份重读
+        // Records: node labels are set when read, reread all of it
         if let Some(v) = self.trace.take() {
             self.trace = Some(TraceView::new(v.name));
         }
@@ -4821,21 +4947,21 @@ impl App {
         self.reload_settings();
     }
 
-    /// config.toml 被改了(编辑器里、另一个 aca):开着的设置页跟着重读
+    /// config.toml changed (in an editor, another aca): an open settings page rereads
     pub fn reload_settings(&mut self) {
         if let Some(s) = self.settings.take() {
             self.settings = Some(self.load_settings(s.page, s.sel));
         }
     }
 
-    /// 从设置页进去做的事做完了(或取消了):回到设置页原来那里,值重读
+    /// What was done from the settings page is finished (or cancelled): back to where it was on the settings page, values reread
     fn back_to_settings(&mut self) {
         if let Some(s) = self.settings_back.take() {
             self.settings = Some(self.load_settings(s.page, s.sel));
         }
     }
 
-    /// 离开设置页去做一件事,做完回来
+    /// Leave the settings page to do something, back when done
     fn leave_settings(&mut self) {
         self.settings_back = self.settings.take();
     }
@@ -4876,7 +5002,7 @@ impl App {
         }
     }
 
-    /// 设置页的一行:切换的当场切,别的进去
+    /// A settings page row: switches flip on the spot, others go in
     fn setting(&mut self, r: SetRow) {
         let Some(s) = self.settings.as_mut() else { return };
         match r {
@@ -4884,7 +5010,7 @@ impl App {
                 self.leave_settings();
                 self.open_themes();
             }
-            // 当场换(整个界面下一帧就是那种话),也记进 config.toml 下次照用
+            // Switch on the spot (the whole interface is in that language next frame), also saved to config.toml for next time
             SetRow::Lang => {
                 let to = if s.lang == Lang::Zh { Lang::En } else { Lang::Zh };
                 match (self.config_set)("ui", "lang", toml::Value::String(to.code().into())) {
@@ -4914,7 +5040,7 @@ impl App {
                     Err(e) => self.flash(&e),
                 }
             }
-            // 账号页是它自己的弹窗(acctpage.rs):关了回设置页这一行,几个账号重数
+            // The accounts page is its own popup (acctpage.rs): closing it returns to this settings row, accounts recounted
             SetRow::Accounts => {
                 if let Some(page) = self.accounts_page {
                     self.leave_settings();
@@ -4938,7 +5064,7 @@ impl App {
                 }
                 self.leave_settings();
                 self.apply(fx);
-                // 没进到哪去(当场切的):回设置页,值重读
+                // Didn't go anywhere (switched on the spot): back to the settings page, values reread
                 if self.overlays.is_empty() && self.external.is_none() {
                     self.back_to_settings();
                 }
@@ -4947,15 +5073,16 @@ impl App {
         }
     }
 
-    /// 路径默认填选中会话的目录 —— 列表本身就是目录选择器,多数时候直接回车,手机上不用打路径
-    /// fzf 候选的开头:选中会话的目录,再是列表里其他会话的
+    /// The path defaults to the selected session's directory — the list itself is the directory picker; mostly just Enter, no typing
+    /// paths on a phone
+    /// Start of the fzf candidates: the selected session's directory, then the other sessions' in the list
     pub fn dir_hints(&self) -> Vec<String> {
         let first = self.current().map(|s| s.dir.clone());
         first.clone().into_iter().chain(self.view.iter().map(|&i| self.all[i].dir.clone()).filter(|d| Some(d) != first.as_ref())).collect()
     }
 
-    /// ↓ / ^F 要打开的 fzf:候选目录,每个标上图标、会进哪个组、里面已有的会话。
-    /// 要扫目录、问 zoxide(~0.1s),在让出终端之前备好,免得露出底下的 shell 画面
+    /// The fzf opened by ↓ / ^F: candidate directories, each marked with an icon, which group it goes to, and sessions already in it.
+    /// Scans directories and asks zoxide (~0.1s), so prepared before giving up the terminal, to avoid showing the shell underneath
     pub fn dir_pick(&self, width: u16, height: u16) -> Option<DirPick> {
         let base = self.new_draft.as_ref()?.base.clone();
         self.dir_pick_from(create::dir_candidates(base.as_deref(), &self.dir_hints()), width, height)
@@ -4966,7 +5093,7 @@ impl App {
         let rows = cands
             .into_iter()
             .map(|(dir, src)| {
-                // 只数这个工作区的:别的工作区(尤其 h)的标题不在这露出来
+                // Count only this workspace's: other workspaces' titles (h especially) shouldn't show here
                 let here: Vec<&Session> =
                     self.all.iter().filter(|s| s.space == self.space && !s.dir.is_empty() && create::tilde(&s.dir) == dir).collect();
                 let mark = match src {
@@ -4986,7 +5113,8 @@ impl App {
         Some(DirPick { rows, what: d.label.clone(), query: d.pick_query(), width, height })
     }
 
-    /// fzf 回来了:回车 / 双击就开在那;→ 填进路径框接着打;Esc 什么都不变;出错写在输入框下面
+    /// fzf is back: Enter / double click opens there; → fills the path box to
+    /// keep typing; Esc changes nothing; errors go below the input box
     pub fn picked(&mut self, got: Result<Option<Picked>, String>) {
         let Some(d) = self.new_draft.as_mut() else { return };
         match got {
@@ -5006,7 +5134,7 @@ impl App {
         }
     }
 
-    /// `n`:先选工具(账号和 config.toml 里自己起名的工具),再和 N 一样填路径
+    /// `n`: pick a tool first (accounts and tools named in config.toml), then fill the path like N
     fn open_tools(&mut self) {
         match (self.tools_loader)() {
             Ok(v) if v.is_empty() => self.flash(t!("工具菜单为空", "the tool menu is empty")),
@@ -5018,7 +5146,7 @@ impl App {
         }
     }
 
-    /// 工具菜单里每个账号后面的额度:和 X 的框读的是同一份
+    /// The quota after each account in the tool menu: the same copy X's box reads
     fn load_tool_quotas(&mut self) {
         self.tool_quotas = [Agent::Claude, Agent::Codex].into_iter().flat_map(self.rehome_quotas).collect();
     }
@@ -5034,7 +5162,8 @@ impl App {
                 self.pick_tool(i);
             }
             KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < n => self.pick_tool(c as usize - '1' as usize),
-            // 加账号在账号页里(先挑是 Claude Code 还是 Codex);加完留在那一页,看得到它登录着没有
+            // Adding accounts is on the accounts page (pick Claude Code or Codex first);
+            // after adding it stays on that page, showing whether it's logged in
             KeyCode::Char('+') if self.handoff.is_none() => {
                 if let Some(page) = self.accounts_page {
                     self.tool_menu = None;
@@ -5050,7 +5179,7 @@ impl App {
     }
 
     fn pick_tool(&mut self, i: usize) {
-        // 起不了的那行(账号没登记、工具写坏了)选不了:菜单留着,底栏说为什么
+        // A row that can't start (account not registered, broken tool) can't be picked: the menu stays, the bottom bar says why
         if let Some(p) = self.tool_menu.as_ref().and_then(|(m, _)| m[i].problem.clone()) {
             return self.flash(&p);
         }
@@ -5078,14 +5207,15 @@ impl App {
     }
 
     fn ask_remove(&mut self) {
-        // 别的删除还在删不碍事,接着删;别的活(重启、改名…)做完才行
+        // Other deletes still running don't matter, delete on; other work (restart, rename…) must finish first
         if let Some(b) = self.busy.clone().or_else(|| self.job.as_ref().map(Job::doing)) {
             let m = tr!("请稍候:{b}", "still busy: {b}");
             return self.flash(&m);
         }
         let Some(s) = self.current() else { return };
-        // 普通 tmux 会话那行、里面还有别的窗口 / 窗格:只关它这一格,编号最小的接着当头(tmux 的 renumber-windows 把 #2 挪成 #1)。
-        // 登记的会话删的是整个会话:里面另开的窗口一起关(确认框里写着几个)
+        // A plain tmux session row with other windows / panes inside: close only this cell, the lowest-numbered one becomes the head
+        // (tmux's renumber-windows turns #2 into #1). A registered session deletes the whole session: extra windows inside close with
+        // it (the confirm box says how many)
         let others = self.all.iter().filter(|x| x.sub.is_some() && x.subagent.is_none() && x.family() == s.name).count();
         let next = match &s.sub {
             None if !s.pane.is_empty() && s.deck_id.is_empty() => self
@@ -5118,7 +5248,8 @@ impl App {
         }));
     }
 
-    /// R / r / m 要的:高亮的登记过的会话。后台还在忙、停在折叠行上、是普通 tmux 会话,说一声返回 None
+    /// What R / r / m need: the highlighted registered session. Background
+    /// busy, on a fold row, or a plain tmux session: say so, return None
     fn deck_target(&mut self, what: &str) -> Option<Target> {
         if let Some(b) = self.doing() {
             let m = tr!("请稍候:{b}", "still busy: {b}");
@@ -5143,7 +5274,7 @@ impl App {
         Some(t)
     }
 
-    /// s 那一格,交给 park.rs
+    /// s's cell, handed to park.rs
     fn pane_of(&self, s: &Session) -> crate::park::Pane {
         let title = clip(&s.title, 16).trim_end().to_string();
         crate::park::Pane {
@@ -5152,8 +5283,9 @@ impl App {
         }
     }
 
-    /// 不是登记的 agent 那一格(会话里另开的窗口 / 窗格、普通 tmux 会话)上的 D:只停这一格,窗格连最后的画面留着(见 park.rs)。
-    /// 先问一句。返回 false = 不归这里管(登记的会话那行:停的是 agent,走 `session::stop`)
+    /// D on a cell that isn't a registered agent (extra windows / panes in a session, a plain tmux session): stops only this cell,
+    /// the pane is kept with its last screen (see park.rs). Asks first. Returns false = not handled here (a registered session's
+    /// row: it's the agent that stops, via `session::stop`)
     fn ask_pane(&mut self) -> bool {
         if self.on_group_row() {
             return false;
@@ -5182,7 +5314,7 @@ impl App {
         true
     }
 
-    /// R:在跑 / 在等你选的先问一句(重启会打断它),别的直接重启
+    /// R: running / waiting for your choice asks first (a restart interrupts it), others restart directly
     fn ask_restart(&mut self) {
         let why = match self.current().map(|s| s.state) {
             Some(State::Running) => t!("正在运行,将被中断", "it's running; this interrupts it"),
@@ -5197,7 +5329,8 @@ impl App {
         }
     }
 
-    /// D:停掉 —— agent 退出,窗格连最后的画面留着,登记也留着,之后 ⏎ 在原地再启动接着聊。先问一句
+    /// D: stop — the agent exits, the pane is kept with its last screen, the registration too; later ⏎ restarts it in place and
+    /// the conversation continues. Asks first
     fn ask_stop(&mut self) {
         if self.ask_pane() {
             return;
@@ -5211,8 +5344,9 @@ impl App {
         }
     }
 
-    /// A:接管高亮的普通 tmux 会话(不是 aca 起的)—— 登记成 aca 的,进程不动。先认一遍,把认出来的摆在确认框里。
-    /// 停在普通会话里另开的窗口上:接管它所在的会话,agent 算这一格的
+    /// A: adopt the highlighted plain tmux session (not started by aca) — register it with aca, processes untouched. Identify it
+    /// first and show what was found in the confirm box. On an extra window in a plain session: adopt the session it's in, the
+    /// agent counted as this cell's
     fn ask_adopt(&mut self) {
         if let Some(b) = self.doing() {
             let m = tr!("请稍候:{b}", "still busy: {b}");
@@ -5237,7 +5371,7 @@ impl App {
         }
     }
 
-    /// r:弹窗里改标题,原标题先填好。停在分组上:改分组(名字、默认目录)
+    /// r: change the title in a popup, the old title pre-filled. On a group: edit the group (name, default directory)
     fn ask_rename(&mut self) {
         if let Some(g) = self.group_row().map(String::from) {
             return self.ask_group_edit(g);
@@ -5246,7 +5380,8 @@ impl App {
         self.prompt = Some(Prompt { text: t.title.clone(), ask: Ask::Rename(t), hint: String::new() });
     }
 
-    /// 分组上 r:先改名(原名填好,可以带上级),回车后改默认目录。只改登记表里有的组(「未分组」、普通 tmux 会话那一区不是)
+    /// r on a group: rename first (old name pre-filled, may include parents), then after Enter the default directory. Only groups
+    /// in the registry ("No group" and the plain tmux sessions section aren't)
     fn ask_group_edit(&mut self, g: String) {
         if let Some(b) = self.doing() {
             return self.flash(&tr!("请稍候:{b}", "still busy: {b}"));
@@ -5260,7 +5395,7 @@ impl App {
         self.prompt = Some(Prompt { text: g.clone(), ask: Ask::GroupName(g), hint: String::new() });
     }
 
-    /// 分组的新名字填好了:没撞上别的组,就接着填默认目录(原来的先填好)
+    /// The group's new name is in: if it doesn't clash with another group, go on to the default directory (old one pre-filled)
     fn group_name_given(&mut self, group: String, text: String) {
         let hints = (self.group_hints)().groups;
         let to = match ops::clean_group(&text) {
@@ -5283,12 +5418,13 @@ impl App {
         }
     }
 
-    /// 默认目录也填好了:空 = 不记;不空要是已有的目录、不是别的组的默认目录。名字、目录都没变就不动
+    /// The default directory is in too: empty = not recorded; otherwise it must be an existing directory and not another group's
+    /// default. Neither name nor directory changed = nothing done
     fn group_home_given(&mut self, group: String, to: String, was: String, text: String) {
         let real = aca_core::paths::real;
         let dir = match text.trim() {
             "" => Ok(String::new()),
-            // 没改:不再查(原来那个目录没了也让人只改名)
+            // Unchanged: no more checks (lets you just rename even if the old directory is gone)
             t if !was.is_empty() && real(&create::expand(t)) == real(&was) => Ok(was.clone()),
             t => {
                 let abs = create::expand(t);
@@ -5312,7 +5448,8 @@ impl App {
         self.job = Some(Job::Group(groups::Act::Edit { profile: crate::data::REGISTERED.into(), group, to, dir }));
     }
 
-    /// 分组改了名(撤销改回来的也算):界面里记着它的 —— 在看的组、折起来的、高亮停着的组标题、工作区里记的 —— 跟过去
+    /// A group was renamed (an undo renaming it back counts): whatever the interface remembers of it — the group shown, folded ones,
+    /// the group heading the highlight is on, workspace records — follows
     fn group_renamed(&mut self, from: &str, to: &str) {
         let r = |g: &str| groups::renamed(g, from, to);
         if let Some(g) = self.group.as_deref().and_then(r) {
@@ -5323,24 +5460,26 @@ impl App {
         }
         self.folded = std::mem::take(&mut self.folded).into_iter().map(|g| r(&g).unwrap_or(g)).collect();
         self.spot = None;
-        // 工作区文件里的已经在后台改好了(`groups::rename_all`)
+        // The workspace file's records were already changed in the background (`groups::rename_all`)
         self.spaces.reload();
     }
 
-    /// m:用 fzf 挑一个分组挪进去。每行带上那个组的目录,和它同目录的排最前(m ⏎ 就是归位)
+    /// m: pick a group in fzf to move into. Each row shows that group's
+    /// directory, groups with the same directory first (m ⏎ puts it back home)
     fn ask_move(&mut self) {
         let Some(t) = self.deck_target(t!("移到分组", "move")) else { return };
         let (from, here) = self.current().map(|s| (s.group.clone(), s.dir.clone())).unwrap_or_default();
         self.pick_group = Some(self.group_pick(t, from, here, vec![]));
     }
 
-    /// m 的 fzf 要列的分组:挪的都在同一个组里就不列它;here 是它们共同的目录(不同 = 空),同目录的分组排最前
+    /// Groups m's fzf lists: if all moved ones are in one group, not that one; `here` is their shared directory (different = empty),
+    /// groups with that directory first
     fn group_pick(&self, t: Target, from: String, here: String, more: Vec<(Target, String)>) -> GroupPick {
         let hints = (self.group_hints)().groups;
         let mut groups: Vec<String> = hints.iter().map(|(g, _)| g.clone()).collect();
         groups.sort();
         groups.dedup();
-        // 先按列表里的分区顺序,再是列表里没有的(空的)
+        // First in the list's section order, then those not in the list (empty)
         let mut cands: Vec<String> = self.groups().into_iter().filter(|g| groups.contains(g)).collect();
         let rest: Vec<String> = groups.iter().filter(|g| !cands.contains(g)).cloned().collect();
         cands.extend(rest);
@@ -5358,12 +5497,13 @@ impl App {
                 ops::GroupRow { group, dir, same }
             })
             .collect();
-        // 稳定排序:别的照原来的先后
+        // Stable sort: the rest keep their order
         rows.sort_by_key(|r| !r.same);
         GroupPick { t, from, here, rows, groups, more }
     }
 
-    /// 组里会话最多的那个目录(一样多取列表里先出现的),组里没有会话 = 空。分组没记默认目录时 `m` 显示这个
+    /// The directory with the most sessions in the group (on a tie, the first in the list); no sessions in the group = empty.
+    /// `m` shows this when a group has no default directory recorded
     fn usual_dir(&self, group: &str) -> String {
         let mut seen: Vec<(&str, usize)> = vec![];
         for s in self.all.iter().filter(|s| s.group == group && !s.dir.is_empty()) {
@@ -5372,12 +5512,12 @@ impl App {
                 None => seen.push((&s.dir, 1)),
             }
         }
-        // max_by_key 一样大时取后面的,倒过来找
+        // max_by_key takes the later one on a tie, so search reversed
         seen.iter().rev().max_by_key(|(_, n)| *n).map(|(d, _)| d.to_string()).unwrap_or_default()
     }
 
-    /// f:带着对话分叉出一个新会话,先起标题(分出来的和原来的一模一样,不起名分不清):
-    /// 先填好默认的「标题 (分叉)」,直接 ⏎ 就用它
+    /// f: fork a new session carrying the conversation, naming it first (the fork is identical to the original, without a name
+    /// they can't be told apart): pre-filled with the default "<title> (fork)", ⏎ just uses it
     fn ask_fork(&mut self) {
         let Some(t) = self.deck_target(t!("分叉", "fork")) else { return };
         if self.current().is_none_or(|s| !matches!(s.agent, Agent::Claude | Agent::Codex | Agent::Pi | Agent::Opencode)) {
@@ -5386,7 +5526,8 @@ impl App {
         self.prompt = Some(Prompt { text: fork_title(&t.title), ask: Ask::Fork(t), hint: String::new() });
     }
 
-    /// X:换个账号接着跑 —— 框里是它现在的账号和额度、能换过去的账号(登录着没有、额度),⏎ 直接换(见 `rehome`)
+    /// X: switch account and carry on — the box shows its current account and quota and the accounts it can switch to
+    /// (logged in or not, quota); ⏎ switches directly (see `rehome`)
     fn ask_rehome(&mut self) {
         self.digits.clear();
         let Some(t) = self.deck_target(t!("换账号", "switch accounts of")) else { return };
@@ -5404,8 +5545,9 @@ impl App {
         self.open(Box::new(menu));
     }
 
-    /// H:交接给新会话 —— 先挑新会话的工具 / 账号(`n` 的菜单,没有 shell),在它的目录、分组里建好,
-    /// 把交接说明发过去,让新会话读它的对话接着干(见 `handoff`)。它的便签一起带过去
+    /// H: hand off to a new session — first pick the new session's tool / account (`n`'s menu, without shell), create it in the
+    /// same directory and group, send the handoff note, and have the new session read its conversation and carry on
+    /// (see `handoff`). Its note goes along too
     fn ask_handoff(&mut self) {
         self.digits.clear();
         if let Some(b) = self.doing() {
@@ -5445,7 +5587,7 @@ impl App {
         self.tool_menu = Some((menu, 0));
     }
 
-    /// M:这个会话的 MCP
+    /// M: this session's MCP
     fn open_mcp(&mut self) {
         let Some(t) = self.deck_target(t!("查看 MCP", "view the MCPs of")) else { return };
         let Some(s) = self.current() else { return };
@@ -5457,14 +5599,14 @@ impl App {
         self.open(Box::new(v));
     }
 
-    /// P:挂载 / 远端任务的菜单(不对着哪个会话,停在分组上也能开)
+    /// P: the mounts / remote tasks menu (not aimed at a session, opens on a group too)
     fn open_plugins(&mut self) {
         if let Some(page) = self.plugins_page {
             self.open(page());
         }
     }
 
-    /// 分组上 d:确认框说连子分组、里面的会话一起删,y 删(见 groups.rs)
+    /// d on a group: the confirm box says subgroups and sessions inside are deleted with it, y deletes (see groups.rs)
     fn ask_remove_group(&mut self) {
         if let Some(b) = self.busy.clone().or_else(|| self.job.as_ref().map(Job::doing)) {
             return self.flash(&tr!("请稍候:{b}", "still busy: {b}"));
@@ -5492,17 +5634,18 @@ impl App {
         }));
     }
 
-    /// b:回收站(见 trash.rs)
+    /// b: the trash (see trash.rs)
     fn open_trash(&mut self) {
         self.open(Box::new(crate::trash::Page::new(self.trash.clone(), epoch)));
     }
 
-    /// 开一个功能自己的弹窗(见 overlay.rs)
+    /// Open a feature's own popup (see overlay.rs)
     fn open(&mut self, o: Box<dyn Overlay>) {
         self.overlays.push(o);
     }
 
-    /// `:`:命令面板(aca 的动作 + 插件的),冲着高亮的那行(会话 / 分组;普通 tmux 会话、另开的窗口当成别处)
+    /// `:`: the command palette (aca's actions + plugins'), aimed at the highlighted row (session / group; plain tmux sessions and
+    /// extra windows count as elsewhere)
     fn open_caps(&mut self) {
         let target = match (&self.head, self.current()) {
             (Some(g), _) => crate::caps::Target { on: "group", session: String::new(), label: g.clone() },
@@ -5514,12 +5657,12 @@ impl App {
         self.open(Box::new(crate::caps::Menu::new(aca_core::plugin::menu(), target)));
     }
 
-    /// 插件跑完了:视图、输出长的放进全屏阅读页;短的写在底栏
+    /// A plugin finished: views and long output go into the full-screen reader page; short output goes in the bottom bar
     pub fn plugin_done(&mut self, req: crate::caps::Req, ok: bool, out: String) {
         use aca_core::plugin::ItemKind;
-        // 列表视图:开着的那一页换上新的;没开着的开一页(重读的、它已经关了的不再开)
+        // List view: replace the open page with the new one; if none is open, open one (not for rereads or one already closed)
         if req.item.kind == ItemKind::View && req.item.rows {
-            // 「正在跑 / 正在重读…」那句到这就过时了:列表自己摆在那
+            // The "running / rereading…" message is stale by now: the list is there on its own
             self.msg = None;
             if let Some(o) = self.overlays.iter_mut().find(|o| o.takes(&req)) {
                 o.feed(ok, &out);
@@ -5528,7 +5671,7 @@ impl App {
             }
             return;
         }
-        // 列表里的键跑完了:结果写在那一页下面,列表重读;那一页已经关了就照平常的来
+        // A list key finished: the result goes below that page and the list rereads; if the page is already closed, handle it as usual
         if let Some(view) = req.then.as_deref()
             && let Some(o) = self.overlays.iter_mut().find(|o| o.takes(view))
         {
@@ -5550,7 +5693,7 @@ impl App {
             ItemKind::Command | ItemKind::Pane if one_line => self.flash(&format!("{mark} {title}:{text}")),
             _ => {
                 let lines = ansi::parse_lines(&text.lines().map(str::to_string).collect::<Vec<_>>());
-                // 重跑的那个开着:换上新的,翻到的位置留着
+                // The rerun one is open: replace it, keeping the scroll position
                 let scroll = self.reader.as_ref().filter(|r| r.plugin.as_ref() == Some(&req)).map_or(usize::MAX, |r| r.scroll);
                 self.trace = None;
                 self.reader = Some(Reader {
@@ -5570,7 +5713,8 @@ impl App {
         }
     }
 
-    /// 键给最上面那层弹窗;它要做的事照办,它关了就露出下面那层(没有了、又是从设置页进来的,回设置页)
+    /// Keys go to the top popup; do what it asks, and when it closes the one below shows (none left and it came from the
+    /// settings page: back to the settings page)
     fn on_overlay_key(&mut self, k: KeyEvent) {
         let Some(top) = self.overlays.last_mut() else { return };
         let mut fx = Fx::default();
@@ -5583,7 +5727,7 @@ impl App {
         }
     }
 
-    /// 弹窗 / 设置行要界面做的事
+    /// What a popup / settings row asks the interface to do
     fn apply(&mut self, fx: Fx) {
         if let Some(m) = fx.flash {
             self.flash(&m);
@@ -5598,7 +5742,8 @@ impl App {
             self.external = Some(x);
         }
         if let Some(t) = fx.term {
-            // 终端占着下半屏,弹窗都收起来,关了终端也不回设置页
+            // The terminal takes the lower half of the screen: all popups are put
+            // away, and closing the terminal doesn't return to the settings page
             self.overlays.clear();
             self.settings_back = None;
             self.term_req = Some(t);
@@ -5617,14 +5762,15 @@ impl App {
         }
     }
 
-    /// 后台的活做完了、从编辑器回来了:开着的弹窗重读
+    /// Background work finished, back from the editor: open popups reread
     fn reload_overlays(&mut self) {
         for o in &mut self.overlays {
             o.reload();
         }
     }
 
-    /// m 挪分组之前:跟着组的会话换了组会跟到新组记的工作区,先记住它现在在哪,挪完留在原处
+    /// Before m moves a group: a session that follows its group would follow to the new group's recorded workspace, so record where
+    /// it is now and leave it there after the move
     fn stay_on_move(&mut self, name: &str, to: &str) {
         let mut after = self.all.clone();
         for s in after.iter_mut().filter(|s| s.family() == name) {
@@ -5637,7 +5783,7 @@ impl App {
         }
     }
 
-    /// fzf 挑完分组回来:选中的或者新打的名字
+    /// Back from picking a group in fzf: the selected one or a newly typed name
     pub fn group_picked(&mut self, p: GroupPick, got: Result<Option<String>, String>) {
         match got {
             Ok(Some(g)) => match ops::clean_group(&g) {
@@ -5646,7 +5792,7 @@ impl App {
                     self.stay_on_move(&p.t.name, &to);
                     self.job = Some(Job::Move { t: p.t, from: p.from, to, groups: p.groups });
                 }
-                // 多选的一起挪:已经在那个组里的不动
+                // Multi-selected ones move together: ones already in that group stay
                 Some(to) => {
                     let moves: Vec<(Target, String)> =
                         std::iter::once((p.t, p.from)).chain(p.more).filter(|(_, from)| !to.eq_ignore_ascii_case(from)).collect();
@@ -5667,14 +5813,15 @@ impl App {
         }
     }
 
-    /// e:写便签,已有的先填好
+    /// e: write a note, the existing one pre-filled
     fn ask_note(&mut self) {
         let Some((key, title)) = self.note_target() else { return };
         let text = self.notes.get(&key).unwrap_or_default().to_string();
         self.prompt = Some(Prompt { ask: Ask::Note { key, title, orig: text.clone() }, text, hint: String::new() });
     }
 
-    /// e / ^G 写谁的便签:(键, 叫什么)。停在分组上(标题 / 折叠行)是这个组的,不然是高亮的会话的
+    /// Whose note e / ^G writes: (key, what it's called). On a group (heading /
+    /// fold row) it's the group's, otherwise the highlighted session's
     fn note_target(&self) -> Option<(String, String)> {
         match self.group_row() {
             Some(g) => Some((group_key(g), group_label(g).to_string())),
@@ -5682,9 +5829,9 @@ impl App {
         }
     }
 
-    /// E / Shift+Enter:带着便签进去 —— 进去前粘进它的输入框(不发送),填完删掉。没便签就和回车一样。
-    /// 只填 Claude / Codex(别的程序比如 vim,粘进去的字会被当成命令);在等你选(!)时不填 —— 字会被当成选项。
-    /// 填不了就说为什么、不进去(免得以为填了)
+    /// E / Shift+Enter: go in with the note — pasted into its input box before going in (not sent), deleted once filled. No note = Enter.
+    /// Only fills Claude / Codex (other programs, like vim, would take the pasted text as commands); not while waiting for your choice (!)
+    /// — the text would be taken as an option. If it can't fill, say why and don't go in (so you don't think it filled)
     fn enter_with_note(&mut self) {
         if self.on_group_row() {
             return self.toggle_fold();
@@ -5699,7 +5846,8 @@ impl App {
         self.enter();
     }
 
-    /// s:把便签直接发给它(粘进输入框再回车),人留在列表里。没便签就什么都不发;有也先问一句,免得误触
+    /// s: send the note to it directly (pasted into the input box, then Enter), you stay in the list. No note sends nothing;
+    /// with one it still asks first, against slips
     fn ask_send(&mut self) {
         self.digits.clear();
         if let Some(b) = self.doing() {
@@ -5720,14 +5868,14 @@ impl App {
         self.confirm = Some(Confirm::Send { t, pane, key, text });
     }
 
-    /// ^G(列表里):用编辑器写高亮的会话 / 分组的便签
+    /// ^G (in the list): write the highlighted session's / group's note in the editor
     fn note_in_editor(&mut self) {
         let Some((key, title)) = self.note_target() else { return };
         let text = self.notes.get(&key).unwrap_or_default().to_string();
         self.edit_note = Some(NoteEdit { key, title, orig: text.clone(), text, from_prompt: false });
     }
 
-    /// 编辑器写完回来:存上;从底栏编辑里去的,回到那里接着写
+    /// Back from the editor: save it; if it came from bottom bar editing, go back there to keep writing
     pub fn note_editor_done(&mut self, ed: NoteEdit, got: Result<String, String>) {
         let (text, err) = match got {
             Ok(t) => (t, None),
@@ -5747,7 +5895,7 @@ impl App {
         }
     }
 
-    /// 便签改了就存(每个字都存:手机断线时 aca 是被直接杀掉的,等不到退出)
+    /// Save the note whenever it changes (every keystroke: when a phone disconnects aca is killed outright, it never gets to exit)
     fn save_note(&mut self, key: &str, text: &str) {
         if let Err(e) = self.notes.set(key, text) {
             self.flash(&tr!("便签保存失败:{e}", "note not saved: {e}"));
@@ -5755,7 +5903,7 @@ impl App {
         self.apply_pins();
     }
 
-    /// 便签写完了:和开始写之前不一样就记一步撤销
+    /// The note is done: if it differs from before writing started, record an undo step
     fn note_done(&mut self, key: String, title: String, orig: String) {
         if self.notes.get(&key).unwrap_or_default() != orig {
             self.remember(Undo::Note { key, title, text: orig });
@@ -5766,19 +5914,20 @@ impl App {
         self.flash(if text.trim().is_empty() { t!("便签已清空", "note cleared") } else { t!("便签已保存", "note saved") });
     }
 
-    /// 便签填进去了:删掉
+    /// The note was filled in: delete it
     pub fn note_filled(&mut self, key: &str) {
         let _ = self.notes.take(key);
         self.apply_pins();
     }
 
-    /// ^N:先起新分组的名字,回车后直接进 fzf 挑目录(第一行是默认目录),新会话开在这个组里
+    /// ^N: name the new group first, after Enter go straight into fzf to pick a directory (first row is the default directory);
+    /// the new session opens in this group
     fn ask_new_group(&mut self) {
         self.prompt = Some(Prompt { ask: Ask::NewGroup, text: String::new(), hint: String::new() });
     }
 
-    /// ^N 起名的新分组:后台建好(建完高亮停在它的标题上,见 `job_done`)。
-    /// 不在 1 里建的,组记在这个工作区(列表里在这,以后这个组里新开的也落在这)
+    /// The new group named with ^N: created in the background (when done the highlight goes to its heading, see `job_done`).
+    /// If not created in 1, the group is recorded in this workspace (it shows here in the list, and new ones in it later land here)
     fn add_group(&mut self, g: &str) {
         if self.space != spaces::HOME {
             let keep = self.keep_marks();
@@ -5791,7 +5940,7 @@ impl App {
         let Some(p) = self.prompt.as_mut() else { return };
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if let Ask::Note { key, title, orig } = &p.ask {
-            // 便签:回车换行,Esc 退出(早就存好了),^G 交给编辑器
+            // Note: Enter is a newline, Esc leaves (already saved long ago), ^G hands it to the editor
             match k.code {
                 KeyCode::Esc => {
                     let (key, title, orig) = (key.clone(), title.clone(), orig.clone());
@@ -5809,7 +5958,7 @@ impl App {
                     return;
                 }
                 KeyCode::Enter => p.text.push('\n'),
-                KeyCode::Char('j') if ctrl => p.text.push('\n'), // 粘贴进来的换行
+                KeyCode::Char('j') if ctrl => p.text.push('\n'), // a pasted newline
                 KeyCode::Backspace => {
                     p.text.pop();
                 }
@@ -5843,7 +5992,7 @@ impl App {
                 p.text.pop();
             }
             KeyCode::Char('u') if ctrl => p.text.clear(),
-            // 删掉最后一个词(连同它前面的空格 / 分组的 /)
+            // Delete the last word (along with the space / the group's `/` next to it)
             KeyCode::Char('w') if ctrl => {
                 let t = p.text.trim_end_matches([' ', '/']);
                 let cut = t.rfind([' ', '/']).map_or(0, |i| i + 1);
@@ -5871,12 +6020,12 @@ impl App {
                 if to.is_empty() {
                     self.prompt = Some(Prompt { ask: Ask::Fork(t), text, hint: t!("标题不能为空", "the title is empty").into() });
                 } else {
-                    // 没改就用默认的(不锁,Claude 之后还能改);改了的锁住
+                    // Unchanged: use the default (not locked, Claude can still change it later); changed: lock it
                     let title = (to != fork_title(&t.title)).then_some(to);
                     self.job = Some(Job::Fork { t, title });
                 }
             }
-            // 便签的回车是换行,不会走到这
+            // Enter in a note is a newline, never gets here
             Ask::Note { .. } => {}
             Ask::GroupDir => {
                 let dir = text.trim().to_string();
@@ -5908,14 +6057,14 @@ impl App {
                 match self.draft() {
                     Ok(mut d) => {
                         match d.hints.groups.iter().find(|(g, _)| g.eq_ignore_ascii_case(&name)) {
-                            // 其实已经有了(大小写不同):用已有的
+                            // Actually exists already (different case): use the existing one
                             Some((g, _)) => name = g.clone(),
-                            // 新的:现在就建,中途 Esc 组也留着
+                            // New: create it now, the group stays even if Esc is pressed midway
                             None => self.add_group(&name),
                         }
                         d.start_group(name, &(self.new_group_dir)());
                         self.new_draft = Some(d);
-                        self.pick = true; // Esc 出来就是填着默认目录的输入框
+                        self.pick = true; // Esc out of it lands in the input box with the default directory filled
                     }
                     Err(e) => self.flash(&e),
                 }
@@ -5923,7 +6072,8 @@ impl App {
         }
     }
 
-    /// run 循环要放进后台的活;同时记下「忙」和要不要让高亮跟着重启走。删除不记「忙」(`vanish` 里记着)
+    /// Work the run loop should put in the background; also record "busy" and whether the highlight should follow the restart.
+    /// Deletes don't record "busy" (`vanish` tracks them)
     pub fn take_job(&mut self) -> Option<Job> {
         if self.job.is_none()
             && self.doing().is_none()
@@ -5934,7 +6084,8 @@ impl App {
             self.job = Some(job);
         }
         let job = self.job.take()?;
-        // 之前的提示让位给「正在…」;⇧↑ ⇧↓ 的写入不算(连按时一下下的写入会把别的提示冲掉)
+        // Earlier messages give way to the "…ing…" status; ⇧↑ ⇧↓ writes don't count
+        // (each write while pressing repeatedly would wipe other messages)
         if !matches!(job, Job::Order { .. } | Job::GroupOrder { .. }) {
             self.msg = None;
         }
@@ -5945,13 +6096,13 @@ impl App {
         Some(job)
     }
 
-    /// 底栏上的「正在…」,也是别的操作要等的:别的活,或者还在删的(可以好几个)
+    /// The "…ing…" status in the bottom bar, also what other operations wait for: other work, or deletes still running (can be several)
     fn doing(&self) -> Option<String> {
         if let Some(b) = &self.busy {
             return Some(b.clone());
         }
         let live: Vec<&Job> = self.vanish.iter().filter(|v| v.until.is_none()).map(|v| &v.job).collect();
-        // 一起删的那一批按会话数
+        // A batch deleted together counts by sessions
         let n: usize = live.iter().map(|j| if let Job::Many(v) = j { v.len() } else { 1 }).sum();
         match live[..] {
             [] => None,
@@ -5961,7 +6112,8 @@ impl App {
         }
     }
 
-    /// 从 all 里拿掉 d 删掉的(还在删的、刚删完的);挂在它下面的子会话照删完的样子算(删父会话不连带子会话)
+    /// Remove from all what d deleted (still deleting, just deleted); child sessions hanging under it are counted as after the
+    /// delete (deleting a parent doesn't take the child sessions with it)
     fn drop_vanished(&mut self) {
         let now = Instant::now();
         self.vanish.retain(|v| v.until.is_none_or(|u| now < u));
@@ -5988,11 +6140,12 @@ impl App {
         }
     }
 
-    /// 后台做完了。fresh 是做完后重读的会话:重启换了 tmux 会话名,置顶、高亮、看过的记录跟过去
+    /// Background work done. fresh is the sessions reread afterwards: a restart
+    /// changes the tmux session name, so pins, highlight and seen records follow
     pub fn job_done(&mut self, job: &Job, out: Outcome, fresh: Vec<Session>) {
         let mut was_running = None;
         if deleting(job) {
-            // 删掉了(进了回收站):再藏一会儿;没删掉:放回来
+            // Deleted (into the trash): hide it a while longer; not deleted: put it back
             let ok = matches!(out, Outcome::Done(_) | Outcome::Binned { .. });
             let at = self.vanish.iter().position(|v| v.until.is_none() && v.job == *job);
             was_running = at.map(|i| self.vanish[i].running.clone());
@@ -6007,7 +6160,7 @@ impl App {
         if let Job::Order { .. } | Job::GroupOrder { .. } = job {
             self.reorder_writing = false;
             self.reorders.pop_front();
-            // 写失败了,后面排着的也不作数,列表回到登记表里的顺序
+            // Write failed, the queued ones after it don't count either, the list goes back to the registry's order
             if matches!(out, Outcome::Failed(_)) {
                 self.reorders.clear();
             }
@@ -6021,8 +6174,8 @@ impl App {
         if let Some((_, u, msg)) = self.reverting.take_if(|(j, ..)| j == job) {
             return self.reverted(job, u, msg, out, fresh);
         }
-        // 做成了、撤得回的记一步
-        // 做之前它什么样(在不在跑、标题锁没锁)
+        // Done and undoable: record a step
+        // What it was like before (running or not, title locked or not)
         let (running, locked) = self
             .all
             .iter()
@@ -6034,17 +6187,17 @@ impl App {
             _ => vec![],
         };
         let mut out = out;
-        // 自动清理删的:说是自动删的、停了多久以上
+        // Deleted by auto-cleanup: say it was automatic and stopped for how long
         if let Some((_, after)) = self.swept.take_if(|(j, _)| j == job)
             && let Outcome::Binned { msg, item } = &mut out
         {
             let (age, who) = (crate::print::age(after), item.name());
             *msg = tr!("已自动删除停止超过 {age} 的{who} · ^Z 撤销", "auto-deleted {who}, stopped over {age} · ^Z undoes");
         }
-        // d 删的会话 / 分组进了回收站:记下这一条(列表里就不列了),^Z 能撤回
+        // A session / group deleted with d went to the trash: record the entry (no longer listed), ^Z brings it back
         if let Outcome::Binned { item, .. } = &mut out {
             let mut item = *std::mem::take(item);
-            // 组记在哪个工作区、它的便签:拿回来时照旧
+            // The group's recorded workspace and its note: restored as before when brought back
             self.notes.reload();
             for g in &mut item.groups {
                 g.space = self.spaces.group_of(&item.profile, &g.path);
@@ -6055,7 +6208,8 @@ impl App {
             match self.trash.add(item) {
                 Ok(()) => {
                     self.remember(u);
-                    // 组的记录、便签清了:以后再建个同名的不该还落在老地方、带着老便签
+                    // The group's records and note are cleared: a later group of the same
+                    // name shouldn't land in the old place or carry the old note
                     if !gone.is_empty() {
                         let profile = crate::data::REGISTERED;
                         let _ = self.spaces.forget_groups(&|p, g| p == profile && gone.iter().any(|x| x.path == g));
@@ -6067,7 +6221,7 @@ impl App {
                 Err(e) => out = Outcome::Failed(tr!("已删除,但未能记入回收站:{e}", "deleted, but the trash didn't record it: {e}")),
             }
         }
-        // 回收站里的一条拿回来了 / 真删了
+        // An entry in the trash was brought back / deleted for real
         match (job, &out) {
             (Job::Restore { item, .. }, Outcome::Done(m)) => return self.restored(item, fresh, m),
             (Job::Purge { item }, Outcome::Done(_)) => drop(self.trash.forget(&item.id)),
@@ -6078,7 +6232,8 @@ impl App {
         {
             self.remember(u);
         }
-        // 一起做的:做成了的那几个合成一步,^Z 一起撤。回收站里一起拿回来的:高亮停在第一条上
+        // Done together: the ones that succeeded become one step, undone together by ^Z. Brought back from the trash together:
+        // the highlight goes to the first one
         let mut landed = None;
         if let (Job::Many(jobs), Outcome::Many(outs)) = (job, &out) {
             let done = || jobs.iter().zip(outs).filter(|(_, o)| matches!(o, Outcome::Done(_))).map(|(j, _)| j);
@@ -6107,14 +6262,14 @@ impl App {
         if let (Job::Restart { t, .. } | Job::Rehome { t, .. }, Outcome::Done(_)) = (job, &out) {
             self.restarted(t, &fresh, follow);
         }
-        // 接管的:那一行的键从 tmux 会话名换成了登记的 id,置顶跟过去
+        // Adopted: the row's key changed from the tmux session name to the registered id, pins follow
         if let (Job::Adopt { t, .. }, Outcome::Made { id, .. }) = (job, &out) {
             let _ = self.pins.rename(&t.name, id);
         }
         if let (Job::Send { key, .. }, Outcome::Done(_)) = (job, &out) {
             self.note_filled(key);
         }
-        // 交接:便签跟着说明带到新会话去了
+        // Hand off: the note went with the handoff note to the new session
         if let (Job::Handoff { note: Some(key), .. }, Outcome::Made { .. } | Outcome::Handed { .. }) = (job, &out) {
             self.note_filled(key);
         }
@@ -6122,7 +6277,8 @@ impl App {
         if let Some(item) = landed {
             self.land_on_group(item);
         }
-        // ^N 建好的组还空着:高亮停在它的标题上(新建会话的框还开着也先停好,Esc 回来就在这)
+        // A group made with ^N is still empty: the highlight goes to its heading
+        // (even while the new session box is open, so Esc lands here)
         if let (Job::Group(groups::Act::Create { group }), Outcome::Done(_)) = (job, &out)
             && let Some(p) = self.head_pos(group).filter(|&p| self.all[self.view[p]].blank)
         {
@@ -6145,7 +6301,7 @@ impl App {
         }
     }
 
-    /// 重启 / 换账号之后 tmux 会话名换了:置顶跟过去,follow 时高亮也跟过去
+    /// After a restart / account switch the tmux session name changed: pins follow, and the highlight too with follow
     fn restarted(&mut self, t: &Target, fresh: &[Session], follow: bool) {
         let new = fresh.iter().find(|s| s.deck_id == t.id && s.profile == t.profile).map(|s| s.name.clone());
         if let Some(new) = new.filter(|n| *n != t.name) {
@@ -6156,7 +6312,8 @@ impl App {
         }
     }
 
-    /// 分叉 / 交接出来的新会话:落在现在这个工作区,高亮它(被当前的范围 / 过滤筛掉了就留在原处)
+    /// A new session forked / handed off: lands in the current workspace and gets the highlight (if filtered out by the current
+    /// scope / filter, the highlight stays put)
     fn made(&mut self, id: &str, msg: &str) {
         self.adopt(id);
         self.apply_pins();
@@ -6168,12 +6325,13 @@ impl App {
         self.flash(msg);
     }
 
-    /// 记一步 ^Z 能撤的
+    /// Record a step ^Z can undo
     fn remember(&mut self, u: Undo) {
         undo::push(&mut self.undo, u);
     }
 
-    /// 回收站里的一条拿回来了(b 那一页 ⏎、^Z):组记的工作区照旧,不再藏,高亮停在它上面(分组停在标题上)
+    /// An entry in the trash was brought back (⏎ on b's page, ^Z): the group's recorded workspace as before, no longer hidden,
+    /// the highlight on it (a group: on its heading)
     fn restored(&mut self, item: &crate::trash::Item, fresh: Vec<Session>, msg: &str) {
         self.unbin(item);
         self.land(item, &fresh);
@@ -6183,7 +6341,7 @@ impl App {
         self.flash(msg);
     }
 
-    /// 拿回来的一条:回收站里去掉,组记的工作区、便签照旧,不再藏
+    /// An entry brought back: removed from the trash, the group's recorded workspace and note as before, no longer hidden
     fn unbin(&mut self, item: &crate::trash::Item) {
         let _ = self.trash.forget(&item.id);
         let spaces: Vec<(spaces::Group, Option<char>)> =
@@ -6192,7 +6350,7 @@ impl App {
             let keep = self.keep_marks();
             let _ = self.spaces.assign(&[], &spaces, &keep);
         }
-        // 这期间又建了个同名的组、写了便签的:拿回来的接在后面,两段都留着
+        // A group of the same name was created and a note written in the meantime: the one brought back is appended, both kept
         self.notes.reload();
         for g in item.groups.iter().filter(|g| !g.note.is_empty()) {
             let key = group_key(&g.path);
@@ -6205,7 +6363,7 @@ impl App {
         self.vanish.retain(|v| !v.undone_by(item));
     }
 
-    /// 拿回来的是会话(一起删的几个:第一个):列表换上新的之后高亮停在它上面
+    /// A session was brought back (several deleted together: the first): after the list is replaced, the highlight goes to it
     fn land(&mut self, item: &crate::trash::Item, fresh: &[Session]) {
         let one = item.sessions.first().filter(|_| item.group.is_empty());
         if let Some(s) = one.and_then(|g| fresh.iter().find(|s| s.sub.is_none() && s.deck_id == g.id && s.profile == item.profile)) {
@@ -6213,7 +6371,7 @@ impl App {
         }
     }
 
-    /// 拿回来的是分组:高亮停在它的标题上(列表换上新的之后)
+    /// A group was brought back: the highlight goes to its heading (after the list is replaced)
     fn land_on_group(&mut self, item: &crate::trash::Item) {
         if !item.group.is_empty()
             && let Some(p) = self.head_pos(&item.group)
@@ -6222,7 +6380,7 @@ impl App {
         }
     }
 
-    /// 撤销要找的会话:还列着的那个(tmux 名可能因为重启换了)。不在了说一声,返回 None
+    /// The session undo looks for: the one still listed (its tmux name may have changed with a restart). If gone, say so, return None
     fn still_here(&mut self, t: &Target) -> Option<(Target, &Session)> {
         if self.here(t).is_none() {
             self.flash(&tr!("「{}」已不存在", "“{}” is gone", clip(&t.title, 16).trim_end()));
@@ -6231,18 +6389,18 @@ impl App {
         self.here(t)
     }
 
-    /// 同 `still_here`,不在了不说(一起撤的那几个里少一个不算事)
+    /// Like `still_here`, but says nothing if gone (one missing among several undone together is no big deal)
     fn here(&self, t: &Target) -> Option<(Target, &Session)> {
         let s = self.all.iter().find(|s| s.sub.is_none() && s.deck_id == t.id && s.profile == t.profile)?;
         Some((Target { name: s.name.clone(), title: s.title.clone(), ..t.clone() }, s))
     }
 
-    /// 按 key(`notes::key`)找会话现在的 tmux 名(重启会换),找不到就用记下的
+    /// Find a session's current tmux name by key (`notes::key`) (a restart changes it); if not found, use the recorded one
     fn name_now(&self, key: &str, name: String) -> String {
         self.all.iter().find(|s| s.sub.is_none() && notes::key(s) == key).map_or(name, |s| s.name.clone())
     }
 
-    /// ^Z:撤销上一步(见 undo.rs)
+    /// ^Z: undo the last step (see undo.rs)
     fn undo_last(&mut self) {
         if let Some(b) = self.doing() {
             return self.flash(&tr!("请稍候:{b}", "still busy: {b}"));
@@ -6277,7 +6435,8 @@ impl App {
                     Ok(()) => tr!("已撤销标为{what}「{}」", "undid marking “{}” {what}", short(&title)),
                     Err(e) => tr!("保存失败:{e}", "not saved: {e}"),
                 };
-                // 列表里的状态是叠过已读记录的,重算会丢掉原来的:直接放回去,下次刷新照新记录算
+                // The list's state has the read records laid over it, recomputing would lose the original: put it back directly,
+                // the next refresh computes from the new records
                 if let Some(s) = self.all.iter_mut().find(|s| s.name == name) {
                     s.state = state;
                 }
@@ -6360,11 +6519,12 @@ impl App {
         }
     }
 
-    /// ^Z 撤 v 多选一起做的那一步:置顶、已读当场放回;停止、挪分组一起放进后台撤(不在了的、已经回去了的跳过)
+    /// ^Z undoing a step done together via v multi-select: pins and read marks restored on the spot; stops and group moves undone
+    /// together in the background (ones gone or already back are skipped)
     fn undo_many(&mut self, us: &[Undo], u: Undo) {
         let keep = self.keep_marks();
         let (mut put, mut jobs, mut err) = (0, vec![], None);
-        // 倒着放回:置顶的先后照原样
+        // Put back in reverse: pin order as before
         for x in us.iter().rev().cloned() {
             match x {
                 Undo::Pin { key, name, rank, .. } => {
@@ -6429,7 +6589,7 @@ impl App {
         self.rebuild();
     }
 
-    /// 撤销要在后台做的:放进后台,做完在 `reverted` 收尾
+    /// Undo work done in the background: queue it, `reverted` finishes up when done
     fn revert(&mut self, job: Job, u: Undo, msg: Option<String>) {
         self.reverting = Some((job.clone(), u, msg));
         self.job = Some(job);
@@ -6441,7 +6601,7 @@ impl App {
                 if let Job::Restore { item, .. } = job {
                     return self.restored(item, fresh, &msg.unwrap_or(m));
                 }
-                // 高亮停在撤回来的那个上
+                // The highlight goes to the one brought back
                 if let Some(t) = u.target()
                     && let Some(s) = fresh.iter().find(|s| s.sub.is_none() && s.deck_id == t.id && s.profile == t.profile)
                 {
@@ -6449,12 +6609,12 @@ impl App {
                 }
                 msg.unwrap_or(m)
             }
-            // 没撤成:这步放回去,能再按 ^Z
+            // Undo failed: put this step back, ^Z can be pressed again
             Outcome::Failed(m) => {
                 self.undo.push(u);
                 m
             }
-            // 一起撤的:都没撤成才放回去;撤了一部分的照实说
+            // Undone together: put back only if none succeeded; a partial undo is reported as it is
             Outcome::Many(outs) => {
                 let jobs = if let Job::Many(v) = job { v.as_slice() } else { &[] };
                 let ok = outs.iter().filter(|o| matches!(o, Outcome::Done(_))).count();
@@ -6472,7 +6632,7 @@ impl App {
         self.flash(&m);
     }
 
-    /// W:只看高亮会话所在的分组;已经只看一个分组了就回到全部分组
+    /// W: only the highlighted session's group; if already showing a single group, back to all groups
     fn toggle_own_group(&mut self) {
         let to = match (&self.group, self.current()) {
             (Some(_), _) => None,
@@ -6482,8 +6642,8 @@ impl App {
         self.set_group(to);
     }
 
-    /// w:只看开着的,再按一次不看;天数、挑着的状态都留着,叠在上面。进来先看全部(几天前开着的也在),在里面按 * 再缩。
-    /// 挑着 ^ / % 按 w:它们让位,出来时回来
+    /// w: only open ones, again to stop; days and the picked state are kept, layered on top. Starts from all (ones open days ago
+    /// are there too), press * inside to narrow. With ^ / % picked, w makes them step aside; they come back on leaving
     fn toggle_open(&mut self) {
         self.set_open(!self.open);
         match self.yielded.take() {
@@ -6496,7 +6656,8 @@ impl App {
         self.rebuild();
     }
 
-    /// 开 / 关「开着的」这一层:开时范围先换成「全部」,关时回到开之前的(在里面按过 * / a 就留在挑的)
+    /// Turn the "open ones" layer on / off: on switches the scope to "all" first, off goes back to what it was before (or to what
+    /// was picked if * / a was pressed inside)
     fn set_open(&mut self, on: bool) {
         if on == self.open {
             return;
@@ -6510,14 +6671,15 @@ impl App {
         }
     }
 
-    /// a:进「全部」,再按一次回到近几天(天数本来就不丢)。开着的、挑着的状态都留着
+    /// a: go into "all", again goes back to recent days (days are never lost anyway). Open ones and the picked state are kept
     fn toggle_all(&mut self) {
         self.back = None;
         self.scope = if self.scope == Scope::All { Scope::Recent } else { Scope::All };
         self.rebuild();
     }
 
-    /// ! @ # & ^ %:只看这种状态,再按一次取消;范围留着。在「开着的」里挑 ^ / %,「开着的」让位,它们取消 / 换掉了再回来
+    /// ! @ # & ^ %: only this state, again cancels; scope kept. Picking ^ / % among "open ones" makes "open ones" step aside;
+    /// it comes back once they're cancelled / swapped
     fn toggle_status(&mut self, p: Pick) {
         self.status = if self.status == Some(p) { None } else { Some(p) };
         let stopped = self.status.is_some_and(Pick::stopped);
@@ -6533,8 +6695,9 @@ impl App {
         self.rebuild();
     }
 
-    /// *:近一天 → 近三天 → 近一周 → 近一天,只管天数(全部是 a,两个键各管一样);在「全部」里按就回到近几天。
-    /// 开着的、挑着的状态都留着:在开着的里按就是缩到近几天里开着的。换到了哪顶栏上亮着,底栏不再另说一句
+    /// *: 1 day → 3 days → 7 days → 1 day, days only (all is a, each key does one thing); in "all" it goes back to recent days.
+    /// Open ones and the picked state are kept: among open ones it narrows to the open ones of recent days. Which one is on lights
+    /// up in the top bar, the bottom bar doesn't say it again
     fn cycle_days(&mut self) {
         self.back = None;
         if self.scope == Scope::All {
@@ -6556,8 +6719,9 @@ impl App {
         }
     }
 
-    /// N / n 从哪开始填:停在会话上是照它再开一个;停在分组上是组的路径(见 `group_dir`)、进这个组。
-    /// 空分组:进这个组(路径改了也是它),从组的默认目录开始,没记过就和 ^N 一样从新分组的目录开始
+    /// Where N / n start filling from: on a session, another one like it; on a group, the group's path (see `group_dir`), into
+    /// this group. Empty group: into this group (it stays even if the path changes), starting from the group's default directory,
+    /// or if none recorded, from the new group directory like ^N
     fn draft(&self) -> Result<Draft, String> {
         if let Some(g) = self.blank_group() {
             let mut d = Draft::from(None, self.group_hints);
@@ -6571,7 +6735,8 @@ impl App {
         }
     }
 
-    /// 正在打字(过滤词 / 新会话路径):这时一次到达好几个键是输入法联想或粘贴,不是 Moshi 代敲
+    /// Typing (filter words / a new session's path): several keys arriving at once
+    /// then is IME suggestions or a paste, not Moshi typing on your behalf
     pub fn typing(&self) -> bool {
         self.filtering
             || self.new_draft.is_some()
@@ -6609,17 +6774,18 @@ impl App {
     fn rebuild(&mut self) {
         let kw = self.filter.to_lowercase();
         let window = self.days * 86400;
-        // 只列现在这个工作区的;空分组只在分区时有(它只有标题)
+        // Only list the current workspace's; empty groups exist only when sectioned (they're just a heading)
         let base: Vec<usize> = (0..self.all.len())
             .filter(|&i| self.all[i].space == self.space && self.group.as_ref().is_none_or(|g| &self.all[i].group == g))
             .filter(|&i| self.sectioned() || !self.all[i].blank)
             .collect();
-        // 个数只数会话(子窗格、空分组不算)
+        // The count only counts sessions (child panes and empty groups don't count)
         let heads = |v: &[usize]| v.iter().filter(|&&i| self.all[i].sub.is_none() && !self.all[i].blank).count();
         self.base_len = heads(&base);
         self.fell_back = false;
-        // 会话和它下面的窗口同进同出:有一个符合就整家留下(窗口里在跑,会话本身闲着,也要看得到)
-        // 子会话留下,它挂的父会话也留下,一直到顶格的那个(不然顶格,看不出是谁派的);反过来不带,免得父会话一动早跑完的子会话全翻出来
+        // A session and its windows come and go together: if one matches, the whole family stays (a window running while the
+        // session itself is idle must still show). A child session that stays keeps its parent too, up to the top level (otherwise
+        // you couldn't tell who sent it); not the reverse, or one move of a parent would dig up all its long-finished child sessions
         let hangs = hangs(&self.all);
         let families = |pass: &dyn Fn(&Session) -> bool| -> Vec<usize> {
             let mut keep: HashSet<&str> = base.iter().map(|&i| &self.all[i]).filter(|s| pass(s)).map(|s| s.family()).collect();
@@ -6628,7 +6794,8 @@ impl App {
             keep.extend(ups);
             base.iter().copied().filter(|&i| keep.contains(self.all[i].family())).collect()
         };
-        // 天数 / 全部、开着的、! @ # & ^ % 挑的状态三层叠加;搜索时都不管。空分组搜索时对上组名才列,挑了状态、只看开着的时不列
+        // Days / all, open ones, and the status picked with ! @ # & ^ % stack in three layers; search ignores all of them. While searching,
+        // an empty group is listed only if its name matches; with a status picked or only open ones shown, it isn't listed
         let pick = self.status;
         let only_open = self.open;
         let st = |s: &Session| pick.is_none_or(|p| !s.blank && p.hit(s)) && (!only_open || !s.blank && open(s));
@@ -6640,7 +6807,7 @@ impl App {
                 Scope::All => families(&st),
                 Scope::Recent => {
                     let keep = families(&|s| (s.blank || s.idle_for < window || s.state == State::Ask || s.attached || s.pinned) && st(s));
-                    // 挑了状态、只看开着的是明说要看这种,没有就是空的,不退回全部
+                    // Picking a status or only open ones says you want to see just those: none means empty, don't fall back to all
                     if heads(&keep) == 0 && pick.is_none() && !only_open {
                         self.fell_back = true;
                         base.clone()
@@ -6651,14 +6818,16 @@ impl App {
             }
         };
         self.view = view;
-        // 放宽天数能多出来几个;挑了状态、只看开着的就只数这些(view 是它的子集,减不出负数)
+        // How many more widening the days would show;
+        // with a status picked or only open ones shown, count only those (view is a subset of it, can't go negative)
         self.hidden = if kw.is_empty() && self.scope == Scope::Recent {
             let reach = if pick.is_some() || only_open { heads(&families(&st)) } else { self.base_len };
             reach - heads(&self.view)
         } else {
             0
         };
-        // 折叠:每个折起来的分区只留第一个会话占位(置顶的不在分区里,不受影响)。过滤时全展开,免得搜不到
+        // Folding: each folded section keeps only its first session as a placeholder (pinned ones aren't in sections, unaffected).
+        // Everything is unfolded while filtering, so nothing is hidden from search
         self.folds.clear();
         if self.sectioned() && kw.is_empty() && !self.folded.is_empty() {
             let mut kept = vec![];
@@ -6677,7 +6846,7 @@ impl App {
             }
             self.view = kept;
         }
-        // 刷新后高亮跟着会话走,而不是停在原来的行号
+        // After a refresh the highlight follows the session, not the old row number
         let pos = self.selected.as_ref().and_then(|n| self.view.iter().position(|&i| &self.all[i].name == n));
         let idx = match pos {
             Some(p) => Some(p),
@@ -6686,13 +6855,13 @@ impl App {
         };
         let head = self.head.take();
         self.select(idx);
-        // 停在分组标题上的,刷新后还停在那;组折起来了就落在折叠行上,不在了就跟着会话走
+        // On a group header: still there after a refresh; if the group got folded, land on the fold row; if it's gone, follow the session
         if let Some(p) = head.as_deref().and_then(|g| self.head_pos(g)) {
             self.select_head(p);
         }
     }
 
-    /// 分组 g 展开着的标题下面第一个会话在可见列表第几个;不分区、折着、不在列表里 = None
+    /// Position in the visible list of the first session under group g's unfolded header; not sectioned, folded, or not listed = None
     fn head_pos(&self, g: &str) -> Option<usize> {
         if !self.sectioned() || self.folds.contains_key(g) {
             return None;
@@ -6700,13 +6869,13 @@ impl App {
         self.view.iter().position(|&i| !self.all[i].pinned && self.all[i].group == g)
     }
 
-    /// 高亮停在可见列表第 p 个会话所在分组的标题上(p 是组里第一个)
+    /// Put the highlight on the header of the group of the p-th session in the visible list (p is the group's first)
     fn select_head(&mut self, p: usize) {
         self.select(Some(p));
         self.head = Some(self.all[self.view[p]].group.clone());
     }
 
-    /// 高亮停在哪个分组上:展开的组标题,或者折叠行。None = 停在会话上
+    /// Which group the highlight is on: an unfolded group header, or a fold row. None = on a session
     fn group_row(&self) -> Option<&str> {
         match &self.head {
             Some(g) => Some(g),
@@ -6718,17 +6887,17 @@ impl App {
         self.group_row().is_some()
     }
 
-    /// 高亮停在空分组上(展开的标题、折叠行都算):返回这个组
+    /// Highlight on an empty group (unfolded header or fold row both count): return that group
     fn blank_group(&self) -> Option<&str> {
         self.group_row().filter(|_| self.current().is_some_and(|s| s.blank))
     }
 
-    /// 在空分组上新建、组还没有目录:直接进 fzf 挑(同 ^N)
+    /// New session on an empty group that has no directory yet: go straight to fzf (same as ^N)
     fn pick_first(&self) -> bool {
         self.blank_group().is_some_and(|g| self.group_dir(g).is_none())
     }
 
-    /// 高亮在分组上时,只能对会话做的事说一声、不做:返回 true
+    /// With the highlight on a group, things that only work on sessions just say so and do nothing: returns true
     fn on_group(&mut self, what: &str) -> bool {
         let m = match () {
             _ if self.head.is_some() => tr!("不能对分组{what}", "can't {what} on a group"),
@@ -6739,9 +6908,9 @@ impl App {
         true
     }
 
-    /// 分组的路径(在分组上 t / N 用):组的默认路径(目录还在的话),
-    /// 不然是组里最近有动静的会话的目录(worktree 用原仓库;一样新的取列表里靠上的)。
-    /// 连带给出那个会话(N 沿用它的工具 / 账号)、是不是组的默认路径
+    /// The group's path (for t / N on a group): the group's default path (if the directory still exists), else the directory of the group's
+    /// session with the latest activity (worktree: the original repo; a tie goes to the one higher in the list). Also returns that session
+    /// (N reuses its tool / account) and whether it's the group's default path
     fn group_dir(&self, g: &str) -> Option<(&Session, String, bool)> {
         let mine = self.all.iter().filter(|s| s.space == self.space && s.group == g && s.sub.is_none());
         let s = mine.min_by_key(|s| std::cmp::Reverse(s.active_at))?;
@@ -6755,7 +6924,8 @@ impl App {
         (!dir.is_empty()).then_some((s, dir, is_set))
     }
 
-    /// 高亮停着的分组和它的路径(预览里写)。换了组、定时刷新(见 `glance_request`)才重算,不用每画一帧都去读库
+    /// The group under the highlight and its path (shown in the preview). Recomputed only when the group changes or on the timed refresh
+    /// (see `glance_request`), not by reading the db every frame
     fn spot(&mut self) -> Option<Spot> {
         let g = self.group_row()?.to_string();
         if self.spot.as_ref().is_none_or(|s| s.group != g) {
@@ -6765,7 +6935,7 @@ impl App {
         self.spot.clone()
     }
 
-    /// 当前可见的会话 + 被「近几天」藏起来的个数(给 `aca -l` 用)
+    /// Sessions visible now + how many "recent days" hides (for `aca -l`)
     pub fn visible(&self) -> (Vec<&Session>, usize) {
         (self.view.iter().map(|&i| &self.all[i]).collect(), self.hidden)
     }
@@ -6773,7 +6943,7 @@ impl App {
     fn select(&mut self, idx: Option<usize>) {
         self.list.select(idx);
         self.selected = idx.map(|i| self.all[self.view[i]].name.clone());
-        // 空分组那一项只画了标题:停在它上面就是停在标题上(折起来的照样是折叠行)
+        // An empty group's entry draws only the header: being on it means being on the header (folded, it's still the fold row)
         let blank = idx.filter(|&p| !self.is_fold_row(p)).map(|p| &self.all[self.view[p]]).filter(|s| s.blank);
         self.head = blank.map(|s| s.group.clone());
     }
@@ -6782,8 +6952,8 @@ impl App {
         self.list.selected().and_then(|i| self.view.get(i)).map(|&i| &self.all[i])
     }
 
-    /// 高亮这一项的目录(kitty 的浮窗跟着开在这,见 `tell_var`):分组是组的路径,
-    /// 会话是预览查到的干活目录(和 t 开的终端一样),还没查到就用登记的。空 = 列表是空的
+    /// The highlighted item's directory (kitty's floating window opens there, see `tell_var`): for a group, the group's path;
+    /// for a session, the working directory the preview found (same as t's terminal), the registered one until found. Empty = list is empty
     fn here_dir(&mut self) -> String {
         if self.on_group_row() {
             return self.spot().map(|sp| sp.dir).unwrap_or_default();
@@ -6792,7 +6962,8 @@ impl App {
         self.glances.get(&s.name).map(|g| g.work.dir.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| s.dir.clone())
     }
 
-    /// 高亮的是哪个登记的会话(kitty 的浮窗绑在它上面,见 `tell_var`):分组、普通 tmux 会话、另开的窗口是空的
+    /// Which registered session is highlighted (kitty's floating window is tied to it, see `tell_var`):
+    /// empty for groups, plain tmux sessions, extra windows
     fn here_sid(&self) -> String {
         if self.on_group_row() {
             return String::new();
@@ -6800,7 +6971,7 @@ impl App {
         self.current().map(|s| s.deck_id.clone()).unwrap_or_default()
     }
 
-    /// 可见列表里每一段的开头:分区时一个分组一段(置顶块单独一段),不分区时整个列表一段
+    /// Where each section of the visible list starts: one per group when sectioned (the pinned block is its own), the whole list when not
     fn section_starts(&self) -> Vec<usize> {
         let key = |p: usize| {
             let s = &self.all[self.view[p]];
@@ -6813,7 +6984,8 @@ impl App {
         (0..self.view.len()).filter(|&p| p == 0 || key(p) != key(p - 1)).collect()
     }
 
-    /// J:下一段的第一个,没有下一段就到最后一个。K:本段第一个,已经在了就上一段的第一个
+    /// J: first of the next section, or the last one if there's no next section.
+    /// K: first of this section, or of the previous one if already there
     fn jump_section(&mut self, d: isize) {
         if self.view.is_empty() {
             return;
@@ -6828,17 +7000,18 @@ impl App {
         self.select(Some(to));
     }
 
-    /// 正连着快速挪(滑动途中):预览先不换。单独挪一下(和上一下隔得够久)照样马上换
+    /// Moving quickly in a row (mid-slide): don't switch the preview yet.
+    /// A single move (long enough after the last one) switches it right away
     fn sliding(&self) -> bool {
         self.moved.is_some_and(|(t, gap)| gap < SETTLE && t.elapsed() < SETTLE)
     }
 
-    /// 还要等多久预览才换(run 循环按这个定下次醒来的时间,停下来就按时换上)
+    /// How long until the preview switches (the run loop sets its next wakeup from this, so it switches on time once you stop)
     pub fn settle_left(&self) -> Option<Duration> {
         self.sliding().then(|| self.moved.map_or(Duration::ZERO, |(t, _)| SETTLE.saturating_sub(t.elapsed())))
     }
 
-    /// 刚挪过(见 HOLD)
+    /// Just moved (see HOLD)
     pub fn just_moved(&self) -> bool {
         self.moved.is_some_and(|(t, _)| t.elapsed() < HOLD)
     }
@@ -6850,7 +7023,7 @@ impl App {
         let now = Instant::now();
         let gap = self.moved.map_or(Duration::MAX, |(t, _)| now - t);
         self.moved = Some((now, gap));
-        // 按屏幕上的顺序一格一格走,展开的分组标题也是一格
+        // Step one stop at a time in screen order; an unfolded group header is a stop too
         let stops = self.stops();
         let cur = stops.iter().position(|&t| Some(t) == self.at()).unwrap_or(0) as isize;
         match stops[(cur + d).clamp(0, stops.len() as isize - 1) as usize] {
@@ -6859,25 +7032,25 @@ impl App {
         }
     }
 
-    /// 高亮能停的地方,按屏幕上从上到下(见 `jump_targets`)
+    /// Where the highlight can stop, top to bottom as on screen (see `jump_targets`)
     fn stops(&self) -> Vec<Jump> {
         let view: Vec<&Session> = self.view.iter().map(|&i| &self.all[i]).collect();
         jump_targets(&view, self.sectioned(), &self.folds)
     }
 
-    /// 高亮现在停在哪
+    /// Where the highlight is now
     fn at(&self) -> Option<Jump> {
         let p = self.list.selected()?;
         Some(if self.head.is_some() { Jump::Head(p) } else { Jump::Row(p) })
     }
 
-    /// 回车:进会话;停在分组上就是折叠 / 展开
+    /// Enter: go into the session; on a group, fold / unfold
     fn enter(&mut self) {
         self.digits.clear();
         if self.on_group_row() {
             return self.toggle_fold();
         }
-        // 子代理那一行没有窗格可进:看它的记录
+        // A subagent row has no pane to go into: show its record
         if self.current().is_some_and(|s| s.subagent.is_some()) {
             return self.open_trace();
         }
@@ -6886,10 +7059,11 @@ impl App {
         }
     }
 
-    /// 进 all[i] 那一项(回车、点了通知)
+    /// Go into item all[i] (Enter, clicked notification)
     fn go(&mut self, i: usize) {
         let s = &self.all[i];
-        // 登记的会话那行:agent 退了(窗格连画面还留着)、tmux 里整个没了,都是接着原来的对话再起(`session::start`)
+        // A registered session's row: if the agent exited (the pane and its screen are still there) or it's gone from tmux entirely, start
+        // it again continuing the old conversation (`session::start`)
         let own = s.sub.is_none() && !s.deck_id.is_empty();
         if s.state == State::Dead && !own {
             self.respawn = Some((s.family().to_string(), self.pane_of(s)));
@@ -6902,7 +7076,7 @@ impl App {
         }
     }
 
-    /// 点了桌面通知(见 clicked.rs):进那个会话,高亮挪到它上面(列表里看得到的话)
+    /// Clicked a desktop notification (see clicked.rs): go into that session, move the highlight onto it (if it's in the list)
     pub fn open_clicked(&mut self, id: &str) {
         let Some(i) = self.all.iter().position(|s| s.deck_id == id && s.sub.is_none() && s.subagent.is_none() && !s.blank) else {
             return self.flash(t!("通知中的会话已不存在", "the notification's session is gone"));
@@ -6913,8 +7087,8 @@ impl App {
         self.go(i);
     }
 
-    /// t:在它真正干活的目录开个临时终端,画在列表下面;这一行开过就回到那个。停着的会话也行。
-    /// 停在分组上:开在组的路径(见 `group_dir`),一个组一个
+    /// t: open a temporary terminal in the directory it's really working in, drawn below the list; if this row already has one, back to it.
+    /// Works for stopped sessions too. On a group: opens at the group's path (see `group_dir`), one per group
     fn open_term(&mut self) {
         self.digits.clear();
         if let Some(g) = self.group_row().map(String::from) {
@@ -6947,7 +7121,7 @@ impl App {
         });
     }
 
-    /// 登录终端里出了登录链接(收起来了的也算):弹出来挑用哪个浏览器开
+    /// A login link showed up in a login terminal (a hidden one counts too): pop up a choice of browser to open it with
     fn catch_links(&mut self) {
         let mut got: Vec<(String, crate::term::Link)> =
             self.terms.values_mut().filter_map(|t| t.new_link().map(|l| (t.title.clone(), l))).collect();
@@ -6957,7 +7131,7 @@ impl App {
         }
     }
 
-    /// 终端开着:按键都给它(包括 ^C),只有 Esc 收起 —— shell 接着跑,再按 t 回来
+    /// Terminal open: every key goes to it (^C included), only Esc hides it — the shell keeps running, t again comes back
     fn on_term_key(&mut self, key: &str, k: KeyEvent) {
         if k.code == KeyCode::Esc && k.modifiers.is_empty() {
             self.term_on = None;
@@ -6966,7 +7140,7 @@ impl App {
         }
     }
 
-    /// T:在它的会话里新开一个窗口跑 shell(同 prefix c),目录是它真正干活的目录
+    /// T: open a new window running a shell in its session (same as prefix c), in the directory it's really working in
     fn window_here(&mut self) {
         self.digits.clear();
         if self.on_group(t!("打开窗口", "open a window")) {
@@ -6979,16 +7153,17 @@ impl App {
         self.split = Some(self.split_of(s, false));
     }
 
-    /// 在 s 那格旁边分屏:窗口行分的是那一格,会话行不知道窗格 id 就分它当前那格
+    /// Split next to s's pane: a window row splits that pane; a session row with no known pane id splits its current pane
     fn split_of(&self, s: &Session, yazi: bool) -> Split {
         let target = if s.pane.is_empty() { format!("={}:", s.family()) } else { s.pane.clone() };
-        // 会话里另开的窗口那一行:账号跟它所在的会话
+        // A row for an extra window in a session: account comes from the session it's in
         let head = if s.sub.is_none() { Some(s) } else { self.all.iter().find(|x| x.sub.is_none() && x.name == s.family()) };
         let env = head.map(crate::data::shell_env).unwrap_or_default();
         Split { yazi, name: s.family().to_string(), target, w: Where::of(s), side: self.screen.width >= 100, env }
     }
 
-    /// y:在它真正干活的目录开 yazi,q 退出就回到 aca。停着的会话也行(目录用它记下的)
+    /// y: open yazi in the directory it's really working in, q quits back to aca.
+    /// Works for stopped sessions too (uses the directory it saved)
     fn open_yazi(&mut self) {
         self.digits.clear();
         if self.on_group(t!("打开 yazi", "open yazi")) {
@@ -7002,7 +7177,8 @@ impl App {
         self.external = Some(External::Yazi(sp));
     }
 
-    /// 弹窗里的界面:这台客户端现在停在哪(tmux 的会话号、窗格)→ 高亮它(那一格有自己的一行就高亮那行,不然是会话那行)
+    /// Interface in a popup: where this client is now (tmux session, pane) → highlight it
+    /// (that pane's own row if it has one, else the session's row)
     pub fn highlight_here(&mut self, session: &str, pane: &str) {
         let row = self.all.iter().find(|s| !pane.is_empty() && s.pane == pane && s.tmux == session);
         let Some(name) = row.or_else(|| self.all.iter().find(|s| s.sub.is_none() && s.tmux == session)).map(|s| s.name.clone()) else {
@@ -7013,16 +7189,17 @@ impl App {
         self.set_sessions(all);
     }
 
-    /// 开始跟随(见 follow.rs):session / pane 是这台客户端现在停着的地方。先 `highlight_here`,高亮落在哪一行就认哪一行是「原来那个」
+    /// Start following (see follow.rs): session / pane is where this client is now. `highlight_here` first; whichever row the highlight
+    /// lands on is taken as "the original one"
     pub fn follow_from(&mut self, session: &str, pane: &str) {
         let row = self.current().filter(|_| !self.on_group_row()).map(|s| s.name.clone()).unwrap_or_default();
         self.following = Some(Follow::new(Place { row, session: session.into(), pane: pane.into() }));
     }
 
-    /// 高亮的这一行要把客户端带到哪:分组行、没在跑的会话 = 哪也不去
+    /// Where the highlighted row should take the client: group rows and sessions not running = nowhere
     fn follow_want(&self) -> Option<Place> {
         let s = self.current().filter(|_| !self.on_group_row())?;
-        // 子代理那一行没有窗格:带到它的会话那一格
+        // A subagent row has no pane: take it to its session's pane
         let pane = match &s.subagent {
             Some(_) => self.all.iter().find(|x| x.sub.is_none() && x.name == s.family()).map_or_else(String::new, |x| x.pane.clone()),
             None => s.pane.clone(),
@@ -7030,12 +7207,14 @@ impl App {
         (!s.tmux.is_empty() && !s.state.gone()).then(|| Place { row: s.name.clone(), session: s.tmux.clone(), pane })
     }
 
-    /// 跟随的一步(run 循环每轮问一次):高亮停稳了、该换地方了就给出切到哪。滑动途中、正在打过滤词时不切
+    /// One step of following (the run loop asks each round): once the highlight settles and it's time to move, say where to switch to. Not
+    /// while sliding or typing a filter
     pub fn follow_step(&mut self) -> Option<Place> {
         let want = if self.sliding() || self.filtering { None } else { self.follow_want() };
         let f = self.following.as_mut()?;
         let to = f.step(want)?;
-        // 路过不算看过:切过去 tmux 就记它「连进去过」,核心那边的「跑完没看」跟着没了 → 记成未读,⏎ 留下、关在它上面才清
+        // Passing by doesn't count as seen: switching there makes tmux record it as "attached", and core's "finished, not looked at" goes
+        // away with it → mark it unread; only ⏎ stay or closing on it clears that
         let passing = !f.is_home(&to.session);
         if let Some(key) =
             self.all.iter().find(|s| passing && s.sub.is_none() && s.tmux == to.session && s.state == State::Unread).map(notes::key)
@@ -7045,14 +7224,14 @@ impl App {
         Some(to)
     }
 
-    /// 跟随着关掉了(^\ / qq;⏎ 和 Esc 各有各的去处):人留在旁边露出来的那个会话,它算看过
+    /// Closed while following (^\ / qq; ⏎ and Esc each go elsewhere): you stay on the session showing beside; it counts as seen
     pub fn follow_done(&mut self) {
         if let Some(session) = self.following.as_ref().and_then(|f| f.stayed()).map(String::from) {
             self.mark_seen(&session);
         }
     }
 
-    /// 可见列表第 pos 个是不是折叠行(折起来的分区的占位)
+    /// Whether the pos-th item of the visible list is a fold row (placeholder of a folded section)
     fn is_fold_row(&self, pos: usize) -> bool {
         self.view.get(pos).is_some_and(|&i| {
             let s = &self.all[i];
@@ -7064,7 +7243,8 @@ impl App {
         self.list.selected().is_some_and(|p| self.is_fold_row(p))
     }
 
-    /// 账号列宽:按所有会话里最长的定(不按当前显示的),切范围 / 分组时标题不跟着伸缩
+    /// Account column width: set by the longest among all sessions (not just the ones shown),
+    /// so headers don't resize when switching scope / group
     pub fn who_width(&self) -> usize {
         self.all.iter().map(|s| s.who.width()).max().unwrap_or(0).min(WHO_MAX)
     }
@@ -7073,7 +7253,7 @@ impl App {
         &self.folds
     }
 
-    /// o:折叠 / 展开当前分区(停在折叠行上就展开)。折起来后高亮落在折叠行上
+    /// o: fold / unfold the current section (on a fold row: unfold). After folding the highlight lands on the fold row
     fn toggle_fold(&mut self) {
         let Some(s) = self.current() else { return };
         if !self.sectioned() {
@@ -7085,7 +7265,7 @@ impl App {
         let g = s.group.clone();
         match self.folded.contains(&g) {
             false => {
-                // 占位的是这个分区第一个会话,高亮跟过去
+                // The placeholder is this section's first session; the highlight goes with it
                 let first = self.view.iter().map(|&i| &self.all[i]).find(|x| !x.pinned && x.group == g).map(|x| x.name.clone());
                 self.folded.insert(g.clone());
                 self.selected = first;
@@ -7095,21 +7275,21 @@ impl App {
             }
         }
         self.rebuild();
-        // 展开了:高亮还在这个组上(停在标题上)
+        // Unfolded: the highlight stays on this group (on its header)
         if let Some(p) = self.head_pos(&g).filter(|_| !self.folded.contains(&g)) {
             self.select_head(p);
         }
     }
 
-    /// h / ←:往外一层。窗口 / 子代理 / 子会话 → 它挂的会话;展开着子代理的会话上 = 把它们收起来;
-    /// 会话、展开的标题上 = 把分组折起来(只有 h 折,只有 l 展);
-    /// 只看一个分组时回到全部分组(高亮留在原处)。折叠行、置顶块里的没有外层,不动
+    /// h / ←: one level out. Window / subagent / child session → the session it hangs off; on a session with subagents unfolded = fold
+    /// them; on a session or an unfolded header = fold the group (only h folds, only l unfolds); viewing a single group: back to all groups
+    /// (highlight stays put). Fold rows and pinned-block items have no outer level; do nothing
     fn step_out(&mut self) {
         if self.head.is_some() {
             return self.toggle_fold();
         }
         let Some(s) = self.current() else { return };
-        // 展开着子代理的会话:先把它们收起来,再按一次才轮到分组
+        // A session with subagents unfolded: fold those first; only the next press gets to the group
         if s.sub.is_none() && self.agents_open.contains(&s.name) {
             let name = s.name.clone();
             self.agents_open.remove(&name);
@@ -7130,8 +7310,8 @@ impl App {
         }
     }
 
-    /// l / →:往里一层。折叠行上 = 展开(高亮停在标题上),分组标题上 = 进到组里第一个会话;
-    /// 会话上:它派了子代理就把它们展开成行(高亮不动),已经展开了就进到第一个;没派的不动
+    /// l / →: one level in. On a fold row = unfold (highlight on the header); on a group header = go to the group's first session; on a
+    /// session: if it spawned subagents, unfold them into rows (highlight stays), if already unfolded go to the first; none, do nothing
     fn step_in(&mut self) {
         if self.on_fold_row() {
             self.toggle_fold();
@@ -7149,7 +7329,7 @@ impl App {
         }
     }
 
-    /// O:有折着的就全展开,没有就把所有分区都折起来
+    /// O: unfold everything if anything is folded, else fold every section
     fn toggle_fold_all(&mut self) {
         if !self.sectioned() {
             return self.flash(t!("单个分组中不能折叠", "can't fold inside a single group"));
@@ -7162,7 +7342,7 @@ impl App {
         self.rebuild();
     }
 
-    /// c:复制最后一条回复;B:复制路径 / 分支 / 会话 id(同 agent-deck)。真正的复制由 run 循环做
+    /// c: copy the last reply; B: copy path / branch / session id (like agent-deck). The actual copying is done by the run loop
     fn ask_copy(&mut self, last: bool) {
         if self.on_group(t!("复制", "copy")) {
             return;
@@ -7170,22 +7350,22 @@ impl App {
         let Some(s) = self.current() else { return };
         let title = s.title.clone();
         self.clip = Some(if last {
-            // 拿不到(普通 tmux 会话、还没跑完过一轮)时用屏幕上的字
+            // When unavailable (plain tmux session, no finished turn yet) use the text on screen
             let screen = preview_lines(s).iter().map(ansi::plain).collect::<Vec<_>>().join("\n");
             Clip::Last { profile: s.profile.clone(), id: s.deck_id.clone(), title, screen }
         } else {
-            Clip::Info { title, text: s.info.clone() }
+            Clip::Info { title, text: crate::data::copy_text(s) }
         });
     }
 
-    /// C:挑一样复制(aca id / session id / path,见 copies.rs)
+    /// C: pick one thing to copy (aca id / session id / path, see copies.rs)
     fn open_copy_menu(&mut self) {
         if self.on_group(t!("复制", "copy")) {
             return;
         }
         let Some(s) = self.current() else { return };
         let id = if s.profile == crate::data::REGISTERED { s.deck_id.as_str() } else { "" };
-        let m = crate::copies::Menu::new(&s.title, id, &s.info);
+        let m = crate::copies::Menu::new(&s.title, id, &crate::data::copy_text(s));
         self.open(Box::new(m));
     }
 
@@ -7199,8 +7379,9 @@ impl App {
     }
 
     pub fn on_key(&mut self, k: KeyEvent) {
-        // ^`:回到上一个会话,同 tmux 里的 ^`。弹窗开着时 tmux 不走键位,把它转成 NUL 给 aca,到手是 ^空格
-        // (真的 ^空格 被 macOS 拿去换输入法,到不了这里);快捷键弹窗里只是查它
+        // ^`: back to the previous session, like ^` in tmux. With a popup open tmux doesn't apply key bindings;
+        // it turns it into NUL for aca, which arrives as ^Space (a real ^Space is taken by macOS to switch input method,
+        // never gets here); in the keys popup it's only looked up
         if crate::data::in_popup()
             && k.code == KeyCode::Char(' ')
             && k.modifiers.contains(KeyModifiers::CONTROL)
@@ -7208,15 +7389,16 @@ impl App {
         {
             return self.back_session();
         }
-        // 终端上面盖着弹窗(登录链接出来时弹的,见 browser.rs):键先给弹窗,关了再回终端
+        // A popup covers the terminal (popped when a login link appears, see browser.rs):
+        // keys go to the popup first, back to the terminal once it's closed
         if self.term_on.is_some() && !self.overlays.is_empty() {
             return self.on_overlay_key(k);
         }
         if let Some(key) = self.term_on.clone() {
             return self.on_term_key(&key, k);
         }
-        // ^\:开弹窗的那个键,再按一下关掉(弹窗开着时 tmux 不走键位,键到了这里)。人留在旁边现在露出来的那个会话;
-        // 快捷键弹窗里只是查它
+        // ^\: the key that opened the popup, press it again to close (with a popup open tmux doesn't apply key bindings, so the key arrives
+        // here). You stay on the session now showing beside; in the keys popup it's only looked up
         if (self.following.is_some() || crate::data::in_popup()) && closes_popup(k) && !self.reader.as_ref().is_some_and(|r| r.help) {
             self.quit = true;
             return;
@@ -7252,16 +7434,16 @@ impl App {
         if self.settings.is_some() {
             return self.on_settings_key(k);
         }
-        // 确认:只认 y,别的键(包括回车)一律取消 —— 删了就回不来,重启会打断它
+        // Confirm: only y counts, any other key (Enter included) cancels — delete can't be undone, restart interrupts it
         if let Some(c) = self.confirm.take() {
             let yes = k.code == KeyCode::Char('y');
-            // 除了 y 什么键都算不要:Esc 是明着不要,不用说;按了别的键才说一句,免得没留意按掉了
+            // Any key but y means no: Esc is an explicit no, nothing to say; other keys get a line, in case it was pressed by accident
             let no = |what: &'static str| if k.code == KeyCode::Esc { "" } else { what };
             let mut said = "";
             match c {
                 Confirm::Remove(r) if yes => {
                     let t = Target { name: r.name, title: r.title, profile: r.profile, id: r.id };
-                    // 先从列表里拿掉,不等后台删完(要等进程退干净)
+                    // Remove from the list first, without waiting for the background delete (it waits for the process to exit cleanly)
                     let running = !t.id.is_empty()
                         && self.all.iter().any(|s| s.sub.is_none() && s.deck_id == t.id && s.profile == t.profile && !s.state.gone());
                     let job = Job::Remove { t: t.clone(), pane: r.pane.map(|(p, _)| p) };
@@ -7275,7 +7457,7 @@ impl App {
                 Confirm::Remove(r) if r.pane.is_some() => said = no(t!("未关闭", "not closed")),
                 Confirm::Remove(_) => said = no(t!("未删除", "not deleted")),
                 Confirm::Group(g) if yes => {
-                    // 组里的先从列表里拿掉,不等后台停完、删完
+                    // Remove the group's sessions from the list first, without waiting for the background stop / delete
                     let job = Job::Group(groups::Act::Delete { profile: g.profile, group: g.group });
                     self.vanish.push(Vanish { job: job.clone(), until: None, running: g.running });
                     self.job = Some(job);
@@ -7371,8 +7553,9 @@ impl App {
                 self.rebuild();
             }
             KeyCode::Esc if let Some(p) = self.status => self.toggle_status(p),
-            // tmux 弹窗里、跟随着时 Esc 关掉(跟随着的先回到打开时停着的地方,run 循环里 `follow_step` 切)。
-            // 独立终端里 Esc 到了底不退出:每个弹窗、每一页都是 Esc 关,多按一下不该把整个界面关掉;退出是 q q
+            // In a tmux popup or while following, Esc closes (following first goes back to where it was when opened; `follow_step` in the
+            // run loop switches). In a standalone terminal Esc at the bottom doesn't quit: every popup and page closes with Esc, one press
+            // too many shouldn't close the whole interface; quitting is q q
             KeyCode::Esc if self.following.is_some() || crate::data::in_popup() => {
                 if let Some(f) = self.following.as_mut() {
                     f.back();
@@ -7439,7 +7622,7 @@ impl App {
             KeyCode::Char('R') => self.ask_restart(),
             KeyCode::Char('D') => self.ask_stop(),
             KeyCode::Char('m') => self.ask_move(),
-            // F 是原来的「起名再分叉」,现在 f 就是
+            // F used to be "name it, then fork"; f does that now
             KeyCode::Char('f') => self.ask_fork(),
             KeyCode::Char('F') => self.open_only_menu(),
             KeyCode::Char('H') => self.ask_handoff(),
@@ -7462,7 +7645,7 @@ impl App {
                 self.digits.push(c);
                 let n: usize = self.digits.parse().unwrap_or(0);
                 if self.numbered(n).is_none() {
-                    // 12 号不存在 → 当作重新按了 2
+                    // No number 12 → treat it as pressing 2 afresh
                     self.digits = c.to_string();
                 }
                 let n: usize = self.digits.parse().unwrap_or(0);
@@ -7502,7 +7685,7 @@ impl App {
             };
             match v.detail.as_mut() {
                 Some(x) => x.scroll = x.scroll.saturating_add_signed(d),
-                // 两栏:鼠标在哪边滚哪边
+                // Two panes: scroll whichever side the mouse is on
                 None if v.wide && m.column >= v.split => v.steps.scroll(d),
                 None if v.wide => v.chat.scroll(d),
                 None => v.cur().scroll(d),
@@ -7517,7 +7700,8 @@ impl App {
             if self.list_area.contains(pos) {
                 self.move_by(if m.kind == MouseEventKind::ScrollUp { -1 } else { 1 });
             } else if self.preview_area.contains(pos) && !self.on_group_row() && self.current().is_some_and(|s| s.subagent.is_none()) {
-                // 预览往回翻这一屏里放不下的;翻到顶了再往上:更早的在全屏阅读里
+                // The preview scrolls back through what doesn't fit on this screen;
+                // past the top, earlier stuff is in the full-screen reader
                 match m.kind {
                     MouseEventKind::ScrollUp if self.preview_up >= self.preview_max => self.flash(t!("z 全屏阅读", "z read output")),
                     MouseEventKind::ScrollUp => self.preview_up = (self.preview_up + 3).min(self.preview_max),
@@ -7527,7 +7711,7 @@ impl App {
             return;
         }
         match m.kind {
-            // 分组列表开着:点哪都是关
+            // Group list open: a click anywhere closes it
             MouseEventKind::Down(MouseButton::Left) if self.group_menu.is_some() => self.group_menu = None,
             MouseEventKind::Down(MouseButton::Left)
                 if self.chip_area.contains(ratatui::layout::Position::new(m.column, m.row)) && !self.modal_open() =>
@@ -7539,12 +7723,14 @@ impl App {
                 if m.column < a.x || m.column >= a.x + a.width || m.row < a.y || m.row >= a.y + a.height {
                     return;
                 }
-                // 列表项有一行也有两行(带问题的),还夹着分区标题;从当前滚动位置往下累加高度找被点的那项
+                // List items are one or two lines (two with a question), with section headers in between; add up heights from the current
+                // scroll position to find the clicked one
                 let mut y = a.y;
                 for &(pos, head, h) in self.drawn.iter().skip(self.disp.offset()) {
                     if m.row < y + h {
                         let on = self.list.selected();
-                        // 点已高亮的那行 = 回车(进入 / 折叠);分组标题也点得中,空行和置顶块的标题不算
+                        // Clicking the already highlighted row = Enter (go in / fold); group headers are clickable too, blank rows and the
+                        // pinned block's header aren't
                         match (pos, head) {
                             (Some(p), _) if on == Some(p) && self.head.is_none() => self.enter(),
                             (Some(p), _) => self.select(Some(p)),
@@ -7562,19 +7748,20 @@ impl App {
     }
 }
 
-/// 桌面(够宽够高):四周留白(左右 3 格、上下 1 行,顶栏下、底栏上各空一行);列表写编号、组和组之间空一行
+/// Desktop (wide and tall enough): margins all round (3 columns left and right, 1 line top and bottom, a blank line below the top bar and
+/// above the bottom bar); the list shows numbers and a blank line between groups
 fn roomy(area: Rect) -> bool {
     area.width >= 100 && area.height >= 30
 }
 
-/// 顶栏左边的标签:工作区的名字(只用着 1 时是「会话」);只看一个分组时换成那个分组
+/// The tag at the left of the top bar: the workspace's name ("sessions" when only 1 is in use); viewing a single group, that group instead
 fn chip_text(app: &App) -> String {
     let label = app.group.as_ref().map_or_else(|| app.space_label(), |g| group_label(g).to_string());
     format!(" {} ", clip(&label, 14).trim_end())
 }
 
-/// 顶栏:左边是在看什么(强调色的标签 + 天数 / 全部 / 开着的,或者正在搜的词),右边是各状态几个。
-/// 窄了先把计数写短(◆1),再只留当前那个范围
+/// Top bar: left is what you're looking at (accent-colored tag + days / all / open, or the search term), right is the count per state. When
+/// narrow, shorten the counts first (◆1), then keep only the current scope
 fn top_bar(app: &App, w: usize) -> Line<'static> {
     let on = theme::accent().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     let chip = vec![Span::styled(chip_text(app), theme::chip()), Span::raw("  ")];
@@ -7599,7 +7786,8 @@ fn top_bar(app: &App, w: usize) -> Line<'static> {
             tab(tr!("{d} 天", "{d}d"), app.scope == Scope::Recent && app.days == d);
         }
         tab(t!("全部", "All").into(), app.scope == Scope::All);
-        // 「开着的」是叠在范围上的开关,不是范围里的一档:隔开,开着时是一块标签,不和范围的下划线混在一起
+        // "Open" is a toggle stacked on the scope, not one of its steps:
+        // set apart, a tag when on, not mixed with the scope's underline
         if all || app.open {
             if !v.is_empty() {
                 v.push(Span::styled("  │  ", theme::faint()));
@@ -7619,9 +7807,11 @@ fn top_bar(app: &App, w: usize) -> Line<'static> {
     if !app.digits.is_empty() && app.digits_at.elapsed() <= DIGIT_GAP {
         extra.push(Span::styled(format!("  #{}", app.digits), theme::accent().add_modifier(Modifier::BOLD)));
     }
-    // ! @ # & ^ % 挑的状态:那几格铺上选中的底色(搜索时不管状态,也就不铺)。空闲、■、☾ 平时不数,挑了才列,0 个也列
+    // Status picked with ! @ # & ^ %: those cells get the selection background (search ignores status, so no background then). Idle, ■, ☾
+    // aren't counted normally; listed when picked, even at 0
     let pick = app.status.filter(|_| app.filter.is_empty());
-    // 和 i 一样只数列表里看得见的(折叠组的占位行不算);■ 那格数 ^ 挑的全部(已退出、没在跑的出错、☾ 也算),☾ 那格只数自动停的
+    // Like i, count only what's visible in the list (folded groups' placeholder rows don't count); the ■ cell counts everything ^ picks
+    // (exited, errored and not running, ☾ too), the ☾ cell only auto-stopped ones
     let count = |hit: &dyn Fn(&Session) -> bool| {
         app.view
             .iter()
@@ -7666,7 +7856,7 @@ fn top_bar(app: &App, w: usize) -> Line<'static> {
             }
             v.extend(cell);
         }
-        // 出错了的插件:几个插件,不是几处
+        // Broken plugins: how many plugins, not how many places
         let mut broken: Vec<&str> = app.plugin_alerts.iter().map(|p| p.plugin.as_str()).collect();
         broken.dedup();
         if !broken.is_empty() {
@@ -7704,7 +7894,7 @@ fn top_bar(app: &App, w: usize) -> Line<'static> {
     Line::from(left)
 }
 
-/// 下面放预览时的分隔:一条淡线,标题嵌在线上 ——「─ ● 标题 ───── Claude·team ─」
+/// Divider when the preview is below: a faint line with the title set in it — "─ ● title ───── Claude·team ─"
 fn title_rule(ic: (&'static str, Style), title: &str, label: Vec<Span<'static>>, w: usize) -> Line<'static> {
     let line = theme::faint();
     let label_w: usize = label.iter().map(|s| s.content.width()).sum();
@@ -7732,8 +7922,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.last_frame = f.buffer_mut().clone();
 }
 
-/// 一行中文整体往左挪一格时(比如关掉顶栏「 未停止 」那块),新字盖住旧字的左半,旧字的右半 ratatui 当终端会清、不写,
-/// tmux 却把旧字的底色留在那格,多出一小块色块。旧字带底色(或下划线这类空格上也看得见的)时,那格标成必写
+/// When a line of Chinese shifts left one cell as a whole (say closing the top bar's 「 未停止 」 (" Open ") tag), new chars cover the old
+/// chars' left halves; ratatui leaves the right halves for the terminal to clear and doesn't write them, but tmux keeps the old char's
+/// background in that cell, leaving a small colored block. When the old char has a background (or an underline, visible on spaces too),
+/// mark that cell as must-write
 fn mark_torn_tails(prev: &Buffer, next: &mut Buffer) {
     if prev.area != next.area {
         return;
@@ -7773,9 +7965,9 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
     let roomy = roomy(full);
     let area = if roomy { Rect { x: full.x + 3, y: full.y + 1, width: full.width - 6, height: full.height - 2 } } else { full };
     let side = preview_side(app.mode(), full.width, full.height).filter(|_| !app.view.is_empty());
-    // 只看列表:底下留一行,写高亮的那个在干什么
+    // List only: keep one line at the bottom saying what the highlighted one is doing
     let summary = side.is_none() && app.mode() == Preview::Off && !app.view.is_empty();
-    // 便签正写在预览里(带光标):底栏就不再重复一遍内容,只留按键
+    // Note being written in the preview (with cursor): the bottom bar doesn't repeat its content, only the keys
     let note_in_preview = side.is_some() && matches!(&app.prompt, Some(Prompt { ask: Ask::Note { .. }, .. }));
     let foot_h = 1;
     let gap = u16::from(roomy);
@@ -7787,7 +7979,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         Constraint::Length(foot_h),
     ])
     .areas(area);
-    // t 的终端:占下面一半多一点,上面照常是列表 / 预览
+    // t's terminal: takes a bit over the lower half; the list / preview stays above as usual
     let term = app.term_on.clone().filter(|k| app.terms.contains_key(k));
     let (body, term_area) = match term {
         Some(_) => {
@@ -7797,7 +7989,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         }
         None => (body, None),
     };
-    // 分割比例固定,不随会话多少伸缩 —— 会话一多一少,预览的边界不会上下跳
+    // Split ratio is fixed, not resized by the number of sessions — so the preview's edge doesn't jump up and down as sessions come and go
     let (list_area, prev_area) = match side {
         Some(Side::Below) => {
             let [l, p] = Layout::vertical([Constraint::Percentage(50), Constraint::Fill(1)]).areas(body);
@@ -7824,7 +8016,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         let view: Vec<&Session> = app.view.iter().map(|&i| &app.all[i]).collect();
         list_rows(&view, app.sectioned(), list_area.width as usize, app.jump.as_deref(), &app.folds, app.who_width(), roomy)
     };
-    // v 选上的行(同 yazi):行首一道绿记号、整行铺淡绿底
+    // Rows selected with v (like yazi): a green mark at the start, the whole row on a light green background
     let mut ticked = vec![false; rows.len()];
     if app.picking() {
         let chosen = app.chosen();
@@ -7857,7 +8049,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(top_bar(app, head.width as usize)), head);
     app.chip_area = Rect { width: (chip_text(app).width() as u16).min(head.width), height: 1, ..head };
 
-    // 列表
+    // List
     if app.view.is_empty() {
         let msg = if !app.filter.is_empty() {
             tr!(" 没有匹配「{}」的会话", " nothing matches “{}”", app.filter)
@@ -7896,20 +8088,20 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
                 if on { item.style(Style::new().bg(theme::pal().pick)) } else { item }
             })
             .collect();
-        // 选中的整块铺淡紫底,各段的颜色照留(状态、账号一眼还看得出)。
-        // 留一项余量:滚到某组第一个会话时,它上面的分区标题也露出来
+        // The selected item gets a light purple background, keeping each part's color (state and account still readable at a glance). Keep
+        // one item of padding: scrolling to a group's first session also shows the section header above it
         let list = List::new(items).highlight_style(Style::new().bg(theme::pal().sel)).scroll_padding(1);
         f.render_stateful_widget(list, list_area, &mut app.disp);
     }
 
-    // 预览:高亮会话的屏幕底部。放右边是全屏唯一一个框(强调色,标题嵌在上边框);
-    // 放下面是一条嵌着标题的强调色的线,同时把列表和预览隔开
+    // Preview: the bottom of the highlighted session's screen. On the right it's the only box on the screen (accent-colored, title set in
+    // the top border); below, it's an accent-colored line with the title in it, which also separates list and preview
     let spot = if app.on_group_row() { app.spot() } else { None };
     let shown = if app.on_group_row() { None } else { preview_name(app).and_then(|n| app.all.iter().position(|s| s.name == n)) };
     if let Some(pa) = prev_area {
         let (ic, title, label) = match shown.map(|i| &app.all[i]) {
             Some(s) => {
-                // 账号名太长时截它,标题优先
+                // Clip the account name when too long; the title comes first
                 let label = clip(&s.agent_label(), (pa.width as usize / 3).max(12)).trim_end().to_string();
                 let label = if label.is_empty() { vec![] } else { vec![Span::styled(label, agent_style(s.agent))] };
                 match &s.subagent {
@@ -7919,11 +8111,11 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
             }
             None => (("▸", dim()), app.current().map(|s| group_label(&s.group).to_string()).unwrap_or_default(), vec![]),
         };
-        // 列表露得少(预览为主 / 只看列表)时,线上写着高亮的是第几个
+        // When little of the list shows (mostly preview / list only), the line says which number the highlighted one is
         let at = Span::styled(format!("{}/{}", app.list.selected().map_or(0, |p| p + 1), app.view.len()), dim());
         let label = if side == Some(Side::Focus) { [label, vec![Span::raw("  "), at.clone()]].concat() } else { label };
         let inner = if summary {
-            // 只看列表:预览收成一条线,写状态和目录
+            // List only: the preview shrinks to one line, showing state and directory
             let what = match (shown.map(|i| &app.all[i]), &spot) {
                 (Some(s), _) => format!("{} · {}", state_word(s), create::tilde(&s.dir)),
                 (None, Some(sp)) => format!("{title} · {}", create::tilde(&sp.dir)),
@@ -7933,7 +8125,8 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
             Rect { height: 0, ..pa }
         } else if side == Some(Side::Right) {
             let t = clip(&title, (pa.width as usize).saturating_sub(12 + label.iter().map(|s| s.content.width()).sum::<usize>()).max(6));
-            // 淡色的框:列表旁边不再立着一大块浓色;标题照常是深色粗体(不写前景色的话会沾上边框的颜色)
+            // A faint box: no big block of strong color standing next to the list; the title stays dark bold (without a foreground color it
+            // would take the border's color)
             let bold = Style::new().fg(Color::Reset).add_modifier(Modifier::BOLD);
             let mut block =
                 Block::bordered().border_type(BorderType::Rounded).border_style(theme::faint()).padding(Padding::horizontal(1)).title_top(
@@ -7958,7 +8151,8 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         match shown {
             _ if inner.height == 0 => {}
             None => {
-                // 分组:正在写它的便签就显示正在写的。组还没有目录(空的组)时只有便签
+                // Group: if its note is being written, show what's being written.
+                // A group without a directory yet (empty group) has only the note
                 let key = app.group_row().map(group_key);
                 let editing = app.prompt.as_ref().and_then(|p| match &p.ask {
                     Ask::Note { key: k, .. } if Some(k) == key.as_ref() => Some(p.text.as_str()),
@@ -7974,7 +8168,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
             }
             Some(i) => {
                 let s = &app.all[i];
-                // 正在写这个会话的便签:显示正在写的
+                // This session's note is being written: show what's being written
                 let editing = app.prompt.as_ref().and_then(|p| match &p.ask {
                     Ask::Note { key, .. } if *key == notes::key(s) => Some(p.text.as_str()),
                     _ => None,
@@ -7990,7 +8184,8 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
                 let body = Rect { y: inner.y + hh, height: inner.height - hh, ..inner };
                 let lines = ansi::wrap(&preview_lines(s), body.width as usize);
                 let h = body.height as usize;
-                // 屏幕露底下那截(最新的在最下面),滚轮往回翻过的往上挪;交回话了的子代理从头露(它交回来的话排在最前面)
+                // Show the bottom of the screen (latest at the bottom), moved up by what the wheel scrolled back; a subagent that has
+                // reported back shows from the top (its report comes first)
                 let top_first = s.subagent.as_ref().is_some_and(|a| a.reported);
                 let max = if top_first { 0 } else { lines.len().saturating_sub(h) };
                 let up = if app.preview_for == s.name { app.preview_up.min(max) } else { 0 };
@@ -8000,7 +8195,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
                 };
                 f.render_widget(Paragraph::new(tail.iter().map(ansi::to_line).collect::<Vec<_>>()), body);
                 ansi::paint_links(f.buffer_mut(), body, tail);
-                // 翻上去了:右下角说底下还有几行(同阅读页)
+                // Scrolled up: the bottom-right corner says how many lines are below (like the reader)
                 if up > 0 {
                     let tag = tr!(" ↓ {up} 行 ", " ↓ {up} lines ");
                     let tw = tag.width() as u16;
@@ -8015,7 +8210,8 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         }
     }
 
-    // 底栏:按键提示,或者短暂显示一条消息。新建、改名、确认、选工具、快捷键都是弹窗,盖在这一整层上面
+    // Bottom bar: key hints, or a message shown briefly.
+    // New, rename, confirm, tool pick and keys are all popups, on top of this whole layer
     let w = foot.width as usize;
     let layout_strip = app.layout_at.filter(|t| t.elapsed() < Duration::from_secs(3)).map(|_| {
         let mut v = vec![Span::styled(t!("布局  ", "layout  "), dim())];
@@ -8034,12 +8230,12 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
             Some(0),
             w,
         ),
-        // 按了 q / Q:比刚才的提示要紧
+        // q / Q pressed: more urgent than the hint before
         _ if app.pending.is_some() => pending_bar(app, w),
         Some((m, t)) if t.elapsed() < app.msg_ttl => Line::styled(m.clone(), theme::warn()).centered(),
         _ if term_area.is_some() => menu_bar(&[vec![("Esc", t!("收起", "hide"), 0), ("exit", t!("关闭", "close"), 0)]], Some(0), w),
         _ if layout_strip.is_some() => layout_strip.unwrap_or_default(),
-        // 多选着:比后台在做的要紧(按的键都在这)
+        // Multi-selecting: more urgent than background work (the keys pressed are all here)
         _ if app.picking() && !app.filtering => pick_bar(app, w),
         _ if doing.is_some() => Line::styled(doing.clone().unwrap_or_default(), theme::warn()).centered(),
         _ if app.filtering => {
@@ -8050,14 +8246,15 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
                 .centered()
         }
         _ => {
-            // 三组:管会话 │ 对着高亮的这个做(主操作)│ 看。只放最常用的,别的都在 ? 里;放不下时先丢排在后面的,? 和 ⏎ 永远在
-            // 停在子代理那一行:只能看它的记录、回它的会话,管会话的那几个键不列
+            // Three groups: manage sessions │ act on the highlighted one (main actions) │ view. Only the most used, the rest are in ?; when
+            // it doesn't fit, drop the later ones first, ? and ⏎ always stay. On a subagent row: only view its record or go back to its
+            // session; the session-management keys aren't listed
             let on_agent = app.head.is_none() && app.current().is_some_and(|s| s.subagent.is_some());
             let enter = match () {
                 _ if app.head.is_some() => t!("折叠", "fold"),
                 _ if app.on_fold_row() => t!("展开", "unfold"),
                 _ if on_agent => t!("查看记录", "record"),
-                // 跟随着:旁边已经是它了
+                // Following: it's already beside
                 _ if app.following.is_some() => t!("留下", "stay"),
                 _ => t!("打开", "open"),
             };
@@ -8076,7 +8273,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
             } else {
                 act.push(("e", t!("便签", "note"), 6));
             }
-            // 有便签才有 s 可按
+            // s only when there's a note
             if !app.on_group_row() && !on_agent && app.current().is_some_and(|s| s.noted) {
                 act.push(("s", t!("发送", "send"), 6));
             }
@@ -8096,7 +8293,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         draw_term(f, app, &key, ta);
     }
 
-    // 弹窗
+    // Popups
     if app.reader.as_ref().is_some_and(|r| r.help) {
         draw_help(f, app);
     } else if let Some(d) = &app.new_draft {
@@ -8106,10 +8303,11 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
     } else if let Some((menu, sel)) = &app.tool_menu {
         draw_tools(f, menu, *sel, app.handoff.as_ref(), &app.tool_quotas);
     } else if let Some(o) = app.overlays.last() {
-        // 底栏的那句话(刚说的,不然是后台在做的)也写在弹窗最下面:手机上弹窗盖着底栏,开着弹窗做的事结果就看不到了
+        // The bottom bar's line (just said, or else the background work) also goes at the bottom of the popup: on a phone the popup covers
+        // the bottom bar, so results of things done with a popup open would be invisible
         let note = app.msg.as_ref().filter(|(_, t)| t.elapsed() < app.msg_ttl).map(|(m, _)| m.clone()).or_else(|| app.doing());
         if o.fill() {
-            // 框的大小不变:最底下留一行给那句话(长了两行),没话说空着,页面的行不跟着跳
+            // Box size stays: the last line is kept for that line (two if long), blank when nothing to say; page lines don't jump
             modal_fill(f, o.width(), o.fill_rows(), theme::pal().accent, |w, h| {
                 let mut said: Vec<Line> = note
                     .as_ref()
@@ -8146,7 +8344,8 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// v 选上的那行(每一行都画):行首空着的那一格换成绿的「▌」(同 yazi 的记号),编号跟着绿
+/// A row selected with v (drawn for every row): the blank cell at the start becomes a green "▌" (like yazi's mark),
+/// the number turns green too
 fn tick_row(segs: &mut Vec<(String, Style)>) {
     let Some((text, style)) = segs.first_mut() else { return };
     let Some(rest) = text.strip_prefix(' ') else { return };
@@ -8158,8 +8357,9 @@ fn tick_row(segs: &mut Vec<(String, Style)>) {
     segs.insert(0, ("▌".into(), green));
 }
 
-/// 多选时的底栏(同 yazi):打头一块绿底写选上几个(连选着先写在连选还是在去掉勾),
-/// 再是对着它们一起做的键(主操作,p / u 写按下去会怎样),最后是连选 / 勾选 / 定下 / 全不选
+/// Bottom bar while multi-selecting (like yazi): first a green block saying how many are selected (during a range select, first whether the
+/// range selects or unselects), then the keys acting on all of them together (main actions; p / u say what pressing does), last range /
+/// select / set / none
 fn pick_bar(app: &App, w: usize) -> Line<'static> {
     let rows = app.chosen_rows();
     let n = rows.len();
@@ -8176,7 +8376,7 @@ fn pick_bar(app: &App, w: usize) -> Line<'static> {
     } else {
         t!("未读", "unread")
     };
-    // 一个都没选上(什么都没勾就按了 V)没有能一起做的
+    // Nothing selected (V pressed with nothing ticked): nothing to act on together
     let acts: Vec<MenuItem> = if n == 0 {
         vec![]
     } else {
@@ -8190,7 +8390,8 @@ fn pick_bar(app: &App, w: usize) -> Line<'static> {
             ("Q", t!("移动到工作区", "to space"), 7),
         ]
     };
-    // 高亮这行勾着没有:空格按下去是勾上还是去掉。放不下先丢空格,再丢 V(手机上只剩 v、Esc)
+    // Whether the highlighted row is ticked: whether Space ticks or unticks.
+    // When it doesn't fit drop Space first, then V (a phone keeps only v, Esc)
     let on = app.list.selected().is_some_and(|p| app.head.is_none() && app.picked.contains(&app.all[app.view[p]].deck_id));
     let tail: Vec<MenuItem> = match app.anchor {
         Some(_) => vec![("Esc", t!("确定", "keep"), 0)],
@@ -8207,7 +8408,7 @@ fn pick_bar(app: &App, w: usize) -> Line<'static> {
     l
 }
 
-/// 按了 q / Q 等下一个键:底栏列出能去的工作区(h 不列,现在这个也不列)
+/// After q / Q, waiting for the next key: the bottom bar lists the workspaces you can go to (not h, nor the current one)
 fn pending_bar(app: &App, w: usize) -> Line<'static> {
     let names: Vec<(String, String)> =
         app.space_list().into_iter().filter(|&c| c != app.space).map(|c| (c.to_string(), app.spaces.name(c))).collect();
@@ -8227,12 +8428,13 @@ fn pending_bar(app: &App, w: usize) -> Line<'static> {
     l
 }
 
-/// S:工作区列表。一行一个:键、名字、几个会话、各状态几个;现在这个的键用强调色,高亮的整行铺底色
+/// S: workspace list. One per row: key, name, how many sessions, count per state; the current one's key in accent color, the highlighted
+/// row gets a background
 fn draw_spaces(f: &mut Frame, app: &App, sel: usize) {
     let list = app.space_list();
     modal(f, 48, theme::pal().accent, |w| {
         let mut out = vec![modal_title(t!("工作区", "Workspace"), theme::accent(), esc_hint(t!("关闭", "close")), w), Line::raw("")];
-        // 没起名的只写键,不再把键当名字写一遍
+        // Unnamed ones show only the key, without repeating the key as the name
         let shown = |c: char| if app.spaces.renamed(c) { app.spaces.name(c) } else { String::new() };
         let name_w = list.iter().map(|&c| shown(c).width()).max().unwrap_or(0).min(16);
         for (i, &c) in list.iter().enumerate() {
@@ -8252,7 +8454,7 @@ fn draw_spaces(f: &mut Frame, app: &App, sel: usize) {
     });
 }
 
-/// 工作区 / 分组列表的一行:键、名字、几个会话、各状态几个
+/// A row of the workspace / group list: key, name, how many sessions, count per state
 fn menu_row(key: &str, key_st: Style, name: &str, name_w: usize, heads: &[&Session]) -> Line<'static> {
     let mut spans = vec![
         Span::styled(key.to_string(), key_st),
@@ -8272,12 +8474,12 @@ fn menu_row(key: &str, key_st: Style, name: &str, name_w: usize, heads: &[&Sessi
     Line::from(spans)
 }
 
-/// Tab:这个工作区的分组列表。一行一个:字母(全部分组是 ␣)、组名、几个会话、各状态几个;
-/// 现在看着的那组字母用强调色,高亮的整行铺底色
+/// Tab: this workspace's group list. One per row: letter (␣ for all groups), group name, how many sessions, count per state; the viewed
+/// group's letter in accent color, the highlighted row gets a background
 fn draw_groups(f: &mut Frame, app: &App, sel: usize) {
     let rows = app.group_rows();
     let name = |g: &Option<String>| g.as_deref().map_or(t!("全部", "all"), group_label).to_string();
-    // 组名整个写出来(长的框跟着放宽),不然前面一样的几个组截成一个样
+    // Write group names in full (a long one widens the box), else groups with the same start get clipped to look alike
     let name_w = rows.iter().map(|(_, g)| name(g).width()).max().unwrap_or(0).min(40);
     modal(f, 48 + name_w.saturating_sub(20) as u16, theme::pal().accent, |w| {
         let mut out = vec![modal_title(t!("分组", "Groups"), theme::accent(), esc_hint(t!("关闭", "close")), w), Line::raw("")];
@@ -8303,7 +8505,7 @@ fn draw_groups(f: &mut Frame, app: &App, sel: usize) {
     });
 }
 
-/// 一种状态在 `F` 的小单里的图标(同列表)和名字(同顶栏)
+/// A state's icon (as in the list) and name (as in the top bar) in `F`'s small list
 fn pick_look(p: Pick) -> (Vec<(&'static str, Style)>, &'static str) {
     match p {
         Pick::Run => (vec![icon(State::Running)], t!("运行中", "running")),
@@ -8315,8 +8517,8 @@ fn pick_look(p: Pick) -> (Vec<(&'static str, Style)>, &'static str) {
     }
 }
 
-/// F:只看一种状态的小单。一行一种:行首是直接挑它的键(挑着的那种用强调色)、图标、名字、这个工作区里有几个;
-/// 第 0 行是全部(空格)。高亮的整行铺底色
+/// F: small list to view only one state. One state per row: first the key that picks it directly (the picked one in accent color), icon,
+/// name, how many in this workspace; row 0 is all (Space). The highlighted row gets a background
 fn draw_only(f: &mut Frame, app: &App, sel: usize) {
     modal(f, 44, theme::pal().accent, |w| {
         let mut out = vec![modal_title(t!("按状态筛选", "Only"), theme::accent(), esc_hint(t!("关闭", "close")), w), Line::raw("")];
@@ -8348,7 +8550,7 @@ fn draw_only(f: &mut Frame, app: &App, sel: usize) {
     });
 }
 
-/// t 的终端:顶上一行写开在哪,下面是 shell 的画面,光标放在它的光标上
+/// t's terminal: the top line says where it's open, below is the shell's screen, the cursor on its cursor
 fn draw_term(f: &mut Frame, app: &mut App, key: &str, area: Rect) {
     let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
     let Some(t) = app.terms.get_mut(key) else { return };
@@ -8360,14 +8562,14 @@ fn draw_term(f: &mut Frame, app: &mut App, key: &str, area: Rect) {
     let head_line = Line::from(vec![Span::styled(label, theme::chip()), Span::raw(" "), Span::styled(clip_left(&dir, rest), dim())]);
     f.render_widget(Paragraph::new(head_line), head);
     f.render_widget(ratatui::widgets::Clear, body);
-    // 上面盖着弹窗(登录链接的)时不放光标:键在弹窗那
+    // With a popup on top (the login link one), no cursor: keys go to the popup
     let covered = !app.overlays.is_empty();
     if let Some(pos) = app.terms.get(key).and_then(|t| t.render(body, f.buffer_mut())).filter(|_| !covered) {
         f.set_cursor_position(pos);
     }
 }
 
-/// 弹窗放哪:够宽够高(桌面)居中浮着、带阴影;窄(手机)从底下升起、占满宽
+/// Where a popup goes: wide and tall enough (desktop) floats centered with a shadow; narrow (phone) rises from the bottom at full width
 fn modal_area(full: Rect, w: u16, h: u16) -> (Rect, bool) {
     if full.width >= 70 && full.height >= 20 {
         let (w, h) = (w.min(full.width.saturating_sub(4)), h.min(full.height.saturating_sub(2)));
@@ -8378,12 +8580,13 @@ fn modal_area(full: Rect, w: u16, h: u16) -> (Rect, bool) {
     }
 }
 
-/// 弹窗在这块屏幕上是不是浮着的(桌面);手机上是底部的一整条
+/// Whether a popup floats on this screen (desktop); on a phone it's a full-width strip at the bottom
 fn floating(full: Rect) -> bool {
     modal_area(full, 1, 1).1
 }
 
-/// 把 (x, y) 那格换成窄字符之前:它要是宽字符的后半格、或者本身是宽字符,把另一半清成空格,免得字错位
+/// Before turning cell (x, y) into a narrow char: if it's the second half of a wide char, or a wide char itself, clear the other half to a
+/// space so chars don't misalign
 fn split_wide(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16) {
     let area = buf.area;
     if x > area.left() && buf[(x - 1, y)].symbol().width() > 1 {
@@ -8394,8 +8597,9 @@ fn split_wide(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16) {
     }
 }
 
-/// 弹窗的底和框:底下整层变灰(字换成淡灰,去掉底色和粗细),桌面上右下错开一格铺 ░ 阴影,
-/// 面板清空后画圆角边框(平常强调色,删除用红)。返回面板里面(去掉边框和内边距)
+/// A popup's backdrop and frame: the whole layer below goes grey (text faint grey, background and weight removed), on desktop a ░ shadow
+/// offset one cell down-right, the panel cleared and given a rounded border (accent color normally, red for delete). Returns the inside of
+/// the panel (minus border and padding)
 fn modal_frame(f: &mut Frame, w: u16, h: u16, border: Color) -> Rect {
     let full = f.area();
     let (r, float) = modal_area(full, w, h);
@@ -8423,7 +8627,7 @@ fn modal_frame(f: &mut Frame, w: u16, h: u16, border: Color) -> Rect {
     panel(f, r, float, border)
 }
 
-/// 面板本身:压在边上的宽字符先拆开,清空,画圆角边框。返回里面(去掉边框和内边距)
+/// The panel itself: split wide chars sitting on the edge, clear, draw a rounded border. Returns the inside (minus border and padding)
 fn panel(f: &mut Frame, r: Rect, float: bool, border: Color) -> Rect {
     let full = f.area();
     let buf = f.buffer_mut();
@@ -8444,8 +8648,9 @@ fn panel(f: &mut Frame, r: Rect, float: bool, border: Color) -> Rect {
     inner
 }
 
-/// 配色列表。不像别的弹窗把底下变灰:底下的 aca 就是预览。桌面上贴左下角浮着(列表、预览大半露在外面),
-/// 手机上从底下升起。一行一套:记着的那套打 ●,名字,它自己的强调色、状态(红绿黄)、账号的颜色
+/// Color theme list. Unlike other popups it doesn't grey out what's below: the aca below is the preview. On desktop it floats in the
+/// bottom-left corner (most of the list and preview stay visible), on a phone it rises from the bottom. One theme per row: ● on the saved
+/// one, name, its own accent color, state colors (red green yellow), account colors
 fn draw_themes(f: &mut Frame, m: &ThemeMenu) {
     let (outer, w) = side_width(f.area(), 50);
     let mut body = vec![modal_title(t!("配色", "Colors"), theme::accent(), esc_hint(t!("返回", "back")), w), Line::raw("")];
@@ -8484,22 +8689,23 @@ fn draw_themes(f: &mut Frame, m: &ThemeMenu) {
     side_panel(f, outer, body);
 }
 
-/// 边上的面板要多宽:桌面上 want(屏幕窄了收一点),手机上占满;第二个是里面能写多宽
+/// How wide a side panel is: want on desktop (a bit less on a narrow screen), full width on a phone;
+/// the second value is the usable inner width
 fn side_width(full: Rect, want: u16) -> (u16, usize) {
     let float = floating(full);
     let outer = if float { want.min(full.width.saturating_sub(4)) } else { full.width };
     (outer, outer.saturating_sub(if float { 6 } else { 4 }) as usize)
 }
 
-/// 不把底下变灰的面板(配色列表:底下的 aca 照常看得见,就是预览)。
-/// 桌面上贴左下角浮着,手机上从底下升起
+/// A panel that doesn't grey out what's below (the color theme list: the aca below stays visible as the preview). On desktop it floats in
+/// the bottom-left corner, on a phone it rises from the bottom
 fn side_panel(f: &mut Frame, outer: u16, body: Vec<Line<'static>>) {
     let full = f.area();
     let float = floating(full);
     let h = body.len() as u16 + modal_chrome(full);
     let r = if float {
         let h = h.min(full.height.saturating_sub(2));
-        // 左边、底栏上面各留两格
+        // Two cells off the left, two above the bottom bar
         Rect { x: full.x + 2, y: full.bottom().saturating_sub(h + 2), width: outer, height: h }
     } else {
         modal_area(full, outer, h).0
@@ -8508,8 +8714,9 @@ fn side_panel(f: &mut Frame, outer: u16, body: Vec<Line<'static>>) {
     f.render_widget(Paragraph::new(body), inner);
 }
 
-/// `^S` 设置页:居中的弹窗(和 Tab / S 一样底下变灰;挑主题时换成左下角不变灰的配色列表)。
-/// 一行一项,「键  名字  现在的值」,› = 进去再挑,↗ = 用编辑器打开;写错的是它自己的一页,账号是另开的弹窗(acctpage.rs)
+/// `^S` settings page: a centered popup (greys out what's below like Tab / S; when picking a theme, it becomes the color theme list in the
+/// bottom-left that doesn't grey out). One item per row, "key  name  current value", › = go in to pick, ↗ = open in an editor; Problems get
+/// their own page, accounts are a separate popup (acctpage.rs)
 fn draw_settings(f: &mut Frame, s: &Settings) {
     modal(f, 54, theme::pal().accent, |w| settings_lines(s, w));
 }
@@ -8538,7 +8745,7 @@ fn settings_lines(s: &Settings, w: usize) -> Vec<Line<'static>> {
                         [vec![Span::styled(s.theme.clone(), Style::new().add_modifier(Modifier::BOLD))], forced(theme::forced())].concat(),
                         "›",
                     ),
-                    // 两种都摆出来,在用的那种亮
+                    // Show both, the one in use lit up
                     SetRow::Lang => {
                         let opt = |l: Lang| {
                             let st = if l == s.lang { theme::accent().add_modifier(Modifier::BOLD) } else { theme::faint() };
@@ -8596,12 +8803,12 @@ fn settings_lines(s: &Settings, w: usize) -> Vec<Line<'static>> {
     body
 }
 
-/// 弹窗外框加内边距一共占几行(按弹窗最后落在哪算)
+/// How many rows the popup's frame plus padding take (by where the popup ends up)
 fn modal_chrome(full: Rect) -> u16 {
     if floating(full) { 4 } else { 2 }
 }
 
-/// 一行:左边一段、右边一段(靠右),中间补空格;放不下时先丢右边
+/// One line: a left part, a right part (right-aligned), spaces in between; when it doesn't fit, drop the right part first
 pub fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, w: usize) -> Line<'static> {
     let wid = |v: &[Span]| v.iter().map(|s| s.content.width()).sum::<usize>();
     let (lw, rw) = (wid(&left), wid(&right));
@@ -8613,7 +8820,7 @@ pub fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, w: usize) -> 
     Line::from(v)
 }
 
-/// 弹窗的标题行:强调色粗体的标题,右边一段(关掉的键 / 第几页)
+/// A popup's title line: the title in accent bold, a part on the right (key to close / page number)
 pub fn modal_title(title: &str, st: Style, right: Vec<Span<'static>>, w: usize) -> Line<'static> {
     spread(vec![Span::styled(clip(title, w).trim_end().to_string(), st.add_modifier(Modifier::BOLD))], right, w)
 }
@@ -8622,19 +8829,20 @@ pub fn esc_hint(what: &str) -> Vec<Span<'static>> {
     vec![Span::styled("Esc", key_style()), Span::styled(format!(" {what}"), dim())]
 }
 
-/// 强调色底的按钮,比如「 ⏎ 新建 」
+/// A button with an accent background, like " ⏎ create "
 pub fn button(t: &str, bg: Color) -> Span<'static> {
     Span::styled(format!(" {t} "), Style::new().fg(theme::pal().on_accent).bg(bg).add_modifier(Modifier::BOLD))
 }
 
-/// 输入框:「> 内容▏」,太长只显示结尾,光标永远看得见;右边可以挂一段(比如「新目录」)
+/// Input box: "> text▏", only the end when too long, the cursor always visible;
+/// a part can hang on the right (like 「新目录」 ("new directory"))
 fn input_row(text: &str, right: Vec<Span<'static>>, w: usize) -> Line<'static> {
     let right_w: usize = right.iter().map(|s| s.content.width()).sum();
     let room = w.saturating_sub(2 + 1 + if right_w > 0 { right_w + 2 } else { 0 });
     let mut shown = text.to_string();
     if shown.width() > room {
         let mut tail: Vec<char> = vec![];
-        let mut n = 1; // 留给 …
+        let mut n = 1; // room for …
         for c in text.chars().rev() {
             n += c.width().unwrap_or(0);
             if n > room {
@@ -8648,19 +8856,19 @@ fn input_row(text: &str, right: Vec<Span<'static>>, w: usize) -> Line<'static> {
     spread(left, right, w)
 }
 
-/// 输入框下面那条线
+/// The line under the input box
 fn input_rule(w: usize) -> Line<'static> {
     Line::styled("─".repeat(w), dim())
 }
 
-/// 按键说明一行(弹窗底下)
+/// One line of key hints (at the bottom of a popup)
 pub fn keys_line(items: &[(&str, &str)], right: Vec<Span<'static>>, w: usize) -> Line<'static> {
     let right_w: usize = right.iter().map(|s| s.content.width()).sum();
     let (keys, _) = key_spans(items, w.saturating_sub(if right_w > 0 { right_w + 2 } else { 0 }));
     spread(keys, right, w)
 }
 
-/// 画一个弹窗:算好高度(内容行数 + 外框),画框,再把行填进去
+/// Draw a popup: work out its height (content lines + frame), draw the frame, then fill in the lines
 fn modal(f: &mut Frame, w: u16, border: Color, lines: impl Fn(usize) -> Vec<Line<'static>>) {
     let full = f.area();
     let (probe, float) = modal_area(full, w, full.height);
@@ -8671,11 +8879,12 @@ fn modal(f: &mut Frame, w: u16, border: Color, lines: impl Fn(usize) -> Vec<Line
     f.render_widget(Paragraph::new(body), inner);
 }
 
-/// 大小固定的弹窗最多这么高(大屏上不撑满)
+/// Max height of fixed-size popups (they don't fill a large screen)
 const FILL_H: u16 = 44;
 
-/// 大小固定的弹窗(插件页、账号页):桌面上宽 w、高占满屏幕(上下各留两行,最多 FILL_H;页面说了只要 rows 行的照它,
-/// 再加底下那句话的一行),手机上占满;里面正好 h 行
+/// Fixed-size popups (plugins page, accounts page): on desktop w wide, full screen height (two lines off top and bottom,
+/// at most FILL_H; a page that asks for only `rows` lines gets that, plus one line for the message at the bottom),
+/// full screen on a phone; exactly h lines inside
 fn modal_fill(f: &mut Frame, w: u16, rows: Option<u16>, border: Color, lines: impl Fn(usize, usize) -> Vec<Line<'static>>) {
     let full = f.area();
     let most = full.height.saturating_sub(4).min(FILL_H);
@@ -8690,15 +8899,18 @@ fn modal_fill(f: &mut Frame, w: u16, rows: Option<u16>, border: Color, lines: im
     f.render_widget(Paragraph::new(body), inner);
 }
 
-/// 工具菜单最多同时显示这么多行,再多就跟着高亮滚
+/// The tool menu shows at most this many rows at a time; more scroll with the highlight
 const TOOL_ROWS: usize = 12;
 
-/// 设置页里用编辑器开 config.toml,文件还没有时先写进去的
-const CONFIG_TEMPLATE: Tr =
-    Tr::new("# aca 的配置:账号、工具、界面的设置(写法见 README)\n", "# aca config: accounts, tools, interface settings (see the README)\n");
+/// What gets written into config.toml first when the settings page opens it in an editor and the file doesn't exist yet
+const CONFIG_TEMPLATE: Tr = Tr::new(
+    "# aca 的配置:账号、工具、界面的设置。写法见 https://github.com/cheny-00/aca/blob/main/docs/configuration.zh-CN.md\n",
+    "# aca config: accounts, tools, interface settings. See https://github.com/cheny-00/aca/blob/main/docs/configuration.md\n",
+);
 
-/// `n` 的工具菜单:每个工具一行「编号 名字 哪家 额度」(自己起名的工具写命令),名字按哪家上色,高亮的整行铺淡紫
-/// `n` / `H` 的工具菜单;pass 有 = 给交接挑的:标题写交接谁,它在跑、带便签的提一句
+/// `n`'s tool menu: one tool per row, "number name provider quota" (tools you named show the command), name colored by provider, the
+/// highlighted row on light purple. `n` / `H`'s tool menu; with pass = picking for a hand off: the title says who's handed off, and
+/// mentions if it's running or has a note
 fn draw_tools(f: &mut Frame, menu: &[Tool], sel: usize, pass: Option<&Pass>, quotas: &[crate::usage::Quota]) {
     let (at, off) = (epoch() as i64, crate::usage::local_offset());
     modal(f, 72, theme::pal().accent, |w| {
@@ -8727,12 +8939,12 @@ fn draw_tools(f: &mut Frame, menu: &[Tool], sel: usize, pass: Option<&Pass>, quo
             let mut line = vec![Span::styled(num, dim()), Span::raw(""), Span::raw("  ")];
             let room = w.saturating_sub(2 + name_w + 2);
             match &t.problem {
-                // 用不了的:名字不上色,后面写原因
+                // Unusable: name not colored, the reason after it
                 Some(p) => {
                     line[1] = Span::styled(name, dim());
                     line.push(Span::styled(clip(p, room).trim_end().to_string(), theme::warn()));
                 }
-                // 账号:哪家、额度(额度只有 Claude、Codex 有)
+                // Account: provider, quota (only Claude and Codex have quota)
                 None if matches!(t.agent, Agent::Claude | Agent::Codex) && t.note.is_empty() => {
                     line[1] = Span::styled(name, agent_style(t.agent).add_modifier(Modifier::BOLD));
                     let fam = if t.agent == Agent::Codex { "Codex " } else { "Claude" };
@@ -8758,7 +8970,7 @@ fn draw_tools(f: &mut Frame, menu: &[Tool], sel: usize, pass: Option<&Pass>, quo
             out.push(line);
         }
         out.push(Line::raw(""));
-        // 交接时不加账号(按 + 会把交接丢在半路)
+        // No adding accounts during a hand off (pressing + would drop the hand off halfway)
         let keys: &[(&str, &str)] = if pass.is_some() {
             &[("⏎", t!("交接", "hand off"))]
         } else {
@@ -8769,7 +8981,8 @@ fn draw_tools(f: &mut Frame, menu: &[Tool], sel: usize, pass: Option<&Pass>, quo
     });
 }
 
-/// 删除 / 重启的确认:删除用红框(状态的红)。第一行问什么,接着是哪个会话、要注意的(别处连着、worktree 目录),最后 y 的按钮;别的键都是取消
+/// Confirm for delete / restart: delete uses a red box (the state red). First line asks what, then which session, what to watch out for
+/// (attached elsewhere, worktree directory), last the y button; any other key cancels
 fn draw_confirm(f: &mut Frame, c: &Confirm, all: &[Session]) {
     let danger = theme::pal().red;
     let red = Style::new().fg(danger);
@@ -8788,7 +9001,7 @@ fn draw_confirm(f: &mut Frame, c: &Confirm, all: &[Session]) {
             (r.name.as_str(), r.title.as_str(), danger, head, String::new(), notes, t!("关闭", "close"))
         }
         Confirm::Remove(r) => {
-            // 先说结果:登记的进回收站、拿得回来;普通 tmux 会话是真关掉
+            // Say the result first: registered ones go to the Trash, recoverable; plain tmux sessions are really closed
             let mut notes = vec![if r.id.is_empty() {
                 t!("普通 tmux 会话:将直接关闭,无法撤销", "a plain tmux session: closed for good, no undo").to_string()
             } else {
@@ -8883,7 +9096,7 @@ fn draw_confirm(f: &mut Frame, c: &Confirm, all: &[Session]) {
             (row.as_str(), t.title.as_str(), theme::pal().accent, head, String::new(), notes, act)
         }
         Confirm::Send { t, text, .. } => {
-            // 发什么:便签原文,太长只露前几行
+            // What gets sent: the note's text, only the first few lines when too long
             let mut lines: Vec<&str> = text.lines().collect();
             let more = lines.len() > 4;
             lines.truncate(4);
@@ -8937,10 +9150,11 @@ fn draw_confirm(f: &mut Frame, c: &Confirm, all: &[Session]) {
     });
 }
 
-/// 多选的确认框里最多列这么多行会话,再多的写「还有几个」
+/// The multi-select confirm lists at most this many sessions; beyond that it says how many more
 const MANY_SHOWN: usize = 6;
 
-/// v 多选后 d / D / R 的确认框:问什么,会话一行一个(图标、标题、账号,同单个的),要留意的,y 的按钮
+/// Confirm for d / D / R after v multi-select: what it asks, one session per row (icon, title, account, as for a single one), what to watch
+/// out for, the y button
 fn draw_many(f: &mut Frame, act: Batch, ts: &[Target], notes: &[String], all: &[Session]) {
     let danger = theme::pal().red;
     let n = ts.len();
@@ -8950,7 +9164,7 @@ fn draw_many(f: &mut Frame, act: Batch, ts: &[Target], notes: &[String], all: &[
         Batch::Restart => (tr!("重启 {n} 个会话？", "Restart {n} sessions?"), t!("重启", "restart"), theme::pal().accent),
     };
     let head_style = if border == danger { Style::new().fg(danger) } else { theme::accent() };
-    // 多了只列前几个,最后一行写还有几个
+    // Too many: list only the first few, the last line says how many more
     let shown = if n > MANY_SHOWN { MANY_SHOWN - 1 } else { n };
     modal(f, 60, border, |w| {
         let mut out = vec![modal_title(&head, head_style, vec![], w), Line::raw("")];
@@ -8976,13 +9190,13 @@ fn draw_many(f: &mut Frame, act: Batch, ts: &[Target], notes: &[String], all: &[
     });
 }
 
-/// `A`:认一遍这个 tmux 会话接管过来会是什么样(只看不动)
+/// `A`: work out what adopting this tmux session would look like (look only, touch nothing)
 fn adopt_plan(target: &str) -> Result<aca_core::adopt::Plan, String> {
     let store = aca_core::store::Store::open()?;
     aca_core::adopt::plan(&store, &aca_core::config::load(), target, &aca_core::adopt::Opts::default())
 }
 
-/// 接管的确认框里:认出来的是什么、接过来之后会怎样。一行一件
+/// In the adopt confirm: what it was recognized as, and what happens after adopting. One thing per line
 fn adopt_summary(p: &aca_core::adopt::Plan) -> String {
     let mut v = vec![tr!(
         "登记为 {}{}",
@@ -9017,17 +9231,17 @@ fn adopt_summary(p: &aca_core::adopt::Plan) -> String {
     v.join("\n")
 }
 
-/// 分叉时默认起的标题(和 `session::fork` 不给标题时起的一样)
+/// Default title when forking (same as what `session::fork` gives when no title is passed)
 fn fork_title(title: &str) -> String {
     tr!("{title} (分叉)", "{title} (fork)")
 }
 
-/// 改名 / 新分组 / 便签(预览关着时)的输入弹窗
+/// Input popup for rename / new group / note (when the preview is off)
 fn draw_prompt(f: &mut Frame, p: &Prompt) {
     let (title, keys): (String, &[(&str, &str)]) = match &p.ask {
         Ask::Rename(_) => (t!("重命名", "Rename").into(), &[("⏎", t!("确定", "ok"))]),
         Ask::NewGroup => (t!("新建分组", "New group").into(), &[("⏎", t!("下一步", "next"))]),
-        // 便签的 Esc 是写完(不是取消):和预览里写便签时的底栏一样,排在键行最前
+        // A note's Esc means done (not cancel): like the bottom bar when writing a note in the preview, first in the key line
         Ask::Note { title, .. } => (
             tr!("便签 · {title}", "Note · {title}"),
             &[("Esc", t!("保存", "done")), ("⏎", t!("换行", "newline")), ("^G", t!("编辑器", "editor"))],
@@ -9041,12 +9255,12 @@ fn draw_prompt(f: &mut Frame, p: &Prompt) {
             &[("⏎", t!("确定", "ok")), ("Tab", t!("补全", "complete")), ("^U", t!("清空 = 不设置", "empty = forget"))],
         ),
     };
-    // 取消的 Esc 和别的弹窗一样写在标题右边
+    // Cancel's Esc goes to the right of the title, like other popups
     let esc = if matches!(p.ask, Ask::Note { .. }) { vec![] } else { esc_hint(t!("取消", "cancel")) };
     modal(f, 64, theme::pal().accent, |w| {
         let mut out = vec![modal_title(&title, theme::accent(), esc.clone(), w), Line::raw("")];
         if let Ask::Note { .. } = p.ask {
-            // 多行:最多 8 行,留住最后几行(光标在那)
+            // Multi-line: at most 8 lines, keeping the last few (where the cursor is)
             let mut body: Vec<String> = p.text.split('\n').flat_map(|l| wrap_width(l, w.saturating_sub(1))).collect();
             match body.last_mut() {
                 Some(l) if l.width() < w => l.push('▏'),
@@ -9067,13 +9281,13 @@ fn draw_prompt(f: &mut Frame, p: &Prompt) {
     });
 }
 
-/// 新建的候选最多列这么多行
+/// Max rows of candidates listed for new
 const DRAFT_ROWS: usize = 8;
 
-/// `N` 的新建弹窗:用什么工具、落在哪个分组(跟着路径变)、目录输入框,下面是 Tab 补全的候选
+/// `N`'s new popup: which tool, which group it lands in (follows the path), the directory input box, below it Tab-completion candidates
 fn draw_draft(f: &mut Frame, d: &Draft) {
     modal(f, 78, theme::pal().accent, |w| {
-        // 名字那一栏:中文都是两个字(4 格);英文的补到一样宽
+        // The label column: Chinese labels are all two chars (4 cells); English ones are padded to the same width
         let lab = |t: &str| Span::styled(format!("{t}{}", " ".repeat(7usize.saturating_sub(t.width()).max(2))), dim());
         let shell = d.is_shell();
         let tool = match () {
@@ -9089,7 +9303,7 @@ fn draw_draft(f: &mut Frame, d: &Draft) {
             Some("OpenCode") => agent_style(Agent::Opencode),
             _ => Style::new(),
         };
-        // ^T 在沿用的工具和 shell 之间换(n 里选了 shell 的就不用换了)
+        // ^T switches between the reused tool and a shell (no need if shell was picked in n)
         let swap = match () {
             _ if d.shell => t!("^T 换回", "^T back"),
             _ if shell => "",
@@ -9164,7 +9378,8 @@ fn draw_draft(f: &mut Frame, d: &Draft) {
     });
 }
 
-/// `?` 的快捷键弹窗。桌面上居中、三栏一屏看完;手机上从底下升起、一栏往下翻,顶上露出几行列表
+/// `?`'s keys popup. On desktop centered, three columns in one screen; on a phone it rises from the bottom, one column scrolling down, a
+/// few list rows showing on top
 fn draw_help(f: &mut Frame, app: &mut App) {
     let full = f.area();
     let float = floating(full);
@@ -9174,12 +9389,12 @@ fn draw_help(f: &mut Frame, app: &mut App) {
     let hit = app.reader.as_ref().and_then(|r| r.hit.clone());
     let (lines, lit) = crate::help::lines(inner_w, hit.as_ref());
     let total = lines.len();
-    // 标题、空行、(内容)、空行、底下一行
+    // Title, blank line, (content), blank line, a line at the bottom
     let room = full.height.saturating_sub(if float { 2 } else { 3 } + modal_chrome(full) + 4) as usize;
     let body_h = total.min(room).max(1);
     let Some(r) = app.reader.as_mut() else { return };
     r.scroll = r.scroll.min(total - body_h);
-    // 刚按了键:亮起来的第一行不在这一屏就滚过去(停在它上面一行);之后随便翻
+    // Just pressed a key: if the first lit row isn't on this screen, scroll to it (stop one row above it); after that, scroll freely
     if let Some(h) = r.hit.as_mut().filter(|h| h.jump) {
         h.jump = false;
         let top = total - body_h - r.scroll;
@@ -9193,7 +9408,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
     let pages = total.div_ceil(body_h);
     let page = if r.scroll == 0 { pages } else { top / body_h + 1 };
     let pos = if pages > 1 { vec![Span::styled(format!("{page}/{pages}"), dim())] } else { esc_hint(t!("关闭", "close")) };
-    // 底栏左边:按了不是快捷键的键才说一声;是快捷键的,那几行自己会亮
+    // Left of the bottom bar: say something only when the pressed key isn't a shortcut; for a shortcut, its rows light up by themselves
     let said = match &hit {
         Some(h) if lit.is_empty() => Span::styled(tr!("「{}」不是快捷键", "“{}” isn't a key", h.label), dim()),
         _ => Span::raw(""),
@@ -9210,7 +9425,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(body), inner);
 }
 
-/// 全屏阅读(`z`):顶上一条嵌着标题的强调色线(和手机上的预览一样),折好行的输出,底栏
+/// Full-screen reader (`z`): an accent-colored line with the title on top (like the preview on a phone), the wrapped output, the bottom bar
 fn draw_reader(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let [head, body, foot] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(1)]).areas(area);
@@ -9228,12 +9443,13 @@ fn draw_reader(f: &mut Frame, app: &mut App) {
         if let Some(d) = r.diff.as_mut() {
             d.rows = d.files.iter().filter_map(|&i| starts.get(i).copied()).collect();
             d.starts = starts;
-            // 改动刷新了:顶上还是第几行就是第几行
+            // Diff refreshed: keep the same line number at the top
             if same_width {
                 r.scroll = r.wrapped.len().saturating_sub(old_top + h);
             }
         } else if same_width && r.scroll > 0 {
-            // 往上翻着时底下长出新内容:把离底部的距离加上,画面停在原处(转屏换了宽度就不管了)
+            // New content grows at the bottom while scrolled up: add the distance from the bottom so the view stays put
+            // (not when a rotation changed the width)
             r.scroll = r.scroll.saturating_add(r.wrapped.len().saturating_sub(old));
         }
         r.wrap_w = w;
@@ -9248,7 +9464,7 @@ fn draw_reader(f: &mut Frame, app: &mut App) {
     let scroll = r.scroll;
     let name = r.name.clone();
     let empty = r.lines.is_empty();
-    // 看改动:未提交 / 连同提交,看到第几个文件
+    // Viewing a diff: uncommitted / with commits, which file you're on
     let diff = r.diff.as_ref().map(|d| {
         let mode = if d.mode == Mode::Uncommitted { t!("未提交", "uncommitted") } else { t!("连同提交", "with commits") };
         let cur = d.rows.iter().filter(|&&x| x <= top).count();
@@ -9271,7 +9487,7 @@ fn draw_reader(f: &mut Frame, app: &mut App) {
     let plugin = r.plugin.is_some();
     let (title, right) = match &diff {
         Some((_, label)) => (tr!("改动 · {title}", "Diff · {title}"), label.clone()),
-        // 插件的输出不是会话:没有「第几个会话」
+        // A plugin's output isn't a session: no "which session number"
         None if plugin => (title.to_string(), where_),
         None => (title.to_string(), format!("{}/{n} · {where_}", pos + 1)),
     };
@@ -9287,7 +9503,7 @@ fn draw_reader(f: &mut Frame, app: &mut App) {
         _ => match diff {
             Some((mode, _)) => menu_bar(
                 &[
-                    // 手机上先丢「滚动」(谁都会),留住 n p 和 m
+                    // On a phone drop 「滚动」 ("scroll") first (everyone knows it), keep n p and m
                     vec![
                         ("↑↓", t!("滚动", "scroll"), 2),
                         ("n p", t!("切换文件", "file"), 0),
@@ -9339,15 +9555,15 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
-/// 记录:这么宽才分两栏(左边的对话、右边的过程都要放得下一句话)
+/// Record: split into two panes only this wide (the conversation on the left and the steps on the right each need room for a sentence)
 const TRACE_SPLIT: usize = 90;
 
-/// 对话里一轮最多先露几行(你说的 / Claude 说的),多的 `o` 看全文
+/// Max lines of a turn shown at first in the conversation (what you said / what Claude said); `o` shows the full text
 const ASK_LINES: usize = 6;
 const REPLY_LINES: usize = 12;
 
-/// Z 会话记录:整屏,顶上一行标题线(几轮 · 干了多久 · 多少钱);桌面左边对话、右边选中那一轮的过程,
-/// 手机上整屏是其中一边;⏎ 整屏看一步;底下按键
+/// Z session record: full screen, a title line on top (turns · how long it worked · how much it cost); on desktop the conversation left,
+/// the selected turn's steps right; on a phone the whole screen is one side; ⏎ views one step full screen; keys at the bottom
 fn draw_trace(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let [head, body, foot] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(1)]).areas(area);
@@ -9356,7 +9572,7 @@ fn draw_trace(f: &mut Frame, app: &mut App) {
     let now = now_ms();
     let msg = app.msg.as_ref().filter(|(_, t)| t.elapsed() < app.msg_ttl).map(|(m, _)| m.clone());
     let Some(v) = app.trace.as_mut() else { return };
-    // 换了主题(设置页预览、主题文件改了):排好的全重排
+    // Theme changed (settings page preview, theme file edited): re-lay everything already laid out
     let pal = theme::pal() as *const theme::Pal as usize;
     if v.pal != pal {
         v.pal = pal;
@@ -9374,7 +9590,7 @@ fn draw_trace(f: &mut Frame, app: &mut App) {
     let s = app.all.iter().find(|s| s.name == v.name);
     let ic = s.map_or(("·", dim()), session_icon);
     let mut title = s.map_or(v.name.as_str(), |s| s.title.as_str()).to_string();
-    // 在子代理里:标题写它是谁,在不在跑按它自己的
+    // Inside a subagent: the title says who it is; running or not goes by its own
     let live = v.live(live, now);
     if let (Some(t), Some((&tool, up))) = (v.t.as_ref(), v.path.split_last())
         && let Some(sub) = t.at(up).sub_of(tool)
@@ -9397,7 +9613,7 @@ fn draw_trace(f: &mut Frame, app: &mut App) {
         Some(m) => Line::styled(m.clone(), theme::warn()).centered(),
         None => menu_bar(groups, action, w),
     };
-    // 整屏看一步
+    // One step full screen
     if let (Some(d), Some(t)) = (v.detail.as_mut(), v.t.as_ref().map(|t| t.at(&v.path))) {
         if d.lines.is_empty() {
             d.lines = crate::trace::detail(t, d.node, live, now);
@@ -9433,7 +9649,7 @@ fn draw_trace(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(foot_line(&keys, None)), foot);
         return;
     }
-    // 手机上在看过程:顶上写第几轮
+    // Viewing steps on a phone: the top says which turn
     let phone_steps = !v.wide && v.in_steps;
     let head_t = v.t.as_ref().map(|t| t.at(&v.path));
     let title = if v.path.is_empty() { tr!("记录 · {title}", "Record · {title}") } else { title };
@@ -9475,7 +9691,7 @@ fn draw_trace(f: &mut Frame, app: &mut App) {
             draw_steps(f, v, right, live, now);
         }
         (Some(_), None) => {
-            // 手机:先排对话(过程看的是对话里选中的那一轮),再画在看的那边
+            // Phone: lay out the conversation first (the steps are for the turn selected in it), then draw the side being viewed
             if v.in_steps {
                 lay_chat(v, w, h, live, now);
                 draw_steps(f, v, body, live, now);
@@ -9512,14 +9728,14 @@ fn draw_trace(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(foot_line(&keys, Some(0))), foot);
 }
 
-/// 折好的一行前面空几格
+/// How many cells to indent a wrapped line
 fn pad_line(l: &Styled, pad: &'static str) -> Line<'static> {
     let mut line = ansi::to_line(l);
     line.spans.insert(0, Span::raw(pad));
     line
 }
 
-/// 多了只留前 max 行,末尾写还有几行
+/// Keep only the first max lines when there are more, the last saying how many more
 fn clip_lines(mut ls: Vec<Styled>, max: usize, pad: &str) -> Vec<Styled> {
     if ls.len() > max {
         let more = ls.len() - max;
@@ -9532,10 +9748,11 @@ fn clip_lines(mut ls: Vec<Styled>, max: usize, pad: &str) -> Vec<Styled> {
     ls
 }
 
-/// 排左边的对话:顶上一层一块 —— 一轮是你说的、Claude 最后说的、一行数字;压缩一行;抄过来的那一块一行(展开了接着它的几轮)
+/// Lay out the conversation on the left: one block per item from the top — a turn is what you said, what Claude said last, a line of
+/// numbers; compaction one line; the copied-over block one line (unfolded, its turns follow it)
 fn lay_chat(v: &mut TraceView, w: usize, h: usize, live: bool, now: i64) -> Vec<Vec<Line<'static>>> {
     let Some(t) = v.t.as_ref().map(|t| t.at(&v.path)) else { return vec![] };
-    // 左边一格竖线、再空一格,右边留一格
+    // One cell for the vertical bar on the left, one blank, one cell left on the right
     let cw = w.saturating_sub(3).max(1);
     let mut tops = vec![];
     for &r in &t.roots {
@@ -9544,7 +9761,8 @@ fn lay_chat(v: &mut TraceView, w: usize, h: usize, live: bool, now: i64) -> Vec<
             tops.extend(t.nodes[r].kids.iter().copied());
         }
     }
-    // 先不上色地排好、量出每块多高(排过的用缓存),定了从哪行看起,再给看得见的上色、转成屏幕行
+    // First lay out without color and measure each block's height (cached if laid out before), decide which line to start from, then color
+    // the visible ones and turn them into screen lines
     let mut sizes = vec![];
     for &i in &tops {
         let len = if t.nodes[i].kind == crate::trace::Kind::Turn {
@@ -9567,7 +9785,7 @@ fn lay_chat(v: &mut TraceView, w: usize, h: usize, live: bool, now: i64) -> Vec<
         if e <= top || s >= end {
             continue;
         }
-        // 上色到屏幕底为止(露出更多了再上一回)
+        // Color down to the bottom of the screen (again once more shows)
         let need = end.min(e) - s;
         if let Some(c) = v.chat_cache.get_mut(&i).filter(|c| c.colored < need) {
             let (lines, _) = crate::hl::upto(need, || chat_lines(t, i, cw, c.full, live, now));
@@ -9577,7 +9795,7 @@ fn lay_chat(v: &mut TraceView, w: usize, h: usize, live: bool, now: i64) -> Vec<
         }
     }
     if moved {
-        // 上了色行数不该变;真变了就按新的重新定位
+        // Coloring shouldn't change the line count; if it really did, reposition by the new one
         let sizes: Vec<(usize, usize)> = tops.iter().map(|&i| (i, v.chat_cache.get(&i).map_or(2, |c| c.lines.len()))).collect();
         v.chat.lay(t, &sizes, h);
     }
@@ -9592,7 +9810,8 @@ fn lay_chat(v: &mut TraceView, w: usize, h: usize, live: bool, now: i64) -> Vec<
         .collect()
 }
 
-/// 对话里的一轮排成行:你说的、Claude 最后说的(收着各露前几行)、一行数字;第二个值:收着的时候截没截
+/// One turn of the conversation as lines: what you said, what Claude said last (folded, each shows its first few lines), a line of numbers;
+/// second value: whether folding clipped anything
 fn chat_lines(t: &crate::trace::Trace, i: usize, cw: usize, full: bool, live: bool, now: i64) -> (Vec<Styled>, bool) {
     let c = crate::trace::chat(t, i, live, now);
     let (ask_max, reply_max) = if full { (usize::MAX, usize::MAX) } else { (ASK_LINES, REPLY_LINES) };
@@ -9608,7 +9827,8 @@ fn chat_lines(t: &crate::trace::Trace, i: usize, cw: usize, full: bool, live: bo
     (ls, clipped)
 }
 
-/// 排右边的过程:对话里选中的那一轮(换了轮就从头看;跟着最新的贴底)。同左边:先不上色地排,看得见的块再上色
+/// Lay out the steps on the right: the turn selected in the conversation (a new turn starts from the top; following the latest sticks to
+/// the bottom). Like the left: lay out without color first, then color the visible blocks
 fn lay_steps(v: &mut TraceView, w: usize, h: usize, live: bool, now: i64) -> Vec<Vec<Line<'static>>> {
     let Some(t) = v.t.as_ref().map(|t| t.at(&v.path)) else { return vec![] };
     let cur = v.chat.sel;
@@ -9624,7 +9844,7 @@ fn lay_steps(v: &mut TraceView, w: usize, h: usize, live: bool, now: i64) -> Vec
     let turn = t.nodes[cur].kind == crate::trace::Kind::Turn;
     let unfold = &v.unfold;
     let open = |x: usize| unfold.contains(&x);
-    // 这一项不是一轮(抄过来的那块、压缩):整页详情当一块
+    // This item isn't a turn (the copied-over block, compaction): the whole page of details as one block
     let build = |k: usize| {
         if turn {
             crate::trace::step(t, cur, k, live, now, &open)
@@ -9633,7 +9853,7 @@ fn lay_steps(v: &mut TraceView, w: usize, h: usize, live: bool, now: i64) -> Vec
         }
     };
     if !matches!(&v.steps_cache, Some(c) if c.item == cur && c.w == cw && c.ver == ver && c.folds == folds) {
-        // 同一轮、同样宽:没变的块(见 trace::step_sig)照旧用,只排变了的
+        // Same turn, same width: reuse unchanged blocks (see trace::step_sig), lay out only the changed ones
         let mut old: HashMap<usize, StepLaid> = match v.steps_cache.take() {
             Some(c) if c.item == cur && c.w == cw => c.blocks.into_iter().map(|b| (b.node, b)).collect(),
             _ => HashMap::new(),
@@ -9647,7 +9867,7 @@ fn lay_steps(v: &mut TraceView, w: usize, h: usize, live: bool, now: i64) -> Vec
                         return Some(b);
                     }
                     let s = crate::hl::plain(|| build(k))?;
-                    // 收着的思考按行数截:这个宽度下截了才有东西可展开(手机上截得多)
+                    // Folded thinking is clipped by line count: only clipped at this width is there anything to unfold (a phone clips more)
                     let (lines, clipped) = crate::trace::wrap_clipped(&s.paras, cw);
                     Some(StepLaid { node: s.node, lines, fold: s.fold || clipped, colored: 0, sig })
                 })
@@ -9689,8 +9909,8 @@ fn lay_steps(v: &mut TraceView, w: usize, h: usize, live: bool, now: i64) -> Vec
         .collect()
 }
 
-/// 画一列块:选中的那块左边一条竖线 —— 在按的这一列强调色、头一行淡紫底;
-/// 不在按的对话画淡的竖线(右边是哪一轮的过程),不在按的过程不画
+/// Draw a column of blocks: a vertical bar left of the selected block — accent color in the column with focus, its first line on light
+/// purple; the conversation without focus gets a faint bar (the steps on the right are that turn's), the steps without focus get none
 fn draw_blocks(f: &mut Frame, area: Rect, b: &Blocks, blocks: Vec<Vec<Line<'static>>>, focus: bool, faint_bar: bool) {
     let (top, h) = (b.top, area.height as usize);
     let k = b.at();
@@ -9717,7 +9937,7 @@ fn draw_blocks(f: &mut Frame, area: Rect, b: &Blocks, blocks: Vec<Vec<Line<'stat
         f.buffer_mut()
             .set_style(Rect { x: area.x, y: area.y + (s - top) as u16, width: area.width, height: 1 }, Style::new().bg(theme::pal().sel));
     }
-    // 底下还有:右下角说还剩几行
+    // More below: the bottom-right corner says how many lines are left
     let below = b.total().saturating_sub(top + h);
     if below > 0 && !b.follow {
         let tag = tr!(" ↓ {below} 行 ", " ↓ {below} lines ");
@@ -9739,24 +9959,24 @@ fn draw_steps(f: &mut Frame, v: &mut TraceView, area: Rect, live: bool, now: i64
     draw_blocks(f, area, &v.steps, blocks, v.in_steps, false);
 }
 
-/// 起 `aca ui --cost-json` 读计费(同一个程序,环境原样带过去);only = 只看哪些账号
+/// Run `aca ui --cost-json` to read billing (same program, environment passed as is); only = which accounts to show
 fn read_bill(only: &[String]) -> Result<crate::usage::Report, String> {
     let exe = aca_core::agent::self_path().ok_or(t!("找不到 aca 程序", "can't find the aca program"))?;
     let out = std::process::Command::new(exe)
         .args(["ui", "--cost-json"])
         .args(only.iter().flat_map(|o| ["--only", o.as_str()]))
-        // 照这边现在的语言(设置页刚换过的话 ACA_LANG 可能还是另一种)
+        // Use this side's current language (if the settings page just switched it, ACA_LANG may still be the other)
         .env("ACA_LANG", i18n::lang().code())
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .map_err(|e| e.to_string())?;
-    // 换了新版没重开,子进程是新的、格式对不上:说一声,重开就好
+    // Upgraded without reopening, the child is the new version and the format doesn't match: say so, reopening fixes it
     serde_json::from_slice(&out.stdout)
         .map_err(|_| t!("数据格式有误(如果刚升级过 aca,按 ^L 重启)", "unexpected format (if aca was upgraded, reopen with ^L)").to_string())
 }
 
-/// $ 计费面板:整屏,顶上写是几点的数,中间是内容(见 `bill`),底下按键
+/// $ billing panel: full screen, the top says what time the numbers are from, content in the middle (see `bill`), keys at the bottom
 fn draw_bill(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let [head, body, foot] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(1)]).areas(area);
@@ -9765,7 +9985,7 @@ fn draw_bill(f: &mut Frame, app: &mut App) {
     let lines = app.bill_data.as_ref().map(|r| crate::bill::lines(r, b.sel, b.more, w)).unwrap_or_default();
     let more = b.more;
     b.scroll = b.scroll.min(lines.len().saturating_sub(h));
-    // 一屏放得下就不提滚动
+    // Don't mention scrolling when it fits one screen
     let long = lines.len() > h;
     b.view_h = h;
     let scroll = b.scroll;
@@ -9778,7 +9998,7 @@ fn draw_bill(f: &mut Frame, app: &mut App) {
             format!("{:02}:{:02}", t / 3600, t % 3600 / 60)
         }
     };
-    // 只看了哪些账号写在标题后面(按显示着的这份数写)
+    // Which accounts are shown goes after the title (by the data shown)
     let title = match app.bill_data.as_ref().map(|r| &r.only) {
         Some(o) if !o.is_empty() => tr!("计费 · {}", "Billing · {}", o.join(" + ")),
         _ => t!("计费", "Billing").into(),
@@ -9809,8 +10029,9 @@ fn draw_bill(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// a 的挑账号浮窗:第一行「全部」,往下一个账号一行(数字、勾、名字按哪家上色、全部时段花了多少);
-/// 现在只看着的那几行数字用强调色,选上的打勾,高亮的整行铺底色;连选着的时候底下换成连选的键
+/// a's account picker floating window: first row 「全部」 ("all"), then one account per row (number, tick, name colored by provider,
+/// spend over all time); the numbers of the ones shown now in accent color, selected ones ticked, the highlighted row gets a background;
+/// during a range select the keys at the bottom become range-select ones
 fn draw_bill_pick(f: &mut Frame, app: &App, sel: usize) {
     let accts = app.bill_accounts();
     let pick = app.bill.as_ref().and_then(|b| b.pick.as_ref());
@@ -9852,7 +10073,7 @@ fn draw_bill_pick(f: &mut Frame, app: &App, sel: usize) {
                 Span::raw("  "),
                 Span::styled(money, dim()),
             ]);
-            // 高亮的铺淡紫底,勾上的铺淡绿底(同主列表的 v)
+            // The highlighted one on light purple, ticked ones on light green (like v in the main list)
             let bg = if i == sel { Some(theme::pal().sel) } else { ticked.then(|| theme::pal().pick) };
             if let Some(bg) = bg {
                 let pad = w.saturating_sub(line.width());
@@ -9879,15 +10100,17 @@ fn draw_bill_pick(f: &mut Frame, app: &App, sel: usize) {
     });
 }
 
-/// 启动静默多久。by_hand = 自己按键打开的(开在 tmux 弹窗里、^L 重启):这时没有 Moshi 在连,静默只会吞掉紧跟着按的 ⏎
-/// (弹窗画出来之前按的键,画完第一帧马上就读到,多短的静默都会吞)
+/// How long the startup quiet period is. by_hand = opened by your own keypress (in a tmux popup, ^L restart): no Moshi is connecting then,
+/// the quiet period would only swallow the ⏎ pressed right after (keys pressed before the popup is drawn are read right after the first
+/// frame; any quiet period, however short, swallows them)
 fn startup_quiet(by_hand: bool) -> Duration {
     if by_hand { Duration::ZERO } else { STARTUP_QUIET }
 }
 
-/// 这批按键要不要丢(为什么丢见 run 循环)。quiet = 还在启动 / 刚退出会话的静默期里。
-/// 只挪光标的键从来不丢:Moshi 代敲的命令和粘贴里没有方向键,而手机上滑动、按住方向键会一下接一下地来 ——
-/// 落进静默期的那几下被丢,一起到的几下还会续上静默期,整串就全没了
+/// Whether to drop this batch of keys (why, see the run loop). quiet = still in the quiet period of startup / just leaving a session. Keys
+/// that only move the cursor are never dropped: commands Moshi types and pastes have no arrow keys, while swiping or holding an arrow on a
+/// phone sends them one after another — the few landing in the quiet period get dropped, those arriving together extend it, and the whole
+/// run is lost
 fn drops(keys: &[KeyEvent], quiet: bool, typing: bool) -> bool {
     let nav = |k: &KeyEvent| {
         matches!(
@@ -9905,8 +10128,8 @@ fn drops(keys: &[KeyEvent], quiet: bool, typing: bool) -> bool {
     !keys.is_empty() && !keys.iter().all(nav) && (quiet || (keys.len() >= 3 && !typing))
 }
 
-/// 被当成自动输入丢掉的按键,追加到 ~/.cache/aca/ignored-input.log(只留最近 200 行,权限 600)。
-/// 设了 ACA_TMUX_SOCKET 就写 ignored-input.<它>.log,测试不混进真日志
+/// Keys dropped as automatic input are appended to ~/.cache/aca/ignored-input.log (last 200 lines only, mode 600). With ACA_TMUX_SOCKET set
+/// it writes ignored-input.<it>.log, so tests don't mix into the real log
 fn log_ignored(keys: &[KeyEvent]) {
     let text: String = keys
         .iter()
@@ -9933,13 +10156,13 @@ fn log_ignored(keys: &[KeyEvent]) {
     lines.push(&line);
     let keep = &lines[lines.len().saturating_sub(200)..];
     let _ = std::fs::write(&path, keep.join("\n") + "\n");
-    // 误粘贴进列表界面的东西也会记在这,只给自己读
+    // Anything pasted into the list by mistake gets logged here too: readable only by you
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
 }
 
-/// 终端支持 kitty 的扩展键盘协议(桌面的 kitty):开了才分得出 Shift+Enter 和回车。
-/// 手机走 mosh,mosh 不转发这套协议,那边只能按 `E`
+/// The terminal supports kitty's extended keyboard protocol (desktop kitty): only with it on can Shift+Enter be told from Enter. Phones go
+/// through mosh, which doesn't forward this protocol; there only `E` works
 static KBD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn kbd(on: bool) {
@@ -9952,20 +10175,22 @@ fn kbd(on: bool) {
     }
 }
 
-/// 设置页写错的:主题(config.toml 的 [theme]、themes/ 里的文件)和别的几项
+/// What the settings page lists under Problems: the theme (config.toml's [theme], files in themes/) and a few other items
 fn config_bad() -> Vec<String> {
     [theme::problems(), crate::config::problems()].concat()
 }
 
-/// 焦点事件只在管输入法时要(桌面);让出终端前关掉,里面的程序不认得
+/// Focus events are needed only when managing the input method (desktop);
+/// turned off before handing over the terminal, since programs inside don't know them
 fn focus_events(on: bool) {
     if crate::ime::active() {
         let _ = if on { execute!(stdout(), EnableFocusChange) } else { execute!(stdout(), DisableFocusChange) };
     }
 }
 
-/// 直接开在 kitty 里时:把高亮那一项记在这个窗口的变量上(OSC 1337 SetUserVar):`aca_dir` 它的目录、`aca_sid` 它是哪个会话。
-/// kitty 的浮窗(cmd+enter 跑的 kfloat)照着开在那、绑在那个会话上。空 = 删掉这个变量(退出时)
+/// When opened directly in kitty: store the highlighted item in this window's variables (OSC 1337 SetUserVar): `aca_dir` its directory,
+/// `aca_sid` which session it is. kitty's floating window (kfloat, run by cmd+enter) opens there and is tied to that session. Empty =
+/// delete the variable (on exit)
 fn tell_var(name: &str, value: &str) {
     use std::io::Write;
     let v = if value.is_empty() { String::new() } else { format!("={}", crate::clip::base64(value.as_bytes())) };
@@ -9973,8 +10198,8 @@ fn tell_var(name: &str, value: &str) {
     let _ = write!(out, "\x1b]1337;SetUserVar={name}{v}\x07").and_then(|_| out.flush());
 }
 
-/// 便签能不能往它的输入框里填(E 带进去、s 发出去):只填 Claude / Codex(别的程序比如 vim,粘进去的字会被当成命令);
-/// 在等你选(!)时不填 —— 字会被当成选项
+/// Whether a note can be filled into its input box (E takes it in, s sends it): only Claude / Codex (other programs like vim would take
+/// pasted text as commands); not while it waits for you to choose (!) — the text would be taken as a choice
 fn cant_fill(s: &Session) -> Option<&'static str> {
     match s.state {
         State::Ask => Some(t!("正在等待回应", "it's waiting for your choice")),
@@ -9986,7 +10211,7 @@ fn cant_fill(s: &Session) -> Option<&'static str> {
     }
 }
 
-/// 看改动里的 l / e、列表里的 y:让出终端跑 lazygit / 编辑器 / yazi,回来返回出了什么错
+/// l / e in the diff view, y in the list: hand over the terminal to run lazygit / an editor / yazi, return what went wrong when back
 fn run_external(x: &External) -> Option<String> {
     let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     let (name, st) = match x {
@@ -9994,7 +10219,8 @@ fn run_external(x: &External) -> Option<String> {
         External::Edit { path, line } => {
             let ed = notes::editor();
             let name = notes::editor_name();
-            // 各家「打开到第几行」的写法不一样:VS Code 系用 -g 文件:行,helix / zed / sublime 用 文件:行,其余 +行 文件
+            // Each editor writes "open at line N" differently:
+            // the VS Code family uses -g file:line, helix / zed / sublime use file:line, the rest +line file
             let cmd = match name.as_str() {
                 "code" | "code-insiders" | "cursor" | "windsurf" => format!("{ed} -g {}", q(&format!("{path}:{line}"))),
                 "hx" | "helix" | "zed" | "subl" => format!("{ed} {}", q(&format!("{path}:{line}"))),
@@ -10016,7 +10242,8 @@ fn run_external(x: &External) -> Option<String> {
         External::View { path, line, temp } => {
             let ed = notes::editor();
             let name = notes::editor_name();
-            // 只读:vim 系 -M(改不了也存不了)、不建交换文件、别处开着也不问;nano -v;别的编辑器没有只读的开法,照常打开
+            // Read-only: vim family -M (can't edit or save), no swap file, no prompt if open elsewhere; nano -v; other editors have no
+            // read-only mode, open them as usual
             let gui = matches!(name.as_str(), "code" | "code-insiders" | "cursor" | "windsurf" | "zed" | "subl");
             let cmd = match name.as_str() {
                 "vi" | "vim" | "nvim" | "view" | "gvim" | "mvim" => format!("{ed} -M -n --cmd 'set shortmess+=A' +{line} {}", q(path)),
@@ -10026,7 +10253,7 @@ fn run_external(x: &External) -> Option<String> {
                 _ => format!("{ed} +{line} {}", q(path)),
             };
             let st = std::process::Command::new("sh").arg("-c").arg(cmd).status();
-            // 开窗口的编辑器马上就回来了,文件留着(下次看的时候清掉一天前的)
+            // Editors that open a window return at once; the file stays (files older than a day are cleared next time)
             if *temp && !gui {
                 let _ = std::fs::remove_file(path);
             }
@@ -10051,7 +10278,7 @@ fn run_external(x: &External) -> Option<String> {
     }
 }
 
-/// 缺了一个程序时说怎么装:macOS 上是 brew;别处(Linux 上多半没有 brew)让用自己的包管理器
+/// How to install a missing program: brew on macOS; elsewhere (Linux mostly has no brew) use your own package manager
 fn not_found(name: &str) -> String {
     if cfg!(target_os = "macos") {
         tr!("未找到 {name}(brew install {name})", "{name} not found (brew install {name})")
@@ -10060,7 +10287,8 @@ fn not_found(name: &str) -> String {
     }
 }
 
-/// e 要看的字写成临时文件:放在只有自己能进的目录里,名字是「第 3 轮-Bash」这样(编辑器顶上看得到);顺手清掉一天前没删的
+/// Write the text for e to a temp file: in a directory only you can enter, named like "turn 3-Bash" (shown at the top of the editor); also
+/// clear leftovers older than a day
 fn write_view(name: &str, text: &str, ext: &str) -> std::io::Result<String> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let dir = std::env::temp_dir().join("aca-trace-view");
@@ -10080,7 +10308,7 @@ fn write_view(name: &str, text: &str, ext: &str) -> std::io::Result<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
-/// 等按键,最多 max。开着终端时它一有输出也醒来重画
+/// Wait for a key, up to max. With a terminal open, its output also wakes it to redraw
 fn wait_input(max: Duration, term: bool) -> std::io::Result<bool> {
     if !term {
         return event::poll(max);
@@ -10096,7 +10324,7 @@ fn wait_input(max: Duration, term: bool) -> std::io::Result<bool> {
     }
 }
 
-/// yazi 开不了的原因:目录没了、没装
+/// Why yazi can't open: directory gone, not installed
 fn yazi_blocked(dir: &str) -> Option<String> {
     if !std::path::Path::new(dir).is_dir() {
         return Some(if dir.is_empty() {
@@ -10109,15 +10337,17 @@ fn yazi_blocked(dir: &str) -> Option<String> {
     (!found).then(|| not_found("yazi"))
 }
 
-/// 出错时把终端还回去(exitlog 的善后在主线程上调):和正常退出一样关掉键盘增强、焦点事件、鼠标,退出全屏和 raw 模式。
-/// 不碰输入法:它的锁可能正被出错的那段占着(ime::Guard 退出时会切回去)
+/// Give the terminal back on error (exitlog's cleanup calls this on the main thread): like a normal exit, turn off keyboard enhancement,
+/// focus events and mouse, leave full screen and raw mode. Don't touch the input method: its lock may be held by the code that failed
+/// (ime::Guard switches back on exit)
 fn release_terminal() -> std::io::Result<()> {
     kbd(false);
     let _ = execute!(stdout(), DisableFocusChange, DisableMouseCapture);
     ratatui::try_restore()
 }
 
-/// 让出终端(进会话 / fzf / 编辑器)。扩展键盘协议先关掉,不然里面的程序收到的是它不认识的按键编码
+/// Hand over the terminal (go into a session / fzf / editor). Turn off the extended keyboard protocol first, else programs inside get key
+/// codes they don't know
 fn suspend() -> std::io::Result<()> {
     kbd(false);
     focus_events(false);
@@ -10126,13 +10356,15 @@ fn suspend() -> std::io::Result<()> {
     disable_raw_mode()
 }
 
-/// 接回终端,当场画好一帧(拿手上现有的数据:要重读的交给后台,读完再换上)。
-/// 先补一个「同步结束」:tmux 画一帧前后夹着同步开始 / 结束,detach 正赶上画到一半(会话在刷屏)时,
-/// 没写出去的后半帧连同「结束」被它扔掉,kitty 停在「同步中」不刷新,aca 画好了也看不见,最多卡 2 秒
-/// (实测刷屏的会话里 100 次 detach 有 7 次)。没停在同步中的终端收到它什么也不做。
-/// 进全屏、清屏、画这一帧再夹在一次同步里:终端等画完一起换上,中间不露出空屏(以前先清屏再读列表,空着几十毫秒,看着是一闪)。
-/// 清屏用 resize 不用 clear:clear 为了把光标放回原处,先问终端光标在哪、等它答,ssh 连着的手机线路一卡
-/// (2 秒没答)就报错,aca 跟着退出。resize 一样清屏、下一帧整屏重画,但不问
+/// Take the terminal back and draw a frame right away (with the data at hand: what needs rereading goes to the background and is swapped in
+/// when read). First send an "end sync": tmux wraps each frame in sync begin / end; if a detach lands mid-frame (the session is flooding
+/// output), the unsent second half of the frame and its "end" are thrown away, kitty stays "in sync" and doesn't refresh, aca's drawn frame
+/// stays invisible, stuck up to 2 seconds (measured: 7 of 100 detaches in a flooding session). A terminal not stuck in sync does nothing
+/// with it. Entering full screen, clearing and drawing this frame are wrapped in one sync too: the terminal swaps it in when done, with no
+/// blank screen in between (it used to clear first and then read the list, blank for tens of milliseconds, seen as a flash). Clear with
+/// resize, not clear: to put the cursor back, clear first asks the terminal where the cursor is and waits for the answer; on a phone over
+/// ssh, one stall (no answer for 2 seconds) is an error and aca exits with it. resize clears too and the next frame redraws the whole
+/// screen, but it doesn't ask
 fn resume(t: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     enable_raw_mode()?;
     execute!(stdout(), EndSynchronizedUpdate, BeginSynchronizedUpdate, EnterAlternateScreen, EnableMouseCapture)?;
@@ -10145,14 +10377,14 @@ fn resume(t: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     execute!(stdout(), EndSynchronizedUpdate)
 }
 
-/// 是不是 Ctrl+\。终端发的是 0x1C,crossterm 读成 ^4;开了键盘增强的终端里是 ^\ 本身
+/// Whether it's Ctrl+\. The terminal sends 0x1C, which crossterm reads as ^4; in terminals with keyboard enhancement it's ^\ itself
 fn closes_popup(k: KeyEvent) -> bool {
     k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('\\' | '4'))
 }
 
-/// 换成自己(同一个路径,也就是新装的那个)接着跑:exec,同一个进程、同一个终端。
-/// 只带 --client(弹窗里要它)和 --restarted(开到哪);不带启动时的关键词 —— 带了又会直接进那个会话。
-/// 视图(分组、范围、布局、高亮的会话)本来就记着,新的照样恢复
+/// Replace this process with itself (same path, i.e. the newly installed one) and keep going: exec, same process, same terminal. Only pass
+/// --client (the popup needs it) and --restarted (where to open); not the keywords from startup — they'd go straight into that session. The
+/// view (groups, scope, layout, highlighted session) is saved anyway, and the new one restores it
 fn relaunch(state: &str) -> anyhow::Error {
     use std::os::unix::process::CommandExt;
     let Some(exe) = aca_core::agent::self_path() else {
@@ -10170,7 +10402,7 @@ fn relaunch(state: &str) -> anyhow::Error {
     anyhow::anyhow!("{}", tr!("重启界面失败:{}", "restarting the interface failed: {}", cmd.exec()))
 }
 
-/// 这个 aca 程序什么时候装的(文件的修改时间):今天的写 11:28,别的天写 9/29 11:28
+/// When this aca program was installed (the file's mtime): 11:28 for today, 9/29 11:28 for other days
 fn installed_at() -> Option<String> {
     let secs = |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64);
     let t = secs(std::fs::metadata(aca_core::agent::self_path()?).ok()?.modified().ok()?)?;
@@ -10178,8 +10410,9 @@ fn installed_at() -> Option<String> {
     Some(local_when(t.max(0) as u64, now.max(0) as u64))
 }
 
-/// 照 config.toml 的 `[idle] stop_after` 定时停闲着的会话(见 `session::stop_idle`),停了的送回界面。
-/// 配置每次现读,改了不用重开界面;没写、写错了(设置页里列着)就不停。按 u 标成未读的留着:核心那份「看过」不知道这个
+/// Stop idle sessions on the timer from config.toml's `[idle] stop_after` (see `session::stop_idle`), sending the stopped ones back to the
+/// interface. The config is read fresh each time, so changes need no reopen; missing or invalid (listed in the settings page) = no
+/// stopping. Ones marked unread with u are kept: core's "seen" doesn't know about that
 fn idle_watch(tx: mpsc::Sender<IdleTick>) {
     let mut wait = IDLE_FIRST;
     loop {
@@ -10201,13 +10434,14 @@ fn idle_watch(tx: mpsc::Sender<IdleTick>) {
     }
 }
 
-/// `idle_watch` 每一轮交回来的:自动停了哪些;`[idle] remove_after` 写了的话,它和归档着的会话(见 `App::sweep`)
+/// What `idle_watch` hands back each round: which ones were auto-stopped; if `[idle] remove_after` is set, it and the archived sessions
+/// (see `App::sweep`)
 struct IdleTick {
     stopped: Vec<aca_core::session::Idled>,
     remove: Option<(u64, Vec<(Target, u64)>)>,
 }
 
-/// 归档着的登记会话(列表里不列)和它最后动的时刻:归档的那一刻、hook 最后报事、登记里最晚的
+/// Archived registered sessions (not listed) and their last activity: when archived, the hook's last report, the latest in the registry
 fn archived_sessions(store: &aca_core::store::Store) -> Vec<(Target, u64)> {
     let all = store.sessions(true).unwrap_or_default();
     all.into_iter()
@@ -10221,7 +10455,7 @@ fn archived_sessions(store: &aca_core::store::Store) -> Vec<(Target, u64)> {
         .collect()
 }
 
-/// 自动停了几个闲着的会话之后,底栏说的那句:哪几个(多了只列前三个)、怎么再起
+/// The bottom bar's line after auto-stopping some idle sessions: which ones (only the first three if many), how to start them again
 fn idle_note(v: &[aca_core::session::Idled]) -> String {
     let mut names: Vec<String> = v.iter().take(3).map(|s| tr!("「{}」", "“{}”", clip(&s.title, 16).trim_end())).collect();
     if v.len() > 3 {
@@ -10237,12 +10471,14 @@ fn idle_note(v: &[aca_core::session::Idled]) -> String {
 }
 
 pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
-    // 首屏等读完再画(~20ms),免得先闪一下空列表;在后台读,同时在这边切输入法(第一次要 ~40ms)
+    // Draw the first screen once read (~20ms), to avoid flashing an empty list first; read in the background while switching the input
+    // method here (~40ms the first time)
     let first = thread::spawn(crate::data::collect_first);
-    // 先切输入法:弹窗一出来就按的键不被拼音吃掉。和之后的切来切去一样在主线程
+    // Switch the input method first: keys pressed as soon as the popup appears don't get eaten by pinyin.
+    // On the main thread, like later switches
     crate::ime::start();
     let _ime = crate::ime::Guard;
-    // 带着关键词打开时只看匹配的,不恢复上次停在哪个分组
+    // Opened with keywords: show only the matches, don't restore the group it was last on
     let view_file = crate::state::state_file("view");
     let restore = filter.is_empty();
     let sessions = first.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
@@ -10261,14 +10497,14 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
         .with_groups(crate::groups::load)
         .with_handoff(crate::handoff::source)
         .with_rehome(crate::rehome::quotas, crate::accounts::login, true);
-    // 远端任务的 server 在设置页里填;P 是插件页(挂载、远端任务都是插件了,在 : 菜单里)
+    // The remote tasks server is set in the settings page; P is the plugins page (mounts and remote tasks are plugins now, in the : menu)
     app = app.with_plugins(|| Box::new(crate::plugins::Page::new(crate::plugins::load)));
-    // 起 Claude 时带不带 aca 的 mod(额度不靠状态栏)
+    // Whether Claude starts with aca's mod (quota doesn't rely on the status bar)
     app = app.with_setting(Box::new(crate::limits::ModRow::real()));
     app = app.with_setting(Box::new(crate::trust::TrustRow::real()));
-    // 上次被杀掉 / 崩了的界面删了没来得及真删的
+    // Sessions a killed / crashed interface deleted but didn't get to really delete
     thread::spawn(crate::trash::purge);
-    // 升级了没跑 install.sh 的(brew 之类):aca 的 tmux 设置照这一版重写
+    // Upgraded without running install.sh (brew and the like): rewrite aca's tmux settings for this version
     thread::spawn(crate::tmuxconf::refresh);
     if let (true, Some(p)) = (restore, &view_file) {
         app = app.restore(View::load(p));
@@ -10276,34 +10512,34 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     if let Some((session, pane)) = crate::data::client_at() {
         app.highlight_here(&session, &pane);
         if crate::follow::asked() {
-            // 关在别的会话上时没走 `switch_to`:Ctrl+Q 的绑定这里先补一次
+            // Closed while on another session, so `switch_to` didn't run: set up the Ctrl+Q binding here once
             aca_core::tmux::bind_detach();
             app.follow_from(&session, &pane);
         }
     }
-    // config.toml 写坏了:账号和工具都当成没写,设置页的「写错的」里说是哪
+    // config.toml is broken: treat accounts and tools as unset; the settings page's Problems says where
     app.sync_failed = aca_core::config::problem().into_iter().collect();
     if let Some(state) = &restarted {
         app.resume(state, installed_at());
     }
-    // 上次的界面是随终端关掉 / 出错退出的:说一次(见 exitlog.rs)
+    // The last interface went away with its terminal / exited on error: say it once (see exitlog.rs)
     if let Some(m) = crate::exitlog::take_notice() {
         app.flash_for(&m, NOTICE);
     }
     let mut saved = app.view_state();
     let mut lang = i18n::lang();
 
-    // 后台每 2 秒重读一次;attach 期间暂停
+    // The background rereads every 2 seconds; paused while attached
     let (tx, rx) = mpsc::channel::<Vec<Session>>();
-    // 插件出错了没有:跟着列表一起重读(顶栏那一格 ⚠)
+    // Whether plugins have errors: reread along with the list (the ⚠ cell in the top bar)
     let (alert_tx, alert_rx) = mpsc::channel::<Vec<aca_core::plugin::health::Problem>>();
     let (req_tx, req_rx) = mpsc::channel::<()>();
     let paused = Arc::new(AtomicBool::new(false));
     {
         let paused = paused.clone();
         thread::spawn(move || {
-            // 到点了、有人催了、hook 刚报了事(事件流的文件变了)都重读一次;界面那头没了就停。
-            // 事件来得再密,靠它触发的刷新也隔开 EVENT_GAP
+            // Reread when it's time, when someone asks, or when a hook just reported (the event stream file changed); stop once the
+            // interface is gone. However dense the events, refreshes they trigger stay EVENT_GAP apart
             let stamp = || std::fs::metadata(aca_core::paths::events_log()).and_then(|m| m.modified()).ok();
             let (mut seen, mut last) = (stamp(), Instant::now());
             loop {
@@ -10327,23 +10563,27 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
         });
     }
 
-    // 闲着的会话到点停掉:单独一个线程,不跟着刷新暂停 —— 你连进哪个会话里了也照看
+    // Stop idle sessions when their time is up: its own thread, not paused with the refresh —
+    // it keeps watch whichever session you're attached to
     let (idle_tx, idle_rx) = mpsc::channel::<IdleTick>();
     thread::spawn(move || idle_watch(idle_tx));
 
-    // 重启 / 改名 / 挪分组 / 删除在后台跑,做完连同重读的会话一起送回来(重读也要几十毫秒,不占界面)
+    // Restart / rename / move group / delete run in the background and come back when done along with the reread sessions (rereading takes
+    // tens of milliseconds too, kept off the interface)
     let (job_tx, job_rx) = mpsc::channel::<(Job, Outcome, Vec<Session>)>();
-    // 滑动途中攒着的后台刷新
+    // Background refreshes held back while sliding
     let mut pending: Option<Vec<Session>> = None;
-    // 看改动:后台跑完的 git diff
+    // Diff view: git diff finished in the background
     let (diff_tx, diff_rx) = mpsc::channel::<(String, Mode, diff::Diff)>();
     let (plug_tx, plug_rx) = mpsc::channel::<(crate::caps::Req, bool, String)>();
     let mut diff_busy = false;
     let (glance_tx, glance_rx) = mpsc::channel::<(String, Glance)>();
     let mut glance_busy = false;
-    // 会话记录:第一次读整份(最大的一百多 MB,零点几秒)在后台,之后的新增在刷新时就地读
+    // Session record: the first full read (the largest over a hundred MB, a fraction of a second) is in the background; later additions are
+    // read in place on refresh
     let (trace_tx, trace_rx) = mpsc::channel::<(String, Result<crate::trace::Trace, String>)>();
-    // 计费面板:让子进程 aca ui --cost-json 去读(读的时候内存要一百来 MB,子进程退出就还了),这个线程等它交回结果
+    // Billing panel: the child process aca ui --cost-json does the reading (it needs a hundred-odd MB of memory while reading, returned
+    // when the child exits); this thread waits for its result
     let (bill_tx, bill_rx) = mpsc::channel::<Result<crate::usage::Report, String>>();
     let (bill_req_tx, bill_req_rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || {
@@ -10355,15 +10595,16 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     });
 
     let mut quiet_until = Instant::now() + startup_quiet(crate::data::in_popup() || restarted.is_some());
-    // ratatui::init 会装自己的出错善后,先把原来的(std 默认的)拿出来,init 之后换成 exitlog 的
+    // ratatui::init installs its own panic cleanup; take out the original one (std's default) first, and after init swap in exitlog's
     let std_hook = std::panic::take_hook();
     let mut terminal = ratatui::init();
     crate::exitlog::install(std_hook, release_terminal);
     execute!(stdout(), EnableMouseCapture)?;
     focus_events(true);
-    // 在 tmux 窗格里 / 直接开在 kitty 里时,切到别的窗格、别的 App 就把输入法还回去(弹窗收不到焦点事件)
+    // In a tmux pane / opened directly in kitty: switching to another pane or app gives the input method back (popups get no focus events)
     let mut focused = true;
-    // 只在看得出是支持的终端里才问:问的时候要等终端回话,手机那边隔着 mosh,它不回的话每次打开都白等 2 秒
+    // Ask only in terminals known to support it: asking waits for the terminal's answer, and with a phone behind mosh that never answers,
+    // every open would wait 2 seconds for nothing
     let env = |k: &str| std::env::var(k).unwrap_or_default();
     let likely = !env("KITTY_WINDOW_ID").is_empty()
         || ["ghostty", "WezTerm"].contains(&env("TERM_PROGRAM").as_str())
@@ -10371,21 +10612,22 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     let ok = likely && matches!(ratatui::crossterm::terminal::supports_keyboard_enhancement(), Ok(true));
     KBD.store(ok, Ordering::Relaxed);
     kbd(true);
-    // 高亮那一项的目录、会话告诉 kitty(见 `tell_var`);在 tmux 里写了也到不了 kitty。told = 上次告诉的,变了才再写
+    // Tell kitty the highlighted item's directory and session (see `tell_var`); inside tmux it wouldn't reach kitty. told = what was told
+    // last, rewrite only when it changes
     let tell = !env("KITTY_WINDOW_ID").is_empty() && env("TMUX").is_empty();
     let mut told = (String::new(), String::new());
     let res = (|| -> anyhow::Result<()> {
         loop {
-            // 终端没了(窗口被关、ssh 断了):不等读写出错,收尾退出(见 exitlog.rs)
+            // Terminal gone (window closed, ssh dropped): don't wait for a read / write error, clean up and exit (see exitlog.rs)
             if crate::exitlog::gone() {
                 return Ok(());
             }
-            // 后台线程出错了:界面还在,底栏说一声
+            // A background thread failed: the interface is still up, say so in the bottom bar
             if let Some(m) = crate::exitlog::take_live() {
                 app.flash_for(&m, NOTICE);
             }
             let mut refreshed = false;
-            // 刚挪过就先攒着,停手再换上:滑动途中插进一次整屏重画,手机上就是一顿
+            // Just moved: hold it and swap in once you stop: a full redraw in the middle of a slide is a stutter on a phone
             while let Ok(v) = rx.try_recv() {
                 pending = Some(v);
             }
@@ -10409,11 +10651,12 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                     app.sweep(after, aca_core::paths::now(), archived);
                 }
             }
-            // 全屏阅读:刚打开 / 换了会话 / 每次定时刷新,重抓历史(3000 行也只要几毫秒)
+            // Full-screen reader: just opened / session changed / every timed refresh, refetch the history
+            // (even 3000 lines take only a few ms)
             if let Some(target) = app.reader_target().filter(|_| std::mem::take(&mut app.reader_load) || refreshed) {
                 app.set_reader_lines(crate::data::capture_history(&target));
             }
-            // 插件的能力 / 视图 / 窗格:一个一个线程,做完送回来
+            // Plugin capabilities / views / panes: one thread each, sent back when done
             for req in std::mem::take(&mut app.plugin_q) {
                 let tx = plug_tx.clone();
                 thread::spawn(move || {
@@ -10424,7 +10667,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
             while let Ok((req, ok, out)) = plug_rx.try_recv() {
                 app.plugin_done(req, ok, out);
             }
-            // 看改动:git 在后台跑(大仓库要一会儿),同时只跑一个
+            // Diff view: git runs in the background (a big repo takes a while), only one at a time
             while let Ok((name, mode, d)) = diff_rx.try_recv() {
                 diff_busy = false;
                 app.set_diff(&name, mode, d);
@@ -10449,7 +10692,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
             if refreshed {
                 app.trace_tail();
             }
-            // 预览顶上的改动统计:高亮的那个,同样在后台读
+            // Diff stats at the top of the preview: for the highlighted one, also read in the background
             while let Ok((name, g)) = glance_rx.try_recv() {
                 glance_busy = false;
                 app.set_glance(name, g);
@@ -10457,7 +10700,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
             if !glance_busy && let Some((name, w)) = app.glance_request(refreshed) {
                 glance_busy = true;
                 let tx = glance_tx.clone();
-                // 分组的预览还要列目录里的东西
+                // A group's preview also lists what's in the directory
                 let group = is_group_key(&name);
                 thread::spawn(move || {
                     let g = if group { diff::glance_dir(&w) } else { diff::glance(&w) };
@@ -10471,7 +10714,8 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 let _ = bill_req_tx.send(only);
             }
             crate::ime::english(focused && !app.typing());
-            // config.toml 里的颜色改了就换上;输入法开关也跟着(设置页里改的当场生效)
+            // Colors changed in config.toml get swapped in; so does the input method switch
+            // (changes in the settings page take effect at once)
             let cfg_changed = theme::refresh();
             if cfg_changed || std::mem::take(&mut app.ime_changed) {
                 let was = crate::ime::active();
@@ -10501,22 +10745,24 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 }
                 told = here;
             }
-            // 正滑动时按预览该换的时刻醒来,停下来就按时换上
+            // While sliding, wake up at the time the preview should switch, so it switches on time once you stop
             let mut wait =
                 app.settle_left().map_or(Duration::from_millis(150), |d| d.min(Duration::from_millis(150)) + Duration::from_millis(5));
-            // 计费在读:几十毫秒就回来,别等满 150 毫秒才换上
+            // Billing is loading: it's back in tens of milliseconds, don't wait the full 150 ms to swap it in
             if app.bill_loading {
                 wait = wait.min(Duration::from_millis(15));
             }
             if wait_input(wait, app.term_on.is_some())? {
-                // 把已经到达的事件一次读完。3 个以上按键同时到 = 不是人手敲的:Moshi 连上后会往 shell
-                // 里代敲命令(比如 cd 到最近目录),而这时接收输入的是 aca —— 其中的 "/" 会进过滤模式、
-                // 路径变成过滤词、回车再把它确认,列表被筛空,看着就像卡死的 fzf。粘贴同理。整段丢掉。
+                // Read all the events that have arrived at once. 3 or more keys arriving together = not typed by hand: after connecting,
+                // Moshi types commands into the shell for you (like cd to the latest directory), but aca is what's taking input then — the
+                // "/" in it enters filter mode, the path becomes the filter, Enter confirms it, and the list is filtered to empty, looking
+                // like a stuck fzf. Pastes likewise. Drop the whole batch.
                 let mut batch = vec![event::read()?];
                 while batch.len() < 4096 && event::poll(Duration::ZERO)? {
                     batch.push(event::read()?);
                 }
-                // 点了桌面通知时 kitty 回的那串不是按键,先拣出来(不然一整串会被当成代敲的丢掉,还静音一阵)
+                // The sequence kitty sends back when a desktop notification is clicked isn't keys: pick it out first (else the whole
+                // sequence would be dropped as typed-for-you, and muted for a while)
                 for osc in crate::clicked::take(&mut batch) {
                     if let Some(id) = crate::clicked::session(&osc) {
                         app.open_clicked(id);
@@ -10532,9 +10778,10 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 let now = Instant::now();
                 let drop = drops(&keys, now < quiet_until, app.typing());
                 if drop {
-                    // 只记进日志,不在底栏提示
+                    // Log only, no hint in the bottom bar
                     log_ignored(&keys);
-                    // 只丢了一个键 = 静默期里人按的,不续:续了手快的会一下接一下全被吞
+                    // Only one key dropped = pressed by a person during the quiet period, don't extend:
+                    // extending would swallow every key of a fast typist
                     if keys.len() > 1 {
                         quiet_until = quiet_until.max(now + BURST_QUIET);
                     }
@@ -10581,7 +10828,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 };
                 app.flash(&m);
             }
-            // 视图一变就存(断线时 aca 是被直接杀掉的,等不到退出)
+            // Save the view as soon as it changes (when the connection drops aca is killed outright, never reaching exit)
             let now_view = app.view_state();
             if now_view != saved && !app.just_moved() {
                 if let Some(p) = &view_file {
@@ -10589,7 +10836,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 }
                 saved = now_view;
             }
-            // 跟随:高亮停稳了就把这台客户端带过去;Esc 是带回原处再退
+            // Following: once the highlight settles, take this client there; Esc takes it back to where it was, then exits
             if let Some(to) = app.follow_step() {
                 crate::data::show(&to.session, &to.pane);
             }
@@ -10597,7 +10844,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 app.follow_done();
                 return Ok(());
             }
-            // fzf 放在新建前面:在 fzf 里回车就开,紧接着就新建
+            // fzf before new: Enter in fzf opens it, and new follows right away
             if std::mem::take(&mut app.pick) {
                 let size = terminal.size()?;
                 if let Some(p) = app.dir_pick(size.width, size.height) {
@@ -10615,11 +10862,11 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 match create::create(&req) {
                     Ok(id) => {
                         app.adopt(&id);
-                        app.attach = Some(id); // 接着走下面的 attach
+                        app.attach = Some(id); // go on to the attach below
                     }
                     Err(e) => app.flash(&tr!("新建失败:{e}", "creating failed: {e}")),
                 }
-                // 等待期间攒下的按键不是冲着新会话按的
+                // Keys held up while waiting weren't meant for the new session
                 while event::poll(Duration::ZERO)? {
                     let _ = event::read()?;
                 }
@@ -10658,8 +10905,9 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 resume(&mut terminal, &mut app)?;
                 paused.store(false, Ordering::Relaxed);
             }
-            // tmux 弹窗里的 yazi:它认出 tmux 后会穿透出去问外面的终端,弹窗不转发,退出时每次干等 5 秒(图也出不来)
-            // → 改在会话里分一格放大的跑它,q 退出这格就关了,人留在会话里(弹窗本来就是切过去用的)
+            // yazi in a tmux popup: it detects tmux and passes through to ask the outer terminal, the popup doesn't forward that, and every
+            // exit waits 5 seconds for nothing (no images either) → instead run it in a zoomed split in the session; q quits and closes
+            // that pane, leaving you in the session (the popup is for switching over anyway)
             if let Some(External::Yazi(sp)) =
                 app.external.take_if(|x| matches!(x, External::Yazi(sp) if !sp.target.is_empty()) && crate::data::in_popup())
             {
@@ -10685,14 +10933,14 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
             if let Some(r) = app.term_req.take() {
                 let dir = crate::workdir::find(&r.w).dir;
                 if std::path::Path::new(&dir).is_dir() {
-                    // 分组的终端不属于哪个会话,不带账号
+                    // A group's terminal belongs to no session: no account
                     let env = if !r.env.is_empty() || r.family.is_empty() {
                         r.env.clone()
                     } else {
                         let head = app.all.iter().find(|s| s.sub.is_none() && s.name == r.family);
                         crate::data::account_env(head, r.w.pid, r.w.agent)
                     };
-                    // 先按半屏开,画第一帧时跟着终端那块改成准确的大小
+                    // Open at half screen first, then resize to the terminal area's exact size when drawing the first frame
                     let (rows, cols) = (app.screen.height / 2, app.screen.width);
                     let spawned = match &r.run {
                         Some(c) => crate::term::Term::spawn_cmd(c, &dir, &env, rows, cols),
@@ -10715,17 +10963,17 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                     });
                 }
             }
-            // 里面 exit 了的去掉;正看着的那个没了就回列表
+            // Remove ones whose shell exited; if the one being viewed is gone, back to the list
             app.terms.retain(|_, t| !t.exited());
             app.catch_links();
             if app.term_on.as_ref().is_some_and(|k| !app.terms.contains_key(k)) {
                 app.term_on = None;
-                // 终端那一块没了,就是关了:不再另说一句
+                // The terminal area gone means it was closed: nothing more to say
             }
             if let Some(sp) = app.split.take() {
                 let dir = crate::workdir::find(&sp.w).dir;
                 let session = app.tmux_of(&sp.name);
-                // 会话行不知道窗格 id:分它当前那格
+                // A session row doesn't know the pane id: split its current pane
                 let target = if sp.target.is_empty() { format!("{session}:") } else { sp.target.clone() };
                 match sp.yazi.then(|| yazi_blocked(&dir)).flatten() {
                     Some(e) => app.flash(&e),
@@ -10747,29 +10995,31 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 }
             }
             if let Some(name) = app.attach.take() {
-                // name 是会话的键;tmux 里按会话号找(会话名就是标题,会变)
+                // name is the session's key; tmux looks it up by session number (the session name is the title, which changes)
                 let target = app.tmux_of(&name);
-                // 先切到那一格:会话本身落在主窗格(agent 在的那格),子行落在那个窗口 / 窗格
+                // Switch to that pane first: the session itself lands on the main pane (where the agent is),
+                // a child row on that window / pane
                 let focus = app.focus.take();
                 if let Some(p) = &focus {
                     crate::data::focus_pane(p);
                 }
-                // E:先把便签粘进它的输入框(不回车),进去就看到
+                // E: paste the note into its input box first (no Enter), so you see it on entering
                 if let Some((key, text)) = app.fill.take()
                     && crate::data::paste_into(&focus.unwrap_or_else(|| format!("{target}:")), &text).is_ok()
                 {
                     app.note_filled(&key);
                 }
                 if std::env::var_os("TMUX").is_some() {
-                    // 已经在 tmux 里(桌面上开在 tmux 里、手机上的弹窗):直接切过去,不嵌套。切走界面就退了,进去就算看过。
-                    // 先切再让出终端:界面已经不在眼前了才退全屏,看不到底下的 shell
+                    // Already in tmux (in tmux on desktop, a popup on a phone): switch over directly, no nesting. Switching away exits the
+                    // interface; going in counts as seen. Switch first, then hand over the terminal: leave full screen only once the
+                    // interface is out of sight, so the shell below isn't seen
                     app.mark_seen(&name);
                     aca_core::tmux::bind_detach();
                     crate::data::switch_to(&target)?;
                     suspend()?;
                     return Ok(());
                 }
-                // 让出终端之前备好(界面还在屏上),tmux 一起来就是它的画面
+                // Prepare before handing over the terminal (the interface is still on screen), so tmux comes up showing it
                 let entry = crate::data::prepare(&target);
                 paused.store(true, Ordering::Relaxed);
                 suspend()?;
@@ -10778,7 +11028,8 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 if left.is_none() {
                     app.flash(t!("无法进入:会话可能刚结束", "can't go in: the session may have just ended"));
                 }
-                // 先拿进去之前的列表画出回来的第一帧,新的交给后台读(几十毫秒),读完再换上
+                // Draw the first frame back with the list from before going in;
+                // the new one is read in the background (tens of ms) and swapped in
                 resume(&mut terminal, &mut app)?;
                 quiet_until = Instant::now() + BACK_QUIET;
                 paused.store(false, Ordering::Relaxed);
@@ -10799,14 +11050,15 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     }
     crate::ime::english(false);
     let _ = execute!(stdout(), DisableMouseCapture);
-    // 终端没了(窗口被关、ssh 断了)就还不回去,也没处说:记进 exit.log,不打印、错误不往外交。
-    // 以前这里用 ratatui::restore(),还不回去就往没了的终端打印,出错再出错,程序直接中止(见 exitlog.rs)
+    // Terminal gone (window closed, ssh dropped): it can't be given back and there's nowhere to say so: log to exit.log, don't print, don't
+    // pass the error on. This used to use ratatui::restore(), which printed to the dead terminal when it couldn't restore, error on error,
+    // and the program aborted (see exitlog.rs)
     let restored = ratatui::try_restore();
     let gone = restored.is_err() || crate::exitlog::gone();
     if gone {
         crate::exitlog::term_gone(res.as_ref().err(), restored.as_ref().err());
     }
-    // 回收站里到期的:真删(另起进程去删,不耽误退出;终端没了也照删)
+    // Trash entries that are due: really delete (in a separate process, so exit isn't delayed; deleted even if the terminal is gone)
     if app.trash.due(epoch()) {
         crate::trash::purge_detached();
     }
@@ -10814,7 +11066,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
         return Ok(());
     }
     if app.relaunch && res.is_ok() {
-        // 刚挪过的高亮可能还没记(停手才记),换之前补记一次
+        // A highlight that just moved may not be saved yet (saved once you stop): save it once more before switching
         if let Some(p) = &view_file {
             let _ = app.view_state().save(p);
         }
@@ -10823,10 +11075,10 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     res
 }
 
-/// 调试用:按给定尺寸渲染一帧到内存,按顺序喂 keys 里的按键,打印成文本(中文按两格处理)。
-/// 和界面一样每个键画一帧:有些状态(记录里哪些步能展开)是画的时候才算出来的
+/// For debugging: render one frame of the given size in memory, feed the keys in keys in order, print it as text (CJK counted as two
+/// cells). Draws a frame per key like the interface: some state (which steps of the record can unfold) is only computed while drawing
 pub fn snapshot(w: u16, h: u16, keys: &str) -> anyhow::Result<String> {
-    // 显示真的置顶,但按 p 只改内存,不写文件
+    // Shows the real pinned ones, but p only changes memory, doesn't write the file
     let mut app = App::new(String::new(), collect())
         .with_pins(Pins::open(Pins::default_path()).detached())
         .with_notes(Notes::open(Notes::default_path()).detached())
@@ -10856,13 +11108,14 @@ pub fn snapshot(w: u16, h: u16, keys: &str) -> anyhow::Result<String> {
             c => KeyCode::Char(c),
         };
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
-        // 记录界面里是后台读的;这里当场读完,后面的按键(n / o / →)才落在记录上
+        // Read in the background in the interface; here it's read on the spot, so the following keys (n / o / →) land on the record
         if let Some(s) = app.trace_request() {
             app.set_trace(&s.name, crate::trace::load(&s));
         }
         t.draw(|f| draw(f, &mut app))?;
     }
-    // 交出去的这帧画在干净的屏上:内存屏只按差异更新,连着画几帧会留下前一帧的半个宽字
+    // The frame handed out is drawn on a clean screen: the in-memory screen updates only diffs, so drawing several frames in a row leaves
+    // half a wide char from the previous frame
     let mut t = Terminal::new(TestBackend::new(w, h))?;
     t.draw(|f| draw(f, &mut app))?;
     let buf = t.backend().buffer();
@@ -10899,7 +11152,7 @@ pub fn snapshot(w: u16, h: u16, keys: &str) -> anyhow::Result<String> {
         let groups: Vec<&str> = p.rows.iter().map(|r| r.group.as_str()).collect();
         out.push_str(&format!("[挑分组 → {}]\n", groups.join(" ")));
     }
-    // 只打印,不真的新建
+    // Print only, don't really create
     if let Some(r) = app.create {
         let mut flags = String::new();
         if !r.group.is_empty() {
@@ -10950,19 +11203,19 @@ mod tests {
     #[test]
     fn swipes_and_arrow_runs_are_never_taken_for_auto_input() {
         let k = |c| KeyEvent::new(c, KeyModifiers::NONE);
-        assert!(!drops(&[k(KeyCode::Down)], true, false)); // 刚退出会话就滑
-        assert!(!drops(&[k(KeyCode::Up); 5], false, false)); // 网络一卡,一串一起到
-        assert!(drops(&[k(KeyCode::Enter)], true, false)); // 静默期里单独到的回车照丢
+        assert!(!drops(&[k(KeyCode::Down)], true, false)); // swipe right after leaving a session
+        assert!(!drops(&[k(KeyCode::Up); 5], false, false)); // a network stall, a run arriving together
+        assert!(drops(&[k(KeyCode::Enter)], true, false)); // a lone Enter in the quiet period is still dropped
         let typed: Vec<_> = "cd ~/x".chars().map(|c| k(KeyCode::Char(c))).collect();
         assert!(drops(&typed, false, false));
-        assert!(!drops(&typed, false, true)); // 在输入框里打字不算
+        assert!(!drops(&typed, false, true)); // typing in an input box doesn't count
         assert!(drops(&[k(KeyCode::Char('j')), k(KeyCode::Down), k(KeyCode::Down)], false, false));
     }
 
     #[test]
     fn popup_starts_without_the_quiet_period() {
-        assert_eq!(startup_quiet(false), STARTUP_QUIET); // 直接开(Moshi 连上那条路)照旧
-        assert_eq!(startup_quiet(true), Duration::ZERO); // 弹窗:C-\ 紧跟着 ⏎ 不能吞
+        assert_eq!(startup_quiet(false), STARTUP_QUIET); // opened directly (the Moshi connect path): unchanged
+        assert_eq!(startup_quiet(true), Duration::ZERO); // popup: ⏎ right after C-\ must not be swallowed
     }
 
     fn mk(title: &str, group: &str, state: State, idle_for: u64) -> Session {
@@ -10993,7 +11246,7 @@ mod tests {
             deck_id: format!("id-{title}"),
             info: format!("Path: /p/{group}"),
             worktree: false,
-            // 分区顺序:fun 在 work 前面
+            // Section order: fun before work
             slot: (["fun", "work"].iter().position(|g| *g == group).unwrap_or(usize::MAX), 0, 0),
             pane: String::new(),
             sub: None,
@@ -11020,7 +11273,7 @@ mod tests {
         v
     }
 
-    /// 组内顺序就是这里的先后
+    /// Order within a group is the order here
     fn sessions() -> Vec<Session> {
         let v = vec![
             mk("问", "fun", State::Ask, 999_999),
@@ -11042,7 +11295,7 @@ mod tests {
         App::new(String::new(), sessions())
     }
 
-    /// 按列表顺序,不排序
+    /// In list order, unsorted
     fn order(app: &App) -> Vec<String> {
         app.visible().0.iter().map(|s| s.title.clone()).collect()
     }
@@ -11068,14 +11321,14 @@ mod tests {
         ctrl(&mut app, 'l');
         assert!(app.relaunch && app.quit);
         assert_eq!(app.relaunch_state(), "list");
-        // 计费面板里也行(不是换时段),记着开在哪个时段
+        // Works in the billing panel too (it's not a period switch); remembers which period was open
         let mut app = App::new(String::new(), sessions());
         press(&mut app, KeyCode::Char('$'));
         press(&mut app, KeyCode::Right);
         ctrl(&mut app, 'l');
         assert!(app.relaunch && app.quit);
         assert_eq!(app.relaunch_state(), "bill:2");
-        // 新的那个:接着开计费面板,说一声是几点装的
+        // The new one: reopens the billing panel and says when it was installed
         let mut app = App::new(String::new(), sessions());
         app.resume("bill:2", Some("11:28".into()));
         assert_eq!(app.bill.as_ref().map(|b| b.sel), Some(2));
@@ -11109,7 +11362,7 @@ mod tests {
             vec![row("Codex big", Agent::Codex, 30.0), row("Claude mid", Agent::Claude, 20.0), row("Claude small", Agent::Claude, 1.0)];
         app.set_bill(Ok(Report { accounts: accounts.clone(), ..Default::default() }));
         app.bill.as_mut().unwrap().scroll = 5;
-        // a 打开,高亮在「全部」;↓ ⏎ = 只看第一个,回到顶上,马上按它重读
+        // a opens with the highlight on 「全部」 ("all"); ↓ ⏎ = show only the first, back to the top, reread for it right away
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(app.bill.as_ref().unwrap().pick.as_ref().map(|p| p.sel), Some(0));
         press(&mut app, KeyCode::Down);
@@ -11117,10 +11370,10 @@ mod tests {
         assert!(app.bill.as_ref().unwrap().pick.is_none());
         assert_eq!(app.bill.as_ref().unwrap().scroll, 0);
         assert_eq!(app.bill_request(), Some(vec!["Codex big".to_string()]));
-        // 还没读回来:顶上照旧是显示着的那份
+        // Not read back yet: the top still shows the data on display
         assert_eq!(app.bill_request(), None);
         app.set_bill(Ok(Report { only: vec!["Codex big".into()], accounts: accounts.clone(), ..Default::default() }));
-        // 再打开高亮停在只看着的那个;空格勾上两个(勾完往下走),⏎ 看勾上的,按花费排
+        // Reopened, the highlight is on the one shown; Space ticks two (moving down after each), ⏎ shows the ticked ones, sorted by cost
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(app.bill.as_ref().unwrap().pick.as_ref().map(|p| p.sel), Some(1));
         press(&mut app, KeyCode::Down);
@@ -11132,14 +11385,14 @@ mod tests {
         assert_eq!(app.bill.as_ref().unwrap().pick.as_ref().unwrap().marked, vec!["Claude small".to_string(), "Claude mid".to_string()]);
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.bill_only, vec!["Claude mid".to_string(), "Claude small".to_string()]);
-        // 浮窗里 1-4 不是换时段,是直接挑账号;0 = 全部;Esc 不改
+        // In the floating window 1-4 don't switch periods, they pick accounts directly; 0 = all; Esc changes nothing
         press(&mut app, KeyCode::Char('a'));
         press(&mut app, KeyCode::Char('3'));
         assert_eq!((app.bill_only.clone(), app.bill.as_ref().unwrap().sel), (vec!["Claude small".to_string()], 1));
         press(&mut app, KeyCode::Char('a'));
         press(&mut app, KeyCode::Esc);
         assert!(app.bill.is_some() && app.bill_only == vec!["Claude small".to_string()]);
-        // 重启带着只看哪些,新的那个照样只看它们
+        // The restart carries which ones are shown, and the new one shows just those
         assert_eq!(app.relaunch_state(), "bill:1\tClaude small");
         let mut again = App::new(String::new(), sessions());
         again.resume(&app.relaunch_state(), None);
@@ -11148,7 +11401,7 @@ mod tests {
         press(&mut app, KeyCode::Char('a'));
         press(&mut app, KeyCode::Char('0'));
         assert!(app.bill_only.is_empty());
-        // 关了再开还是只看的那些(这里是全部)
+        // Closed and reopened, it still shows only those (here: all)
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char('$'));
         assert!(app.bill_only.is_empty());
@@ -11163,7 +11416,7 @@ mod tests {
         app.set_bill(Ok(Report { accounts: vec![row("A"), row("B"), row("C"), row("D")], ..Default::default() }));
         let pick = |app: &App| app.bill.as_ref().unwrap().pick.as_ref().map(|p| (p.sel, p.anchor, p.chosen(&app.bill_accounts())));
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // 停在「全部」上按 v:从第一个账号开始;往上拉不绕回「全部」
+        // v on 「全部」 ("all"): starts from the first account; going up doesn't wrap back to 「全部」
         press(&mut app, KeyCode::Char('a'));
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Up);
@@ -11171,19 +11424,21 @@ mod tests {
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(pick(&app), Some((3, Some(1), names(&["A", "B", "C"]))));
-        // 连选着再按 v:没定下的这一段不要了,从高亮这行重新起;Esc 定下,浮窗还开着
+        // v again during a range select: the unsettled range is dropped, starting over from the highlighted row; Esc settles it, the
+        // floating window stays open
         press(&mut app, KeyCode::Char('v'));
         assert_eq!(pick(&app), Some((3, Some(3), names(&["C"]))));
         press(&mut app, KeyCode::Esc);
         assert_eq!(pick(&app), Some((3, None, names(&["C"]))));
-        // 从勾着的那行起 v 还是连选;V 连着去掉勾
+        // v from a ticked row still range-selects; V range-unticks
         keys(&mut app, "kkvjj");
         press(&mut app, KeyCode::Esc);
         assert_eq!(pick(&app), Some((3, None, names(&["A", "B", "C"]))));
         keys(&mut app, "kVj");
         assert_eq!(pick(&app), Some((3, Some(2), names(&["A"]))));
         press(&mut app, KeyCode::Esc);
-        // 连选着空格:勾上这一个、往下走,还在连选(到了最后一个不绕回「全部」);⏎ 看选上的
+        // Space during a range select: ticks this one and moves down, still range-selecting
+        // (at the last it doesn't wrap back to 「全部」); ⏎ shows the selected
         keys(&mut app, "v ");
         assert_eq!(pick(&app), Some((4, Some(3), names(&["A", "C", "D"]))));
         press(&mut app, KeyCode::Char(' '));
@@ -11200,21 +11455,21 @@ mod tests {
     #[test]
     fn new_defaults_to_the_selected_sessions_dir_and_group() {
         let mut app = fixture();
-        pin(&mut app, "跑"); // 选中「跑」(work 分组)
+        pin(&mut app, "跑"); // select 「跑」 (work group)
         press(&mut app, KeyCode::Char('N'));
         assert_eq!(app.new_draft.as_ref().unwrap().text, "/p/work");
         assert!(app.typing());
         press(&mut app, KeyCode::Enter);
         let r = app.create.take().unwrap();
         assert_eq!((r.dir.as_str(), r.group.as_str(), r.spec().as_str()), ("/p/work", "work", "claude"));
-        assert!(r.create_dir); // /p/work 不存在
-        assert!(app.attach.is_none()); // 回车被输入框吃掉了,没进原来的会话
+        assert!(r.create_dir); // /p/work doesn't exist
+        assert!(app.attach.is_none()); // Enter went to the input box, didn't go into the original session
     }
 
     #[test]
     fn new_inherits_tool_and_account_from_the_selected_session() {
         let mut v = sessions();
-        v[2].tool = "codex".into(); // 跑
+        v[2].tool = "codex".into(); // 「跑」
         v[2].account = "team".into();
         let mut app = App::new(String::new(), v);
         pin(&mut app, "跑");
@@ -11222,7 +11477,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         let r = app.create.take().unwrap();
         assert_eq!((r.tool.as_str(), r.account.as_str()), ("codex", "team"));
-        pin(&mut app, "闲"); // 默认账号的 claude
+        pin(&mut app, "闲"); // claude on the default account
         press(&mut app, KeyCode::Char('N'));
         press(&mut app, KeyCode::Enter);
         let r = app.create.take().unwrap();
@@ -11247,7 +11502,7 @@ mod tests {
         let app = fixture().restore(v.clone());
         assert_eq!(app.view_state(), v);
         assert_eq!(app.current().unwrap().title, "错");
-        // 分组没了 → 全部分组;会话没了 → 高亮第一个
+        // Group gone → all groups; session gone → highlight the first
         let gone = View { group: Some("旧分组".into()), selected: Some("没了".into()), ..v };
         let app = fixture().restore(gone);
         assert_eq!(app.group, None);
@@ -11257,20 +11512,20 @@ mod tests {
     #[test]
     fn down_or_ctrl_f_in_new_asks_for_fzf_and_fills_the_path() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('j')); // 选中「跑」
-        assert_eq!(app.dir_hints(), ["/p/work", "/p/fun"]); // 选中的在前,同目录的不重复
-        press(&mut app, KeyCode::Down); // 列表里 ↓ 是往下走,不开 fzf
+        press(&mut app, KeyCode::Char('j')); // select 「跑」
+        assert_eq!(app.dir_hints(), ["/p/work", "/p/fun"]); // the selected one first, same directories not repeated
+        press(&mut app, KeyCode::Down); // ↓ in the list moves down, doesn't open fzf
         assert!(!app.pick);
         press(&mut app, KeyCode::Char('N'));
         press(&mut app, KeyCode::Down);
         assert!(std::mem::take(&mut app.pick));
         ctrl(&mut app, 'f');
         assert!(std::mem::take(&mut app.pick));
-        app.picked(Ok(None)); // Esc:原样
+        app.picked(Ok(None)); // Esc: unchanged
         assert_eq!(app.new_draft.as_ref().unwrap().text, "/p/work");
         app.picked(Err("没装 fzf".into()));
         assert_eq!(app.new_draft.as_ref().unwrap().hint, "没装 fzf");
-        app.picked(Ok(Some(Picked::Edit("~/code/app".into())))); // →:填回去接着打
+        app.picked(Ok(Some(Picked::Edit("~/code/app".into())))); // →: fill it back in and keep typing
         typ(&mut app, "new");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.create.take().unwrap().dir, format!("{}/code/app/new", std::env::var("HOME").unwrap()));
@@ -11289,12 +11544,12 @@ mod tests {
     #[test]
     fn fzf_rows_mark_dirs_that_already_have_sessions() {
         let mut app = fixture().with_group_hints(|| crate::data::GroupHints { groups: vec![("work".into(), String::new())] });
-        press(&mut app, KeyCode::Char('j')); // 选中「跑」(/p/work)
+        press(&mut app, KeyCode::Char('j')); // select 「跑」 (/p/work)
         press(&mut app, KeyCode::Char('N'));
         let cands = [("/p/work", Src::Known), ("/p/gone-quiet", Src::Known), ("/z/often", Src::Zoxide), ("/p/near", Src::Near)];
         let p = app.dir_pick_from(cands.map(|(d, s)| (d.to_string(), s)).to_vec(), 40, 16).unwrap();
         let marks: String = p.rows.iter().map(|r| r.mark).collect();
-        assert_eq!(marks, "●◇↗ "); // 有会话的 ●,登记过但现在没会话的 ◇
+        assert_eq!(marks, "●◇↗ "); // ● has a session, ◇ registered but no session now
         assert_eq!(p.rows[0].group, ("work".into(), false));
         assert!(p.rows[0].sessions.iter().any(|(_, t)| t == "跑"), "{:?}", p.rows[0].sessions);
         assert_eq!(p.rows[3].group, ("near".into(), true));
@@ -11311,7 +11566,7 @@ mod tests {
         assert_eq!(app.new_draft.as_ref().unwrap().finish().unwrap().tool, "shell");
         ctrl(&mut app, 't');
         assert!(!app.new_draft.as_ref().unwrap().is_shell());
-        // 手机宽度:提示和工具名挤一行也不出界
+        // Phone width: the hint and the tool name squeezed into one row still fit
         let rows = reader_rows(&mut app, 44, 30);
         assert!(rows.iter().any(|r| r.contains("^T shell")), "{rows:#?}");
     }
@@ -11327,7 +11582,7 @@ mod tests {
         t.draw(|f| draw(f, &mut app)).unwrap();
         let buf = t.backend().buffer().clone();
         let rows = reader_rows(&mut app, 100, 30);
-        // 最多列 8 个,跟着换到的那个滚;换到的那个整行铺淡紫
+        // At most 8 listed, scrolling with the one switched to; that one's whole row is filled light purple
         assert!(!rows.iter().any(|r| r.contains("item1/")) && rows.iter().any(|r| r.contains("item2/")), "{rows:#?}");
         let y = rows.iter().position(|r| r.contains("item9/")).unwrap() as u16;
         let x = rows[y as usize].find("item9/").map(|b| rows[y as usize][..b].width() as u16).unwrap();
@@ -11339,19 +11594,19 @@ mod tests {
     fn new_session_group_changes_with_the_path() {
         let mut app = fixture()
             .with_group_hints(|| crate::data::GroupHints { groups: vec![("work".into(), String::new()), ("fun".into(), String::new())] });
-        pin(&mut app, "跑"); // work 分组
+        pin(&mut app, "跑"); // work group
         press(&mut app, KeyCode::Char('N'));
         assert_eq!(app.new_draft.as_ref().unwrap().group(), ("work".into(), false));
-        app.picked(Ok(Some(Picked::Edit("/p/fun".into())))); // 目录名就是 fun 组
+        app.picked(Ok(Some(Picked::Edit("/p/fun".into())))); // the directory name is the fun group
         assert_eq!(app.new_draft.as_ref().unwrap().group(), ("fun".into(), false));
-        typ(&mut app, "lab"); // /p/fun/lab:上一级是 fun 组 → 嵌套
+        typ(&mut app, "lab"); // /p/fun/lab: parent is the fun group → nested
         assert_eq!(app.new_draft.as_ref().unwrap().group(), ("fun/lab".into(), true));
         app.picked(Ok(Some(Picked::Edit("/p/brand".into()))));
         let rows = reader_rows(&mut app, 60, 20);
         assert!(rows.iter().any(|r| r.contains("brand  新分组")), "{rows:#?}");
         press(&mut app, KeyCode::Enter);
         let req = app.create.take().unwrap();
-        // 按路径推出来的:不用 ^N 那种绑,交给核心按目录认领(记上默认目录)
+        // Derived from the path: no ^N-style binding; left to core to claim by directory (recording the default directory)
         assert_eq!((req.group.as_str(), req.bind, req.by_dir), ("brand", false, true));
     }
 
@@ -11359,11 +11614,11 @@ mod tests {
     fn d_asks_first_and_only_y_deletes() {
         let mut app = fixture();
         pin(&mut app, "跑");
-        pin(&mut app, "跑"); // 选中「跑」
+        pin(&mut app, "跑"); // select 「跑」
         for cancel in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('n'), KeyCode::Char('q')] {
             press(&mut app, KeyCode::Char('d'));
             let rows = reader_rows(&mut app, 46, 12);
-            // 手机上从底下升起的一块:问什么、哪个会话、会怎样,最后 y 的按钮
+            // On a phone, a sheet rising from the bottom: what's asked, which session, what happens, then the y button
             let at = |t: &str| rows.iter().position(|r| r.contains(t)).unwrap_or_else(|| panic!("缺「{t}」:{rows:#?}"));
             let (head, y) = (at("删除会话？"), at("y 删除"));
             assert!(head < y && rows[head..y].iter().any(|r| r.contains("跑")), "{rows:#?}");
@@ -11375,19 +11630,20 @@ mod tests {
         let Some(Confirm::Remove(r)) = &app.confirm else { panic!("没问") };
         let r = r.clone();
         press(&mut app, KeyCode::Char('y'));
-        // 放进后台跑(删会话要等进程退干净),界面不等它:先从列表里拿掉,高亮落到下一个
+        // Runs in the background (removing a session waits for its processes to exit fully), the UI doesn't wait: drop it from
+        // the list first, highlight moves to the next
         assert_eq!(app.job, Some(Job::Remove { t: target("跑"), pane: None }));
         let has = |app: &App, t: &str| order(app).contains(&t.to_string());
         assert!(!has(&app, "跑") && app.current().is_some_and(|s| s.title != "跑"));
         let job = app.take_job().unwrap();
         assert!(app.busy.is_none());
         assert_eq!(app.doing().as_deref(), Some("正在删除「跑」…"));
-        press(&mut app, KeyCode::Char('y')); // 确认只管一次
+        press(&mut app, KeyCode::Char('y')); // the confirmation covers one time only
         assert!(app.job.is_none());
-        // 删完之前的刷新读到的还有它:照样藏着
+        // A refresh from before the removal finished still sees it: stays hidden
         app.set_sessions(sessions());
         assert!(!has(&app, "跑"));
-        // 还在删也能接着删别的;别的操作要等删完
+        // Can remove others while one is still being removed; other operations wait until it's done
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('R'));
         assert!(app.job.is_none() && app.confirm.is_none());
@@ -11402,15 +11658,15 @@ mod tests {
         assert!(!has(&app, "跑") && !has(&app, "闲"));
         assert_eq!(app.msg.as_ref().unwrap().0, "已删除「跑」");
         assert_eq!(app.doing().as_deref(), Some("正在删除「闲」…"));
-        // 删掉之后晚到的旧刷新也不让它冒出来;删失败的放回来
+        // A stale refresh arriving after the removal doesn't bring it back either; a failed removal is put back
         app.job_done(&job2, Outcome::Failed("删除失败:不让删".into()), sessions());
         assert!(!has(&app, "跑") && has(&app, "闲") && app.doing().is_none());
         assert_eq!(app.msg.as_ref().unwrap().0, "删除失败:不让删");
-        // 藏够了就不管了(真还在就是真还在)
+        // Once hidden long enough, leave it alone (if it's really still there, it's really there)
         app.vanish[0].until = Some(Instant::now());
         app.set_sessions(sessions());
         assert!(has(&app, "跑") && app.vanish.is_empty());
-        // worktree / 别处连着要说;窄了先截标题,按键说明留着
+        // Mention a worktree / being attached elsewhere; when narrow, truncate the title first, keep the key hints
         let r = Removal {
             title: "很长很长很长很长很长很长很长很长很长很长的标题".into(), worktree: true, attached: true, ..r
         };
@@ -11420,7 +11676,7 @@ mod tests {
             assert!(rows.iter().any(|r| r.contains(want)), "缺「{want}」:{rows:#?}");
         }
         app.confirm = None;
-        // 折叠行上 d 不是删会话:问的是删分组
+        // d on a fold row isn't removing a session: it asks about removing the group
         app = app.with_groups(deck_groups);
         press(&mut app, KeyCode::Char('O'));
         press(&mut app, KeyCode::Char('d'));
@@ -11449,13 +11705,13 @@ mod tests {
         assert_eq!(app.job, Some(Job::Restart { t: target("闲"), force: false }));
         let job = app.take_job().unwrap();
         assert_eq!(app.busy.as_deref(), Some("正在重启「闲」…"));
-        // 后台做完前不接新的
+        // No new job until the background one is done
         press(&mut app, KeyCode::Char('R'));
         assert!(app.job.is_none());
         assert_eq!(app.msg.as_ref().unwrap().0, "请稍候:正在重启「闲」…");
         app.job_done(&job, Outcome::Done("已重启「闲」".into()), sessions());
         assert!(app.busy.is_none() && app.confirm.is_none());
-        // 在跑的先问,别的键取消
+        // Running ones ask first; any other key cancels
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('R'));
         assert!(app.job.is_none());
@@ -11473,13 +11729,13 @@ mod tests {
         let mut app = fixture();
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('f'));
-        // 先起名:填好默认的,直接回车就用它(不锁)
+        // Name it first: prefilled with the default, Enter uses it as is (not locked)
         assert!(app.job.is_none() && app.typing());
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.job, Some(Job::Fork { t: target("闲"), title: None }));
         let job = app.take_job().unwrap();
         assert_eq!(app.busy.as_deref(), Some("正在分叉「闲」…"));
-        // 分出来的排在组里最后,高亮跟过去
+        // The fork goes last in the group, the highlight follows it
         let mut fresh = sessions();
         let mut new = mk("闲-fork", "work", State::Running, 0);
         new.slot.1 = 99;
@@ -11488,7 +11744,7 @@ mod tests {
         app.job_done(&job, Outcome::Made { msg: "已分出「闲-fork」".into(), id: "id-新".into() }, fresh);
         assert_eq!(app.current().unwrap().title, "闲-fork");
         assert_eq!(app.msg.as_ref().unwrap().0, "已分出「闲-fork」");
-        // 失败了高亮不动
+        // On failure the highlight stays
         press(&mut app, KeyCode::Char('f'));
         press(&mut app, KeyCode::Enter);
         let job = app.take_job().unwrap();
@@ -11500,7 +11756,7 @@ mod tests {
     fn a_title_changed_before_forking_is_passed_on() {
         let mut app = fixture();
         select(&mut app, "闲");
-        // F(原来的起名再分叉)和 f 一样
+        // F (formerly name-then-fork) is the same as f
         press(&mut app, KeyCode::Char('f'));
         shows(&reader_rows(&mut app, 46, 12), &["分叉 · 闲", "闲 (分叉)", "⏎ 分叉", "^U 清空重写"]);
         assert!(app.typing());
@@ -11520,8 +11776,8 @@ mod tests {
     #[test]
     fn fork_and_mcp_are_only_for_registered_claude_or_codex_sessions() {
         let mut v = sessions();
-        v[3].agent = Agent::None; // 闲:shell 会话
-        v[2].deck_id.clear(); // 跑:普通 tmux 会话
+        v[3].agent = Agent::None; // 「闲」: a shell session
+        v[2].deck_id.clear(); // 「跑」: a plain tmux session
         let mut app = App::new(String::new(), v);
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('f'));
@@ -11554,7 +11810,7 @@ mod tests {
         })
     }
 
-    /// 菜单里的一项:名字就是账号名,说明写它的配置目录
+    /// A menu item: the name is the account name, the description is its config directory
     fn tool(name: &str, tool: &str, account: &str, agent: Agent) -> Tool {
         Tool { name: name.into(), tool: tool.into(), account: account.into(), agent, note: format!("~/.{name}"), problem: None }
     }
@@ -11574,14 +11830,14 @@ mod tests {
         app.set_sessions(sessions());
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('H'));
-        // 菜单同 n,但没有 shell;标题写交接谁,它在跑、带着便签都提一句
+        // Same menu as n, but no shell; the title says who's handed off, mentioning it if it's running or has a note
         let rows = reader_rows(&mut app, 60, 14);
         shows(&rows, &["交接「跑」给", "仍在运行 · 带上便签", "1 cw  ~/.cw", "2 cx  ~/.cx", "⏎ 交接"]);
         assert!(!rows.iter().any(|r| r.contains("shell")), "{rows:#?}");
         press(&mut app, KeyCode::Esc);
         assert!(app.tool_menu.is_none() && app.handoff.is_none() && app.job.is_none());
         assert!(app.msg.is_none());
-        // 再按 n:还是原来的新建,不带交接
+        // n again: the usual new, no handoff
         press(&mut app, KeyCode::Char('n'));
         shows(&reader_rows(&mut app, 60, 14), &["选择工具", "⏎ 选择"]);
         press(&mut app, KeyCode::Esc);
@@ -11593,13 +11849,13 @@ mod tests {
         let Some(Job::Handoff { t, from, req, to, note }) = app.job.clone() else { panic!("{:?}", app.job) };
         assert_eq!(t, target("跑"));
         assert_eq!((from.sid.as_str(), from.note.as_deref()), ("sid-跑", Some("顺便补测试")));
-        // 新会话开在它的目录、分组里,工具 / 账号用菜单选的
+        // The new session opens in its directory and group, with the tool / account picked in the menu
         assert_eq!((req.dir.as_str(), req.group.as_str(), req.spec().as_str()), ("/p/work", "work", "codex:cx"));
         assert_eq!((to, note.as_deref()), (Agent::Codex, Some("id-跑")));
         let job = app.take_job().unwrap();
         assert_eq!(app.busy.as_deref(), Some("正在交接「跑」…"));
 
-        // 建好了:高亮新会话,便签跟过去了就删
+        // Created: highlight the new session; the note moved over, so it's deleted
         let mut fresh = sessions();
         let mut new = mk("接手", "work", State::Idle, 0);
         new.slot.1 = 99;
@@ -11609,7 +11865,8 @@ mod tests {
         assert_eq!(app.msg.as_ref().unwrap().0, "已交接");
         assert_eq!(app.notes.get("id-跑"), None);
 
-        // 没发出去:说明留在新会话的便签里。H 只管交接:挑同一家的别的账号也是新开一个(原地换账号是 X)
+        // Not sent: the explanation stays in the new session's note. H only hands off: picking another account of the same tool
+        // also opens a new one (switching accounts in place is X)
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('H'));
         press(&mut app, KeyCode::Enter);
@@ -11637,7 +11894,7 @@ mod tests {
         vec![q("ding", 98.0, 61.0), q("cw", 12.0, 40.0)]
     }
 
-    /// cw2 没登录,别的都登录着
+    /// cw2 isn't logged in, all the others are
     fn rehome_ask(_: Agent, name: &str) -> crate::accounts::Login {
         if name == "cw2" { crate::accounts::Login::Out } else { crate::accounts::Login::In("max".into()) }
     }
@@ -11652,7 +11909,7 @@ mod tests {
         ])
     }
 
-    /// 都在 ding 上
+    /// All on ding
     fn on_ding() -> Vec<Session> {
         sessions()
             .into_iter()
@@ -11669,7 +11926,8 @@ mod tests {
         app.set_sessions(on_ding());
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('X'));
-        // 顶上是现在的账号和额度;下面只有同一家的别的账号(没有它自己、没有 Codex、没有 shell),登录着没有、额度
+        // At the top, the current account and quota; below, only the other accounts of the same tool (not itself, no Codex, no
+        // shell), whether logged in, quota
         let rows = reader_rows(&mut app, 80, 24);
         shows(
             &rows,
@@ -11682,11 +11940,11 @@ mod tests {
             ],
         );
         assert!(!rows.iter().any(|r| r.contains(" cx ") || r.contains("将中断")), "{rows:#?}");
-        // 没登录的不让换
+        // Can't switch to one that isn't logged in
         press(&mut app, KeyCode::Char('2'));
         assert!(app.job.is_none() && !app.overlays.is_empty());
         assert_eq!(app.msg.as_ref().unwrap().0, "cw2 未登录 · a 登录");
-        // ⏎ 换到高亮的那个,框收起
+        // ⏎ switches to the highlighted one, the box closes
         press(&mut app, KeyCode::Up);
         press(&mut app, KeyCode::Enter);
         assert!(app.overlays.is_empty());
@@ -11699,7 +11957,7 @@ mod tests {
             ("闲", "已切换到 cw · 发送「继续」即可接着做")
         );
 
-        // 在跑的:框里说会打断它
+        // Running: the box says it will be interrupted
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('X'));
         shows(&reader_rows(&mut app, 80, 24), &["⚠ 切换将中断当前任务"]);
@@ -11709,7 +11967,7 @@ mod tests {
 
     #[test]
     fn x_says_why_it_cannot_switch() {
-        // 没有别的账号:说怎么加
+        // No other accounts: say how to add one
         let mut app =
             fixture().with_tools(|| Ok(vec![tool("ding", "claude", "ding", Agent::Claude)])).with_rehome(rehome_quotas, rehome_ask, false);
         app.set_sessions(on_ding());
@@ -11719,10 +11977,10 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.job.is_none());
         press(&mut app, KeyCode::Esc);
-        // shell 会话、普通 tmux 会话:不开
+        // Shell sessions, plain tmux sessions: doesn't open
         let mut v = on_ding();
-        v[3].agent = Agent::None; // 闲
-        v[0].deck_id.clear(); // 问
+        v[3].agent = Agent::None; // 「闲」
+        v[0].deck_id.clear(); // 「问」
         let mut app = App::new(String::new(), v).with_tools(rehome_tools);
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('X'));
@@ -11743,11 +12001,11 @@ mod tests {
         let mut app = fixture();
         app.set_sessions(v);
         let by = |t: &str| app.all.iter().find(|s| s.title == t).unwrap().clone();
-        // 闲着被 aca 停的:☾、灰的,写明是自动停的、停了多久;人停的照旧 ■「停着」
+        // Stopped by aca for being idle: ☾, gray, saying it was auto-stopped and how long ago; stopped by a person: ■ "stopped" as before
         assert_eq!(session_icon(&by("闲")), ("☾", Style::new().fg(theme::pal().muted)));
         assert_eq!(state_word(&by("闲")), "自动停止 · 2 小时前");
         assert_eq!((session_icon(&by("错")).0, state_word(&by("错")).as_str()), ("■", "已停止 · 2 小时前"));
-        // 又起来了(记号还没清的那一下):照状态画
+        // Back up again (the moment before the mark is cleared): drawn by its state
         let mut up = by("闲");
         up.state = State::Idle;
         assert_eq!(session_icon(&up).0, "○");
@@ -11765,24 +12023,28 @@ mod tests {
             format!("{:02}:{:02}", d.h, d.mi)
         };
         let (soon, later) = (now + 1200, now + 3 * 86400);
-        let loop_ = Due { cron: String::new(), recurring: false, prompt: "接着看\n部署".into(), next: Some(soon) };
-        let daily = Due { cron: "57 8 * * *".into(), recurring: true, prompt: "看一眼".into(), next: Some(later) };
+        let loop_ = Due { cron: String::new(), recurring: false, prompt: "接着看\n部署".into(), next: Some(soon), inbox: false };
+        let daily = Due { cron: "57 8 * * *".into(), recurring: true, prompt: "看一眼".into(), next: Some(later), inbox: false };
         let mut v = sessions();
         v.iter_mut().find(|s| s.title == "闲").unwrap().due = vec![loop_.clone(), daily.clone()];
         let mut app = fixture();
         app.set_sessions(v);
         let by = |t: &str| app.all.iter().find(|s| s.title == t).unwrap().clone();
-        // 标题后面:最先到点的那个几点(今天的只写时分,别的日子带上几月几号),几样的写 +N;没定的什么也没有
+        // After the title: the time of the earliest due one (today's: hour and minute only; other days add month and day), +N
+        // when there are several; nothing when none is scheduled
         assert_eq!(due_badge(&by("闲"), now), format!(" ◷ {} +1", hm(soon)));
         assert_eq!(due_badge(&by("跑"), now), "");
         let day = aca_core::schedule::local(later);
         assert_eq!(local_when(later, now), format!("{}/{} {}", day.m, day.d, hm(later)));
-        // 一样一行:哪种、cron、几点、那句话(换行并成一行);认不出几点的照说
+        // One row each: kind, cron, time, the prompt (newlines joined into one line); one whose time can't be read says so
         assert_eq!(due_line(&loop_, now), format!("◷ /loop 下一次 {} · 接着看 部署", hm(soon)));
         assert_eq!(due_line(&daily, now), format!("◷ 循环定时 57 8 * * * · 下次 {} · 看一眼", local_when(later, now)));
-        let odd = Due { cron: "@daily".into(), recurring: false, prompt: String::new(), next: None };
+        let odd = Due { cron: "@daily".into(), recurring: false, prompt: String::new(), next: None, inbox: false };
         assert_eq!(due_line(&odd, now), "◷ 一次性定时 @daily · 无法识别时间");
-        // 它派的子代理那一行不跟着标
+        // A scheduled message in the inbox (aca msg --in): Codex and pi have them too
+        let msg = Due { cron: String::new(), recurring: false, prompt: "回来看看 CI".into(), next: Some(soon), inbox: true };
+        assert_eq!(due_line(&msg, now), format!("◷ 定时消息 {} · 回来看看 CI", hm(soon)));
+        // The row of a subagent it spawned isn't marked along with it
         let mut parent = by("闲");
         parent.subagents = vec![];
         let a = Subagent {
@@ -11823,9 +12085,10 @@ mod tests {
         app.set_sessions(fail("You've hit your session limit · resets 2:40pm", "account"));
         select(&mut app, "闲");
         let rows = reader_rows(&mut app, 100, 30);
-        // 列表那一行下面:原话(放不下截短)、X 能干什么;预览:状态、原话、按钮
+        // Under the list row: the original message (truncated if it doesn't fit), what X does; preview: state, original
+        // message, button
         shows(&rows, &["You've hit your session li…  X 换账号", "出错 · 额度 / 登录", "✕ You've hit your session limit", "X 换账号"]);
-        // 别的出错(不是账号的):只在预览里写原话,不提 X
+        // Other errors (not account ones): the original message only in the preview, X not mentioned
         app.set_sessions(fail("prompt is too long", "fatal"));
         let rows = reader_rows(&mut app, 100, 30);
         shows(&rows, &["✕ prompt is too long"]);
@@ -11835,24 +12098,24 @@ mod tests {
     #[test]
     fn shift_h_only_hands_off_claude_or_codex_with_a_conversation() {
         let mut v = sessions();
-        v[3].agent = Agent::None; // 闲:shell 会话
+        v[3].agent = Agent::None; // 「闲」: a shell session
         let mut app = App::new(String::new(), v).with_tools(handoff_tools);
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('H'));
         assert!(app.tool_menu.is_none());
         assert_eq!(app.msg.as_ref().unwrap().0, "只能交接 Claude / Codex 会话");
-        // 找不到对话记录(默认的 loader 就是这样)
+        // Transcript not found (the default loader is like this)
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('H'));
         assert!(app.tool_menu.is_none());
         assert_eq!(app.msg.as_ref().unwrap().0, "找不到对话记录");
-        // 菜单里只有 shell
+        // Only shell in the menu
         let mut app = fixture().with_handoff(fake_source).with_tools(|| Ok(vec![tool("shell", "shell", "", Agent::None)]));
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('H'));
         assert!(app.tool_menu.is_none() && app.handoff.is_none());
         assert!(app.msg.as_ref().unwrap().0.starts_with("工具菜单中没有可接手的工具"), "{:?}", app.msg);
-        // 在忙:等做完
+        // Busy: wait until it's done
         let mut app = fixture().with_handoff(fake_source).with_tools(handoff_tools);
         app.busy = Some("正在重启「闲」…".into());
         select(&mut app, "跑");
@@ -11877,16 +12140,16 @@ mod tests {
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('M'));
         shows(&reader_rows(&mut app, 80, 20), &["MCP · 闲", "[ ] alpha", "[x] beta", "·  shared", "全局", "空格 切换", "⏎ 应用"]);
-        // 没改就回车:不做
+        // Enter with nothing changed: does nothing
         press(&mut app, KeyCode::Enter);
         assert!(app.job.is_none() && app.overlays.is_empty());
         assert_eq!(app.msg.as_ref().unwrap().0, "MCP 未修改");
         press(&mut app, KeyCode::Char('M'));
-        press(&mut app, KeyCode::Char(' ')); // alpha 挂上
+        press(&mut app, KeyCode::Char(' ')); // attach alpha
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char(' ')); // beta 卸下
+        press(&mut app, KeyCode::Char(' ')); // detach beta
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char(' ')); // 全局的改不了
+        press(&mut app, KeyCode::Char(' ')); // global ones can't be changed
         assert_eq!(app.msg.as_ref().unwrap().0, "此项只读");
         shows(&reader_rows(&mut app, 80, 20), &["[x] alpha", "[ ] beta"]);
         press(&mut app, KeyCode::Enter);
@@ -11895,7 +12158,7 @@ mod tests {
         assert_eq!(app.busy.as_deref(), Some("正在修改「闲」的 MCP…"));
         app.job_done(&job, Outcome::Done("已挂载 alpha · 已卸载 beta · 重启后生效".into()), sessions());
         assert!(app.busy.is_none());
-        // Esc 什么都不改
+        // Esc changes nothing
         press(&mut app, KeyCode::Char('M'));
         press(&mut app, KeyCode::Char(' '));
         press(&mut app, KeyCode::Esc);
@@ -11912,7 +12175,7 @@ mod tests {
         let rows = reader_rows(&mut app, 80, 20);
         shows(&rows, &["MCP · 闲", "·  lint", "全局", "Esc 关闭"]);
         assert!(!rows.iter().any(|r| r.contains("应用")), "{rows:#?}");
-        // 手机上从底下升起,也放得下
+        // On a phone it rises from the bottom and still fits
         shows(&reader_rows(&mut app, 44, 30), &["MCP · 闲", "·  lint"]);
     }
 
@@ -11923,7 +12186,7 @@ mod tests {
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('R'));
         let job = app.take_job().unwrap();
-        // 改名后 tmux 会话名换了,登记的 id 不变
+        // After a rename the tmux session name changes, the registered id doesn't
         let fresh: Vec<Session> = sessions()
             .into_iter()
             .map(|mut s| {
@@ -11939,7 +12202,7 @@ mod tests {
         assert_eq!(app.msg.as_ref().unwrap().0, "已重启「闲」");
     }
 
-    /// parent 会话里另开的窗口(split = 分出来的窗格)
+    /// Another window opened in the parent session (split = a split-off pane)
     fn sub_of(parent: &Session, win: u32, split: bool, title: &str, state: State, idle_for: u64) -> Session {
         Session {
             name: format!("{}\u{1}%{win}", parent.name),
@@ -11964,7 +12227,7 @@ mod tests {
         app.on_key(KeyEvent::new(code, KeyModifiers::SHIFT));
     }
 
-    /// 写完之后读回来的:组内按给的先后
+    /// What's read back after the write: in-group order as given
     fn reordered(names: &[&str]) -> Vec<Session> {
         sessions()
             .into_iter()
@@ -11987,24 +12250,24 @@ mod tests {
         assert_eq!(order(&app), ["问", "未读", "闲", "跑", "错"]);
         let job = app.take_job().unwrap();
         assert_eq!(job, Job::Order { t: target("闲"), by: "id-跑".into(), after: false });
-        // 组里第一个了:不跨到上一组
+        // Already first in the group: doesn't cross into the group above
         shift(&mut app, KeyCode::Up);
         assert!(app.msg.is_none());
-        // 正在写的时候接着挪:列表照挪,连着的两下只记最后一下
+        // Moving again while a write is in progress: the list still moves; of two moves in a row only the last is kept
         shift(&mut app, KeyCode::Down);
         shift(&mut app, KeyCode::Down);
         assert_eq!(order(&app), ["问", "未读", "跑", "错", "闲"]);
         assert!(app.take_job().is_none());
         shift(&mut app, KeyCode::Down);
         assert!(app.msg.is_none());
-        // 第一下写完,读回来的只有第一下:后面那下照样挪着,接着写
+        // First write done, the read-back has only the first move: the later move stays applied and is written next
         app.msg = None;
         app.job_done(&job, Outcome::Done(String::new()), reordered(&["闲", "跑", "错"]));
         assert_eq!(order(&app), ["问", "未读", "跑", "错", "闲"]);
         assert!(app.msg.is_none());
         let job = app.take_job().unwrap();
         assert_eq!(job, Job::Order { t: target("闲"), by: "id-错".into(), after: true });
-        // 写完之前的定时刷新读到的还是旧的,不跳回去
+        // A periodic refresh from before the write finished still reads the old order: doesn't jump back
         app.set_sessions(reordered(&["闲", "跑", "错"]));
         assert_eq!(order(&app), ["问", "未读", "跑", "错", "闲"]);
         app.job_done(&job, Outcome::Done(String::new()), reordered(&["跑", "错", "闲"]));
@@ -12018,7 +12281,7 @@ mod tests {
         press(&mut app, KeyCode::Char('a'));
         select(&mut app, "闲");
         shift(&mut app, KeyCode::Up);
-        shift(&mut app, KeyCode::Up); // 两下一起到,run 循环这时才开始写第一下
+        shift(&mut app, KeyCode::Up); // both moves arrive together; only now does the run loop start writing the first
         assert!(matches!(app.take_job(), Some(Job::Order { .. })));
         assert!(app.msg.is_none());
     }
@@ -12038,7 +12301,7 @@ mod tests {
         assert!(app.take_job().is_none());
     }
 
-    /// 写完之后读回来的:分组按给的先后
+    /// What's read back after the write: groups in the order given
     fn regrouped(v: Vec<Session>, groups: &[&str]) -> Vec<Session> {
         v.into_iter()
             .map(|mut s| {
@@ -12055,18 +12318,18 @@ mod tests {
         jump_to_group(&mut app, "work");
         shift(&mut app, KeyCode::Up);
         assert_eq!(order(&app), ["跑", "闲", "错", "问", "未读"]);
-        assert_eq!(app.head.as_deref(), Some("work")); // 高亮跟着分组走
+        assert_eq!(app.head.as_deref(), Some("work")); // the highlight follows the group
         let job = app.take_job().unwrap();
         assert_eq!(job, Job::GroupOrder { group: "work".into(), by: "fun".into(), after: false });
         shift(&mut app, KeyCode::Up);
         assert!(app.msg.is_none());
-        // 写完之前的定时刷新读到的还是旧的,不跳回去
+        // A periodic refresh from before the write finished still reads the old order: doesn't jump back
         app.set_sessions(sessions());
         assert_eq!(order(&app), ["跑", "闲", "错", "问", "未读"]);
         app.job_done(&job, Outcome::Done(String::new()), regrouped(sessions(), &["work", "fun"]));
         assert_eq!(order(&app), ["跑", "闲", "错", "问", "未读"]);
         assert!(app.take_job().is_none());
-        // 挪回去:折着的分组(折叠行)也能挪
+        // Move it back: a folded group (fold row) can move too
         jump_to_group(&mut app, "fun");
         press(&mut app, KeyCode::Enter);
         assert!(app.on_fold_row());
@@ -12080,7 +12343,7 @@ mod tests {
         let mut v = sessions();
         v.push(mk("甲", "work/a", State::Idle, 10));
         v.push(mk("乙", "work/b", State::Idle, 10));
-        let mut other = mk("壳", "-", State::Idle, 10); // 普通 tmux 会话:沉底,不跟着挪
+        let mut other = mk("壳", "-", State::Idle, 10); // plain tmux session: sinks to the bottom, doesn't move along
         other.deck_id.clear();
         v.push(other);
         let v = regrouped(v, &["fun", "work", "work/a", "work/b"]);
@@ -12088,7 +12351,7 @@ mod tests {
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "错", "甲", "乙", "壳"]);
         jump_to_group(&mut app, "fun");
-        shift(&mut app, KeyCode::Down); // 越过 work 一整家
+        shift(&mut app, KeyCode::Down); // jumps over the whole of work
         assert_eq!(order(&app), ["跑", "闲", "错", "甲", "乙", "问", "未读", "壳"]);
         assert_eq!(app.take_job().unwrap(), Job::GroupOrder { group: "fun".into(), by: "work".into(), after: true });
         shift(&mut app, KeyCode::Down);
@@ -12096,7 +12359,7 @@ mod tests {
         jump_to_group(&mut app, "work/b");
         shift(&mut app, KeyCode::Up);
         assert_eq!(order(&app), ["跑", "闲", "错", "乙", "甲", "问", "未读", "壳"]);
-        shift(&mut app, KeyCode::Up); // 出不了 work
+        shift(&mut app, KeyCode::Up); // can't leave work
         assert!(app.msg.is_none());
         jump_to_group(&mut app, "-");
         shift(&mut app, KeyCode::Up);
@@ -12119,7 +12382,7 @@ mod tests {
     #[test]
     fn a_session_takes_its_windows_and_sub_sessions_along_and_sub_sessions_stay_under_the_parent() {
         let mut v = sessions();
-        let idle = v[3].clone(); // 闲
+        let idle = v[3].clone(); // 「闲」
         v.push(sub_of(&idle, 2, false, "zsh", State::Idle, 20));
         for (i, t) in ["子一", "子二"].into_iter().enumerate() {
             let mut k = Session { up: Up::Under("闲".into(), "闲".into()), ..mk(t, "work", State::Idle, 10) };
@@ -12133,9 +12396,9 @@ mod tests {
         shift(&mut app, KeyCode::Up);
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "zsh", "子二", "子一", "错"]);
         assert_eq!(app.take_job().unwrap(), Job::Order { t: target("子二"), by: "id-子一".into(), after: false });
-        shift(&mut app, KeyCode::Up); // 出不了父会话
+        shift(&mut app, KeyCode::Up); // can't leave the parent session
         assert!(app.msg.is_none());
-        select(&mut app, "跑"); // 越过「闲」一整家
+        select(&mut app, "跑"); // jumps over 「闲」's whole family
         shift(&mut app, KeyCode::Down);
         assert_eq!(order(&app), ["问", "未读", "闲", "zsh", "子二", "子一", "跑", "错"]);
         select(&mut app, "zsh");
@@ -12146,13 +12409,13 @@ mod tests {
     #[test]
     fn pinned_and_plain_tmux_sessions_stay_put() {
         let mut v = sessions();
-        v[4].deck_id.clear(); // 错:普通 tmux 会话
+        v[4].deck_id.clear(); // 「错」: a plain tmux session
         let mut app = App::new(String::new(), v);
         press(&mut app, KeyCode::Char('a'));
         select(&mut app, "错");
         shift(&mut app, KeyCode::Up);
         assert_eq!(app.msg.as_ref().unwrap().0, "普通 tmux 会话 · A 接管后才能移动");
-        select(&mut app, "闲"); // 下面只剩普通 tmux 会话
+        select(&mut app, "闲"); // only plain tmux sessions below
         app.msg = None;
         shift(&mut app, KeyCode::Down);
         assert!(app.msg.is_none());
@@ -12168,9 +12431,9 @@ mod tests {
         let err = v.iter().find(|s| s.title == "错").unwrap().clone();
         v.push(sub_of(&idle, 2, false, "zsh", State::Idle, 20));
         v.push(sub_of(&idle, 1, true, "htop", State::Idle, 30));
-        // 「错」一天多没动了,但它另开的窗口里在跑
+        // 「错」 hasn't moved for over a day, but a window it opened is running
         let mut build = sub_of(&err, 3, false, "构建", State::Running, 5);
-        (build.agent, build.who) = (Agent::Codex, "cx".into()); // 窗口里手动起的 codex
+        (build.agent, build.who) = (Agent::Codex, "cx".into()); // codex started by hand in the window
         v.push(build);
         App::new(String::new(), v)
     }
@@ -12178,22 +12441,22 @@ mod tests {
     #[test]
     fn shift_t_opens_a_new_window_in_its_session_in_its_real_work_dir() {
         let mut app = with_windows();
-        // 窗口那行:开在它所在的会话里,新窗口跑 shell(不是分屏)
+        // On the window row: opens in the session it belongs to, a new window running a shell (not a split)
         reader_rows(&mut app, 120, 30);
         select(&mut app, "zsh");
         press(&mut app, KeyCode::Char('T'));
         let sp = app.split.take().unwrap();
         assert_eq!((sp.name.as_str(), sp.yazi), ("闲", false));
-        assert_eq!(sp.w.dir, "/p/work"); // 去找真正干活的目录从这里起步
-        // 手机上也一样
+        assert_eq!(sp.w.dir, "/p/work"); // the search for the directory it's really working in starts here
+        // Same on a phone
         reader_rows(&mut app, 46, 30);
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('T'));
         let sp = app.split.take().unwrap();
         assert_eq!((sp.name.as_str(), sp.yazi), ("闲", false));
-        // 停掉的没法分
+        // A stopped one can't be split off
         let mut v = sessions();
-        v[3].state = State::Stopped; // 闲
+        v[3].state = State::Stopped; // 「闲」
         let mut app = App::new(String::new(), v);
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('T'));
@@ -12207,9 +12470,9 @@ mod tests {
         press(&mut app, KeyCode::Char('t'));
         let r = app.term_req.take().unwrap();
         assert_eq!((r.key.as_str(), r.family.as_str(), r.w.dir.as_str()), (app.current().unwrap().name.as_str(), "闲", "/p/work"));
-        // 开着时按键都给终端:q 不退出、^C 不退出、j 不移动,Esc 收起
+        // While open, keys go to the terminal: q doesn't quit, ^C doesn't quit, j doesn't move; Esc hides it
         app.term_on = Some(r.key.clone());
-        assert!(app.typing()); // 粘贴 / 连敲不会被当成自动输入丢掉
+        assert!(app.typing()); // paste / fast typing isn't dropped as automated input
         let at = app.current().unwrap().name.clone();
         press(&mut app, KeyCode::Char('q'));
         ctrl(&mut app, 'c');
@@ -12220,7 +12483,7 @@ mod tests {
         press(&mut app, KeyCode::Char('q'));
         press(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
-        // 折叠行是分组:开在组的路径(见 t_on_a_group_opens_a_terminal_in_the_groups_dir)
+        // A fold row is a group: opens at the group's path (see t_on_a_group_opens_a_terminal_in_the_groups_dir)
         let mut app = fixture();
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('o'));
@@ -12240,17 +12503,17 @@ mod tests {
         app.term_on = Some("account:ding".into());
         app.catch_links();
         assert_eq!(app.overlays.len(), 1);
-        // 同一个链接不再弹
+        // The same link doesn't pop up again
         app.catch_links();
         assert_eq!(app.overlays.len(), 1);
-        // 键先给弹窗:Esc 关的是它,终端还开着
+        // Keys go to the popup first: Esc closes it, the terminal stays open
         press(&mut app, KeyCode::Esc);
         assert!(app.overlays.is_empty() && app.term_on.as_deref() == Some("account:ding"));
         assert!(app.msg.as_ref().is_some_and(|(m, _)| m.contains("链接仍在登录终端中")), "{:?}", app.msg);
-        // 再 Esc:收起终端
+        // Esc again: hides the terminal
         press(&mut app, KeyCode::Esc);
         assert!(app.term_on.is_none());
-        // 终端关了,链接文件一起删
+        // Terminal closed: the link file is deleted with it
         app.terms.clear();
         assert!(!file.exists());
     }
@@ -12261,18 +12524,18 @@ mod tests {
         select(&mut app, "zsh");
         press(&mut app, KeyCode::Char('y'));
         let Some(External::Yazi(sp)) = app.external.take() else { panic!("{:?}", app.msg) };
-        assert_eq!(sp.w.dir, "/p/work"); // 真正干活的目录让出终端时再从这里找
-        // 弹窗里改成分一格跑它:分的是那一格
+        assert_eq!(sp.w.dir, "/p/work"); // the directory it's really working in is looked up from here when handing over the terminal
+        // Switched in the popup to run it in a split: it's that pane that gets split
         assert_eq!((sp.name.as_str(), sp.target.as_str(), sp.yazi), ("闲", "%2", true));
-        // 停着的也能开(目录用它记下的),只是没有能分的格
+        // A stopped one can open too (directory from what it recorded), just with no pane to split
         let mut v = sessions();
-        v[3].state = State::Stopped; // 闲
+        v[3].state = State::Stopped; // 「闲」
         let mut app = App::new(String::new(), v);
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('y'));
         let Some(External::Yazi(sp)) = app.external.take() else { panic!("{:?}", app.msg) };
         assert_eq!(sp.target, "");
-        // 折叠行不知道开哪个
+        // A fold row doesn't know which one to open
         press(&mut app, KeyCode::Char('o'));
         assert!(app.on_fold_row());
         press(&mut app, KeyCode::Char('y'));
@@ -12282,11 +12545,11 @@ mod tests {
     #[test]
     fn the_popup_opens_on_where_that_client_is() {
         let mut app = with_windows();
-        app.highlight_here("$闲", "%2"); // 停在「闲」的 #2 → 高亮那一行
+        app.highlight_here("$闲", "%2"); // on 「闲」's #2 → highlight that row
         assert_eq!(app.current().unwrap().title, "zsh");
-        app.highlight_here("$跑", "%9"); // 那一格没有自己的行 → 会话那行
+        app.highlight_here("$跑", "%9"); // that pane has no row of its own → the session's row
         assert_eq!(app.current().unwrap().title, "跑");
-        app.highlight_here("$别处", ""); // 列表里没有 → 不动
+        app.highlight_here("$别处", ""); // not in the list → no change
         assert_eq!(app.current().unwrap().title, "跑");
     }
 
@@ -12294,7 +12557,7 @@ mod tests {
         crate::follow::Place { row: row.into(), session: session.into(), pane: pane.into() }
     }
 
-    /// 弹窗开在「闲」的一个没有自己那行的格(%9)上,跟随着
+    /// The popup opens on a pane of 「闲」 that has no row of its own (%9), following
     fn following() -> App {
         let mut app = with_windows();
         reader_rows(&mut app, 56, 30);
@@ -12307,34 +12570,34 @@ mod tests {
     fn following_takes_the_client_to_the_row_the_highlight_rests_on() {
         let mut app = following();
         assert_eq!((app.follow_step(), app.current().unwrap().title.as_str()), (None, "闲"), "刚打开:不动");
-        // 滑动途中不切,停稳了切;切过了不再切
+        // No switch while scrolling, switch once settled; once switched, no switching again
         select(&mut app, "跑");
         app.moved = Some((Instant::now(), Duration::ZERO));
         assert_eq!(app.follow_step(), None);
         app.moved = None;
         assert_eq!(app.follow_step(), Some(place("跑", "$跑", "")));
         assert_eq!(app.follow_step(), None);
-        // 会话里另开的窗口那一行:落在那一格
+        // The row of another window in the session: lands on that pane
         select(&mut app, "zsh");
         assert_eq!(app.follow_step(), Some(place("闲\u{1}%2", "$闲", "%2")));
-        // 挪回打开时那一行:落回原来那一格
+        // Back to the row it opened on: lands back on the original pane
         select(&mut app, "闲");
         assert_eq!(app.follow_step(), Some(place("闲", "$闲", "%9")));
-        // 正在打过滤词:不切,回车定下来才切
+        // Typing a filter: no switch; switch only once Enter settles it
         press(&mut app, KeyCode::Char('/'));
         press(&mut app, KeyCode::Char('跑'));
         assert_eq!((app.follow_step(), app.current().unwrap().title.as_str()), (None, "跑"));
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.follow_step(), Some(place("跑", "$跑", "")));
-        press(&mut app, KeyCode::Esc); // 清掉过滤词,不是退出
+        press(&mut app, KeyCode::Esc); // clears the filter, doesn't exit
         assert!(!app.quit);
-        // 停在分组上:旁边不动
+        // On a group: the side stays as it is
         press(&mut app, KeyCode::Char('g'));
         assert!(app.on_group_row());
         assert_eq!(app.follow_step(), None);
-        // 没在跑的会话:切不过去
+        // A session that isn't running: can't switch to it
         let mut v = sessions();
-        v[2].state = State::Stopped; // 跑
+        v[2].state = State::Stopped; // 「跑」
         let mut app = App::new(String::new(), v);
         select(&mut app, "闲");
         app.follow_from("$闲", "");
@@ -12344,7 +12607,7 @@ mod tests {
 
     #[test]
     fn esc_while_following_goes_back_and_the_popup_key_stays() {
-        // Esc:回到打开时停着的地方再退,留下的那个不算看过
+        // Esc: go back to where it was when opened, then exit; the one left behind doesn't count as seen
         let mut app = following();
         select(&mut app, "跑");
         app.follow_step();
@@ -12352,7 +12615,7 @@ mod tests {
         assert_eq!((app.quit, app.follow_step()), (true, Some(place("闲", "$闲", "%9"))));
         app.follow_done();
         assert_eq!(app.reads.read_at("id-跑"), None);
-        // ^\(终端里到手是 ^4):关掉,人留在旁边露出来的那个,它算看过
+        // ^\ (arrives as ^4 in the terminal): close, staying on the one shown beside; it counts as seen
         for key in ['4', '\\'] {
             let mut app = following();
             select(&mut app, "跑");
@@ -12362,17 +12625,17 @@ mod tests {
             app.follow_done();
             assert!(app.reads.read_at("id-跑").is_some());
         }
-        // 快捷键弹窗里按它只是查它
+        // Pressed in the keys popup it's only looked up
         let mut app = following();
         press(&mut app, KeyCode::Char('?'));
         ctrl(&mut app, '4');
         assert!(!app.quit);
-        // 没挪过就关:原来那个不用记
+        // Closed without moving: no need to record the original one
         let mut app = following();
         ctrl(&mut app, '4');
         app.follow_done();
         assert_eq!((app.quit, app.reads.read_at("id-闲")), (true, None));
-        // 不跟随、也不在弹窗里:^\ 不是退出
+        // Not following, not in the popup: ^\ doesn't exit
         let mut app = with_windows();
         ctrl(&mut app, '4');
         assert_eq!(app.quit, crate::data::in_popup());
@@ -12381,18 +12644,18 @@ mod tests {
     #[test]
     fn passing_by_an_unread_session_while_following_leaves_it_unread() {
         let mut v = sessions();
-        v[2].state = State::Unread; // 跑:跑完没看
+        v[2].state = State::Unread; // 「跑」: finished, not looked at yet
         let mut app = App::new(String::new(), v);
         select(&mut app, "闲");
         app.follow_from("$闲", "");
         select(&mut app, "跑");
         assert_eq!(app.follow_step(), Some(place("跑", "$跑", "")));
         assert!(app.reads.unread("id-跑"));
-        // 路过别的:不是「跑完没看」的不记
+        // Passing over others: ones that aren't "finished, not looked at yet" aren't recorded
         select(&mut app, "问");
         app.follow_step();
         assert_eq!(app.reads.mark("id-问"), None);
-        // 回到未读的那个、关在它上面:看过了
+        // Back to the unread one, closing on it: it's seen
         select(&mut app, "跑");
         app.follow_step();
         ctrl(&mut app, '4');
@@ -12403,14 +12666,15 @@ mod tests {
     #[test]
     fn following_draws_no_preview_and_shift_l_leaves_the_saved_layouts_alone() {
         let mut app = with_windows();
-        // 不跟随:窄屏上下分屏,预览占下半屏。跟随着:只剩底下那一行写着它在干什么
+        // Not following: on a narrow screen it splits top/bottom, the preview takes the bottom half. Following: only the bottom
+        // row is left, saying what it's doing
         let strip = |rows: &[String]| rows.iter().position(|r| r.starts_with('─')).unwrap();
         assert!(strip(&reader_rows(&mut app, 56, 30)) < 20);
         app.highlight_here("$闲", "%9");
         app.follow_from("$闲", "%9");
         let rows = reader_rows(&mut app, 56, 30);
         assert_eq!((app.mode(), strip(&rows)), (Preview::Off, 28), "{rows:#?}");
-        // 底栏说的是跟随时这两个键做什么
+        // The bottom bar says what these two keys do while following
         assert!(rows[29].contains("Esc 返回") && rows[29].contains("⏎ 留下"), "{}", rows[29]);
         let saved = app.view_state();
         press(&mut app, KeyCode::Char('L'));
@@ -12421,54 +12685,55 @@ mod tests {
     #[test]
     fn windows_and_split_panes_hang_under_their_session() {
         let mut app = with_windows();
-        // 紧跟在自己的会话下面,窗口号、格号排;会话一天没动但窗口在跑,整家都在
+        // Right below its own session, ordered by window number, pane number; the session idle for a day but a window running:
+        // the whole family stays
         assert_eq!(order(&app), ["问", "跑", "闲", "htop", "zsh", "错", "构建"]);
         let rows = reader_rows(&mut app, 120, 30);
-        // 同一个会话的几个窗口用 ├ 串起来,最后一个 └
+        // A session's windows are joined with ├, the last one with └
         shows(&rows, &["├ ○ #1.1 htop", "└ ○ #2 zsh", "└ ● #3 构建"]);
-        // 窗口号长短不一,时间那一栏照样对齐
+        // Window numbers of different lengths, the time column still lines up
         let col = |t: &str| {
             let r = row_of(&rows, t);
             r[..r.find(t).unwrap()].width()
         };
         assert_eq!((col(" 10s"), col(" 30s")), (col(" 20s"), col(" 20s")), "{rows:#?}");
-        // 账号跟在标题后面,按哪家上色
+        // The account follows the title, colored by tool
         let t = rows.iter().find(|r| r.contains("#3 构建")).unwrap();
         assert!(t.contains(" cx "), "{t}");
-        // 分区标题的个数只数会话
+        // The count in the section header counts sessions only
         assert!(rows.iter().any(|r| r.contains("work  3")), "{rows:#?}");
-        // w:会话闲着、窗口在跑也算
+        // w: an idle session with a running window counts too
         press(&mut app, KeyCode::Char('w'));
         assert!(order(&app).contains(&"构建".to_string()) && order(&app).contains(&"错".to_string()));
         press(&mut app, KeyCode::Char('w'));
-        // 回车:进它所在的会话,先切到那一格
+        // Enter: go into its session, switching to that pane first
         select(&mut app, "zsh");
         press(&mut app, KeyCode::Enter);
         assert_eq!((app.attach.take().as_deref(), app.focus.take().as_deref()), (Some("闲"), Some("%2")));
-        // 对登记会话的操作不对窗口(D 只停这一格,见下面)
+        // Operations on registered sessions don't apply to windows (D stops only this pane, see below)
         for k in ['R', 'r', 'm'] {
             press(&mut app, KeyCode::Char(k));
             assert!(app.confirm.is_none() && app.job.is_none() && app.prompt.is_none(), "{k}");
             assert!(app.msg.as_ref().unwrap().0.contains("#2 是窗口"), "{k}: {:?}", app.msg);
         }
-        // d:只关这一格
+        // d: closes only this pane
         press(&mut app, KeyCode::Char('d'));
         shows(&reader_rows(&mut app, 100, 30), &["关闭窗口？", "y 关闭"]);
         press(&mut app, KeyCode::Char('y'));
         let job = app.take_job();
         assert!(matches!(&job, Some(Job::Remove { t, pane: Some(p) }) if t.title == "zsh" && p == "%2"), "{job:?}");
         assert_eq!(app.doing().as_deref(), Some("正在关闭「zsh」…"));
-        // 只藏这一格,会话和别的窗口都在
+        // Only this pane is hidden; the session and the other windows stay
         let at = |app: &App, t: &str| app.all.iter().any(|s| s.title == t);
         assert!(!at(&app, "zsh") && at(&app, "闲") && at(&app, "htop"));
-        let fresh = with_windows().all; // 关之前读的,还有它
+        let fresh = with_windows().all; // read before closing: still has it
         app.job_done(&job.unwrap(), Outcome::Done("已关闭「zsh」".into()), fresh);
         assert!(app.doing().is_none() && !at(&app, "zsh"));
         select(&mut app, "htop");
         press(&mut app, KeyCode::Char('d'));
         shows(&reader_rows(&mut app, 100, 30), &["关闭窗格？"]);
         press(&mut app, KeyCode::Esc);
-        // p:置顶它所在的会话,窗口跟着一起上去
+        // p: pins the session it's in, the windows go up with it
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(order(&app)[..2], ["闲", "htop"]);
     }
@@ -12476,19 +12741,19 @@ mod tests {
     #[test]
     fn back_from_a_session_the_highlight_is_on_the_one_you_were_last_in() {
         let mut app = with_windows();
-        // 从「跑」进去,在里面点了通知切到「闲」,Ctrl+Q 出来:停在「闲」
+        // Enter from 「跑」, click a notification inside to switch to 「闲」, Ctrl+Q out: lands on 「闲」
         select(&mut app, "跑");
         app.came_back("跑", "$闲");
         app.rebuild();
         assert_eq!(app.current().map(|s| s.title.as_str()), Some("闲"));
-        // 没切过、tmux 没说、切到的不在列表里:停在进去的那个
+        // Didn't switch, tmux didn't say, or the one switched to isn't in the list: lands on the one entered
         for left in ["$跑", "", "$99"] {
             select(&mut app, "问");
             app.came_back("跑", left);
             app.rebuild();
             assert_eq!(app.current().map(|s| s.title.as_str()), Some("跑"), "{left:?}");
         }
-        // 本来停在它的窗口上:不动
+        // Already on its window: no change
         select(&mut app, "zsh");
         app.came_back("跑", "$闲");
         app.rebuild();
@@ -12499,7 +12764,7 @@ mod tests {
     fn a_clicked_notification_goes_into_its_session_wherever_the_highlight_is() {
         let mut app = with_windows();
         select(&mut app, "htop");
-        // kitty 回的那串在输入里是 Alt+] … Alt+\,拣出来、不当按键
+        // kitty's reply arrives in the input as Alt+] … Alt+\: pick it out, don't treat it as keys
         let k = |c: char, m: KeyModifiers| Event::Key(KeyEvent::new(KeyCode::Char(c), m));
         let mut batch = vec![k(']', KeyModifiers::ALT)];
         batch.extend("99;i=aca-id-闲;".chars().map(|c| k(c, KeyModifiers::NONE)));
@@ -12510,11 +12775,11 @@ mod tests {
         assert!(batch.is_empty());
         assert_eq!(app.current().map(|s| s.title.as_str()), Some("闲"));
         assert_eq!(app.attach.take().as_deref(), Some("闲"));
-        // 停着的会话:接着原来的对话再起,同回车
+        // A stopped session: start again continuing the original conversation, same as Enter
         app.all.iter_mut().find(|s| s.title == "错" && s.sub.is_none()).unwrap().state = State::Stopped;
         app.open_clicked("id-错");
         assert_eq!((app.start.take(), app.attach.take()), (Some(target("错")), None));
-        // 会话删了:说一声,不动
+        // Session removed: say so, no change
         app.open_clicked("id-没了");
         assert_eq!((app.attach.take(), app.start.take()), (None, None));
         assert_eq!(said(&app), "通知中的会话已不存在");
@@ -12524,7 +12789,7 @@ mod tests {
     fn big_d_on_a_window_stops_just_that_pane_and_enter_brings_it_back_in_place() {
         let mut app = with_windows();
         reader_rows(&mut app, 120, 30);
-        // 窗口那行:只停它,留在原地
+        // Window row: stops only it, stays in place
         select(&mut app, "zsh");
         press(&mut app, KeyCode::Char('D'));
         shows(&reader_rows(&mut app, 100, 30), &["停止此窗格？", "停止程序，保留窗格 · ⏎ 重新启动", "y 停止"]);
@@ -12533,11 +12798,11 @@ mod tests {
         let t = |label: &str| Target { name: "闲".into(), title: label.into(), profile: "default".into(), id: String::new() };
         let job = app.take_job().unwrap();
         assert_eq!(job, Job::Park { t: t("#2「zsh」"), p: pane("%2", "#2「zsh」") });
-        // 停完:记一步(^Z 在原地再启动,见下面)
+        // Stopped: record a step (^Z starts it again in place, see below)
         let mut fresh = with_windows().all;
         fresh.iter_mut().find(|s| s.title == "zsh").unwrap().state = State::Dead;
         app.job_done(&job, Outcome::Done("已停「#2「zsh」」 · ⏎ 再启动".into()), fresh.clone());
-        // 停着的:D 说一声,⏎ 在原地再启动(run 循环起来了再 attach)
+        // Stopped: D says so, ⏎ starts it again in place (attaching once the run loop is up)
         select(&mut app, "zsh");
         press(&mut app, KeyCode::Char('D'));
         assert_eq!(said(&app), "已停止 · ⏎ 重新启动");
@@ -12547,19 +12812,20 @@ mod tests {
         assert_eq!(app.take_job(), Some(Job::Respawn { t: t("#2「zsh」"), p: pane("%2", "#2「zsh」") }));
         app.job_done(&Job::Respawn { t: t("#2「zsh」"), p: pane("%2", "#2「zsh」") }, Outcome::Done("已重启".into()), fresh);
         assert_eq!(said(&app), "已撤销停止:「#2「zsh」」已在原位置重新启动");
-        // 登记的会话那行:停的是 agent(它的窗格、别的窗口都留着),不是「这一格」
+        // Registered session row: stops the agent (its pane and the other windows stay), not "this pane"
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('D'));
         assert!(matches!(app.confirm, Some(Confirm::Stop { .. })));
         press(&mut app, KeyCode::Esc);
-        // R:在原地重启 agent,别的窗口不动
+        // R: restarts the agent in place, other windows untouched
         press(&mut app, KeyCode::Char('R'));
         assert_eq!(app.take_job(), Some(Job::Restart { t: target("闲"), force: false }));
     }
 
     #[test]
     fn an_agent_that_quit_but_left_its_pane_starts_again_on_enter() {
-        // agent 退了(D 停的、自己退的),窗格连画面留着:■。⏎ 接着原来的对话再起,不是直接进去,也不是照窗格原来的命令重跑
+        // Agent exited (stopped by D or on its own), pane kept with its screen: ■. ⏎ starts again continuing the original
+        // conversation; not going straight in, nor rerunning the pane's original command
         let mut v = with_windows().all;
         let h = v.iter_mut().find(|s| s.title == "闲").unwrap();
         (h.state, h.pane) = (State::Dead, "%0".into());
@@ -12570,11 +12836,11 @@ mod tests {
         press(&mut app, KeyCode::Char('D'));
         assert!(app.confirm.is_none());
         assert_eq!(said(&app), "已停止 · ⏎ 重新启动");
-        // 它里面另开的窗口照常进
+        // Another window inside it is entered as usual
         select(&mut app, "zsh");
         press(&mut app, KeyCode::Enter);
         assert_eq!((app.attach.take().as_deref(), app.focus.take().as_deref()), (Some("闲"), Some("%2")));
-        // 普通 tmux 会话:D 停的是它那一格,⏎ 照原来的命令在原地再起
+        // Plain tmux session: D stops its pane, ⏎ starts it again in place with the original command
         let mut s = mk("外", "-", State::Idle, 5);
         (s.deck_id, s.profile, s.pane) = (String::new(), String::new(), "%7".into());
         let mut app = App::new(String::new(), vec![s.clone()]);
@@ -12597,7 +12863,7 @@ mod tests {
     #[test]
     fn d_on_a_registered_session_takes_its_windows_along_and_a_plain_one_only_loses_its_head() {
         let at = |app: &App, t: &str| app.all.iter().any(|s| s.title == t);
-        // 登记的会话:删的是整个会话,里面另开的窗口一起关,确认框里说
+        // Registered session: removes the whole session, other windows in it close too; the confirmation says so
         let mut app = with_windows();
         reader_rows(&mut app, 120, 30);
         select(&mut app, "闲");
@@ -12608,7 +12874,7 @@ mod tests {
         assert!(matches!(&job, Job::Remove { t, pane: None } if t.title == "闲"), "{job:?}");
         assert!(!at(&app, "闲") && !at(&app, "htop") && !at(&app, "zsh"));
 
-        // 普通 tmux 会话那行、里面还有别的窗口:只关头一格,下一个顶上来
+        // Plain tmux session row with other windows inside: closes only the first pane, the next one moves up
         let plain = |v: &mut Vec<Session>, pane: &str| {
             v.iter_mut().filter(|s| s.family() == "闲").for_each(|s| s.profile.clear());
             let h = v.iter_mut().find(|s| s.title == "闲").unwrap();
@@ -12624,15 +12890,16 @@ mod tests {
         press(&mut app, KeyCode::Char('y'));
         let job = app.take_job().unwrap();
         assert!(matches!(&job, Job::Remove { t, pane: Some(p) } if t.title == "闲" && p == "%0"), "{job:?}");
-        // 关的时候谁都不藏:会话那行留着等 htop 顶上来,窗口不跟着会话一起藏(藏了就找不到了),也不会没了头
+        // Nothing is hidden while closing: the session row stays until htop moves up, windows aren't hidden along with the
+        // session (they'd be lost), and the family never loses its head
         assert!(at(&app, "闲") && at(&app, "htop") && at(&app, "zsh"));
         reader_rows(&mut app, 100, 30);
-        // 关完:htop 顶上来成了会话那行(会话名没变)
+        // Closed: htop moves up and becomes the session row (session name unchanged)
         let mut fresh: Vec<Session> = with_windows().all.into_iter().filter(|s| s.title != "htop").collect();
         plain(&mut fresh, "%1");
         app.job_done(&job, Outcome::Done("已关闭「闲」".into()), fresh);
         assert!(at(&app, "闲") && at(&app, "zsh"));
-        // 只剩一格了:d 就是关掉整个会话
+        // Only one pane left: d closes the whole session
         let mut v = sessions();
         plain(&mut v, "%1");
         let mut app = App::new(String::new(), v);
@@ -12641,7 +12908,8 @@ mod tests {
         assert!(matches!(&app.confirm, Some(Confirm::Remove(r)) if r.pane.is_none() && r.next.is_none() && r.others == 0));
     }
 
-    /// 「闲」派出去两个子会话:「子跑」在跑(里面另开了个窗口)、「子旧」三天没动;parent_idle = 「闲」多久没动
+    /// 「闲」 spawned two child sessions: 「子跑」 running (with another window opened in it), 「子旧」 idle for three days;
+    /// parent_idle = how long 「闲」 has been idle
     fn with_children(parent_idle: u64) -> App {
         let mut v = sessions();
         let idle = v.iter_mut().find(|s| s.title == "闲").unwrap();
@@ -12651,14 +12919,14 @@ mod tests {
             slot: (1, order, 0),
             ..mk(title, "work", state, idle_for)
         };
-        let run = child("子跑", State::Running, 5, -1); // 组内顺序比谁都靠前,照样跟着父会话
+        let run = child("子跑", State::Running, 5, -1); // ahead of everyone in group order, still follows its parent
         v.push(sub_of(&run, 2, false, "zsh", State::Idle, 20));
         v.push(run);
         v.push(child("子旧", State::Idle, 3 * 86400, 9));
         App::new(String::new(), v)
     }
 
-    /// 列表里含 want 的那一行
+    /// The list row containing want
     fn row_of(rows: &[String], want: &str) -> String {
         rows.iter().find(|r| r.contains(want)).unwrap_or_else(|| panic!("缺「{want}」:{rows:#?}")).clone()
     }
@@ -12666,23 +12934,23 @@ mod tests {
     #[test]
     fn children_hang_under_the_session_that_sent_them() {
         let mut app = with_children(10);
-        // 近一天:跟在父会话(和它的窗口)后面;三天没动的子会话照样藏
+        // Last day: follows its parent session (and its windows); a child idle for three days is still hidden
         assert_eq!(order(&app), ["问", "跑", "闲", "子跑", "zsh"]);
         for (w, two) in [(46, false), (120, true)] {
             let rows = reader_rows(&mut app, w, 30);
             assert!(row_of(&rows, "子跑").contains("└ ● 子跑"), "{w}: {rows:#?}");
             assert!(row_of(&rows, "zsh").contains("  └ ○ #2 zsh"), "{w}: {rows:#?}");
-            // 分区标题的个数:子会话也是会话
+            // Count in the section header: a child session is a session too
             assert!(rows.iter().any(|r| r.contains("work  3")), "{two}: {rows:#?}");
         }
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "子跑", "zsh", "子旧", "错"]);
-        // 删父会话:子会话不会一起删,说一声(藏着的也算)
+        // Removing the parent: the children aren't removed with it, say so (hidden ones count too)
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('d'));
         shows(&reader_rows(&mut app, 46, 16), &["删除会话？", "2 个子会话不会删除"]);
         press(&mut app, KeyCode::Esc);
-        // 子会话自己、窗口都不说
+        // A child itself, a window: nothing said
         select(&mut app, "子跑");
         press(&mut app, KeyCode::Char('d'));
         assert_eq!(app.confirm.as_ref().map(|c| matches!(c, Confirm::Remove(r) if r.kids == 0)), Some(true));
@@ -12690,15 +12958,15 @@ mod tests {
 
     #[test]
     fn a_kept_child_keeps_its_parent_but_not_the_other_way_round() {
-        // 父会话三天没动,子会话在跑:父会话也留下,子会话挂在它下面
+        // Parent idle for three days, child running: the parent stays too, the child hangs below it
         let mut app = with_children(3 * 86400);
         assert_eq!(order(&app), ["问", "跑", "闲", "子跑", "zsh"]);
         assert!(row_of(&reader_rows(&mut app, 46, 30), "子跑").contains("└ ● 子跑"));
-        // 搜子会话:父会话跟着出来;搜父会话:子会话不跟
+        // Searching a child: the parent comes along; searching the parent: the children don't
         let v: Vec<Session> = app.all.clone();
         let mut app = App::new("子跑".into(), v.clone());
         assert_eq!(order(&app), ["闲", "子跑", "zsh"]);
-        assert!(row_of(&reader_rows(&mut app, 46, 30), "● 子跑").contains("└ ● 子跑")); // 顶栏的搜索词也有「子跑」
+        assert!(row_of(&reader_rows(&mut app, 46, 30), "● 子跑").contains("└ ● 子跑")); // the search term in the top bar has 「子跑」 too
         assert_eq!(order(&App::new("闲".into(), v)), ["闲"]);
     }
 
@@ -12709,7 +12977,7 @@ mod tests {
         (p.state, p.question) = (State::Ask, "Allow?".into());
         let mut app = App::new(String::new(), v);
         let rows = reader_rows(&mut app, 46, 30);
-        // 它问的那句夹在父会话和子会话中间:竖线从那句旁边穿过去,问句和标题对齐
+        // Its question sits between parent and child: the vertical line passes beside it, the question lines up with the title
         let at = |t: &str| rows.iter().position(|r| r.contains(t)).unwrap_or_else(|| panic!("{t}: {rows:#?}"));
         let (p, q, c, w) = (at("◆ 闲"), at("Allow?"), at("● 子跑"), at("#2 zsh"));
         assert_eq!((q, c, w), (p + 1, p + 2, p + 3), "{rows:#?}");
@@ -12724,17 +12992,17 @@ mod tests {
         let mut app = with_children(10);
         pin(&mut app, "闲");
         assert_eq!(order(&app)[..3], ["闲", "子跑", "zsh"]);
-        // 树枝连起来:子跑后面还有子旧,所以是 ├;子跑的窗口前面带着它的 │
+        // Branches connect: 子跑 has 子旧 after it, so ├; 子跑's window is prefixed with its │
         let rr = reader_rows(&mut app, 46, 30);
         for want in ["├ ● 子跑", "│ └ ○ #2 zsh", "└ ○ 子旧"] {
             assert!(row_of(&rr, want).contains(want), "{rr:#?}");
         }
-        // 跟着上去的子会话上按 p:取消的是父会话
+        // p on a child that went up along with its parent: unpins the parent
         select(&mut app, "子跑");
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(app.msg.as_ref().unwrap().0, "已取消置顶「闲」");
         assert_eq!(order(&app), ["问", "跑", "闲", "子跑", "zsh"]);
-        // 子会话自己置顶:在置顶块里顶格,父会话留在分组里
+        // The child pinned itself: top level in the pinned block, the parent stays in its group
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(app.msg.as_ref().unwrap().0, "已置顶「子跑」");
         assert_eq!(order(&app), ["子跑", "zsh", "问", "跑", "闲"]);
@@ -12742,7 +13010,8 @@ mod tests {
         assert!(r.contains("● 子跑") && !r.contains('└'), "{r}");
     }
 
-    /// [`with_children`] 再往下两层:「子跑」派了「孙」(里面另开了个窗口),「孙」又派了「曾孙」,都在跑
+    /// [`with_children`] two levels deeper: 「子跑」 spawned 「孙」 (with another window opened in it), 「孙」 spawned 「曾孙」, all
+    /// running
     fn with_grandchildren() -> App {
         let mut v = with_children(10).all;
         let under = |title: &str, up: &str, order: i64| Session {
@@ -12760,7 +13029,8 @@ mod tests {
     #[test]
     fn sub_sessions_of_sub_sessions_hang_one_level_further_in() {
         let mut app = with_grandchildren();
-        // 一个会话后面是它整家:窗口、子会话(连它的窗口、它再派出去的),然后才轮到下一个
+        // A session is followed by its whole family: windows, children (with their windows and what they spawned), and only
+        // then the next one
         assert_eq!(order(&app), ["问", "跑", "闲", "子跑", "zsh", "孙", "top", "曾孙"]);
         for w in [46, 120] {
             let rows = reader_rows(&mut app, w, 30);
@@ -12768,7 +13038,7 @@ mod tests {
                 assert!(row_of(&rows, want).contains(want), "{w}: {rows:#?}");
             }
         }
-        // 子跑后面还有兄弟(子旧):它那一层的竖线一直带到它整家的最后一行
+        // 子跑 has a sibling after it (子旧): its level's vertical line runs down to the last row of its family
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "子跑", "zsh", "孙", "top", "曾孙", "子旧", "错"]);
         let rows = reader_rows(&mut app, 46, 30);
@@ -12776,18 +13046,20 @@ mod tests {
         for want in wants {
             assert!(row_of(&rows, want).contains(want), "{rows:#?}");
         }
-        // h 一次往外一层
+        // h goes out one level at a time
         select(&mut app, "曾孙");
         press(&mut app, KeyCode::Char('h'));
         assert_eq!(app.current().unwrap().title, "孙");
         press(&mut app, KeyCode::Char('h'));
         assert_eq!(app.current().unwrap().title, "子跑");
-        // 删中间那个:确认框里数的是它自己派的(删了它,它们顶格;再往下的还挂在它们下面)
+        // Removing the middle one: the confirmation counts the ones it spawned (once it's gone they're top level; deeper ones
+        // stay below them)
         select(&mut app, "子跑");
         press(&mut app, KeyCode::Char('d'));
         assert_eq!(app.confirm.as_ref().map(|c| matches!(c, Confirm::Remove(r) if r.kids == 1)), Some(true));
         press(&mut app, KeyCode::Esc);
-        // 搜最里面那个:上面各层都跟着出来(连它们的窗口);搜中间的:它下面的不跟
+        // Searching the innermost: every level above comes along (with their windows); searching the middle one: the ones
+        // below don't
         let v: Vec<Session> = app.all.clone();
         assert_eq!(order(&App::new("曾孙".into(), v.clone())), ["闲", "子跑", "zsh", "孙", "top", "曾孙"]);
         assert_eq!(order(&App::new("子跑".into(), v)), ["闲", "子跑", "zsh"]);
@@ -12799,9 +13071,9 @@ mod tests {
         let chain: Vec<Session> = (0..7).map(|i| Session { up: up(i), ..mk(&format!("s{i}"), "work", State::Idle, 10) }).collect();
         let view: Vec<&Session> = chain.iter().collect();
         let marks: Vec<String> = tree_marks(&view, true).into_iter().map(|m| m.0).collect();
-        // 第 TREE_DEEP 层往下并排着画,不再往右缩
+        // From level TREE_DEEP down, drawn side by side, no further indent
         assert_eq!(marks, ["", "└ ", "  └ ", "    └ ", "      ├ ", "      ├ ", "      └ "]);
-        // 父会话不在上面那一串里(筛掉了):从它那里起算顶格
+        // The parent isn't in the slice above (filtered out): top level counts from there
         let marks: Vec<String> = tree_marks(&view[2..5], true).into_iter().map(|m| m.0).collect();
         assert_eq!(marks, ["", "└ ", "  └ "]);
     }
@@ -12811,12 +13083,12 @@ mod tests {
         let mut app = with_grandchildren();
         pin(&mut app, "闲");
         assert_eq!(order(&app)[..6], ["闲", "子跑", "zsh", "孙", "top", "曾孙"]);
-        // 跟着上去的曾孙上按 p:取消的是最上面置顶了的那个
+        // p on 曾孙, which went up along: unpins the topmost pinned one
         select(&mut app, "曾孙");
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(app.msg.as_ref().unwrap().0, "已取消置顶「闲」");
         assert_eq!(order(&app), ["问", "跑", "闲", "子跑", "zsh", "孙", "top", "曾孙"]);
-        // 中间那个自己置顶:带着它下面的在置顶块里顶格,上面的留在分组里
+        // The middle one pinned itself: top level in the pinned block with the ones below it, the ones above stay in the group
         pin(&mut app, "孙");
         assert_eq!(order(&app), ["孙", "top", "曾孙", "问", "跑", "闲", "子跑", "zsh"]);
         let rows = reader_rows(&mut app, 46, 30);
@@ -12824,7 +13096,7 @@ mod tests {
         for want in ["├ ○ #3 top", "└ ● 曾孙", "└ ● 子跑", "  └ ○ #2 zsh"] {
             assert!(row_of(&rows, want).contains(want), "{rows:#?}");
         }
-        // 上面的也置顶了:各跟各的,曾孙跟的是离它最近的那个
+        // The one above pinned too: each follows its own, 曾孙 follows the nearest
         pin(&mut app, "闲");
         assert_eq!(order(&app)[..6], ["孙", "top", "曾孙", "闲", "子跑", "zsh"]);
         select(&mut app, "曾孙");
@@ -12837,19 +13109,19 @@ mod tests {
     fn shift_arrows_move_a_sub_session_with_everything_under_it() {
         let mut app = with_grandchildren();
         press(&mut app, KeyCode::Char('a'));
-        // 子跑往下:越过自己下面那几层,和兄弟(子旧)换,整家一起走
+        // 子跑 down: skips its own levels below, swaps with its sibling (子旧), the whole family moves together
         select(&mut app, "子跑");
         shift(&mut app, KeyCode::Down);
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "子旧", "子跑", "zsh", "孙", "top", "曾孙", "错"]);
         assert_eq!(app.take_job().unwrap(), Job::Order { t: target("子跑"), by: "id-子旧".into(), after: true });
-        // 没有兄弟的:出不了父会话那一家
+        // No siblings: can't leave its parent's family
         select(&mut app, "孙");
         shift(&mut app, KeyCode::Down);
         assert!(app.msg.is_none());
         select(&mut app, "曾孙");
         shift(&mut app, KeyCode::Up);
         assert!(app.msg.is_none());
-        // 顶格的越过别人一整家(几层都算)
+        // A top-level one jumps over another's whole family (all levels)
         select(&mut app, "跑");
         shift(&mut app, KeyCode::Down);
         assert_eq!(order(&app), ["问", "未读", "闲", "子旧", "子跑", "zsh", "孙", "top", "曾孙", "跑", "错"]);
@@ -12857,7 +13129,7 @@ mod tests {
 
     #[test]
     fn big_d_stops_after_y_and_a_stopped_one_starts_on_enter() {
-        // 活动时间用真的:停掉后按现在的时间接着算多久没动
+        // Real activity times: after stopping, idle time keeps counting against the current time
         let real = |v: Vec<Session>| -> Vec<Session> {
             v.into_iter()
                 .map(|mut s| {
@@ -12870,14 +13142,15 @@ mod tests {
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('D'));
         shows(&reader_rows(&mut app, 46, 16), &["停止会话？", "y 停止"]);
-        press(&mut app, KeyCode::Enter); // 只认 y
+        press(&mut app, KeyCode::Enter); // only y counts
         assert!(app.job.is_none() && app.attach.is_none());
         assert_eq!(app.msg.as_ref().unwrap().0, "未停止");
         press(&mut app, KeyCode::Char('D'));
         press(&mut app, KeyCode::Char('y'));
         assert_eq!(app.job, Some(Job::Stop { t: target("闲") }));
         let job = app.take_job().unwrap();
-        // 停掉后:还在列表里,标 ■;tmux 活动时间没了,接着用停之前看到的,不会被「超过 1 天」藏起来
+        // After stopping: still in the list, marked ■; the tmux activity time is gone, keep using what was seen before stopping,
+        // so it isn't hidden by "over 1 day"
         let fresh: Vec<Session> = real(sessions())
             .into_iter()
             .map(|mut s| {
@@ -12893,18 +13166,18 @@ mod tests {
         assert!(s.idle_for < 60, "{}", s.idle_for);
         assert!(titles(&app).contains(&"闲".to_string()));
         shows(&reader_rows(&mut app, 120, 16), &["已停止", "⏎ 启动 · d 删除"]);
-        // 再按 D:已经停了;⏎ 先启动再进去,不直接 attach
+        // D again: already stopped; ⏎ starts it first, then goes in, no direct attach
         press(&mut app, KeyCode::Char('D'));
         assert!(app.confirm.is_none());
         assert_eq!(app.msg.as_ref().unwrap().0, "已停止 · ⏎ 重新启动");
         press(&mut app, KeyCode::Enter);
         assert_eq!((app.start.take(), app.attach.take()), (Some(target("闲")), None));
-        // 不在 w(开着的)里
+        // Not in w (open ones)
         press(&mut app, KeyCode::Char('w'));
         assert!(!titles(&app).contains(&"闲".to_string()));
     }
 
-    /// 出错了的插件:顶栏右边一格 ⚠,数的是几个插件;宽的写上「插件出错(P)」
+    /// Plugins with errors: a ⚠ cell at the right of the top bar, counting plugins; when wide, 「插件出错(P)」 ("plugin errors (P)")
     #[test]
     fn a_coloured_wide_char_shifted_left_gets_its_right_half_rewritten() {
         let row = |spans: Vec<Span<'static>>| {
@@ -12912,13 +13185,14 @@ mod tests {
             b.set_line(0, 0, &Line::from(spans), 14);
             b
         };
-        // 关掉「 未停止 」那块:三个字往左挪一格,「止」原来的右半(第 9 格)不写就留着紫底
+        // Closing the 「 未停止 」 (" Open ") chip: the three characters move one cell left; 「止」's old right half (cell 9),
+        // not written, keeps its purple background
         let on = row(vec![Span::raw("|  "), Span::styled(" 未停止 ", theme::chip())]);
         let mut off = row(vec![Span::raw("|  "), Span::raw("未停止")]);
         assert!(!on.diff(&off).iter().any(|&(x, _, _)| x == 9));
         mark_torn_tails(&on, &mut off);
         assert!(on.diff(&off).iter().any(|&(x, _, c)| x == 9 && c.bg == Color::Reset));
-        // 没有底色的字挪一格:终端清掉的那格本来就是空白,不多写
+        // Text without a background moves one cell: the cell the terminal clears is blank anyway, nothing extra written
         let plain = row(vec![Span::raw("|   未停止 ")]);
         let mut off = row(vec![Span::raw("|  "), Span::raw("未停止")]);
         mark_torn_tails(&plain, &mut off);
@@ -12943,18 +13217,18 @@ mod tests {
     #[test]
     fn a_crashed_one_is_a_cross_but_starts_like_a_stopped_one() {
         let mut v = sessions();
-        v[3].state = State::Crashed; // 闲:上一轮出错收场,tmux 里也没有了
-        v[4].state = State::Idle; // 错:只留一个出错的,看顶栏数不数它
+        v[3].state = State::Crashed; // 「闲」: the last turn ended in an error, gone from tmux too
+        v[4].state = State::Idle; // 「错」: leave just one with an error, to see whether the top bar counts it
         let mut app = App::new(String::new(), v);
         select(&mut app, "闲");
         assert!(row_of(&reader_rows(&mut app, 46, 16), "闲").contains("✕ 闲"));
         shows(&reader_rows(&mut app, 120, 16), &["出错 · 已停止", "⏎ 启动 · d 删除"]);
-        assert!(!top_bar(&app, 80).to_string().contains("出错")); // 没在跑的不算出错
+        assert!(!top_bar(&app, 80).to_string().contains("出错")); // one that isn't running doesn't count as an error
         press(&mut app, KeyCode::Char('D'));
         assert!(app.confirm.is_none());
         press(&mut app, KeyCode::Enter);
         assert_eq!((app.start.take(), app.attach.take()), (Some(target("闲")), None));
-        press(&mut app, KeyCode::Char('w')); // 也不算开着的
+        press(&mut app, KeyCode::Char('w')); // nor as open
         assert!(!titles(&app).contains(&"闲".to_string()));
     }
 
@@ -12982,21 +13256,21 @@ mod tests {
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('r'));
         shows(&reader_rows(&mut app, 46, 12), &["重命名", "Esc 取消", "> 闲▏", "⏎ 确定"]);
-        press(&mut app, KeyCode::Enter); // 没改
+        press(&mut app, KeyCode::Enter); // unchanged
         assert!(app.job.is_none() && app.prompt.is_none());
         assert!(app.msg.is_none());
         press(&mut app, KeyCode::Char('r'));
         ctrl(&mut app, 'u');
-        press(&mut app, KeyCode::Enter); // 空的不收
+        press(&mut app, KeyCode::Enter); // empty isn't accepted
         shows(&reader_rows(&mut app, 46, 12), &["标题不能为空"]);
-        typ(&mut app, "闲着 jk"); // 打字时 j k 是字,不是上下
+        typ(&mut app, "闲着 jk"); // while typing, j k are letters, not up/down
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.job.take(), Some(Job::Rename { t: target("闲"), to: "闲着 jk".into(), unlock: false }));
         press(&mut app, KeyCode::Char('r'));
         press(&mut app, KeyCode::Esc);
         assert!(app.prompt.is_none() && app.job.is_none());
         assert!(app.msg.is_none());
-        // 刷新挪到了 ^R
+        // Refresh moved to ^R
         ctrl(&mut app, 'r');
         assert!(app.refresh && app.prompt.is_none());
     }
@@ -13004,10 +13278,11 @@ mod tests {
     #[test]
     fn m_picks_a_group_and_a_new_name_becomes_a_new_group() {
         let mut app = fixture().with_group_hints(hints);
-        select(&mut app, "跑"); // 在 work
+        select(&mut app, "跑"); // in work
         press(&mut app, KeyCode::Char('m'));
         let p = app.pick_group.take().unwrap();
-        // 列表里的分区顺序在前,不含它现在的 work,不重复;没记默认目录的显示组里会话的目录
+        // The list's section order first, without its current work, no duplicates; groups with no default directory show
+        // their sessions' directory
         let rows: Vec<(&str, &str, bool)> = p.rows.iter().map(|r| (r.group.as_str(), r.dir.as_str(), r.same)).collect();
         assert_eq!(rows, [("fun", "/p/fun", false), ("Zeta", "", false)]);
         assert_eq!(p.here, "/p/work");
@@ -13021,7 +13296,7 @@ mod tests {
         assert_eq!(app.msg.as_ref().unwrap().0, "已在 Work 中");
         press(&mut app, KeyCode::Char('m'));
         let p = app.pick_group.take().unwrap();
-        app.group_picked(p, Ok(None)); // fzf 里按了 Esc
+        app.group_picked(p, Ok(None)); // Esc pressed in fzf
         assert!(app.job.is_none());
     }
 
@@ -13032,11 +13307,12 @@ mod tests {
             crate::data::GroupHints { groups: vec![g("work", ""), g("fun", "/w/fun-home"), g("Zeta", "/p/work")] }
         };
         let mut app = fixture().with_group_hints(hints);
-        select(&mut app, "跑"); // 在 work,目录 /p/work
+        select(&mut app, "跑"); // in work, directory /p/work
         press(&mut app, KeyCode::Char('m'));
         let p = app.pick_group.take().unwrap();
         let rows: Vec<(&str, &str, bool)> = p.rows.iter().map(|r| (r.group.as_str(), r.dir.as_str(), r.same)).collect();
-        // Zeta 的默认目录就是它的目录:提到最前;fun 记着默认目录,就不看组里会话的 /p/fun
+        // Zeta's default directory is its directory: moved to the front; fun has a default directory, so its sessions' /p/fun
+        // isn't looked at
         assert_eq!(rows, [("Zeta", "/p/work", true), ("fun", "/w/fun-home", false)]);
     }
 
@@ -13052,7 +13328,7 @@ mod tests {
         assert!(app.job.is_none() && app.prompt.is_none() && app.pick_group.is_none() && app.confirm.is_none());
     }
 
-    /// 接管前认出来的那份(假的):只认「外」这个 tmux 会话
+    /// What's recognized before adopting (fake): only recognizes the tmux session 「外」
     fn fake_plan(target: &str) -> Result<aca_core::adopt::Plan, String> {
         if target != "$外" {
             return Err(format!("tmux 里没有 {target} 这个会话"));
@@ -13089,18 +13365,18 @@ mod tests {
         let mut all = sessions();
         all.extend([plain("外"), plain("没了的")]);
         let mut app = App::new(String::new(), all).with_adopt(fake_plan);
-        // 登记过的会话:已经是了
+        // Registered session: already is one
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('A'));
         assert_eq!(app.msg.as_ref().unwrap().0, "它已是 aca 会话");
         assert!(app.confirm.is_none());
-        // 认不了的(那个会话刚好没了):说为什么,不弹框
+        // Can't be recognized (that session just went away): say why, no popup
         select(&mut app, "没了的");
         press(&mut app, KeyCode::Char('A'));
         assert_eq!(app.msg.as_ref().unwrap().0, "无法接管:tmux 里没有 $没了的 这个会话");
         assert!(app.confirm.is_none());
 
-        // 普通会话:先把认出来的摆出来
+        // Plain session: lay out what was recognized first
         select(&mut app, "外");
         press(&mut app, KeyCode::Char('A'));
         assert!(matches!(app.confirm, Some(Confirm::Adopt { .. })));
@@ -13116,7 +13392,7 @@ mod tests {
         ] {
             assert!(rows.contains(want), "确认框里没有「{want}」:\n{rows}");
         }
-        // 只认 y,别的键都是不接
+        // Only y counts; any other key means don't adopt
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.msg.as_ref().unwrap().0, "未接管");
         assert!(app.job.is_none() && app.confirm.is_none());
@@ -13127,7 +13403,7 @@ mod tests {
         assert_eq!(job, Job::Adopt { t, plan: Box::new(fake_plan("$外").unwrap()) });
         assert_eq!(job.doing(), "正在接管「外」…");
 
-        // 接过来之后那一行换成了登记的(键是 id、进了它的分组):高亮跟过去
+        // After adopting, that row becomes the registered one (keyed by id, in its group): the highlight follows
         let mut fresh = sessions();
         let mut got = mk("修登录", "work", State::Idle, 5);
         (got.name, got.deck_id) = ("id-接过来".into(), "id-接过来".into());
@@ -13140,7 +13416,7 @@ mod tests {
     #[test]
     fn the_adopt_dialog_says_when_nothing_will_be_renamed_or_resumed() {
         let mut p = fake_plan("$外").unwrap();
-        // 你自己起的会话名(锁着)、没认出对话、不带参数、不是 agent-deck 的
+        // A session name you gave yourself (locked), no conversation recognized, no args, not agent-deck's
         (p.s.title, p.s.title_locked, p.tmux) = ("我的会话".into(), true, "我的会话".into());
         (p.s.conv, p.s.args, p.s.group, p.deck) = (String::new(), vec![], String::new(), None);
         assert_eq!(adopt_summary(&p), "登记为 claude:sub\n无法识别对话：重启后将开始新对话");
@@ -13158,22 +13434,22 @@ mod tests {
         shows(&reader_rows(&mut app, 46, 12), &["分组名不能为空"]);
         typ(&mut app, "side proj");
         press(&mut app, KeyCode::Enter);
-        // 直接进 fzf,不带搜索词;Esc 回来输入框里是默认目录
+        // Straight into fzf, no search term; after Esc the input box holds the default directory
         assert!(std::mem::take(&mut app.pick));
         let p = app.dir_pick_from(vec![("~/workspace".into(), Src::Near), ("/p/fun".into(), Src::Known)], 40, 16).unwrap();
         assert_eq!((p.query.as_str(), p.rows[0].group.clone()), ("", ("side-proj".into(), true)));
         app.picked(Ok(None));
         assert_eq!(app.new_draft.as_ref().unwrap().text, "~/workspace/");
         shows(&reader_rows(&mut app, 60, 14), &["新建会话", "side-proj  新分组 · 绑定目录", "~/workspace/"]);
-        ctrl(&mut app, 'w'); // 路径改了,分组还是它
+        ctrl(&mut app, 'w'); // path changed, still the same group
         typ(&mut app, "elsewhere");
         let p = app.dir_pick_from(vec![], 40, 16).unwrap();
         assert_eq!(p.query, "elsewhere");
         press(&mut app, KeyCode::Enter);
         let req = app.create.take().unwrap();
-        // 新组记下填的目录当默认路径
+        // The new group records the entered directory as its default path
         assert_eq!((req.group.as_str(), req.bind, req.by_dir), ("side-proj", true, false));
-        // fzf 里回车就开在那
+        // Enter in fzf opens it there
         let mut app = app.with_new_group_dir(|| "/p".into());
         ctrl(&mut app, 'n');
         typ(&mut app, "lab");
@@ -13183,7 +13459,7 @@ mod tests {
         app.picked(Ok(Some(Picked::Open("/p/fun".into()))));
         let req = app.create.take().unwrap();
         assert_eq!((req.dir.as_str(), req.group.as_str(), req.bind), ("/p/fun", "lab", true));
-        // 其实已经有了(大小写不同):用已有的,不改它的默认路径
+        // Actually exists already (different case): use the existing one, its default path unchanged
         ctrl(&mut app, 'n');
         typ(&mut app, "zeta");
         press(&mut app, KeyCode::Enter);
@@ -13201,15 +13477,15 @@ mod tests {
     #[test]
     fn shift_w_jumps_to_the_sessions_group_and_back() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a')); // 全部:fun[问 未读] work[跑 闲 错]
+        press(&mut app, KeyCode::Char('a')); // all: fun[问 未读] work[跑 闲 错]
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('W'));
         assert_eq!(app.group.as_deref(), Some("work"));
         assert_eq!((titles(&app), at(&app)), (vec!["跑".to_string(), "错".into(), "闲".into()], "闲".to_string()));
-        press(&mut app, KeyCode::Char('j')); // 组里换一个再回去,高亮跟着
+        press(&mut app, KeyCode::Char('j')); // switch to another in the group and back, the highlight follows
         press(&mut app, KeyCode::Char('W'));
         assert_eq!((app.group.as_deref(), at(&app).as_str()), (None, "错"));
-        press(&mut app, KeyCode::Char('}')); // } 进的分组,W 也是回到全部
+        press(&mut app, KeyCode::Char('}')); // group entered with }, W also goes back to all
         press(&mut app, KeyCode::Char('W'));
         assert_eq!(app.group, None);
     }
@@ -13219,19 +13495,19 @@ mod tests {
         let mut app = fixture();
         assert_eq!(titles(&app), ["跑", "问", "闲"]);
         press(&mut app, KeyCode::Char('*'));
-        assert_eq!(titles(&app), ["跑", "错", "问", "闲"]); // 错一天多
+        assert_eq!(titles(&app), ["跑", "错", "问", "闲"]); // 「错」 over a day
         assert_eq!(active_tab(&mut app), "3 天");
-        assert!(app.msg.is_none()); // 顶栏亮着,底栏不另说
+        assert!(app.msg.is_none()); // lit in the top bar, nothing extra in the bottom bar
         press(&mut app, KeyCode::Char('*'));
-        assert_eq!(titles(&app), ["未读", "跑", "错", "问", "闲"]); // 未读快六天
+        assert_eq!(titles(&app), ["未读", "跑", "错", "问", "闲"]); // 「未读」 almost six days
         assert_eq!(active_tab(&mut app), "7 天");
-        // * 只管天数,绕回近一天;全部是 a
+        // * only changes the days, wrapping back to 1 day; all is a
         press(&mut app, KeyCode::Char('*'));
         assert_eq!((app.scope, app.days), (Scope::Recent, 1));
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(app.scope, Scope::All);
         assert_eq!(active_tab(&mut app), "全部");
-        // 在全部里按 * 回到近几天,天数不丢
+        // * in all goes back to recent days, the days kept
         press(&mut app, KeyCode::Char('*'));
         assert_eq!((app.scope, app.days), (Scope::Recent, 1));
         press(&mut app, KeyCode::Char('*'));
@@ -13239,7 +13515,7 @@ mod tests {
         press(&mut app, KeyCode::Char('a'));
         assert_eq!((app.scope, app.days), (Scope::Recent, 3));
         assert_eq!(app.view_state().days, 3);
-        // 开着的里按 * 是近几天里开着的(天数照旧)
+        // * among open ones shows the open ones of recent days (days unchanged)
         press(&mut app, KeyCode::Char('w'));
         assert_eq!(app.scope, Scope::All);
         press(&mut app, KeyCode::Char('*'));
@@ -13250,13 +13526,14 @@ mod tests {
     fn question_mark_shows_the_keys_from_the_top() {
         let mut app = fixture();
         press(&mut app, KeyCode::Char('?'));
-        assert!(app.reader_target().is_none()); // 不是会话,run 循环不去 tmux 抓
-        // 手机上从底下升起、从最上面开始一栏往下翻;按用途分组的速查,不是 aca help keys 的原文
+        assert!(app.reader_target().is_none()); // not a session, the run loop doesn't capture it from tmux
+        // On a phone it rises from the bottom, one column scrolling down from the top; a quick reference grouped by purpose,
+        // not the text of aca help keys
         shows(&reader_rows(&mut app, 60, 12), &["快捷键", "1/", "导航"]);
-        // 桌面上居中的弹窗,三栏一屏放下
+        // On a desktop a centered popup, three columns fitting on one screen
         let rows = reader_rows(&mut app, 150, 40);
         assert!(rows.iter().any(|r| r.contains("导航") && r.contains("新建时")), "{rows:#?}");
-        // 在里面按键 = 查它:亮起说明它的行,不真的去做
+        // Pressing a key inside = looking it up: lights up the rows describing it, doesn't actually do it
         let lit = |app: &App| crate::help::lines(100, app.reader.as_ref().and_then(|r| r.hit.as_ref())).1.len();
         press(&mut app, KeyCode::Char('T'));
         assert!(app.split.is_none());
@@ -13267,21 +13544,21 @@ mod tests {
         press(&mut app, KeyCode::Char('y'));
         assert!(app.external.is_none());
         assert_eq!(lit(&app), 1);
-        press(&mut app, KeyCode::Char('J')); // 不换会话
-        press(&mut app, KeyCode::Enter); // 不进会话
+        press(&mut app, KeyCode::Char('J')); // doesn't switch sessions
+        press(&mut app, KeyCode::Enter); // doesn't enter the session
         assert!(app.reader.is_some() && app.attach.is_none());
         assert_eq!(lit(&app), 1);
-        // 不是快捷键的才说一声
+        // Only says so for something that isn't a key
         assert!(!reader_rows(&mut app, 150, 40).iter().any(|r| r.contains("不是快捷键")));
         press(&mut app, KeyCode::Char('U'));
         shows(&reader_rows(&mut app, 150, 40), &["「U」不是快捷键"]);
-        // 手机上一栏往下翻:亮的那行不在这一屏就滚过去
+        // On a phone, one column scrolling down: if the lit row isn't on this screen, scroll to it
         press(&mut app, KeyCode::Char('m'));
         assert_eq!(lit(&app), 2);
         shows(&reader_rows(&mut app, 46, 12), &["移到分组"]);
         press(&mut app, KeyCode::Esc);
         assert!(app.reader.is_none());
-        // 底栏放不下所有键:从不常用的开始丢,? 和 ⏎ 永远在
+        // The bottom bar can't fit every key: drop the least used first; ? and ⏎ always stay
         assert_eq!(reader_rows(&mut app, 46, 12)[11], "n 新建 │ ⏎ 打开 • i 下一个 │ / 搜索 • ? 快捷键");
     }
 
@@ -13292,12 +13569,13 @@ mod tests {
         press(&mut app, KeyCode::Char('n'));
         shows(&reader_rows(&mut app, 60, 14), &["+ 添加账号"]);
         press(&mut app, KeyCode::Char('+'));
-        // 菜单收起,进账号页(一开就是加账号);关了回列表,不回菜单、不弹设置页
+        // The menu closes, into the accounts page (opening on adding an account); closing it returns to the list, not the
+        // menu, no settings page
         assert!(app.tool_menu.is_none() && app.modal_open());
         shows(&reader_rows(&mut app, 100, 30), &["假页面 7"]);
         press(&mut app, KeyCode::Esc);
         assert!(!app.modal_open() && app.tool_menu.is_none() && app.settings.is_none());
-        // 默认(快照、别的测试)没有账号页,不碰配置:+ 不动,菜单还在
+        // By default (snapshots, other tests) there's no accounts page and config isn't touched: + does nothing, the menu stays
         let mut plain = fixture().with_tools(|| Ok(vec![tool("x", "x", "", Agent::Other)]));
         press(&mut plain, KeyCode::Char('n'));
         press(&mut plain, KeyCode::Char('+'));
@@ -13309,21 +13587,22 @@ mod tests {
         let mut app =
             fixture().with_tools(|| Ok(vec![tool("work", "claude", "work", Agent::Claude), tool("cx", "codex", "cx", Agent::Codex)]));
         pin(&mut app, "跑");
-        pin(&mut app, "跑"); // 选中「跑」
+        pin(&mut app, "跑"); // select 「跑」
         press(&mut app, KeyCode::Char('n'));
         shows(&reader_rows(&mut app, 46, 12), &["选择工具", "1 work  ~/.work", "2 cx    ~/.cx", "⏎ 选择"]);
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('j')); // 转一圈回到第一个
+        press(&mut app, KeyCode::Char('j')); // wraps around to the first
         press(&mut app, KeyCode::Esc);
         assert!(app.tool_menu.is_none() && app.new_draft.is_none());
         press(&mut app, KeyCode::Char('n'));
-        press(&mut app, KeyCode::Char('2')); // 数字直接选
+        press(&mut app, KeyCode::Char('2')); // a digit picks directly
         let d = app.new_draft.as_ref().unwrap();
         assert_eq!((d.label.as_str(), d.text.as_str()), ("cx", "/p/work"));
         press(&mut app, KeyCode::Enter);
         let r = app.create.take().unwrap();
         assert_eq!((r.spec().as_str(), r.dir.as_str()), ("codex:cx", "/p/work"));
-        // 起不了的那行(工具写的账号没登记):写原因,选了只提示、菜单还在
+        // A row that can't start (the tool names an unregistered account): says why; picking it only shows a message, the
+        // menu stays
         let mut bad = fixture().with_tools(|| {
             Ok(vec![Tool { problem: Some("没有 Codex 账号槽 gone".into()), ..tool("cx", "codex", "gone", Agent::Codex) }])
         });
@@ -13334,7 +13613,7 @@ mod tests {
         press(&mut bad, KeyCode::Char('1'));
         assert!(bad.tool_menu.is_some() && bad.new_draft.is_none());
         assert_eq!(bad.msg.as_ref().unwrap().0, "没有 Codex 账号槽 gone");
-        // 菜单是空的:提示去哪改
+        // Empty menu: say where to change it
         let mut empty = fixture();
         press(&mut empty, KeyCode::Char('n'));
         assert!(empty.tool_menu.is_none() && empty.msg.as_ref().unwrap().0.starts_with("工具菜单为空"));
@@ -13345,7 +13624,7 @@ mod tests {
         let mut app = fixture();
         pin(&mut app, "跑");
         press(&mut app, KeyCode::Char('N'));
-        typ(&mut app, "q"); // 输入框里的 q 是字,不是退出
+        typ(&mut app, "q"); // q in the input box is a letter, not quit
         assert!(!app.quit);
         press(&mut app, KeyCode::Esc);
         assert!(app.new_draft.is_none() && app.create.is_none());
@@ -13356,7 +13635,7 @@ mod tests {
         assert_eq!(app.create.take().unwrap().dir, "/p/新项目");
         press(&mut app, KeyCode::Char('N'));
         ctrl(&mut app, 'u');
-        press(&mut app, KeyCode::Enter); // 空路径不建,提示留在输入框上方
+        press(&mut app, KeyCode::Enter); // empty path isn't created, the message stays above the input box
         assert!(app.create.is_none());
         assert_eq!(app.new_draft.as_ref().unwrap().hint, "路径不能为空");
     }
@@ -13366,9 +13645,9 @@ mod tests {
         let mut app = fixture();
         assert_eq!(order(&app), ["问", "跑", "闲"]);
         pin(&mut app, "闲");
-        assert_eq!(order(&app), ["闲", "问", "跑"]); // 置顶的在「等你操作」上面
+        assert_eq!(order(&app), ["闲", "问", "跑"]); // pinned ones above "needs you"
         assert_eq!(app.current().unwrap().title, "闲");
-        app.set_sessions(sessions()); // 2 秒刷新,新数据里 pinned 都是 false
+        app.set_sessions(sessions()); // 2-second refresh, pinned is false all over the new data
         assert_eq!(order(&app), ["闲", "问", "跑"]);
     }
 
@@ -13385,15 +13664,15 @@ mod tests {
     #[test]
     fn pinned_shows_in_recent_even_if_old_but_working_stays_a_filter() {
         let mut v = sessions();
-        v[3].state = State::Stopped; // 闲:停掉了
+        v[3].state = State::Stopped; // 「闲」: stopped
         let mut app = App::new(String::new(), v);
         press(&mut app, KeyCode::Char('a'));
-        pin(&mut app, "错"); // 25 小时没动
+        pin(&mut app, "错"); // idle for 25 hours
         pin(&mut app, "闲");
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(order(&app), ["错", "闲", "问", "跑"]);
         press(&mut app, KeyCode::Char('w'));
-        assert_eq!(order(&app), ["错", "问", "未读", "跑"]); // 停掉的不算开着的,置顶的也一样
+        assert_eq!(order(&app), ["错", "问", "未读", "跑"]); // stopped ones aren't open, pinned ones included
     }
 
     #[test]
@@ -13403,9 +13682,9 @@ mod tests {
         v.push(mk("退", "work", State::Exited, 10));
         v.push(mk("关", "work", State::Crashed, 10));
         let mut app = App::new(String::new(), v);
-        assert_eq!(titles(&app), ["停", "关", "跑", "退", "问", "闲"]); // 近一天:未读、错都超过一天被藏,问永远在
+        assert_eq!(titles(&app), ["停", "关", "跑", "退", "问", "闲"]); // 1 day: 未读 and 错 are over a day old, hidden; 问 always shows
         press(&mut app, KeyCode::Char('w'));
-        assert_eq!(titles(&app), ["未读", "跑", "错", "问", "闲"]); // 空闲也在,没在跑的(■ 和关掉的 ✕)不在
+        assert_eq!(titles(&app), ["未读", "跑", "错", "问", "闲"]); // idle ones too; not running ones (■ and closed ✕) aren't
         press(&mut app, KeyCode::Char('w'));
         assert_eq!(titles(&app), ["停", "关", "跑", "退", "问", "闲"]);
     }
@@ -13413,22 +13692,22 @@ mod tests {
     #[test]
     fn w_starts_from_all_and_star_narrows_it_to_recent_days() {
         let mut v = sessions();
-        v.push(mk("老闲", "work", State::Idle, 9 * 86_400)); // 九天没动,近一周里也没有它
+        v.push(mk("老闲", "work", State::Idle, 9 * 86_400)); // idle nine days, not in the last week either
         let mut app = App::new(String::new(), v);
         let now = |app: &App| (app.scope, app.days, app.open);
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // 近一天里按 w:先看全部开着的,几天前的也在
+        // w within 1 day: all open ones first, ones from days ago too
         press(&mut app, KeyCode::Char('w'));
         assert_eq!((now(&app), titles(&app)), ((Scope::All, 1, true), names(&["未读", "老闲", "跑", "错", "问", "闲"])));
-        // 在里面按 *:缩到近一天里开着的,更早的几个写在空着时的提示里
+        // * inside: narrows to the open ones of the last day; the older ones are mentioned in the empty-list hint
         press(&mut app, KeyCode::Char('*'));
         assert_eq!((now(&app), titles(&app), app.hidden), ((Scope::Recent, 1, true), names(&["跑", "问", "闲"]), 3));
         press(&mut app, KeyCode::Char('*'));
         assert_eq!((now(&app), titles(&app)), ((Scope::Recent, 3, true), names(&["跑", "错", "问", "闲"])));
-        // 按过 * 再出来:留在挑的近三天
+        // Leaving after *: stays on the picked 3 days
         press(&mut app, KeyCode::Char('w'));
         assert_eq!(now(&app), (Scope::Recent, 3, false));
-        // 没按过 * / a:出来回到按 w 之前的
+        // No * / a pressed: leaving goes back to what it was before w
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('w'));
         assert_eq!(now(&app), (Scope::Recent, 3, false));
@@ -13436,13 +13715,13 @@ mod tests {
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('w'));
         assert_eq!(now(&app), (Scope::All, 3, false));
-        // 开着的里按 a:全部 ↔ 近几天,开着的一直在
+        // a among open ones: all ↔ recent days, open stays on
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(now(&app), (Scope::Recent, 3, true));
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(now(&app), (Scope::All, 3, true));
-        // 关掉再开也记得按 w 之前在哪
+        // Off and on again still remembers where it was before w
         press(&mut app, KeyCode::Char('*'));
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('w'));
@@ -13477,10 +13756,10 @@ mod tests {
         let mut app = App::new(String::new(), v);
         press(&mut app, KeyCode::Char('%'));
         assert_eq!((titles(&app), lit_counts(&mut app, 120)), (vec!["睡".to_string()], "☾ 1 自动停止".to_string()));
-        // ^ 是全部停着的,☾ 也在里面
+        // ^ is all stopped ones, ☾ included
         press(&mut app, KeyCode::Char('^'));
         assert_eq!((titles(&app), lit_counts(&mut app, 120)), (vec!["停".to_string(), "睡".to_string()], "■ 2 已停止".to_string()));
-        // 和 ^ 一样,开着的里没有它:后按的算,先挑的让位
+        // Like ^, none of it is open: the later key counts, the earlier pick steps aside
         press(&mut app, KeyCode::Char('%'));
         press(&mut app, KeyCode::Char('w'));
         assert_eq!((app.status, app.open), (None, true));
@@ -13489,7 +13768,7 @@ mod tests {
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('%'));
         assert_eq!((app.status, app.open), (Some(Pick::Reaped), false));
-        // 让位的开着的在 ^ / % 之间换来换去时接着让,换成别的才回来
+        // Open, once stepped aside, keeps stepping aside while switching between ^ / %; it comes back on switching to something else
         press(&mut app, KeyCode::Char('^'));
         assert_eq!((app.status, app.open), (Some(Pick::Off), false));
         press(&mut app, KeyCode::Char('#'));
@@ -13503,18 +13782,19 @@ mod tests {
         assert_eq!(titles(&app), ["跑"]);
         press(&mut app, KeyCode::Char('!'));
         assert_eq!(titles(&app), ["跑", "问", "闲"]);
-        // 近一天里的在等你:待确认永远在,未读超过一天被藏,最后写还有一个更早的;* 放宽时状态还在
+        // Needs you within the last day: awaiting confirmation always shows, unread over a day is hidden, with a last line
+        // saying there's one older; the state stays when * widens
         press(&mut app, KeyCode::Char('@'));
         assert_eq!((titles(&app), app.hidden), (vec!["问".to_string()], 1));
         press(&mut app, KeyCode::Char('*'));
         press(&mut app, KeyCode::Char('*'));
         assert_eq!((titles(&app), app.hidden), (vec!["未读".to_string(), "问".to_string()], 0));
-        // 一次一种:换一个键就换过去
+        // One at a time: another key switches over
         press(&mut app, KeyCode::Char('&'));
         assert_eq!(titles(&app), ["错"]);
         press(&mut app, KeyCode::Char('#'));
         assert_eq!(titles(&app), ["闲"]);
-        // Esc 先清状态;到了底再按不退出(弹窗里才退),退出是 q q
+        // Esc clears the state first; pressing it again at the bottom doesn't exit (only popups do), quitting is q q
         press(&mut app, KeyCode::Esc);
         assert_eq!(titles(&app).len(), 5);
         assert!(!app.quit);
@@ -13531,29 +13811,29 @@ mod tests {
         assert_eq!(titles(&app), ["跑", "问", "闲"]);
         press(&mut app, KeyCode::Char('F'));
         assert_eq!(app.only_menu, Some(0));
-        // 一行一种:行首是直接挑它的键、图标、名字、几个;第 0 行是全部
+        // One row per state: at the start the key that picks it directly, icon, name, count; row 0 is all
         let rows = reader_rows(&mut app, 60, 16);
         shows(
             &rows,
             &["按状态筛选", "Esc 关闭", "␣", "全部", "!  ●", "运行中", "@  ◆◐", "等待回应 · 未读", "%  ☾", "自动停止", "⏎ 筛选 • ␣ 全部"],
         );
-        // 行首的键直接挑,关掉小单;再开高亮停在挑着的那种上
+        // The row's key picks directly and closes the small list; reopened, the highlight is on the picked one
         press(&mut app, KeyCode::Char('!'));
         assert_eq!((app.only_menu, app.status), (None, Some(Pick::Run)));
         assert_eq!(titles(&app), ["跑"]);
         press(&mut app, KeyCode::Char('F'));
         assert_eq!(app.only_menu, Some(1));
-        // 停在挑着的那种上 ⏎ = 取消
+        // ⏎ on the picked one = cancel
         press(&mut app, KeyCode::Enter);
         assert_eq!((app.only_menu, app.status), (None, None));
-        // ↓ 到「要你答 · 没看」⏎;空格 = 全部;Esc 只关小单
+        // ↓ to "needs you · unread" ⏎; Space = all; Esc only closes the small list
         keys(&mut app, "Fjj⏎");
         assert_eq!((app.status, titles(&app)), (Some(Pick::Wait), vec!["问".to_string()]));
         keys(&mut app, "F ");
         assert_eq!(app.status, None);
         keys(&mut app, "F⎋");
         assert!(app.only_menu.is_none() && !app.quit);
-        // f 只分叉,不再兼 F
+        // f only forks, no longer doubles as F
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('f'));
         assert!(app.prompt.is_some() && app.only_menu.is_none());
@@ -13562,9 +13842,9 @@ mod tests {
     #[test]
     fn an_empty_status_stays_empty_and_counts_only_its_own_older_ones() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('&')); // 「错」一天多没动了
+        press(&mut app, KeyCode::Char('&')); // 「错」 hasn't moved for over a day
         assert!(app.visible().0.is_empty() && !app.fell_back);
-        assert_eq!(app.hidden, 1); // 只数出错的,不是另外藏着的「未读」
+        assert_eq!(app.hidden, 1); // counts only the error one, not the separately hidden 「未读」
         shows(&reader_rows(&mut app, 46, 20), &["暂无出错的会话 · 还有 1 个更早的 · * 放宽"]);
         press(&mut app, KeyCode::Char('*'));
         press(&mut app, KeyCode::Char('*'));
@@ -13576,14 +13856,14 @@ mod tests {
     #[test]
     fn a_crashed_one_counts_as_not_running_not_as_an_error() {
         let mut v = sessions();
-        v[3].state = State::Crashed; // 闲:上一轮出错收场,tmux 里也没有了
+        v[3].state = State::Crashed; // 「闲」: the last turn ended in an error, gone from tmux too
         let mut app = App::new(String::new(), v);
         press(&mut app, KeyCode::Char('a'));
-        press(&mut app, KeyCode::Char('&')); // 只有还开着、卡在出错上的
+        press(&mut app, KeyCode::Char('&')); // only the ones still open, stuck on an error
         assert_eq!((titles(&app), lit_counts(&mut app, 120)), (vec!["错".to_string()], "✕ 1 出错".to_string()));
         press(&mut app, KeyCode::Char('^'));
         assert_eq!((titles(&app), lit_counts(&mut app, 120)), (vec!["闲".to_string()], "■ 1 已停止".to_string()));
-        // 挑着 ^ 按 w:状态让位,开着的里没有它
+        // w with ^ picked: the state steps aside, none of it is open
         press(&mut app, KeyCode::Char('w'));
         assert_eq!((app.status, titles(&app)), (None, ["未读", "跑", "错", "问"].map(String::from).to_vec()));
     }
@@ -13597,14 +13877,14 @@ mod tests {
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('!'));
         assert_eq!((titles(&app), app.open), (vec!["跑".to_string()], true));
-        press(&mut app, KeyCode::Char('#')); // 空闲也是开着的
+        press(&mut app, KeyCode::Char('#')); // idle is open too
         assert_eq!((titles(&app), app.open), (vec!["闲".to_string()], true));
-        // 开着的里没有 ^ 那些:开着的让位,回到进来之前的「全部」;^ 取消了,开着的回来
+        // None of ^'s are open: open steps aside, back to the "all" from before; ^ canceled, open comes back
         press(&mut app, KeyCode::Char('^'));
         assert_eq!((titles(&app), app.scope, app.open), (vec!["停".to_string()], Scope::All, false));
         press(&mut app, KeyCode::Char('^'));
         assert_eq!((app.status, app.open), (None, true));
-        // 反过来,挑着 ^ 按 w:^ 让位;再按 w 离开开着的,^ 回来
+        // The other way round, w with ^ picked: ^ steps aside; w again leaves open, ^ comes back
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('^'));
         press(&mut app, KeyCode::Char('w'));
@@ -13616,37 +13896,37 @@ mod tests {
     #[test]
     fn range_open_and_state_stack_and_each_key_takes_off_only_its_own() {
         let mut v = sessions();
-        v.push(mk("老闲", "work", State::Idle, 9 * 86_400)); // 九天没动,近一天里没有它
+        v.push(mk("老闲", "work", State::Idle, 9 * 86_400)); // idle nine days, not in the last day
         let mut app = App::new(String::new(), v);
         let now = |app: &App| (app.scope, app.open, app.status, titles(app));
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // 开着的里按 # 叠上空闲(多久以前的都在),再按 # 回到开着的
+        // # among open ones stacks idle on top (of any age), # again goes back to open
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('#'));
         assert_eq!(now(&app), (Scope::All, true, Some(Pick::Idle), names(&["老闲", "闲"])));
         press(&mut app, KeyCode::Char('#'));
         assert_eq!((app.open, app.status), (true, None));
-        // 先挑 ! 再按 w:叠上开着的;再按 w 去掉开着的,! 还在
+        // ! first, then w: stacks open on top; w again takes open off, ! stays
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('!'));
         press(&mut app, KeyCode::Char('w'));
         assert_eq!((app.open, app.status), (true, Some(Pick::Run)));
         press(&mut app, KeyCode::Char('w'));
         assert_eq!(now(&app), (Scope::Recent, false, Some(Pick::Run), names(&["跑"])));
-        // a 也一样
+        // Same for a
         press(&mut app, KeyCode::Char('#'));
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(now(&app), (Scope::All, false, Some(Pick::Idle), names(&["老闲", "闲"])));
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(now(&app), (Scope::Recent, false, Some(Pick::Idle), names(&["闲"])));
-        // 开着的里挑着 @ 按 a:换成近几天,再按回全部,开着的、@ 一直在
+        // a among open ones with @ picked: switches to recent days, again back to all; open and @ stay on throughout
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('@'));
         press(&mut app, KeyCode::Char('a'));
         assert_eq!((app.scope, app.open, app.status), (Scope::Recent, true, Some(Pick::Wait)));
         press(&mut app, KeyCode::Char('a'));
         assert_eq!((app.scope, app.open, app.status), (Scope::All, true, Some(Pick::Wait)));
-        // Esc 只取消状态
+        // Esc cancels only the state
         press(&mut app, KeyCode::Esc);
         assert_eq!((app.scope, app.open, app.status), (Scope::All, true, None));
     }
@@ -13659,8 +13939,8 @@ mod tests {
         typ(&mut app, "闲");
         press(&mut app, KeyCode::Enter);
         assert_eq!(titles(&app), ["闲"]);
-        assert_eq!(lit_counts(&mut app, 120), ""); // 搜着的时候顶栏也不铺
-        press(&mut app, KeyCode::Esc); // 先清搜索词,状态还在
+        assert_eq!(lit_counts(&mut app, 120), ""); // no fill in the top bar while searching either
+        press(&mut app, KeyCode::Esc); // clears the search term first, the state stays
         assert_eq!(titles(&app), ["跑"]);
         let app = fixture().restore(app.view_state());
         assert_eq!((app.status, titles(&app)), (None, vec!["跑".to_string(), "问".to_string(), "闲".to_string()]));
@@ -13668,17 +13948,17 @@ mod tests {
 
     #[test]
     fn status_keeps_families_and_parents_together() {
-        // 会话出错一天多了,另开的窗口里在跑:整家留下
+        // Session in error for over a day, another window running: the whole family stays
         let mut app = with_windows();
         press(&mut app, KeyCode::Char('!'));
         assert_eq!(order(&app), ["跑", "错", "构建"]);
-        // 子会话在跑,五天没动的父会话也列出来;父会话自己不带出子会话
+        // A child running: its parent idle five days is listed too; the parent alone doesn't bring out its children
         let mut app = with_children(5 * 86400);
         press(&mut app, KeyCode::Char('!'));
         assert_eq!(order(&app), ["跑", "闲", "子跑", "zsh"]);
     }
 
-    /// 顶栏上铺着选中底色的字(挑中的状态那几格)
+    /// Text in the top bar on the selection background (the cells of the picked state)
     fn lit_counts(app: &mut App, w: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, 20)).unwrap();
         t.draw(|f| draw(f, app)).unwrap();
@@ -13702,13 +13982,13 @@ mod tests {
         assert_eq!(lit_counts(&mut app, 120), "● 1 运行中");
         press(&mut app, KeyCode::Char('@'));
         assert_eq!(lit_counts(&mut app, 120), "◆ 1 等待回应 ◐ 0 未读");
-        // 空闲、■ 平时不数,挑了才列,0 个也列
+        // Idle and ■ normally aren't counted; listed only when picked, even with 0
         assert!(!reader_rows(&mut app, 120, 20)[0].contains("空闲"));
         press(&mut app, KeyCode::Char('#'));
         assert_eq!(lit_counts(&mut app, 120), "○ 1 空闲");
         press(&mut app, KeyCode::Char('^'));
         assert_eq!(lit_counts(&mut app, 120), "■ 0 已停止");
-        // 手机上计数写短,照样铺
+        // On a phone the counts are shortened, still filled
         assert_eq!(lit_counts(&mut app, 46), "■0");
     }
 
@@ -13757,14 +14037,14 @@ mod tests {
     #[test]
     fn braces_cycle_groups_in_section_order_and_back() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('}')); // 和分区一样 fun 在前,虽然 work 会话多
+        press(&mut app, KeyCode::Char('}')); // fun first like the sections, though work has more sessions
         assert_eq!(titles(&app), ["问"]);
         press(&mut app, KeyCode::Char('}'));
         assert_eq!(titles(&app), ["跑", "闲"]);
         press(&mut app, KeyCode::Char('}'));
-        assert_eq!(titles(&app), ["跑", "问", "闲"]); // 回到全部分组
+        assert_eq!(titles(&app), ["跑", "问", "闲"]); // back to all groups
         press(&mut app, KeyCode::Char('{'));
-        assert_eq!(titles(&app), ["跑", "闲"]); // 往回转到最后一个分组 work
+        assert_eq!(titles(&app), ["跑", "闲"]); // wraps back to the last group, work
     }
 
     #[test]
@@ -13772,36 +14052,36 @@ mod tests {
         let mut app = App::new(String::new(), life_and_work());
         keys(&mut app, "⇥");
         assert_eq!(app.group_rows(), [(' ', None), ('f', Some("fun".into())), ('w', Some("work".into()))]);
-        assert_eq!(app.group_menu, Some(0)); // 没换过:停在现在这个(全部)
+        assert_eq!(app.group_menu, Some(0)); // never switched: on the current one (all)
         let rows = reader_rows(&mut app, 80, 24);
         shows(&rows, &["分组", "␣  全部", "f  fun", "w  work", "⏎ 切换"]);
         keys(&mut app, "w");
         assert_eq!((app.group.as_deref(), app.group_menu, titles(&app)), (Some("work"), None, vec!["工作".to_string()]));
-        keys(&mut app, "⇥⏎"); // 停在上一个看的(全部):Tab ⏎ = 换回去
+        keys(&mut app, "⇥⏎"); // on the last one looked at (all): Tab ⏎ = switch back
         assert_eq!(app.group, None);
         keys(&mut app, "⇥⏎");
         assert_eq!(app.group.as_deref(), Some("work"));
-        keys(&mut app, "⇥ "); // 空格 = 全部
+        keys(&mut app, "⇥ "); // Space = all
         assert_eq!(app.group, None);
-        keys(&mut app, "⇥↑⏎"); // 停在 work,往上一个是 fun
+        keys(&mut app, "⇥↑⏎"); // on work, one up is fun
         assert_eq!(app.group.as_deref(), Some("fun"));
-        keys(&mut app, "⇥z"); // 没有的字母:不动(高亮停在上一个看的:全部)
+        keys(&mut app, "⇥z"); // a letter with no group: no change (highlight on the last one looked at: all)
         assert_eq!((app.group_menu, app.group.as_deref()), (Some(0), Some("fun")));
-        keys(&mut app, "⇥"); // 再按 Tab 关
-        keys(&mut app, "⇥q⇥⎋"); // q / Esc 也是关,不退出
+        keys(&mut app, "⇥"); // Tab again closes
+        keys(&mut app, "⇥q⇥⎋"); // q / Esc close too, don't quit
         assert!(app.group_menu.is_none() && !app.quit && app.group.as_deref() == Some("fun"));
-        keys(&mut app, "}"); // { } 照旧一格一格换
+        keys(&mut app, "}"); // { } still switch one step at a time
         assert_eq!(app.group.as_deref(), Some("work"));
     }
 
     #[test]
     fn the_group_list_keeps_to_this_workspace_and_letters_come_from_names() {
         let mut app = fun_in_h();
-        assert_eq!(app.group_rows(), [(' ', None), ('w', Some("work".into()))]); // fun 整组在 h:1 里不列
+        assert_eq!(app.group_rows(), [(' ', None), ('w', Some("work".into()))]); // the whole fun group is in h: not listed in 1
         keys(&mut app, "qh");
         assert_eq!(app.group_rows(), [(' ', None), ('f', Some("fun".into()))]);
         let gs = ["work", "web", "-", "ops/qa", "中文", "Wq"].map(String::from);
-        assert_eq!(group_keys(&gs), ['w', 'e', 't', 'a', 's', 'd']); // 撞了往后找;「其他 tmux 会话」是 t;q 不给;没有字母的按跳转字母表
+        assert_eq!(group_keys(&gs), ['w', 'e', 't', 'a', 's', 'd']); // clash: next; "Other tmux sessions" = t; never q; else jump letters
     }
 
     #[test]
@@ -13817,23 +14097,23 @@ mod tests {
         let has = |rows: &[String], t: &str| rows.iter().any(|r| r.contains(t));
         let rows = reader_rows(&mut app, 120, 36);
         assert!(has(&rows, "第 80 行") && !has(&rows, "↓"), "{rows:#?}");
-        // 往上滚:一次三行,右下角说底下还有几行
+        // Scroll up: three rows at a time, the bottom-right corner says how many rows are below
         wheel(&mut app, MouseEventKind::ScrollUp);
         let rows = reader_rows(&mut app, 120, 36);
         assert!(has(&rows, "第 77 行") && !has(&rows, "第 78 行") && has(&rows, "↓ 3 行"), "{rows:#?}");
         assert!(app.msg.is_none() && app.current().unwrap().title == "跑");
-        // 翻到这一屏的顶:再往上指去全屏阅读
+        // At the top of this screen: further up points to full-screen reading
         for _ in 0..40 {
             wheel(&mut app, MouseEventKind::ScrollUp);
             reader_rows(&mut app, 120, 36);
         }
         assert!(has(&reader_rows(&mut app, 120, 36), "第 1 行"));
         assert_eq!(said(&app), "z 全屏阅读");
-        // 往下滚回来
+        // Scroll back down
         let up = app.preview_up;
         wheel(&mut app, MouseEventKind::ScrollDown);
         assert_eq!(app.preview_up, up - 3);
-        // 换个会话再回来:从最新的开始
+        // Switch session and back: starts from the latest
         select(&mut app, "闲");
         reader_rows(&mut app, 120, 36);
         select(&mut app, "跑");
@@ -13853,7 +14133,7 @@ mod tests {
             let before = app.at();
             let preview = app.preview_area;
             assert!(preview.width > 0 && preview.height > 0);
-            // 预览里放得下整屏:往上没得翻,指去全屏阅读;往下什么也不做
+            // The preview fits the whole screen: nothing to scroll up, points to full-screen reading; down does nothing
             wheel(&mut app, MouseEventKind::ScrollUp, preview.x + 1, preview.y + 1);
             assert_eq!(app.at(), before);
             assert_eq!(said(&app), "z 全屏阅读");
@@ -13887,9 +14167,9 @@ mod tests {
         };
         tap(&mut app, x + 1, y);
         assert!(app.group_menu.is_some());
-        tap(&mut app, x + 1, y + 5); // 开着时点哪都是关
+        tap(&mut app, x + 1, y + 5); // while open, a click anywhere closes it
         assert!(app.group_menu.is_none());
-        tap(&mut app, x + w + 3, y); // 标签外面不开
+        tap(&mut app, x + w + 3, y); // outside the tab doesn't open it
         assert!(app.group_menu.is_none());
     }
 
@@ -13899,7 +14179,7 @@ mod tests {
         press(&mut app, KeyCode::Char('}'));
         press(&mut app, KeyCode::Char('}'));
         press(&mut app, KeyCode::Char('w'));
-        assert_eq!(titles(&app), ["跑", "错", "闲"]); // 只有 work 的,空闲也是开着的
+        assert_eq!(titles(&app), ["跑", "错", "闲"]); // only work's; idle is open too
     }
 
     #[test]
@@ -13908,10 +14188,10 @@ mod tests {
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "错"]);
         let mut v = sessions();
-        v[0].state = State::Idle; // 问 答完了
-        v[3].state = State::Ask; // 闲 开始问
+        v[0].state = State::Idle; // 问 answered
+        v[3].state = State::Ask; // 闲 starts asking
         v[3].idle_for = 0;
-        v[2].state = State::Exited; // 跑 退出了
+        v[2].state = State::Exited; // 跑 exited
         v[4].title = "错(改了标题)".into();
         app.set_sessions(v);
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "错(改了标题)"]);
@@ -13931,17 +14211,17 @@ mod tests {
             press(app, KeyCode::Char('i'));
             let name = app.attach.take();
             if let Some(n) = &name {
-                app.mark_seen(n); // 看完回来
+                app.mark_seen(n); // back after looking
             }
             name
         };
         assert_eq!(next(&mut app).as_deref(), Some("新读"));
-        assert_eq!(app.current().unwrap().title, "新读"); // 回来时高亮停在刚看的那个
+        assert_eq!(app.current().unwrap().title, "新读"); // back, the highlight is on the one just looked at
         assert_eq!(next(&mut app).as_deref(), Some("中读"));
         assert_eq!(next(&mut app).as_deref(), Some("旧问"));
-        assert_eq!(next(&mut app), None); // 在跑的、出错的不算;都看过了就不进
+        assert_eq!(next(&mut app), None); // running and error ones don't count; all seen, so it doesn't enter
         let mut v = v;
-        v[1].active_at = epoch() + 10; // 新读 又有了新输出
+        v[1].active_at = epoch() + 10; // 新读 has new output again
         app.set_sessions(v);
         assert_eq!(next(&mut app).as_deref(), Some("新读"));
     }
@@ -13950,10 +14230,10 @@ mod tests {
     fn i_only_looks_at_what_is_shown() {
         let mut app = fixture();
         press(&mut app, KeyCode::Char('}'));
-        press(&mut app, KeyCode::Char('}')); // work 分组里没有在等你的(未读在 fun,还超过一天)
+        press(&mut app, KeyCode::Char('}')); // nothing in the work group needs you (未读 is in fun, and over a day old)
         press(&mut app, KeyCode::Char('i'));
         assert!(app.attach.is_none());
-        press(&mut app, KeyCode::Char('}')); // 回到全部分组:未读超过一天被「近一天」藏了,只剩问
+        press(&mut app, KeyCode::Char('}')); // back to all groups: 未读 is over a day old, hidden by "1 day", only 问 is left
         press(&mut app, KeyCode::Char('i'));
         assert_eq!(app.attach.as_deref(), Some("问"));
     }
@@ -13966,9 +14246,9 @@ mod tests {
         select(&mut app, "未读");
         press(&mut app, KeyCode::Char('u'));
         assert_eq!(st(&app, "未读"), State::Idle);
-        app.set_sessions(v.clone()); // 刷新:采集还说它跑完了没看,照样算已读
+        app.set_sessions(v.clone()); // refresh: collection still says it finished unseen, still counts as read
         assert_eq!(st(&app, "未读"), State::Idle);
-        press(&mut app, KeyCode::Char('i')); // i 也不进了
+        press(&mut app, KeyCode::Char('i')); // i doesn't enter either
         assert!(app.attach.is_none());
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('u'));
@@ -13976,11 +14256,11 @@ mod tests {
         assert_eq!(st(&app, "闲"), State::Unread);
         press(&mut app, KeyCode::Char('i'));
         assert_eq!(app.attach.take().as_deref(), Some("闲"));
-        app.mark_seen("闲"); // 进去看过就不算未读了
+        app.mark_seen("闲"); // looked at inside, so no longer unread
         app.set_sessions(v.clone());
         assert_eq!(st(&app, "闲"), State::Idle);
         let mut v2 = v.clone();
-        v2[0].active_at = epoch() + 10; // 又跑了一轮、跑完了
+        v2[0].active_at = epoch() + 10; // ran another turn and finished
         app.set_sessions(v2);
         assert_eq!(st(&app, "未读"), State::Unread);
         select(&mut app, "跑");
@@ -14003,7 +14283,7 @@ mod tests {
         for t in ["闲", "跑", "错"] {
             pin(&mut app, t);
         }
-        pin(&mut app, "跑"); // 取消中间那个
+        pin(&mut app, "跑"); // unpin the middle one
         select(&mut app, "未读");
         press(&mut app, KeyCode::Char('u'));
         assert_eq!(st(&app, "未读"), State::Idle);
@@ -14015,16 +14295,16 @@ mod tests {
         typ(&mut app, "hi");
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.notes.get("id-闲"), Some("hi"));
-        // 倒着一步步撤
+        // Undo backwards, one step at a time
         ctrl(&mut app, 'z');
         assert_eq!((app.notes.get("id-闲"), said(&app)), (None, "已撤销修改便签「闲」"));
         ctrl(&mut app, 'z');
         assert_eq!((space(&app, "问"), said(&app)), ('1', "已撤销 「问」 → w"));
         ctrl(&mut app, 'z');
         assert_eq!((st(&app, "未读"), said(&app)), (State::Unread, "已撤销标为已读「未读」"));
-        assert_eq!(app.current().unwrap().title, "未读"); // 高亮停在撤的那个
+        assert_eq!(app.current().unwrap().title, "未读"); // the highlight is on the undone one
         ctrl(&mut app, 'z');
-        assert_eq!(pinned(&app), ["闲", "跑", "错"]); // 回到原来的位置
+        assert_eq!(pinned(&app), ["闲", "跑", "错"]); // back in its original position
         assert_eq!(said(&app), "已撤销取消置顶「跑」");
         for _ in 0..3 {
             ctrl(&mut app, 'z');
@@ -14033,7 +14313,7 @@ mod tests {
         assert_eq!(said(&app), "已撤销置顶「闲」");
         ctrl(&mut app, 'z');
         assert_eq!(said(&app), "没有可撤销的操作");
-        // 没改的便签不记
+        // An unchanged note isn't recorded
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('e'));
         press(&mut app, KeyCode::Esc);
@@ -14045,28 +14325,28 @@ mod tests {
     fn d_hides_the_session_until_ctrl_z_brings_it_back() {
         let mut app = fixture();
         select(&mut app, "跑");
-        keys(&mut app, "Qwqw"); // 删之前记在 w
+        keys(&mut app, "Qwqw"); // recorded in w before the removal
         select(&mut app, "跑");
         keys(&mut app, "dy");
         let job = app.take_job().unwrap();
         assert_eq!(job, Job::Remove { t: target("跑"), pane: None });
-        // 还在归档(这步还没记上):不越过它去撤 Q
+        // Still archiving (this step isn't recorded yet): don't skip past it to undo Q
         ctrl(&mut app, 'z');
         assert!(said(&app).starts_with("请稍候"), "{}", said(&app));
         app.job_done(&job, binned("跑", "work"), sessions());
         assert_eq!(said(&app), "已删除「跑」 · ^Z 撤销");
-        app.set_sessions(sessions()); // 还登记着(归档了),不列
+        app.set_sessions(sessions()); // still registered (archived), not listed
         assert!(!app.all.iter().any(|s| s.title == "跑"));
-        // 等着真删的时候,它的工作区记录不被顺手清掉
+        // While waiting for the real deletion, its workspace record isn't cleared along the way
         keys(&mut app, "q1");
         select(&mut app, "闲");
         keys(&mut app, "Qw");
         assert_eq!(app.spaces.of("id-跑"), Some('w'));
-        ctrl(&mut app, 'z'); // 先撤 Q
+        ctrl(&mut app, 'z'); // undo Q first
         assert_eq!(said(&app), "已撤销 「闲」 → w");
         ctrl(&mut app, 'z');
         let job = app.take_job().unwrap();
-        // 回收站里的那一条拿回来;删之前在跑,再启动
+        // The entry in the Trash is restored; it was running before the removal, so it starts again
         let Job::Restore { item, start } = &job else { panic!("{job:?}") };
         assert_eq!((item.label(), start.as_slice()), ("跑", &["id-跑".to_string()][..]));
         ctrl(&mut app, 'z');
@@ -14075,8 +14355,8 @@ mod tests {
         assert!(!app.trash.has("default", "id-跑"));
         assert_eq!(said(&app), "已恢复「跑」");
         keys(&mut app, "qw");
-        assert_eq!(app.current().unwrap().title, "跑"); // 回到原来的工作区
-        // 撤回失败:这步放回去,还在回收站里,能再按 ^Z
+        assert_eq!(app.current().unwrap().title, "跑"); // back in its original workspace
+        // Undo failed: the step is put back, still in the Trash, ^Z can be pressed again
         keys(&mut app, "q1");
         select(&mut app, "闲");
         keys(&mut app, "dy");
@@ -14091,7 +14371,7 @@ mod tests {
         ctrl(&mut app, 'z');
         assert_eq!(app.take_job(), Some(job.clone()));
         app.job_done(&job, Outcome::Failed("恢复失败:x".into()), sessions());
-        // 期间在回收站那一页拿回来了(或者到期真删了):^Z 说一声,不越过它
+        // Restored meanwhile from the Trash page (or deleted for real once expired): ^Z says so, doesn't skip past it
         let id = app.trash.items(epoch())[0].id.clone();
         app.trash.forget(&id).unwrap();
         ctrl(&mut app, 'z');
@@ -14099,13 +14379,13 @@ mod tests {
         assert_eq!(said(&app), "回收站中已没有「闲」");
     }
 
-    /// 后台删完交回来的:这个会话进了回收站
+    /// What the background removal hands back: this session went to the Trash
     fn binned(title: &str, group: &str) -> Outcome {
         let g = crate::trash::Gone { id: format!("id-{title}"), title: title.into(), group: group.into(), archived: false };
         Outcome::Binned { msg: format!("已删除「{title}」 · ^Z 撤销"), item: Box::new(crate::trash::Item::session("default", g)) }
     }
 
-    /// 列表里打了 ✓ 的那几行的标题(80 列,不是桌面的留白)
+    /// Titles of the list rows ticked ✓ (80 columns, not the desktop margins)
     fn ticked(app: &mut App) -> Vec<String> {
         let rows = reader_rows(app, 80, 20);
         let titles: Vec<String> = app.all.iter().map(|s| s.title.clone()).collect();
@@ -14128,11 +14408,12 @@ mod tests {
         for want in ["连选", "已选 3", "d 删除", "m 移到分组", "Esc 确定"] {
             assert!(foot.contains(want), "缺「{want}」:{foot}");
         }
-        // 往回拉,段跟着缩
+        // Pulling back, the range shrinks with it
         press(&mut app, KeyCode::Char('k'));
         assert_eq!(ticked(&mut app), ["跑", "闲"]);
         press(&mut app, KeyCode::Char('j'));
-        // d:先问,列出是哪几个、几个在跑会被打断;别的键不删,选着的照旧
+        // d: asks first, listing which ones and how many running ones get interrupted; any other key doesn't remove, the
+        // selection stays
         press(&mut app, KeyCode::Char('d'));
         shows(&reader_rows(&mut app, 80, 24), &["删除 3 个会话？", "跑", "闲", "错", "1 个正在运行或等待回应，将被中断", "y 删除"]);
         press(&mut app, KeyCode::Char('n'));
@@ -14140,7 +14421,7 @@ mod tests {
         keys(&mut app, "dy");
         let job = app.take_job().unwrap();
         assert_eq!(job, many(|t| Job::Remove { t, pane: None }, &["跑", "闲", "错"]));
-        // 不选了,先从列表里藏起来,后台一起删
+        // Selection ends; hidden from the list first, removed together in the background
         assert!(!app.picking());
         assert_eq!(order(&app), ["问", "未读"]);
         assert_eq!(app.doing().as_deref(), Some("正在删除 3 个…"));
@@ -14149,7 +14430,8 @@ mod tests {
         let out = Outcome::Binned { msg: format!("已删除{} · ^Z 撤销", item.name()), item: Box::new(item) };
         app.job_done(&job, out, sessions().into_iter().filter(|s| s.group != "work").collect());
         assert_eq!(said(&app), "已删除「跑」等 3 个 · ^Z 撤销");
-        // 回收站里是一条;^Z 一起拿回来,删之前开着的再启动(出错停着的不算)
+        // One entry in the Trash; ^Z restores them together, ones open before the removal start again (ones stopped on an
+        // error don't count)
         assert_eq!(app.trash.items(epoch()).len(), 1);
         ctrl(&mut app, 'z');
         let Some(Job::Restore { item, start }) = app.take_job() else { panic!("{:?}", app.job) };
@@ -14159,7 +14441,7 @@ mod tests {
     #[test]
     fn sessions_stopped_too_long_are_swept_into_the_trash_unless_something_keeps_them() {
         let (now, after, old) = (1_000_000, 10 * 86_400, 11 * 86_400);
-        let mut v = sessions(); // 问:在等你,多久都不删
+        let mut v = sessions(); // 问: needs you, never removed however old
         for (t, st, idle) in [
             ("旧停", State::Stopped, old),
             ("旧退", State::Exited, old),
@@ -14172,7 +14454,7 @@ mod tests {
         ] {
             v.push(mk(t, "old", st, idle));
         }
-        // 派出去的子会话还在跑、另开的窗口里还开着:留着它们的会话
+        // A spawned child still running, another window still open: their sessions are kept
         v.push(Session { up: Up::Under("旧父".into(), "旧父".into()), ..mk("子", "old", State::Running, 5) });
         let win = sub_of(v.iter().find(|s| s.title == "旧窗").unwrap(), 2, false, "zsh", State::Idle, 20);
         v.push(win);
@@ -14183,20 +14465,20 @@ mod tests {
         app.notes.set("id-归档签", "还要看").unwrap();
         app.pins.toggle("归档顶").unwrap();
         app.apply_pins();
-        // 归档着的(列表里不列):一样看多久没动、有没有便签、置没置顶
+        // Archived ones (not listed): likewise checked for idle time, a note, pinned
         let archived = || {
             vec![(target("归档旧"), now - old), (target("归档新"), now - 100), (target("归档签"), now - old), (target("归档顶"), now - old)]
         };
         let mut got: Vec<String> = app.stale(after, now, archived()).into_iter().map(|t| t.title).collect();
         got.sort();
         assert_eq!(got, ["归档旧", "旧停", "旧关", "旧退"]);
-        // 多选着、手上有活:这一轮先不动
+        // Multi-selecting, a job in hand: this round does nothing
         keys(&mut app, "v");
         app.sweep(after, now, archived());
         assert!(app.job.is_none());
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
-        // 和一起删一样:先从列表里藏起来,后台删,进回收站算一条
+        // Same as removing together: hidden from the list first, removed in the background, one entry in the Trash
         app.sweep(after, now, archived());
         let job = app.take_job().unwrap();
         assert_eq!(job, many(|t| Job::Remove { t, pane: None }, &["旧停", "旧关", "旧退", "归档旧"]));
@@ -14211,7 +14493,7 @@ mod tests {
         ctrl(&mut app, 'z');
         let Some(Job::Restore { item, .. }) = app.take_job() else { panic!("{:?}", app.job) };
         assert_eq!(item.sessions.len(), 4);
-        // 删完了:下一轮没有可删的就什么也不做
+        // All removed: the next round, with nothing to remove, does nothing
         let mut app = fixture();
         app.sweep(after, now, vec![]);
         assert!(app.job.is_none());
@@ -14223,20 +14505,21 @@ mod tests {
         press(&mut app, KeyCode::Char('a'));
         let foot = |app: &mut App| reader_rows(app, 80, 20).pop().unwrap();
         let has = |foot: String, want: &[&str]| want.iter().for_each(|w| assert!(foot.contains(w), "缺「{w}」:{foot}"));
-        // 连选着再按 v:没定下的这一段不要了,从高亮这行重新起(这行算在里面)
+        // v again while range-selecting: the unsettled range is dropped, starting over from the highlighted row (this row
+        // included)
         select(&mut app, "问");
         keys(&mut app, "vjv");
         assert!(app.anchor.is_some());
         assert_eq!(ticked(&mut app), ["未读"]);
         has(foot(&mut app), &["连选", "已选 1", "Esc 确定"]);
-        // Esc:这一段定下(勾着),不再连选
+        // Esc: this range is settled (ticked), range select ends
         keys(&mut app, "k");
         press(&mut app, KeyCode::Esc);
         assert!(app.anchor.is_none());
         assert_eq!(ticked(&mut app), ["问", "未读"]);
-        // 高亮在勾着的那行:空格按下去是去掉;v 连选、V 连着去掉勾,不看这行勾没勾
+        // Highlight on a ticked row: Space unticks it; v range-selects, V range-unticks, whether or not this row is ticked
         has(foot(&mut app), &["已选 2", "空格 取消选中", "v 连选", "V 连续取消", "Esc 清空选择"]);
-        // 空格勾上一个,往下走一行;回到它上面再按:去掉
+        // Space ticks one and moves down a row; back on it, pressing again unticks it
         select(&mut app, "闲");
         has(foot(&mut app), &["空格 选中", "v 连选"]);
         press(&mut app, KeyCode::Char(' '));
@@ -14244,12 +14527,13 @@ mod tests {
         assert_eq!(ticked(&mut app), ["问", "未读", "闲"]);
         keys(&mut app, "k ");
         assert_eq!(ticked(&mut app), ["问", "未读"]);
-        // 从勾着的那行起 v 还是连选,勾着的照旧勾着
+        // v from a ticked row still range-selects; ticked ones stay ticked
         select(&mut app, "问");
         keys(&mut app, "vj");
         assert_eq!(ticked(&mut app), ["问", "未读"]);
         press(&mut app, KeyCode::Esc);
-        // V 连着去掉勾;连选着再按 V 或 v:没定下的那段不要了,从这行起重新连 V / v 那种
+        // V range-unticks; V or v again while ranging: the unsettled range is dropped, starting over from this row with
+        // that kind (V / v)
         select(&mut app, "问");
         keys(&mut app, "Vj");
         assert!(ticked(&mut app).is_empty());
@@ -14260,7 +14544,7 @@ mod tests {
         assert_eq!(ticked(&mut app), ["问", "未读"]);
         has(foot(&mut app), &["连选", "已选 2"]);
         press(&mut app, KeyCode::Esc);
-        // 连选着空格:勾上 / 去掉这一个、往下走,还在连选,这一段跟着拉长
+        // Space while ranging: ticks / unticks this one and moves down, still ranging, the range grows with it
         select(&mut app, "跑");
         keys(&mut app, "v ");
         assert!(app.anchor.is_some());
@@ -14270,20 +14554,21 @@ mod tests {
         assert_eq!(ticked(&mut app), ["问", "未读", "跑", "闲"]);
         press(&mut app, KeyCode::Esc);
         assert!(!app.picking());
-        // 没在连选:Esc 全不选,再按才是退出
+        // Not ranging: Esc unselects all, pressing it again exits
         select(&mut app, "问");
         keys(&mut app, "vj");
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
         assert!(!app.picking() && !app.quit && ticked(&mut app).is_empty());
-        // 什么都没勾也能 V(同 yazi):去掉勾的一段,一个都没选;Esc 出来
+        // V works with nothing ticked (as in yazi): an untick range, none selected; Esc leaves
         press(&mut app, KeyCode::Char('V'));
         assert!(app.picking());
         has(foot(&mut app), &["取消选中", "已选 0", "Esc 确定"]);
         assert!(!foot(&mut app).contains("d 删除"));
         press(&mut app, KeyCode::Esc);
         assert!(!app.picking() && !app.quit);
-        // 多选着时分组标题上空格:组里列着的一起勾上,再按一起去掉(没在多选时空格还是跳转)
+        // Space on a group header while multi-selecting: ticks all listed in the group, again unticks them all (outside
+        // multi-select Space still jumps)
         select(&mut app, "问");
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Esc);
@@ -14296,7 +14581,7 @@ mod tests {
         assert_eq!(ticked(&mut app), ["问"]);
         press(&mut app, KeyCode::Esc);
         assert!(!app.picking());
-        // 从组里第一个往上拉到标题:标题下面那个不算进来
+        // Ranging up from the group's first one to its header: the one below the header isn't included
         select(&mut app, "未读");
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('j'));
@@ -14307,7 +14592,7 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(!app.picking());
         press(&mut app, KeyCode::Esc);
-        assert!(!app.quit); // 到了底 Esc 不退出
+        assert!(!app.quit); // at the bottom, Esc doesn't exit
         keys(&mut app, "qq");
         assert!(app.quit);
     }
@@ -14324,12 +14609,12 @@ mod tests {
         press(&mut app, KeyCode::Char('v'));
         assert!(!app.picking());
         assert_eq!(said(&app), "普通 tmux 会话 · A 接管后才能多选");
-        // 连选的段里跨过它:它不算
+        // The range passes over it: it doesn't count
         select(&mut app, "错");
         keys(&mut app, "vj");
         press(&mut app, KeyCode::Esc);
         assert_eq!(ticked(&mut app), ["错"]);
-        // 只选上一个:和对着它按一样(高亮挪过去、平常的确认框)
+        // Only one selected: same as pressing on it (the highlight moves there, the usual confirmation)
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('d'));
         assert!(matches!(&app.confirm, Some(Confirm::Remove(r)) if r.title == "错"));
@@ -14343,7 +14628,7 @@ mod tests {
         let mut app = App::new(String::new(), v.clone());
         press(&mut app, KeyCode::Char('a'));
         select(&mut app, "跑");
-        keys(&mut app, "vjj"); // 跑 闲 错(错已经停了)
+        keys(&mut app, "vjj"); // 跑 闲 错 (错 already stopped)
         press(&mut app, KeyCode::Char('D'));
         shows(&reader_rows(&mut app, 80, 24), &["停止 2 个会话？", "跑", "闲", "另有 1 个已停止", "y 停止"]);
         press(&mut app, KeyCode::Char('y'));
@@ -14362,17 +14647,17 @@ mod tests {
             .collect();
         app.job_done(&job, Outcome::Many(vec![Outcome::Done(String::new()), Outcome::Done(String::new())]), stopped);
         assert_eq!(said(&app), "已停止 2 个");
-        // ^Z 一步:两个都再启动
+        // ^Z one step: both start again
         ctrl(&mut app, 'z');
         let undo = app.take_job().unwrap();
         assert_eq!(undo, many(|t| Job::Revive { t }, &["跑", "闲"]));
         app.job_done(&undo, Outcome::Many(vec![Outcome::Done(String::new()), Outcome::Failed("启动失败:x".into())]), v.clone());
         assert_eq!(said(&app), "已撤销停止:1 个已重新启动 · 1 个失败:启动失败:x");
-        // R:没有在跑的不问,直接一起重启
+        // R: none running, no question, restart them together
         select(&mut app, "闲");
         keys(&mut app, "vjR");
         assert_eq!(app.job.take(), Some(many(|t| Job::Restart { t, force: false }, &["闲", "错"])));
-        // 有在跑的先问
+        // Some running: ask first
         select(&mut app, "跑");
         keys(&mut app, "vjR");
         shows(&reader_rows(&mut app, 80, 24), &["重启 2 个会话？", "1 个正在运行或等待回应，将被中断", "y 重启"]);
@@ -14384,20 +14669,20 @@ mod tests {
         press(&mut app, KeyCode::Char('a'));
         select(&mut app, "未读");
         press(&mut app, KeyCode::Char('v'));
-        select(&mut app, "跑"); // 未读(fun)到 跑(work)
+        select(&mut app, "跑"); // 未读 (fun) to 跑 (work)
         press(&mut app, KeyCode::Char('m'));
         let p = app.pick_group.take().unwrap();
         assert_eq!(p.what(), "「未读」等 2 个");
-        // 不在同一个组:两个组都列;目录不一样,不写目录
+        // Not in the same group: both groups listed; different directories, no directory shown
         let groups: Vec<&str> = p.rows.iter().map(|r| r.group.as_str()).collect();
         assert!(groups.contains(&"fun") && groups.contains(&"work") && p.here.is_empty(), "{groups:?}");
         app.group_picked(p, Ok(Some("work".into())));
         let all = ["Zeta", "fun", "work"].map(String::from).to_vec();
-        // 已经在 work 的不动
+        // Ones already in work don't move
         let job = Job::Many(vec![Job::Move { t: target("未读"), from: "fun".into(), to: "work".into(), groups: all.clone() }]);
         assert_eq!(app.job.take(), Some(job));
         assert!(!app.picking());
-        // 挪了两个:^Z 一起挪回各自原来的组
+        // Two moved: ^Z moves them back together, each to its own original group
         let moved = |v: Vec<Session>| {
             v.into_iter()
                 .map(|mut s| {
@@ -14426,29 +14711,29 @@ mod tests {
         press(&mut app, KeyCode::Char('a'));
         let pinned = |app: &App| app.all.iter().filter(|s| s.pinned).map(|s| s.title.clone()).collect::<Vec<_>>();
         let st = |app: &App, t: &str| app.all.iter().find(|s| s.title == t).unwrap().state;
-        // p:有没置顶的就都置顶
+        // p: if any aren't pinned, pin them all
         pin(&mut app, "跑");
         select(&mut app, "闲");
         keys(&mut app, "vj");
         app.msg = None;
         let foot = reader_rows(&mut app, 120, 20).pop().unwrap();
         assert!(foot.contains("p 置顶") && foot.contains("Q 移动到工作区"), "{foot}");
-        assert!(!reader_rows(&mut app, 80, 20).pop().unwrap().contains("p 置顶")); // 窄了先丢后面的
+        assert!(!reader_rows(&mut app, 80, 20).pop().unwrap().contains("p 置顶")); // when narrow, the later ones are dropped first
         press(&mut app, KeyCode::Char('p'));
         assert_eq!((pinned(&app), said(&app)), (vec!["跑".to_string(), "闲".into(), "错".into()], "已置顶 2 个"));
         assert!(!app.picking());
-        // u:有没看的就标成已读;闲着的不动
+        // u: if any are unread, mark them read; idle ones untouched
         select(&mut app, "未读");
         press(&mut app, KeyCode::Char('v'));
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('u'));
         assert_eq!((st(&app, "未读"), st(&app, "闲"), said(&app)), (State::Idle, State::Idle, "已将 1 个标为已读"));
-        // Q+键:选上的一起送过去
+        // Q+key: sends the selected ones there together
         select(&mut app, "问");
         keys(&mut app, "vjQw");
         assert_eq!((space(&app, "问"), space(&app, "未读")), ('w', 'w'));
         assert!(said(&app).starts_with("「问」等 2 个 → "), "{}", said(&app));
-        // ^Z 一步一步往回:送工作区、标已读、置顶各是一步
+        // ^Z goes back one step at a time: sending to a workspace, marking read and pinning are one step each
         ctrl(&mut app, 'z');
         assert_eq!((space(&app, "问"), space(&app, "未读")), ('1', '1'));
         ctrl(&mut app, 'z');
@@ -14468,7 +14753,7 @@ mod tests {
         assert!(app.modal_open());
         shows(&reader_rows(&mut app, 100, 30), &["回收站", " 闲  work", "刚刚", "⏎ 恢复"]);
         shows(&reader_rows(&mut app, 46, 30), &["回收站", " 闲  work"]);
-        // ⏎:拿回来是停着的(不再启动),页面关掉,高亮停在它上面
+        // ⏎: restored as stopped (not started again), the page closes, the highlight lands on it
         press(&mut app, KeyCode::Enter);
         assert!(!app.modal_open());
         let job = app.take_job().unwrap();
@@ -14476,7 +14761,7 @@ mod tests {
         app.job_done(&job, Outcome::Done("已恢复「闲」".into()), sessions());
         assert!(!app.trash.has("default", "id-闲"));
         assert_eq!((said(&app), app.current().unwrap().title.as_str()), ("已恢复「闲」", "闲"));
-        // 到期的:刷新时去真删
+        // Expired ones: deleted for real on refresh
         let old = crate::trash::Item {
             at: epoch() - crate::trash::KEEP,
             ..crate::trash::Item::session(
@@ -14500,7 +14785,7 @@ mod tests {
             let job = app.take_job().unwrap();
             app.job_done(&job, binned(t, "work"), sessions());
         }
-        // b 里 v 拉两条,⏎ 一起拿回来:回收站里都去掉,高亮停在第一条上
+        // In b, v ranges over two entries, ⏎ restores them together: both leave the Trash, the highlight lands on the first
         press(&mut app, KeyCode::Char('b'));
         keys(&mut app, "vj");
         press(&mut app, KeyCode::Enter);
@@ -14514,7 +14799,7 @@ mod tests {
         app.job_done(&job, Outcome::Many(vec![Outcome::Done(String::new()), Outcome::Done(String::new())]), sessions());
         assert!(app.trash.items(epoch()).is_empty());
         assert_eq!((said(&app), app.current().unwrap().title.clone()), ("已恢复 2 条", first));
-        // 一起真删:回收站里都去掉
+        // Deleted for real together: both leave the Trash
         for t in ["闲", "错"] {
             select(&mut app, t);
             keys(&mut app, "dy");
@@ -14557,7 +14842,7 @@ mod tests {
             app.job_done(&j, Outcome::Done("做完了".into()), back);
             j
         };
-        // m:挪回原来的组
+        // m: moves back to the original group
         let j = undo(
             &mut app,
             Job::Move { t: target("闲"), from: "work".into(), to: "fun".into(), groups: vec![] },
@@ -14566,7 +14851,7 @@ mod tests {
         );
         assert_eq!(j, Job::Move { t: target("闲"), from: "fun".into(), to: "work".into(), groups: vec![] });
         assert_eq!(said(&app), "已撤销移动分组:「闲」回到 work");
-        // r:改回去;原来没锁的解锁
+        // r: renamed back; unlocked if it wasn't locked before
         let renamed = || with(&|s| (s.title, s.locked) = ("新名".into(), true));
         let j = undo(&mut app, Job::Rename { t: target("闲"), to: "新名".into(), unlock: false }, renamed(), sessions());
         assert_eq!(j, Job::Rename { t: Target { title: "新名".into(), ..target("闲") }, to: "闲".into(), unlock: true });
@@ -14574,7 +14859,7 @@ mod tests {
         app.set_sessions(with(&|s| s.locked = true));
         let j = undo(&mut app, Job::Rename { t: target("闲"), to: "新名".into(), unlock: false }, renamed(), sessions());
         assert!(matches!(j, Job::Rename { unlock: false, .. }));
-        // D:再启动;已经又跑起来了就不用
+        // D: start again; not needed if it's already running again
         let stopped = || with(&|s| s.state = State::Stopped);
         let j = undo(&mut app, Job::Stop { t: target("闲") }, stopped(), sessions());
         assert_eq!(j, Job::Revive { t: target("闲") });
@@ -14583,11 +14868,11 @@ mod tests {
         ctrl(&mut app, 'z');
         assert!(app.job.is_none());
         assert_eq!(said(&app), "「闲」已在运行");
-        // M:反过来挂卸
+        // M: attach / detach reversed
         let mcp = Job::Mcp { t: target("闲"), dir: "/p".into(), on: vec!["a".into()], off: vec!["b".into()] };
         let j = undo(&mut app, mcp, sessions(), sessions());
         assert_eq!(j, Job::Mcp { t: target("闲"), dir: "/p".into(), on: vec!["b".into()], off: vec!["a".into()] });
-        // 没做成的、重启不记
+        // Failed ones and restarts aren't recorded
         app.job_done(
             &Job::Move { t: target("闲"), from: "work".into(), to: "fun".into(), groups: vec![] },
             Outcome::Failed("x".into()),
@@ -14596,7 +14881,7 @@ mod tests {
         app.job_done(&Job::Restart { t: target("闲"), force: false }, Outcome::Done(String::new()), sessions());
         ctrl(&mut app, 'z');
         assert_eq!(said(&app), "没有可撤销的操作");
-        // 会话不在了
+        // The session is gone
         app.job_done(&Job::Stop { t: target("闲") }, Outcome::Done(String::new()), stopped());
         app.set_sessions(sessions().into_iter().filter(|s| s.title != "闲").collect());
         ctrl(&mut app, 'z');
@@ -14656,7 +14941,7 @@ mod tests {
         ];
         let life = v[1].clone();
         v.push(sub_of(&life, 2, false, "zsh", State::Idle, 10));
-        // 子会话:自己没分过就跟着父会话
+        // Child session: never sent anywhere on its own, so it follows its parent
         v.push(Session { up: Up::Under("生活".into(), "生活".into()), ..mk("子", "fun", State::Idle, 10) });
         v
     }
@@ -14667,7 +14952,7 @@ mod tests {
         select(&mut app, "生活");
         keys(&mut app, "dy");
         assert!(matches!(app.take_job(), Some(Job::Remove { pane: None, .. })));
-        // 窗口跟着会话一起藏;子会话还在,照删完的样子顶格
+        // Windows hide along with the session; the child session stays, flush left as it is once deleted
         assert_eq!(titles(&app), ["子", "工作", "生活二", "私"]);
         assert_eq!(app.all.iter().find(|s| s.title == "子").map(|s| &s.up), Some(&Up::Gone));
         app.set_sessions(life_and_work());
@@ -14678,21 +14963,21 @@ mod tests {
     fn q_switches_capital_q_sends_brackets_cycle_and_h_stays_hidden() {
         let v = life_and_work();
         let mut app = App::new(String::new(), v.clone());
-        select(&mut app, "zsh"); // 窗口上按 = 送它所在的会话
+        select(&mut app, "zsh"); // Pressed on a window = sends the session it belongs to
         keys(&mut app, "Ql");
-        assert_eq!(titles(&app), ["工作", "生活二", "私"]); // 窗口、子会话跟着走了
+        assert_eq!(titles(&app), ["工作", "生活二", "私"]); // Windows and child sessions went along
         select(&mut app, "私");
         keys(&mut app, "Qh");
         assert_eq!(titles(&app), ["工作", "生活二"]);
-        assert!(!top_bar(&app, 80).to_string().contains("未读")); // 别的工作区不数
-        press(&mut app, KeyCode::Char('i')); // 也不往里跳
+        assert!(!top_bar(&app, 80).to_string().contains("未读")); // Other workspaces aren't counted
+        press(&mut app, KeyCode::Char('i')); // Nor jumped into
         assert!(app.attach.is_none());
         keys(&mut app, "/生活");
-        assert_eq!(titles(&app), ["生活二"]); // 也搜不到
+        assert_eq!(titles(&app), ["生活二"]); // Nor found by search
         keys(&mut app, "⎋");
-        app.set_sessions(v.clone()); // 刷新后照旧
+        app.set_sessions(v.clone()); // Same after a refresh
         assert_eq!(titles(&app), ["工作", "生活二"]);
-        keys(&mut app, "]"); // h 跳过:只有 1 和 l
+        keys(&mut app, "]"); // Skips h: only 1 and l
         assert_eq!((app.space, titles(&app)), ('l', vec!["zsh".to_string(), "子".into(), "生活".into()]));
         assert!(top_bar(&app, 80).to_string().contains(" l ") && top_bar(&app, 80).to_string().contains("1 未读"));
         keys(&mut app, "]");
@@ -14701,11 +14986,11 @@ mod tests {
         assert_eq!(app.space, 'l');
         keys(&mut app, "qh");
         assert_eq!(titles(&app), ["私"]);
-        keys(&mut app, "]"); // 从 h 出来接着往后
+        keys(&mut app, "]"); // Leaving h carries on forward
         assert_eq!(app.space, 'l');
         keys(&mut app, "q1");
-        assert_eq!(at(&app), "生活二"); // 回到 1:高亮停在离开时的那个
-        keys(&mut app, "q⎋"); // 取消,不退出
+        assert_eq!(at(&app), "生活二"); // Back in 1: the highlight is on the one it was on when we left
+        keys(&mut app, "q⎋"); // Cancel, don't quit
         assert!(!app.quit && app.pending.is_none());
         keys(&mut app, "qq");
         assert!(app.quit);
@@ -14718,10 +15003,10 @@ mod tests {
         let mut app = App::new(String::new(), v.clone());
         select(&mut app, "生活");
         keys(&mut app, "Ql");
-        assert_eq!(titles(&app), ["工作", "生活二", "私"]); // 子会话、它的子会话都跟着走了
+        assert_eq!(titles(&app), ["工作", "生活二", "私"]); // The child session and its own child went along
         keys(&mut app, "ql");
         assert_eq!(titles(&app), ["zsh", "子", "孙", "生活"]);
-        // 中间那个自己分过:留在自己那边,它下面的跟着它,不跟再上面的
+        // The middle one was sent on its own: it stays where it is, the ones below follow it, not the one further up
         select(&mut app, "子");
         keys(&mut app, "Qh");
         assert_eq!(titles(&app), ["zsh", "生活"]);
@@ -14731,7 +15016,7 @@ mod tests {
         assert_eq!(titles(&app), ["zsh", "工作", "生活", "生活二", "私"]);
         keys(&mut app, "qh");
         assert_eq!(titles(&app), ["子", "孙"]);
-        app.set_sessions(v); // 刷新后照旧
+        app.set_sessions(v); // Same after a refresh
         assert_eq!(titles(&app), ["子", "孙"]);
     }
 
@@ -14746,16 +15031,16 @@ mod tests {
         keys(&mut app, "Qh");
         select(&mut app, "生活二");
         keys(&mut app, "ql`");
-        assert_eq!((app.space, at(&app)), ('1', "生活二".into())); // 高亮也回到离开时的
+        assert_eq!((app.space, at(&app)), ('1', "生活二".into())); // The highlight comes back to where it was too
         keys(&mut app, "`");
         assert_eq!(app.space, 'l');
-        keys(&mut app, "qh`"); // h 也一样
+        keys(&mut app, "qh`"); // Same for h
         assert_eq!(app.space, 'l');
         keys(&mut app, "`");
         assert_eq!(titles(&app), ["私"]);
-        keys(&mut app, "]`"); // [ ] 换的也算
+        keys(&mut app, "]`"); // Switching with [ ] counts too
         assert_eq!(app.space, 'h');
-        // 记在视图里:重开 aca(弹窗每次都是新开的)接着用
+        // Kept in the view: reopening aca (the popup is a fresh one each time) carries on with it
         let v = app.view_state();
         assert_eq!(v.last_space, Some('l'));
         let mut again = App::new(String::new(), life_and_work()).restore(v);
@@ -14767,13 +15052,13 @@ mod tests {
     fn capital_q_on_a_fold_row_sends_the_whole_group_and_new_ones_land_here() {
         let mut app = App::new(String::new(), life_and_work());
         select(&mut app, "生活二");
-        keys(&mut app, "o"); // 折起 fun,高亮在折叠行上
+        keys(&mut app, "o"); // Fold fun, highlight on the fold row
         assert!(app.on_fold_row());
         keys(&mut app, "Q2");
         assert_eq!(titles(&app), ["工作"]);
-        keys(&mut app, "q2o"); // 折叠按分组记,到这边也折着
+        keys(&mut app, "q2o"); // Folds are kept per group, so it's folded over here too
         assert_eq!(titles(&app), ["zsh", "子", "生活", "生活二", "私"]);
-        app.adopt("id-新"); // 在 2 里新建的
+        app.adopt("id-新"); // Made in 2
         let mut v = life_and_work();
         v.push(mk("新", "work", State::Idle, 1));
         app.set_sessions(v);
@@ -14785,23 +15070,23 @@ mod tests {
     #[test]
     fn capital_s_lists_workspaces_and_ctrl_r_renames() {
         let mut app = App::new(String::new(), life_and_work());
-        assert!(top_bar(&app, 80).to_string().contains(" 全部分组 ")); // 只用着 1:标签写看的是全部分组
+        assert!(top_bar(&app, 80).to_string().contains(" 全部分组 ")); // Only 1 in use: the label reads all groups
         select(&mut app, "生活");
         keys(&mut app, "Ql");
         select(&mut app, "私");
         keys(&mut app, "Qh");
         keys(&mut app, "S");
-        assert_eq!(app.space_list(), ['1', 'l']); // h 不列
+        assert_eq!(app.space_list(), ['1', 'l']); // h isn't listed
         assert_eq!(app.space_menu, Some(0));
         keys(&mut app, "↓");
         app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         keys(&mut app, "生活⏎");
         assert_eq!(app.spaces.name('l'), "生活");
-        keys(&mut app, "Sl"); // 直接按键切过去
+        keys(&mut app, "Sl"); // Switch straight there by key
         assert_eq!(app.space, 'l');
         assert!(top_bar(&app, 80).to_string().contains(" 生活 "));
-        keys(&mut app, "Sh"); // 不列的也能直接按
+        keys(&mut app, "Sh"); // Unlisted ones can be pressed directly too
         assert_eq!(titles(&app), ["私"]);
     }
 
@@ -14809,7 +15094,7 @@ mod tests {
     fn the_theme_list_previews_each_theme_on_the_whole_screen_and_esc_puts_it_back() {
         let mut app = App::new(String::new(), life_and_work());
         let latte = theme::pal().accent;
-        // 不占单键(C 是挑一样复制)
+        // Takes no single key (C is pick something to copy)
         keys(&mut app, "C");
         assert!(app.theme_menu.is_none() && app.modal_open());
         keys(&mut app, "⎋");
@@ -14820,7 +15105,7 @@ mod tests {
         keys(&mut app, "j");
         let mocha = theme::pal().accent;
         assert_ne!(mocha, latte);
-        // 底下不变灰(底下就是预览),弹窗贴在左下角
+        // The layer below isn't dimmed (the layer below is the preview), the popup sits in the bottom-left corner
         let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
         let buf = t.backend().buffer().clone();
@@ -14832,7 +15117,7 @@ mod tests {
         keys(&mut app, "⎋");
         assert!(app.theme_menu.is_none());
         assert_eq!(theme::pal().accent, latte);
-        // ⏎ 用它
+        // ⏎ uses it
         app.open_themes();
         keys(&mut app, "k⏎");
         assert!(app.theme_menu.is_none());
@@ -14844,7 +15129,7 @@ mod tests {
         app.all.iter().find(|s| s.title == title && s.sub.is_none()).unwrap().space
     }
 
-    /// fun 整组(折叠行上)送进 h
+    /// The whole fun group (on its fold row) sent to h
     fn fun_in_h() -> App {
         let mut app = App::new(String::new(), life_and_work());
         select(&mut app, "生活二");
@@ -14859,8 +15144,8 @@ mod tests {
         let mut app = fun_in_h();
         assert_eq!(titles(&app), ["工作"]);
         assert_eq!(app.spaces.group_of("default", "fun"), Some('h'));
-        assert_eq!(app.spaces.of("id-生活"), None); // 跟着组就行,不用一个个记
-        // 不经界面(终端里 aca new、插件)往 fun 新开的:跟着组进 h,不在 1 露出来
+        assert_eq!(app.spaces.of("id-生活"), None); // Following the group is enough, no need to record each one
+        // Opened in fun without the interface (aca new in a terminal, a plugin): follows the group into h, doesn't show up in 1
         let mut v = life_and_work();
         v.push(mk("外面开的", "fun", State::Unread, 1));
         app.set_sessions(v);
@@ -14874,25 +15159,26 @@ mod tests {
         let mut app = fun_in_h();
         keys(&mut app, "qh");
         select(&mut app, "私");
-        keys(&mut app, "Q1"); // 组在 h:送回 1 要单独记着,不然又跟组回去
+        keys(&mut app, "Q1"); // Group in h: sending one back to 1 needs its own record, or it goes back with the group again
         assert_eq!(app.spaces.of("id-私"), Some('1'));
         app.set_sessions(life_and_work());
         assert_eq!(space(&app, "私"), '1');
-        // 在 1 把 fun(这边只有「私」)整组送去 2:组改记 2,留在 h 的那几个照样在 h
+        // In 1, send the whole fun group (only "私" here) to 2: the group is now recorded as 2, the ones left in h stay in h
         keys(&mut app, "q1");
         select(&mut app, "私");
         keys(&mut app, "oQ2");
         assert_eq!(app.spaces.group_of("default", "fun"), Some('2'));
         assert_eq!((space(&app, "私"), space(&app, "生活"), space(&app, "生活二"), space(&app, "子")), ('2', 'h', 'h', 'h'));
-        assert_eq!(app.spaces.of("id-私"), None); // 跟组了
-        // 送回 1:组不记了
+        assert_eq!(app.spaces.of("id-私"), None); // Follows the group
+        // Sent back to 1: the group is no longer recorded
         keys(&mut app, "q2");
         select(&mut app, "私");
         keys(&mut app, "Q1");
         assert_eq!((space(&app, "私"), space(&app, "生活"), app.spaces.group_of("default", "fun")), ('1', 'h', None));
     }
 
-    /// 登记表里的分组(假的):列表里有会话的两个,fun 下面一个只有归档会话的子分组(其中一个删了在回收站里),再加两个没会话的
+    /// Groups in the registry (fake): the two that have sessions in the list, a child group under fun holding only archived sessions
+    /// (one of them deleted, in the Trash), plus two with no sessions
     fn deck_groups() -> Vec<groups::Row> {
         let row = |path: &str, live, archived: &[&str]| groups::Row {
             profile: "default".into(),
@@ -14907,7 +15193,8 @@ mod tests {
         Job::Group(groups::Act::Delete { profile: "default".into(), group: group.into() })
     }
 
-    /// 后台删完 fun 交回来的那一条:组和子分组、里面的会话(旧 删之前就归档着)
+    /// The one handed back once the background has deleted fun: the group, its child groups and the sessions in them (旧 was
+    /// already archived before the delete)
     fn fun_binned() -> Outcome {
         let rec =
             |path: &str, order| crate::trash::GroupRec { path: path.into(), order, dir: String::new(), space: None, note: String::new() };
@@ -14955,31 +15242,31 @@ mod tests {
         press(&mut app, KeyCode::Char('r'));
         assert!(matches!(app.prompt.as_ref().map(|p| &p.ask), Some(Ask::GroupName(g)) if g == "work"));
         assert_eq!(prompt_of(&app).0, "work");
-        // 撞上已有的(大小写不同也算)、挪到自己下面:不往下走
+        // Clashes with an existing one (case-insensitively too), or moved under itself: doesn't go on
         ctrl(&mut app, 'u');
         keys(&mut app, "other⏎");
         assert_eq!(prompt_of(&app), ("other".into(), "分组 Other 已存在".into()));
         ctrl(&mut app, 'u');
         keys(&mut app, "work/x⏎");
         assert_eq!(prompt_of(&app).1, "work 不能移到自身下面");
-        // 空格换成 -;接着填默认目录,原来的填好
+        // Spaces become -; then on to the default directory, prefilled with the old one
         ctrl(&mut app, 'u');
         keys(&mut app, "my job⏎");
         assert!(matches!(app.prompt.as_ref().map(|p| &p.ask), Some(Ask::GroupHome { to, .. }) if to == "my-job"));
         assert_eq!(prompt_of(&app).0, "/w/work");
-        // 不是目录、是别的组的默认目录:不收
+        // Not a directory, or another group's default directory: rejected
         ctrl(&mut app, 'u');
         keys(&mut app, "/no/such/dir⏎");
         assert_eq!(prompt_of(&app).1, "/no/such/dir 不是目录");
         ctrl(&mut app, 'u');
         keys(&mut app, "/⏎");
         assert_eq!(prompt_of(&app).1, "该目录已是分组 Other 的默认目录");
-        // 原来那个目录(没了也行)直接回车:只改名
+        // ⏎ straight on the old directory (fine even if it's gone): rename only
         ctrl(&mut app, 'u');
         keys(&mut app, "/w/work/⏎");
         let job = app.take_job().unwrap();
         assert_eq!(job, edit_group("work", "my-job", None));
-        // 做完:在看的组、折着的(连子分组)跟过去,记一步撤销
+        // Done: the group being viewed and the folded ones (child groups included) move along; one undo step recorded
         app.group = Some("work".into());
         app.folded.insert("work/sub".into());
         let moved = |g: &str| {
@@ -14996,7 +15283,7 @@ mod tests {
         app.job_done(&back, Outcome::Done(String::new()), moved("work"));
         assert_eq!(app.msg.as_ref().unwrap().0, "已撤销修改分组:my-job 改回 work");
         assert_eq!((app.group.as_deref(), app.folded.contains("work/sub")), (Some("work"), true));
-        // 只改目录:清空 = 不记;撤回把原来的记回去
+        // Directory only: cleared = not recorded; undo records the old one again
         app.group = None;
         jump_to_group(&mut app, "work");
         keys(&mut app, "r⏎");
@@ -15007,7 +15294,7 @@ mod tests {
         app.job_done(&job, Outcome::Done(String::new()), moved("work"));
         ctrl(&mut app, 'z');
         assert_eq!(app.take_job().unwrap(), edit_group("work", "work", Some(("", "/w/work"))));
-        // 什么都没改
+        // Nothing changed
         app.job_done(&back, Outcome::Done(String::new()), moved("work"));
         jump_to_group(&mut app, "work");
         keys(&mut app, "r⏎⏎");
@@ -15028,7 +15315,7 @@ mod tests {
         select(&mut app, "裸");
         keys(&mut app, "or");
         assert_eq!(app.msg.as_ref().unwrap().0, "这些是普通 tmux 会话,没有可修改的分组");
-        // 会话上的 r 还是改会话的标题
+        // r on a session still edits the session's title
         select(&mut app, "生活");
         press(&mut app, KeyCode::Char('r'));
         assert!(matches!(app.prompt.as_ref().map(|p| &p.ask), Some(Ask::Rename(_))));
@@ -15044,7 +15331,7 @@ mod tests {
         jump_to_group(&mut app, "fun");
         press(&mut app, KeyCode::Char('d'));
         assert!(app.job.is_none());
-        // 说一起删掉什么:回收站里的不算;开着的会话记下,^Z 撤回后再启动
+        // Says what goes with it: what's in the Trash doesn't count; running sessions are noted and started again after a ^Z undo
         let Some(Confirm::Group(g)) = &app.confirm else { panic!("没问") };
         assert_eq!((g.sessions, g.archived, g.busy, g.kids), (5, 1, 1, 1));
         assert_eq!(g.running, ["id-生活", "id-子", "id-生活二", "id-私"]);
@@ -15053,14 +15340,14 @@ mod tests {
             &["删除分组？", "▾ fun", "同时删除其中 5 个会话（1 个运行中，1 个已归档）", "同时删除 1 个子分组", "y 删除"],
         );
         shows(&reader_rows(&mut app, 46, 30), &["删除分组？", "▾ fun"]);
-        // 别的键:不删,说一声;Esc 不说
+        // Any other key: not deleted, and says so; Esc says nothing
         press(&mut app, KeyCode::Char('n'));
         assert_eq!((app.job.is_none(), said(&app)), (true, "未删除"));
         app.msg = None;
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Esc);
         assert!(app.confirm.is_none() && app.job.is_none() && app.msg.is_none() && !app.quit);
-        // y:组里的先从列表里拿掉,不等后台删完
+        // y: the group's sessions leave the list at once, without waiting for the background delete to finish
         keys(&mut app, "dy");
         let job = app.take_job().unwrap();
         assert_eq!(job, delete_group("fun"));
@@ -15069,7 +15356,7 @@ mod tests {
         app.job_done(&job, fun_binned(), without_fun());
         assert_eq!(said(&app), "已删除分组 fun 和里面 4 个会话 · ^Z 撤销");
         assert!(app.trash.has("default", "id-生活") && app.trash.has("default", "id-旧"));
-        // ^Z:整组回来,删之前开着的再启动;高亮停在组的标题上
+        // ^Z: the whole group comes back, the ones running before the delete start again; highlight on the group's header
         ctrl(&mut app, 'z');
         let job = app.take_job().unwrap();
         let Job::Restore { item, start } = &job else { panic!("{job:?}") };
@@ -15091,7 +15378,7 @@ mod tests {
         press(&mut app, KeyCode::Char('d'));
         assert!(app.confirm.is_none());
         assert_eq!(said(&app), "「未分组」不是已登记的分组");
-        // 折叠行上一样;普通 tmux 会话那一区没有分组可删
+        // Same on a fold row; the plain tmux sessions section has no group to delete
         select(&mut app, "裸");
         keys(&mut app, "od");
         assert!(app.confirm.is_none());
@@ -15109,23 +15396,23 @@ mod tests {
         keys(&mut app, "dy");
         let job = app.take_job().unwrap();
         assert_eq!(job, delete_group("fun"));
-        // 没删成的:组的记录留着
+        // Not deleted: the group's record stays
         app.job_done(&job, Outcome::Failed("删除分组失败:database is locked".into()), life_and_work());
         assert_eq!(app.spaces.group_of("default", "fun"), Some('h'));
         jump_to_group(&mut app, "fun");
         keys(&mut app, "dy");
         let job = app.take_job().unwrap();
         app.job_done(&job, fun_binned(), without_fun());
-        // 组的记录清了(以后再建一个 fun,不会又掉进 h),记在回收站的那一条里
+        // The group's record is cleared (a new fun made later won't land in h again), and kept in the Trash entry
         assert_eq!(app.spaces.group_of("default", "fun"), None);
         assert_eq!(app.trash.get("x1").unwrap().groups.iter().map(|g| g.space).collect::<Vec<_>>(), [Some('h'), None]);
-        // 删完过了一会儿(不再藏着组里的)
+        // A while after the delete (the group's sessions are no longer hidden)
         app.vanish.iter_mut().for_each(|v| v.until = Some(Instant::now()));
         let mut v = without_fun();
         v.push(mk("新的", "fun", State::Idle, 1));
         app.set_sessions(v);
         assert_eq!(space(&app, "新的"), '1');
-        // 拿回来:组回到 h,里面的会话跟着
+        // Restored: the group goes back to h, its sessions with it
         ctrl(&mut app, 'z');
         let job = app.take_job().unwrap();
         app.job_done(&job, Outcome::Done("已恢复分组 fun · 4 个会话".into()), life_and_work());
@@ -15136,14 +15423,14 @@ mod tests {
     #[test]
     fn made_here_stays_here_even_if_its_group_is_kept_elsewhere() {
         let mut app = fun_in_h();
-        // 列表里已经有它了
+        // Already in the list
         let mut v = life_and_work();
         v.push(mk("新", "fun", State::Idle, 1));
         app.set_sessions(v.clone());
         app.adopt("id-新");
         app.apply_pins();
         assert_eq!((space(&app, "新"), app.spaces.of("id-新")), ('1', Some('1')));
-        // 还没刷到它:先记上
+        // Not refreshed in yet: record it first
         app.adopt("id-新二");
         v.push(mk("新二", "fun", State::Idle, 1));
         app.set_sessions(v);
@@ -15159,7 +15446,7 @@ mod tests {
         app.group_picked(p, Ok(Some("fun".into())));
         assert!(matches!(app.job.take(), Some(Job::Move { .. })));
         let mut v = life_and_work();
-        v[0].group = "fun".into(); // 挪完了
+        v[0].group = "fun".into(); // Moved
         app.set_sessions(v);
         assert_eq!(space(&app, "工作"), '1');
     }
@@ -15171,7 +15458,7 @@ mod tests {
         assert_eq!(app.matching("工作").len(), 1);
         keys(&mut app, "qh");
         assert_eq!(app.matching("生活").iter().filter(|s| s.sub.is_none()).count(), 2);
-        // N 的 fzf:h 里的会话不在 1 的候选里露标题
+        // N's fzf: sessions in h don't show their titles among 1's candidates
         keys(&mut app, "q1");
         let mut app = app.with_group_hints(|| crate::data::GroupHints { groups: vec![("work".into(), String::new())] });
         press(&mut app, KeyCode::Char('N'));
@@ -15187,25 +15474,25 @@ mod tests {
     #[test]
     fn shift_j_k_jump_between_sections() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a')); // 全部:fun[问 未读] work[跑 闲 错]
+        press(&mut app, KeyCode::Char('a')); // All: fun[问 未读] work[跑 闲 错]
         press(&mut app, KeyCode::Char('J'));
         assert_eq!(at(&app), "跑");
-        press(&mut app, KeyCode::Char('J')); // 没有下一段 → 最后一个
+        press(&mut app, KeyCode::Char('J')); // No next section → the last one
         assert_eq!(at(&app), "错");
-        press(&mut app, KeyCode::Char('K')); // 先回本段开头
+        press(&mut app, KeyCode::Char('K')); // Back to the start of this section first
         assert_eq!(at(&app), "跑");
         press(&mut app, KeyCode::Char('K'));
         assert_eq!(at(&app), "问");
         press(&mut app, KeyCode::Char('K'));
         assert_eq!(at(&app), "问");
-        pin(&mut app, "闲"); // 置顶块自成一段:[闲] fun[问 未读] work[跑 错]
-        press(&mut app, KeyCode::Char('G')); // 到底 / 到顶,像 vim
+        pin(&mut app, "闲"); // The pinned block is a section of its own: [闲] fun[问 未读] work[跑 错]
+        press(&mut app, KeyCode::Char('G')); // To the bottom / top, like vim
         assert_eq!(at(&app), "错");
         press(&mut app, KeyCode::Char('g'));
         assert_eq!(at(&app), "闲");
         press(&mut app, KeyCode::Char('J'));
         assert_eq!(at(&app), "问");
-        press(&mut app, KeyCode::Char('}')); // 只看 fun:不分区,J/K = 到底 / 到顶
+        press(&mut app, KeyCode::Char('}')); // Only fun: no sections, J/K = to the bottom / top
         press(&mut app, KeyCode::Char('J'));
         assert_eq!(at(&app), "未读");
         press(&mut app, KeyCode::Char('K'));
@@ -15219,7 +15506,7 @@ mod tests {
         assert_eq!(app.msg.as_ref().unwrap().0, "还没有切换过分组");
         press(&mut app, KeyCode::Char('{'));
         assert_eq!(app.group.as_deref(), Some("work"));
-        press(&mut app, KeyCode::BackTab); // 回到刚才的(全部),再按又回来
+        press(&mut app, KeyCode::BackTab); // Back to the previous one (all), press again to come back
         assert_eq!(app.group, None);
         press(&mut app, KeyCode::BackTab);
         assert_eq!(app.group.as_deref(), Some("work"));
@@ -15228,23 +15515,23 @@ mod tests {
     #[test]
     fn h_folds_from_a_session_or_header_and_l_unfolds_then_steps_in() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a')); // 全部:fun[问 未读] work[跑 闲 错]
+        press(&mut app, KeyCode::Char('a')); // All: fun[问 未读] work[跑 闲 错]
         select(&mut app, "闲");
-        press(&mut app, KeyCode::Char('h')); // 会话上 = 直接折起它的分组,高亮落在折叠行上
+        press(&mut app, KeyCode::Char('h')); // On a session = fold its group right away, highlight lands on the fold row
         assert_eq!(layout(&app), ["[fun]", "问", "未读", "[▸ work  3]"]);
         assert!(app.on_fold_row());
-        press(&mut app, KeyCode::Char('h')); // 折叠行是最外层:不动,也不换分组
+        press(&mut app, KeyCode::Char('h')); // The fold row is the outermost level: no move, no group change
         assert_eq!((layout(&app).len(), app.group.as_deref()), (4, None));
-        press(&mut app, KeyCode::Right); // → 同 l:展开,停在标题上
+        press(&mut app, KeyCode::Right); // → same as l: unfolds, stops on the header
         assert_eq!(layout(&app), ["[fun]", "问", "未读", "[work]", "跑", "闲", "错"]);
         assert_eq!(app.group_row(), Some("work"));
-        press(&mut app, KeyCode::Left); // 展开的标题上 ← / h 也是折起来
+        press(&mut app, KeyCode::Left); // ← / h on an unfolded header folds it too
         assert!(app.on_fold_row());
-        keys(&mut app, "ll"); // 展开、进到组里第一个
+        keys(&mut app, "ll"); // Unfold, into the group's first one
         assert_eq!((app.group_row(), at(&app)), (None, "跑".to_string()));
-        press(&mut app, KeyCode::Char('l')); // 会话上不动(只有 h 折)
+        press(&mut app, KeyCode::Char('l')); // No move on a session (only h folds)
         assert_eq!((app.folds.len(), app.group.as_deref(), at(&app)), (0, None, "跑".to_string()));
-        pin(&mut app, "跑"); // 置顶块不在分区里:h 不动
+        pin(&mut app, "跑"); // The pinned block isn't in a section: h does nothing
         press(&mut app, KeyCode::Char('h'));
         assert_eq!((app.folds.len(), at(&app)), (0, "跑".to_string()));
     }
@@ -15252,7 +15539,7 @@ mod tests {
     #[test]
     fn h_from_a_window_or_sub_session_goes_to_its_session_and_out_of_a_single_group() {
         let mut v = sessions();
-        let idle = v[3].clone(); // 闲
+        let idle = v[3].clone(); // 闲 (idle)
         v.push(sub_of(&idle, 2, false, "zsh", State::Idle, 20));
         let mut k = Session { up: Up::Under("闲".into(), "闲".into()), ..mk("子", "work", State::Idle, 10) };
         k.slot.1 = 10;
@@ -15261,12 +15548,12 @@ mod tests {
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "zsh", "子", "错"]);
         select(&mut app, "zsh");
-        press(&mut app, KeyCode::Left); // ← 同 h:窗口 → 它所在的会话
+        press(&mut app, KeyCode::Left); // ← same as h: window → the session it belongs to
         assert_eq!(at(&app), "闲");
         select(&mut app, "子");
-        press(&mut app, KeyCode::Char('h')); // 子会话 → 父会话
+        press(&mut app, KeyCode::Char('h')); // Child session → parent session
         assert_eq!(at(&app), "闲");
-        press(&mut app, KeyCode::Char('W')); // 只看 work:没有标题,h 回到全部分组,高亮不动
+        press(&mut app, KeyCode::Char('W')); // Only work: no header, h goes back to all groups, highlight stays
         press(&mut app, KeyCode::Char('h'));
         assert_eq!((app.group.as_deref(), at(&app)), (None, "闲".to_string()));
     }
@@ -15283,15 +15570,23 @@ mod tests {
             other => panic!("{other:?}"),
         }
         press(&mut app, KeyCode::Char('B'));
-        assert_eq!(app.clip.take(), Some(Clip::Info { title: "跑".into(), text: "Path: /p/work".into() }));
-        // C:挑一样复制;这一行没有对话 id,按 s 只说没有
+        // Then the config dir Claude uses (this machine's default / account): only that it's there
+        match app.clip.take() {
+            Some(Clip::Info { title, text }) => {
+                let v: Vec<&str> = text.lines().collect();
+                assert_eq!((title.as_str(), v[0], v.len()), ("跑", "Path: /p/work", 2));
+                assert!(v[1].starts_with("Home: /"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // C: pick something to copy; this row has no conversation id, so s only says there is none
         press(&mut app, KeyCode::Char('C'));
         assert!(app.modal_open());
         press(&mut app, KeyCode::Char('s'));
         assert!(app.modal_open() && app.clip.is_none());
         press(&mut app, KeyCode::Char('p'));
         assert_eq!((app.modal_open(), app.clip.take()), (false, Some(Clip::Text("/p/work".into()))));
-        press(&mut app, KeyCode::Char('z')); // 全屏阅读里也能复制
+        press(&mut app, KeyCode::Char('z')); // Copying works in full-screen reading too
         press(&mut app, KeyCode::Char('c'));
         assert!(matches!(app.clip.take(), Some(Clip::Last { .. })));
     }
@@ -15307,7 +15602,7 @@ mod tests {
             let uniq: std::collections::HashSet<&String> = h.iter().collect();
             assert_eq!(uniq.len(), n);
             assert!(h.iter().all(|x| x.chars().all(|c| HINT_CHARS.contains(c))));
-            // 谁也不是别人的开头,否则按到一半就会误中
+            // None is the start of another, or pressing halfway through would hit the wrong one
             assert!(h.iter().all(|x| h.iter().filter(|y| y.starts_with(x.as_str())).count() == 1));
         }
         let h = jump_hints(20);
@@ -15316,23 +15611,23 @@ mod tests {
 
     #[test]
     fn space_then_letter_enters_that_session() {
-        let mut app = fixture(); // 近一天:[fun] 问 [work] 跑 闲 → 提示 a d f j s
+        let mut app = fixture(); // 1 day: [fun] 问 [work] 跑 闲 → hints a d f j s
         press(&mut app, KeyCode::Char(' '));
         let view = app.visible().0;
         let rows = list_rows(&view, true, 46, Some(""), &Folds::new(), 0, false);
         let badges: Vec<&str> = rows.iter().filter(|r| r.pos.is_some()).map(|r| r.lines[0][0].0.as_str()).collect();
-        assert_eq!(badges, ["d", "j", "s"]); // 编号的位置换成提示
+        assert_eq!(badges, ["d", "j", "s"]); // Hints take the place of the numbers
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.attach.take().as_deref(), Some("跑"));
         assert!(app.jump.is_none());
-        // Esc / 对不上的字母:退出,不进
+        // Esc / a letter that matches nothing: leave, don't enter
         press(&mut app, KeyCode::Char(' '));
         press(&mut app, KeyCode::Esc);
         assert!(app.jump.is_none() && !app.quit);
         press(&mut app, KeyCode::Char(' '));
         press(&mut app, KeyCode::Char('z'));
         assert!(app.jump.is_none() && app.attach.is_none());
-        // 别的键:退出跳转并照常处理
+        // Any other key: leave the jump and handle the key as usual
         press(&mut app, KeyCode::Char(' '));
         press(&mut app, KeyCode::Char('3'));
         assert!(app.jump.is_none());
@@ -15343,7 +15638,7 @@ mod tests {
     fn two_letter_hints_wait_for_the_second_letter() {
         let v: Vec<Session> = (0..20).map(|i| mk(&format!("会话{i:02}"), "work", State::Idle, 10)).collect();
         let mut app = App::new(String::new(), v);
-        let hints = jump_hints(21); // 分组标题占第一个
+        let hints = jump_hints(21); // The group header takes the first
         let (i, two) = hints.iter().enumerate().find(|(i, h)| *i > 0 && h.len() == 2).unwrap();
         let want = app.visible().0[i - 1].name.clone();
         press(&mut app, KeyCode::Char(' '));
@@ -15353,7 +15648,7 @@ mod tests {
         assert_eq!(app.attach, Some(want));
     }
 
-    /// 空格后按分组标题的字母:高亮停在标题上,不进会话
+    /// After Space, press a group header's letter: the highlight stops on the header, doesn't enter a session
     fn jump_to_group(app: &mut App, group: &str) {
         press(app, KeyCode::Char(' '));
         let view = app.visible().0;
@@ -15376,27 +15671,27 @@ mod tests {
         press(&mut app, KeyCode::Char('f'));
         assert!(app.jump.is_none() && app.attach.is_none());
         assert_eq!(app.head.as_deref(), Some("work"));
-        assert_eq!(at(&app), "跑"); // 背后选的是组里第一个
-        // 画出来:高亮在标题那行
+        assert_eq!(at(&app), "跑"); // Behind it, the group's first one is selected
+        // Drawn: highlight on the header row
         let mut t = Terminal::new(TestBackend::new(46, 20)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
         let buf = t.backend().buffer().clone();
         let bg = |y: u16| buf[(4, y)].bg;
-        // 第 0 行顶栏,1 [fun],2 问,3 [work],4 跑
+        // Row 0 top bar, 1 [fun], 2 问, 3 [work], 4 跑
         assert_eq!((bg(3), bg(4) == theme::pal().sel), (theme::pal().sel, false));
-        // 刷新后还停在标题上
+        // Still on the header after a refresh
         app.set_sessions(sessions());
         assert_eq!(app.head.as_deref(), Some("work"));
-        // 只看一个分组时没有标题可停
+        // Showing only one group, there's no header to stop on
         press(&mut app, KeyCode::Char('W'));
         assert!(app.head.is_none());
-        // 最上面那个组的标题也能停,不分区时没有标题的字母
+        // The topmost group's header can be stopped on too; without sections no header gets a letter
         press(&mut app, KeyCode::Char('W'));
         jump_to_group(&mut app, "fun");
         assert_eq!(app.head.as_deref(), Some("fun"));
     }
 
-    /// 再加一个空分组 lab,排在 work 后面
+    /// One more, empty group lab, sorted after work
     fn with_blank() -> App {
         let mut v = sessions();
         v.push(crate::data::blank_row("lab", 2));
@@ -15409,12 +15704,12 @@ mod tests {
 
     #[test]
     fn an_empty_group_is_just_its_header_and_the_highlight_stops_on_it() {
-        let mut app = with_blank(); // 近一天:[fun] 问 [work] 跑 闲 [lab]
+        let mut app = with_blank(); // 1 day: [fun] 问 [work] 跑 闲 [lab]
         let view = app.visible().0;
         let rows = list_rows(&view, true, 46, None, &Folds::new(), 0, false);
         let text: Vec<String> = rows.iter().map(|r| r.lines.concat().iter().map(|(t, _)| t.as_str()).collect()).collect();
         let heads: Vec<&str> = text.iter().map(|t| t.trim_end()).filter(|t| t.contains('▾')).collect();
-        // 和别的组一个样子,下面没有行
+        // Looks like any other group, with no rows below
         assert_eq!(heads, [" ▾ fun  1", " ▾ work  2", " ▾ lab  0"]);
         assert_eq!(text.len(), 6);
         assert!(text[5].contains("lab"));
@@ -15424,27 +15719,27 @@ mod tests {
         assert_eq!(spot(&app), "闲");
         press(&mut app, KeyCode::Char('J'));
         assert_eq!(spot(&app), "[lab]");
-        // 编号只给会话
+        // Numbers go to sessions only
         press(&mut app, KeyCode::Char('3'));
         assert_eq!(spot(&app), "闲");
         press(&mut app, KeyCode::Char('j'));
-        // 刷新后还停在它上面;跳转的提示字母也有它
+        // Still on it after a refresh; it gets a jump hint letter too
         app.set_sessions(app.all.clone());
         assert_eq!(spot(&app), "[lab]");
         press(&mut app, KeyCode::Char('g'));
         jump_to_group(&mut app, "lab");
         assert_eq!(spot(&app), "[lab]");
-        // 折起来是 0 个的折叠行,展开回到标题
+        // Folded it's a fold row of 0; unfolding goes back to the header
         press(&mut app, KeyCode::Char('o'));
         assert!(app.on_fold_row() && app.head.is_none());
         assert_eq!(app.fold_info().get("lab"), Some(&(0, 0)));
         press(&mut app, KeyCode::Enter);
         assert_eq!(spot(&app), "[lab]");
-        // 只对会话的键不碰它
+        // Session-only keys leave it alone
         press(&mut app, KeyCode::Char('Z'));
         press(&mut app, KeyCode::Char('W'));
         assert!(app.trace.is_none() && app.group.is_none());
-        // 顶栏的个数、Tab 的分组列表、关键词直达都不算它
+        // Not counted by the top bar's counts, Tab's group list or keyword lookup
         assert_eq!(app.groups(), ["fun", "work"]);
         assert!(app.matching("lab").is_empty());
         assert_eq!(app.numbered(4), None);
@@ -15455,15 +15750,15 @@ mod tests {
         let mut app = with_blank();
         let has = |app: &App| app.visible().0.iter().any(|s| s.blank);
         assert!(has(&app));
-        // 近几天里一个有动静的都没有:照旧退回全部,不因为它而不退
+        // Nothing active in recent days: still falls back to all as before; it doesn't stop the fallback
         app.all.retain(|s| s.blank || s.title == "未读");
         app.rebuild();
         assert!(app.fell_back && has(&app));
         let mut app = with_blank();
-        press(&mut app, KeyCode::Char('w')); // 开着的
+        press(&mut app, KeyCode::Char('w')); // Not stopped
         assert!(!has(&app));
         press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('#')); // 挑了状态
+        press(&mut app, KeyCode::Char('#')); // A state picked
         assert!(!has(&app));
         press(&mut app, KeyCode::Char('#'));
         press(&mut app, KeyCode::Char('/'));
@@ -15479,7 +15774,7 @@ mod tests {
 
     #[test]
     fn n_on_an_empty_group_starts_the_new_session_inside_it() {
-        // 没记目录:和 ^N 一样从新分组的目录开始,直接进 fzf
+        // No directory recorded: like ^N, starts from the new group directory, straight into fzf
         fn hints_bare() -> crate::data::GroupHints {
             crate::data::GroupHints { groups: vec![("lab".into(), String::new())] }
         }
@@ -15489,11 +15784,11 @@ mod tests {
         assert!(std::mem::take(&mut app.pick));
         let d = app.new_draft.take().unwrap();
         assert_eq!((d.text.as_str(), d.group(), d.label.as_str()), ("/p/", ("lab".into(), false), ""));
-        // 路径改了也还是这个组
+        // Still this group after the path changes
         let mut d = d;
         d.set_dir("/q/x");
         assert_eq!(d.group().0, "lab");
-        // 记了目录:从那开始,不进 fzf
+        // Directory recorded: starts there, no fzf
         fn hints_lab() -> crate::data::GroupHints {
             crate::data::GroupHints { groups: vec![("lab".into(), "/tmp".into())] }
         }
@@ -15525,7 +15820,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         let job = app.job.take().unwrap();
         assert_eq!(job, Job::Group(groups::Act::Create { group: "lab".into() }));
-        // 建好了:高亮停在它的标题上,Esc 出来就在这
+        // Created: highlight on its header, Esc out lands here
         let mut fresh = sessions();
         fresh.push(crate::data::blank_row("lab", 2));
         app.job_done(&job, Outcome::Done(String::new()), fresh);
@@ -15534,12 +15829,12 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.new_draft.is_none());
         assert_eq!(spot(&app), "[lab]");
-        // 已经有的(大小写不同)不再建
+        // An existing one (differing in case) isn't created again
         ctrl(&mut app, 'n');
         typ(&mut app, "zeta");
         press(&mut app, KeyCode::Enter);
         assert!(app.job.is_none());
-        // 在别的工作区建的:组记在那
+        // Created in another workspace: the group is recorded there
         let mut app = fixture().with_group_hints(hints).in_space('2');
         ctrl(&mut app, 'n');
         typ(&mut app, "lab");
@@ -15549,7 +15844,7 @@ mod tests {
 
     #[test]
     fn j_k_stop_on_group_headers_too() {
-        let mut app = fixture(); // 近一天:[fun] 问 [work] 跑 闲
+        let mut app = fixture(); // 1 day: [fun] 问 [work] 跑 闲
         let spot = |app: &App| app.head.clone().map_or_else(|| at(app), |g| format!("[{g}]"));
         let walk = |app: &mut App, k: char, n: usize| -> Vec<String> {
             (0..n)
@@ -15566,9 +15861,9 @@ mod tests {
         assert_eq!(spot(&app), "闲");
         press(&mut app, KeyCode::Char('g'));
         assert_eq!(spot(&app), "[fun]");
-        press(&mut app, KeyCode::Char('2')); // 编号照常是会话
+        press(&mut app, KeyCode::Char('2')); // Numbers are sessions as usual
         assert_eq!(spot(&app), "跑");
-        // 折起来的组只剩折叠行一格;展开后高亮还在组上
+        // A folded group is just its one fold row; unfolded, the highlight is still on the group
         press(&mut app, KeyCode::Char('o'));
         assert!(app.on_fold_row());
         assert_eq!(walk(&mut app, 'k', 2), ["问", "[fun]"]);
@@ -15576,7 +15871,7 @@ mod tests {
         assert!(app.on_fold_row());
         press(&mut app, KeyCode::Enter);
         assert_eq!(spot(&app), "[work]");
-        // J / K 照旧落在会话上
+        // J / K still land on sessions
         press(&mut app, KeyCode::Char('K'));
         assert_eq!(spot(&app), "问");
         press(&mut app, KeyCode::Char('J'));
@@ -15589,7 +15884,7 @@ mod tests {
             l.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>().trim_end().to_string()).collect::<Vec<_>>()
         };
         let sp = Spot { group: "work".into(), dir: "/p/work".into(), from: None };
-        // 还没读回来:只有路径(组自己的默认路径不另外说)
+        // Not read back yet: path only (the group's own default path gets no extra note)
         assert_eq!(text(&group_pane(&sp, None, None, false, 60, 20)), ["/p/work"]);
         let files = diff::Files {
             dirs: vec!["src".into(), "spec".into()],
@@ -15604,12 +15899,13 @@ mod tests {
         };
         let t = text(&group_pane(&sp, Some(&g), None, false, 60, 20));
         assert_eq!(t[0], "/p/work  main  3 个文件 +12 −4");
-        // 一栏按最宽的 Cargo.toml 10 格 + 2:60 格排 5 栏,目录在前;点开头的不列也不数
+        // Column width = the widest, Cargo.toml's 10 cells, + 2: 60 cells fit 5 columns, directories first; dotfiles neither listed
+        // nor counted
         assert_eq!(t[1..], ["", "src/        spec/       Cargo.toml  README.md   a"]);
-        // 放不下:最后一行数还有几个
+        // Doesn't fit: the last line counts how many more
         let t = text(&group_pane(&sp, Some(&g), None, false, 24, 4));
         assert_eq!(t[2..], ["src/        spec/", "还有 3 个"]);
-        // 跟着会话的目录;目录不在了
+        // Following a session's directory; the directory is gone
         let sp = Spot { from: Some("跑".into()), ..sp };
         let gone =
             Glance { files: Some(diff::Files { err: Some("目录已不存在".into()), ..Default::default() }), ..Default::default() };
@@ -15622,20 +15918,20 @@ mod tests {
         jump_to_group(&mut app, "work");
         let (key, w) = app.glance_request(false).unwrap();
         assert_eq!((key.as_str(), w.dir.as_str(), w.pid), ("group:work", "/p/work", 0));
-        assert!(app.glance_request(false).is_none()); // 同一个组不重复读
+        assert!(app.glance_request(false).is_none()); // The same group isn't read twice
         let files = diff::Files { dirs: vec!["src".into()], files: vec!["Cargo.toml".into()], ..Default::default() };
         app.set_glance(key, Glance { files: Some(files), ..Default::default() });
-        // 桌面:右边的框里;手机:下面
+        // Desktop: in the box on the right; phone: below
         for (w, h) in [(100, 30), (46, 24)] {
             let rows = reader_rows(&mut app, w, h);
             assert!(rows.iter().any(|r| r.contains("▸ work")), "{rows:#?}");
             assert!(rows.iter().any(|r| r.contains("「跑」的目录")), "{rows:#?}");
             assert!(rows.iter().any(|r| r.contains("src/") && r.contains("Cargo.toml")), "{rows:#?}");
         }
-        // 挪回会话上:读会话的
+        // Back on a session: reads the session's
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.glance_request(false).map(|r| r.0).as_deref(), Some("跑"));
-        // 折叠行也是组
+        // A fold row is a group too
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.glance_request(false).map(|r| r.0).as_deref(), Some("group:work"));
     }
@@ -15643,27 +15939,27 @@ mod tests {
     #[test]
     fn t_on_a_group_opens_a_terminal_in_the_groups_dir() {
         let mut v = sessions();
-        v[3].dir = "/p/闲".into(); // work 里最近有动静的是「跑」
+        v[3].dir = "/p/闲".into(); // The most recently active one in work is 「跑」
         let mut app = App::new(String::new(), v);
         jump_to_group(&mut app, "work");
         press(&mut app, KeyCode::Char('t'));
         let r = app.term_req.take().unwrap();
         assert_eq!((r.key.as_str(), r.family.as_str(), r.title.as_str(), r.w.dir.as_str()), ("group:work", "", "work", "/p/work"));
         assert_eq!(app.head.as_deref(), Some("work"));
-        // 一样新:取列表里靠上的
+        // Equally recent: take the one higher in the list
         let mut v = sessions();
         (v[3].active_at, v[3].dir) = (v[2].active_at, "/p/闲".into());
         let mut t = App::new(String::new(), v);
         jump_to_group(&mut t, "work");
         press(&mut t, KeyCode::Char('t'));
         assert_eq!(t.term_req.take().unwrap().w.dir, "/p/work");
-        // 开过就回到那个
+        // Opened before: goes back to that one
         app.terms.insert(r.key.clone(), crate::term::Term::spawn("/", &[], 5, 20).unwrap());
         press(&mut app, KeyCode::Char('t'));
         assert!(app.term_req.is_none() && app.term_on.as_deref() == Some("group:work"));
         app.terms.clear();
         app.term_on = None;
-        // 组设了默认路径(目录还在):用它
+        // The group has a default path (directory still there): use it
         let tmp = || std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string();
         let mut app = fixture().with_group_hints(|| crate::data::GroupHints {
             groups: vec![("work".into(), std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string())],
@@ -15671,15 +15967,15 @@ mod tests {
         jump_to_group(&mut app, "work");
         press(&mut app, KeyCode::Char('t'));
         assert_eq!(app.term_req.take().unwrap().w.dir, tmp());
-        // 默认路径不在了:退回会话的目录;worktree 用原仓库
+        // Default path gone: fall back to the session's directory; a worktree uses its original repository
         let mut v = sessions();
-        (v[2].worktree, v[2].info) = (true, "Repo: /repo\nPath: /p/work".into()); // 跑
+        (v[2].worktree, v[2].info) = (true, "Repo: /repo\nPath: /p/work".into()); // 跑 (running)
         let mut app = App::new(String::new(), v)
             .with_group_hints(|| crate::data::GroupHints { groups: vec![("work".into(), "/没有这个目录".into())] });
         jump_to_group(&mut app, "work");
         press(&mut app, KeyCode::Char('t'));
         assert_eq!(app.term_req.take().unwrap().w.dir, "/repo");
-        // 折叠行也是分组
+        // A fold row is a group too
         press(&mut app, KeyCode::Char('o'));
         assert!(app.on_fold_row());
         press(&mut app, KeyCode::Char('t'));
@@ -15689,7 +15985,7 @@ mod tests {
     #[test]
     fn new_on_a_group_starts_in_the_groups_dir_and_group() {
         let mut v = sessions();
-        v[2].tool = "codex".into(); // 跑:work 里最近有动静的
+        v[2].tool = "codex".into(); // 跑: the most recently active one in work
         v[2].account = "team".into();
         v[3].dir = "/p/闲".into();
         let mut app = App::new(String::new(), v);
@@ -15707,7 +16003,7 @@ mod tests {
     fn session_only_keys_do_nothing_on_a_group_header() {
         let mut app = fixture();
         jump_to_group(&mut app, "work");
-        // r 在分组上改的是分组(见 r_on_a_group_…),e 写的是分组的便签(见 e_on_a_group_…)
+        // r on a group edits the group (see r_on_a_group_…), e writes the group's note (see e_on_a_group_…)
         for c in ['p', 'u', 'z', 'T'] {
             app.msg = None;
             press(&mut app, KeyCode::Char(c));
@@ -15718,10 +16014,10 @@ mod tests {
         assert!(app.pins.rank("跑").is_none());
         let before = order(&app);
         app.msg = None;
-        shift(&mut app, KeyCode::Down); // 分组上 ⇧↑ ⇧↓ 挪的是分组,work 已经在最下
+        shift(&mut app, KeyCode::Down); // ⇧↑ ⇧↓ on a group move the group; work is already at the bottom
         assert!(app.msg.is_none() && before == order(&app));
         assert!(app.reorders.is_empty());
-        // 回车 = 折起来,高亮落在折叠行上
+        // ⏎ = fold, highlight lands on the fold row
         press(&mut app, KeyCode::Enter);
         assert!(app.on_fold_row() && app.head.is_none() && app.attach.is_none());
         press(&mut app, KeyCode::Enter);
@@ -15731,8 +16027,8 @@ mod tests {
     #[test]
     fn account_column_sits_before_the_age_with_a_fixed_width() {
         let mut v = sessions();
-        v[2].who = "team".into(); // 跑
-        v[4].who = "alt".into(); // 错
+        v[2].who = "team".into(); // 跑 (running)
+        v[4].who = "alt".into(); // 错 (error)
         v[4].agent = Agent::Codex;
         let text = |app: &App| -> Vec<String> {
             let view = app.visible().0;
@@ -15747,13 +16043,13 @@ mod tests {
         let rows = text(&app);
         assert!(rows.iter().all(|r| r.width() == 46), "{rows:?}");
         let run = rows.iter().find(|r| r.contains("跑")).unwrap();
-        assert!(run.ends_with(" team  5s "), "{run}"); // 5s 右对齐到 3 格
-        // 只剩没账号的会话在显示,列宽也不变(按全部会话算),标题不会伸缩
+        assert!(run.ends_with(" team  5s "), "{run}"); // 5s right-aligned to 3 cells
+        // Only sessions without an account left on show: the column width stays (computed over all sessions), titles don't shift
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('}'));
         assert_eq!(titles(&app), ["未读", "问"]);
-        assert!(text(&app)[0].ends_with(&format!("{}11d ", " ".repeat(2 + 1 + 4 + 1))), "{:?}", text(&app)); // 标记列 + 空着的账号列
-        // 太长的截断;一个有账号的都没有就不占列
+        assert!(text(&app)[0].ends_with(&format!("{}11d ", " ".repeat(2 + 1 + 4 + 1))), "{:?}", text(&app)); // Mark col + empty account col
+        // Too long is cut; when no session has an account the column takes no space
         v[2].who = "a-very-long-slot".into();
         assert_eq!(App::new(String::new(), v.clone()).who_width(), 8);
         assert_eq!(fixture().who_width(), 0);
@@ -15766,7 +16062,7 @@ mod tests {
             .map(|r| match r.pos {
                 Some(p) if app.is_fold_row(p) => format!("[▸ {}{}{}]", r.lines[0][2].0, r.lines[0][3].0, r.lines[0][4].0),
                 Some(p) => view[p].title.clone(),
-                None => format!("[{}]", r.lines[0][1].0), // 标题行的分组名(置顶那块是「置顶」)
+                None => format!("[{}]", r.lines[0][1].0), // Group name on a header row (the pinned block's is 「置顶」, "Pinned")
             })
             .collect()
     }
@@ -15774,26 +16070,26 @@ mod tests {
     #[test]
     fn o_folds_the_current_section_and_enter_unfolds() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a')); // 全部
+        press(&mut app, KeyCode::Char('a')); // All
         assert_eq!(layout(&app), ["[fun]", "问", "未读", "[work]", "跑", "闲", "错"]);
         pin(&mut app, "闲");
-        pin(&mut app, "闲"); // 选中闲(置顶又取消,位置不变)
+        pin(&mut app, "闲"); // Select 闲 (pin then unpin, position unchanged)
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(layout(&app), ["[fun]", "问", "未读", "[▸ work  3]"]);
-        assert!(app.on_fold_row()); // 高亮落在折叠行上
-        press(&mut app, KeyCode::Char('z')); // 折叠行不能阅读
+        assert!(app.on_fold_row()); // Highlight lands on the fold row
+        press(&mut app, KeyCode::Char('z')); // A fold row can't be read
         assert!(app.reader.is_none());
-        press(&mut app, KeyCode::Enter); // 回车 = 展开,不是进会话
+        press(&mut app, KeyCode::Enter); // ⏎ = unfold, not enter a session
         assert!(app.attach.is_none());
         assert_eq!(layout(&app), ["[fun]", "问", "未读", "[work]", "跑", "闲", "错"]);
         press(&mut app, KeyCode::Char('g'));
-        press(&mut app, KeyCode::Char('o')); // fun 里有个 !,折起来也看得到
+        press(&mut app, KeyCode::Char('o')); // fun has a !, visible even folded
         assert_eq!(layout(&app), ["[▸ fun  2 ◆1]", "[work]", "跑", "闲", "错"]);
-        press(&mut app, KeyCode::Char('i')); // 在等你的都折起来了:不进
+        press(&mut app, KeyCode::Char('i')); // Everything that needs you is folded: doesn't go in
         assert!(app.attach.is_none());
-        press(&mut app, KeyCode::Char('c')); // 折叠行上不能复制
+        press(&mut app, KeyCode::Char('c')); // No copying on a fold row
         assert!(app.clip.is_none());
-        press(&mut app, KeyCode::Char('o')); // 停在折叠行上 o = 展开
+        press(&mut app, KeyCode::Char('o')); // On a fold row, o = unfold
         assert_eq!(layout(&app)[0], "[fun]");
     }
 
@@ -15803,17 +16099,17 @@ mod tests {
         press(&mut app, KeyCode::Char('a'));
         pin(&mut app, "跑");
         press(&mut app, KeyCode::Char('O'));
-        assert_eq!(layout(&app), ["[置顶]", "跑", "[▸ fun  2 ◆1]", "[▸ work  2]"]); // 置顶的不在分区里
+        assert_eq!(layout(&app), ["[置顶]", "跑", "[▸ fun  2 ◆1]", "[▸ work  2]"]); // Pinned ones aren't in sections
         let saved = app.view_state();
         assert_eq!(saved.folded, ["fun", "work"]);
-        assert_eq!(fixture().restore(saved).folds.len(), 2); // 记住了
-        typ(&mut app, "/错"); // 过滤时全展开,免得搜不到
+        assert_eq!(fixture().restore(saved).folds.len(), 2); // Remembered
+        typ(&mut app, "/错"); // Filtering unfolds everything, so search misses nothing
         assert_eq!(order(&app), ["错"]);
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char('O'));
         assert_eq!(layout(&app).len(), 8);
-        press(&mut app, KeyCode::Char('}')); // 只看一个分组:没有分区可折
+        press(&mut app, KeyCode::Char('}')); // Only one group: no sections to fold
         press(&mut app, KeyCode::Char('o'));
         assert!(app.folds.is_empty());
     }
@@ -15822,21 +16118,22 @@ mod tests {
     fn sections_get_a_header_each_and_pins_sit_above_them() {
         let mut app = fixture();
         assert_eq!(layout(&app), ["[fun]", "问", "[work]", "跑", "闲"]);
-        // 标题:分组名后面跟这一区有几个
+        // Header: the group name followed by how many this section has
         let view = app.visible().0;
         let head: String =
             list_rows(&view, true, 30, None, app.fold_info(), 0, false)[2].lines[0].iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(head, " ▾ work  2");
-        // 桌面上也是一个会话一行,但总写编号,组和组之间空一行(空行也是一项,选不中)
+        // On desktop it's one session per row too, but always numbered, with a blank line between groups (the blank line is an
+        // item too, not selectable)
         let desk = list_rows(&view, true, 46, None, app.fold_info(), 0, true);
         assert_eq!(desk.iter().map(|r| r.lines.len()).collect::<Vec<_>>(), [1, 1, 1, 1, 1, 1]);
         assert!(desk[2].pos.is_none() && desk[2].lines[0].is_empty());
         assert_eq!(desk[1].lines[0][0].0, "  1 ");
         pin(&mut app, "闲");
         assert_eq!(layout(&app), ["[置顶]", "闲", "[fun]", "问", "[work]", "跑"]);
-        pin(&mut app, "问"); // fun 只剩置顶的那个,空分区不画标题
+        pin(&mut app, "问"); // fun has only the pinned one left; an empty section draws no header
         assert_eq!(layout(&app), ["[置顶]", "闲", "问", "[work]", "跑"]);
-        press(&mut app, KeyCode::Char('}')); // 只看一个分组:不分区
+        press(&mut app, KeyCode::Char('}')); // Only one group: no sections
         assert_eq!(layout(&app), ["问"]);
     }
 
@@ -15849,12 +16146,14 @@ mod tests {
         let mut app = App::new(String::new(), v);
         let (w, h) = (120u16, 36u16);
         let rows = reader_rows(&mut app, w, h);
-        // 四周留白:上下各空一行、左右 3 格;顶栏下面、底栏上面各再空一行
+        // Margins all around: one blank line top and bottom, 3 cells left and right; one more blank line below the top bar and
+        // above the bottom bar
         let hh = h as usize;
         assert!(rows[0].is_empty() && rows[1].starts_with("    全部分组 ") && rows[2].is_empty(), "{rows:#?}");
         assert!(rows[3].starts_with("    ▾ fun"), "{rows:#?}");
         assert!(rows[hh - 1].is_empty() && rows[hh - 2].contains("? 快捷键") && rows[hh - 3].is_empty(), "{rows:#?}");
-        // 一个会话一行:账号紧跟在(最长的)标题后面,目录不写在列表里;在问你的下面挂一行它问的,和标题对齐
+        // One session per row: the account right after the (longest) title, no directory in the list; one asking you gets a line
+        // below with what it asks, aligned with the title
         let at = |t: &str| rows.iter().position(|r| r.contains(t)).unwrap_or_else(|| panic!("{t}: {rows:#?}"));
         let col = |y: usize, t: &str| rows[y][..rows[y].find(t).unwrap()].width();
         let run = at("2 ● 跑");
@@ -15867,7 +16166,7 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
         let buf = t.backend().buffer();
-        // 预览的框是淡色的,框上的标题是深色
+        // The preview's box is faint, the title on it dark
         let corner = (0..w).find(|&x| buf[(x, 3)].symbol() == "╭").unwrap();
         assert_eq!(buf[(corner, 3)].fg, theme::pal().faint);
         let title = (corner..w).find(|&x| buf[(x, 3)].symbol() == "问").unwrap();
@@ -15894,7 +16193,7 @@ mod tests {
         let mut app = fixture();
         let mut t = Terminal::new(TestBackend::new(46, 20)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
-        // 第 0 行顶栏,1 [fun],2 问,3 [work],4 跑
+        // Row 0 top bar, 1 [fun], 2 问, 3 [work], 4 跑
         let click = |app: &mut App, row: u16| {
             app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 5, row, modifiers: KeyModifiers::NONE })
         };
@@ -15902,17 +16201,17 @@ mod tests {
         assert_eq!(app.current().unwrap().title, "跑");
         click(&mut app, 3);
         assert_eq!((app.current().unwrap().title.as_str(), app.head.as_deref()), ("跑", Some("work")));
-        click(&mut app, 4); // 高亮在标题上时点它下面的会话:选中,不进
+        click(&mut app, 4); // Highlight on a header, click a session below it: selects, doesn't enter
         assert!(app.head.is_none() && app.attach.is_none());
         click(&mut app, 3);
-        click(&mut app, 3); // 再点一下标题 = 折起来
+        click(&mut app, 3); // Click the header again = fold
         assert!(app.on_fold_row() && app.attach.is_none());
         press(&mut app, KeyCode::Enter);
         t.draw(|f| draw(f, &mut app)).unwrap();
         click(&mut app, 2);
         assert_eq!(app.current().unwrap().title, "问");
         assert!(app.attach.is_none());
-        click(&mut app, 2); // 再点一下进入
+        click(&mut app, 2); // Click again to enter
         assert_eq!(app.attach.as_deref(), Some("问"));
     }
 
@@ -15997,13 +16296,13 @@ mod tests {
     #[test]
     fn preview_goes_right_only_when_wide_enough() {
         use Preview::*;
-        assert_eq!(preview_side(Auto, 46, 30), Some(Side::Below)); // 手机竖屏:分屏
-        assert_eq!(preview_side(Auto, 110, 20), Some(Side::Right)); // 手机横屏 / 桌面
+        assert_eq!(preview_side(Auto, 46, 30), Some(Side::Below)); // Phone portrait: split
+        assert_eq!(preview_side(Auto, 110, 20), Some(Side::Right)); // Phone landscape / desktop
         assert_eq!(preview_side(Auto, 90, 30), Some(Side::Below));
-        assert_eq!(preview_side(Focus, 46, 30), Some(Side::Focus)); // 预览为主
-        assert_eq!(preview_side(Focus, 150, 40), Some(Side::Below)); // 宽屏没有这一种(手机转屏才会碰到)
+        assert_eq!(preview_side(Focus, 46, 30), Some(Side::Focus)); // Mostly preview
+        assert_eq!(preview_side(Focus, 150, 40), Some(Side::Below)); // Wide screens don't have this one (only a phone turning hits it)
         assert_eq!(preview_side(Below, 200, 50), Some(Side::Below));
-        assert_eq!(preview_side(Below, 46, 12), None); // 太矮
+        assert_eq!(preview_side(Below, 46, 12), None); // Too short
         assert_eq!(preview_side(Off, 200, 50), None);
     }
 
@@ -16011,28 +16310,28 @@ mod tests {
     fn shift_l_cycles_what_this_screen_can_show_and_phone_and_desk_keep_their_own() {
         use Preview::*;
         let mut app = fixture();
-        app.screen = Rect::new(0, 0, 46, 30); // 手机
+        app.screen = Rect::new(0, 0, 46, 30); // Phone
         let mut seen = vec![];
         for _ in 0..3 {
             press(&mut app, KeyCode::Char('L'));
             seen.push(app.mode());
         }
-        assert_eq!(seen, [Focus, Off, Auto]); // 分屏 → 预览为主 → 只看列表 → 分屏,每下都不一样
+        assert_eq!(seen, [Focus, Off, Auto]); // split → mostly preview → list only → split, each press different
         press(&mut app, KeyCode::Char('L'));
         let rows = reader_rows(&mut app, 46, 30);
-        // 底栏亮一会儿:这几种里轮到了哪个
-        assert_eq!(rows[29].trim(), "布局  分屏 →  预览为主  → 只看列表", "{rows:#?}"); // 当前的是强调色底的块
-        // 预览为主:列表只剩几行,嵌着标题的线上写着高亮的是第几个
+        // The bottom bar lights up for a while: which of these it's on now
+        assert_eq!(rows[29].trim(), "布局  分屏 →  预览为主  → 只看列表", "{rows:#?}"); // The current one is on the accent background
+        // Mostly preview: the list is down to a few rows; the rule holding the title says which one is highlighted
         let rule = rows.iter().position(|r| r.starts_with("─ ")).unwrap();
         assert!(rule <= 1 + FOCUS_ROWS as usize && rows[rule].contains("1/3"), "{rows:#?}");
-        // 桌面各记各的:手机上改了不影响桌面
+        // Desktop keeps its own: a change on a phone doesn't affect the desktop
         app.screen = Rect::new(0, 0, 150, 40);
         assert_eq!(app.mode(), Auto);
         press(&mut app, KeyCode::Char('L'));
         assert_eq!(app.mode(), Below);
         press(&mut app, KeyCode::Char('L'));
         assert_eq!(app.mode(), Off);
-        // 只看列表:底下一行写高亮的那个在干什么
+        // List only: a line at the bottom says what the highlighted one is doing
         let rows = reader_rows(&mut app, 150, 40);
         assert!(rows.iter().any(|r| r.contains("─ ◆ 等待回应 · ") && r.contains("1/3")), "{rows:#?}");
         assert_eq!((app.view_state().preview, app.view_state().preview_narrow), (Off, Focus));
@@ -16043,20 +16342,20 @@ mod tests {
         let wrap_lines = |xs: &[&str], w: usize| ansi::wrap(&ansi::parse_lines(xs), w).iter().map(ansi::plain).collect::<Vec<_>>();
         let v = |xs: &'static [&'static str]| xs;
         assert_eq!(wrap_lines(v(&["hello world foo"]), 11), ["hello world", "foo"]);
-        assert_eq!(wrap_lines(v(&["abcdefghij"]), 4), ["abcd", "efgh", "ij"]); // 没空格就硬断
-        assert_eq!(wrap_lines(v(&["中文一二三"]), 4), ["中文", "一二", "三"]); // 一个字两格
-        assert_eq!(wrap_lines(v(&["a", "", "b"]), 10), ["a", "", "b"]); // 空行保留
-        assert_eq!(wrap_lines(v(&["x yyyyyyyyy"]), 6), ["x yyyy", "yyyyy"]); // 空格太靠前就不在那断
+        assert_eq!(wrap_lines(v(&["abcdefghij"]), 4), ["abcd", "efgh", "ij"]); // No space: hard break
+        assert_eq!(wrap_lines(v(&["中文一二三"]), 4), ["中文", "一二", "三"]); // Two cells per character
+        assert_eq!(wrap_lines(v(&["a", "", "b"]), 10), ["a", "", "b"]); // Blank lines kept
+        assert_eq!(wrap_lines(v(&["x yyyyyyyyy"]), 6), ["x yyyy", "yyyyy"]); // A space too near the start isn't used as the break
     }
 
-    /// 屏幕上每一样都有(按顺序出现在某一行里)
+    /// Every one is on screen (each appearing in some row, in order)
     fn shows(rows: &[String], wants: &[&str]) {
         for w in wants {
             assert!(rows.iter().any(|r| r.contains(w)), "缺「{w}」:{rows:#?}");
         }
     }
 
-    /// 顶栏上当前的范围(强调色、带下划线的那个)
+    /// The current scope on the top bar (the accented, underlined one)
     fn active_tab(app: &mut App) -> String {
         let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
         t.draw(|f| draw(f, app)).unwrap();
@@ -16064,7 +16363,7 @@ mod tests {
         (0..80u16).map(|x| &buf[(x, 0)]).filter(|c| c.modifier.contains(Modifier::UNDERLINED)).map(|c| c.symbol().to_string()).collect()
     }
 
-    /// 打开「跑」的记录,喂进测试用的那一段(不起后台线程)
+    /// Open the record of 「跑」 and feed it the test transcript (no background thread)
     fn trace_app(name: &str) -> (App, std::path::PathBuf) {
         let mut app = fixture();
         select(&mut app, "跑");
@@ -16075,12 +16374,12 @@ mod tests {
         assert!(app.trace_request().is_none(), "只读一次");
         let (t, p) = crate::trace_claude::tests::fixture(&format!("ui-{name}"));
         app.set_trace("跑", Ok(t));
-        // 按键照上次画的走:真用时读好了先画一遍才有键进来
+        // Keys go by the last draw: in real use it's drawn once after loading before any key comes in
         reader_rows(&mut app, 120, 30);
         (app, p)
     }
 
-    /// 桌面两栏的左栏(列表)和右栏(分隔线右边)
+    /// The two desktop panes: the left (list) and the right (right of the divider)
     fn trace_panes(app: &mut App, w: u16, h: u16) -> (Vec<String>, Vec<String>) {
         let rows = reader_rows(app, w, h);
         let split = |r: &String| r.split_once('│').map(|(a, b)| (a.to_string(), b.to_string()));
@@ -16088,7 +16387,8 @@ mod tests {
         (body.iter().map(|x| x.0.clone()).collect(), body.iter().map(|x| x.1.clone()).collect())
     }
 
-    /// 在按的那一列选中的:一轮写提问的第一行,调用写说的第一句,工具写摘要(没有就写名字)
+    /// What's selected in the pane taking keys: a turn gives its prompt's first line, a call the first thing it said, a tool its
+    /// summary (or its name if none)
     fn trace_sel(app: &App) -> String {
         let v = app.trace.as_ref().unwrap();
         let t = v.tr().unwrap();
@@ -16110,7 +16410,7 @@ mod tests {
         }
         app.set_trace("跑", Ok(crate::trace::Trace::open_born(p, Agent::Claude, 0).unwrap()));
         reader_rows(&mut app, 120, 30);
-        // 第一轮的过程里,停到起 Explore 的那一步
+        // In the first turn's steps, stop on the step that starts Explore
         press(&mut app, KeyCode::Char('p'));
         reader_rows(&mut app, 120, 30);
         press(&mut app, KeyCode::Right);
@@ -16125,14 +16425,15 @@ mod tests {
         assert_eq!(trace_sel(&app), "Explore · 找 width");
         let (_, right) = trace_panes(&mut app, 120, 30);
         shows(&right, &["▸ Agent Explore · 找 width", "3 调用 · $", "找到 4 处:", "… 还有 2 行"]);
-        // ⏎:它自己的记录,同样两栏;左边是派给它的任务和它最后说的,右边是它的过程(里面又起了一个)
+        // ⏎: its own record, two panes as well; the left is the task it was given and what it said last, the right its steps
+        // (where it starts another one)
         press(&mut app, KeyCode::Enter);
         let rows = reader_rows(&mut app, 120, 30);
         assert!(rows[0].contains("子代理 · Explore · 找 width"), "{}", rows[0]);
         let (left, right) = trace_panes(&mut app, 120, 30);
         shows(&left, &["任务  找出所有 width( 的调用", "Claude  找到 4 处:"]);
         shows(&right, &["· Agent general-purpose · 细看 ui.rs", "ui.rs 里有 2 处", "Bash  rg -n 'width\\('"]);
-        // 再进一层、Esc 一层层回来,回到起它的那一步
+        // One level deeper, then Esc back level by level, to the step that started it
         for _ in 0..6 {
             if trace_sel(&app) == "general-purpose · 细看 ui.rs" {
                 break;
@@ -16152,13 +16453,14 @@ mod tests {
         let v = app.trace.as_ref().unwrap();
         assert!(v.path.is_empty() && v.in_steps);
         assert_eq!(trace_sel(&app), "Explore · 找 width");
-        // 手机宽度:进子代理也是整屏看它的过程
+        // Phone width: entering a subagent also shows its steps full screen
         press(&mut app, KeyCode::Enter);
         let rows = reader_rows(&mut app, 46, 30);
         assert!(rows.iter().any(|r| r.contains("· Agent general-purpose")), "{rows:#?}");
     }
 
-    /// 列表里的子代理(和 `with_subs` 那份记录里的三个对得上):Explore 在跑,它再起的那个也在跑,fork 的跑完了
+    /// Subagents in the list (matching the three in the `with_subs` record): Explore running, the one it started running too, the
+    /// fork finished
     fn agents() -> Vec<Subagent> {
         let agent = |id: &str, kind: &str, desc: &str, phase, dur, depth| Subagent {
             id: id.into(),
@@ -16179,7 +16481,8 @@ mod tests {
         ]
     }
 
-    /// 「跑」另开了个窗口,又派了三个子代理(窗口是采集时先拼的,不带着子代理)
+    /// 「跑」 opened another window and dispatched three subagents (the window is put together first at collection time, without
+    /// the subagents)
     fn with_agents() -> Vec<Session> {
         let mut v = sessions();
         let win = sub_of(v.iter().find(|s| s.title == "跑").unwrap(), 2, false, "zsh", State::Idle, 20);
@@ -16188,9 +16491,10 @@ mod tests {
         v
     }
 
-    /// 拿本机真的记录看列表长什么样(不在 CI 里跑):
-    /// `ACA_SUBAGENT_PROBE=<会话的记录> cargo test -p aca-tui agents_look -- --ignored --nocapture`。
-    /// 那段对话起过的子代理全挂到「跑」上(每三个里算一个还在跑),展开,高亮停在中间那个
+    /// See what the list looks like with a real record on this machine (not run in CI):
+    /// `ACA_SUBAGENT_PROBE=<session record> cargo test -p aca-tui agents_look -- --ignored --nocapture`.
+    /// Every subagent that conversation started hangs off 「跑」 (one in three counted as still running), unfolded, highlight on
+    /// the middle one
     #[test]
     #[ignore]
     fn agents_look() {
@@ -16224,17 +16528,18 @@ mod tests {
         let mut app = App::new(String::new(), with_agents());
         press(&mut app, KeyCode::Char('a'));
         select(&mut app, "跑");
-        // 收着:那一行写着几个在跑,预览顶上说一句;不占行
+        // Folded: that row says how many are running, plus a line atop the preview; they take no rows
         let rows = reader_rows(&mut app, 120, 30);
         shows(&rows, &[" 3 ● 跑 +2", "子代理 2 个运行中 · 1 个已完成 · l 展开", "● 1 运行中"]);
         assert_eq!(order(&app), ["问", "未读", "跑", "zsh", "闲", "错"]);
-        // l:展开成行,紧跟在会话下面、排在它的窗口前面;高亮不动
+        // l: unfolds into rows right under the session, before its windows; highlight stays
         press(&mut app, KeyCode::Char('l'));
         assert_eq!(order(&app), ["问", "未读", "跑", "Explore · 找 width", "细看 ui.rs", "fork · 接着想", "zsh", "闲", "错"]);
         assert_eq!(app.current().unwrap().title, "跑");
         let rows = reader_rows(&mut app, 120, 30);
-        // 不编号(别的行的号不跟着跳)、字前面是树枝;再起的那个带 ↳;跑完的打勾;最后一列是它跑了多久。顶上数的还是会话;
-        // 预览顶上那句跟着换成这时候能按的键
+        // Not numbered (other rows' numbers don't shift), tree branches before the text; the nested one has ↳; finished ones are
+        // ticked; the last column is how long it ran. The top still counts sessions;
+        // the line atop the preview changes to the keys usable now
         shows(
             &rows,
             &[
@@ -16251,10 +16556,10 @@ mod tests {
         let row = |rows: &[String], what: &str| rows.iter().find(|r| r.contains(what)).cloned().unwrap_or_default();
         assert!(row(&rows, "├ ● Explore").contains(" 1m"), "{rows:#?}");
         assert!(row(&rows, "├ ✓ fork").contains("40s"), "{rows:#?}");
-        // 数字键照编号走:4 是窗口,不是子代理
+        // Digit keys follow the numbers: 4 is the window, not a subagent
         press(&mut app, KeyCode::Char('4'));
         assert_eq!(app.current().unwrap().title, "zsh");
-        // 再按 l:进到第一个子代理;预览画的是它的那几行,顶上是它的状态、谁派的
+        // l again: onto the first subagent; the preview draws its lines, with its state and who dispatched it on top
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('l'));
         assert_eq!(app.current().unwrap().title, "Explore · 找 width");
@@ -16270,7 +16575,7 @@ mod tests {
                 "09:01 Bash  rg -n width",
             ],
         );
-        // 对着会话做的键不理;走动的照常
+        // Keys that act on a session are ignored; moving works as usual
         for c in ['d', 'r', 'D', 'e', 'z', 'x', 'p', 'N'] {
             app.msg = None;
             press(&mut app, KeyCode::Char(c));
@@ -16279,7 +16584,7 @@ mod tests {
         }
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.current().unwrap().title, "细看 ui.rs");
-        // h:回到它的会话;再 h:收起来(分组没折);再 h 才折分组
+        // h: back to its session; h again: folds them (the group isn't folded); only another h folds the group
         press(&mut app, KeyCode::Char('h'));
         assert_eq!(app.current().unwrap().title, "跑");
         press(&mut app, KeyCode::Char('h'));
@@ -16301,14 +16606,14 @@ mod tests {
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('l'));
         press(&mut app, KeyCode::Char('l'));
-        // 还在跑的:照屏幕那样露底下那截(最新的一步在最下面)
+        // Still running: shows the bottom part, like the screen (latest step at the bottom)
         let rows = reader_rows(&mut app, 120, 30);
         assert!(rows.iter().any(|r| r.contains("第 80 行")) && !rows.iter().any(|r| r.contains("第 1 行")), "{rows:#?}");
-        // 交回话了的:从头露,先看到它交回来的话的开头
+        // Reported back: shown from the top, so the start of what it handed back comes first
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.current().unwrap().title, "fork · 接着想");
-        // 连着按了两下:预览等高亮停稳才换(见 SETTLE),这里当它停稳了
+        // Two presses in a row: the preview waits for the highlight to settle before switching (see SETTLE); treat it as settled here
         app.moved = None;
         let rows = reader_rows(&mut app, 120, 30);
         shows(&rows, &["交回来的", "第 1 行"]);
@@ -16324,7 +16629,7 @@ mod tests {
         press(&mut app, KeyCode::Char('l'));
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.current().unwrap().title, "细看 ui.rs");
-        // 刷新:Explore 跑完了,它再起的那个不列了 → 高亮回到会话上;别的行照新的画
+        // Refresh: Explore finished and the one it started is no longer listed → highlight back on the session; other rows drawn anew
         let mut v = with_agents();
         let run = v.iter_mut().find(|s| s.title == "跑").unwrap();
         run.subagents.remove(1);
@@ -16335,12 +16640,12 @@ mod tests {
         let rows = reader_rows(&mut app, 120, 30);
         shows(&rows, &[" 3 ● 跑", "    ├ ✓ Explore · 找 width", "子代理 2 个已完成 · h 收起"]);
         assert!(!rows.iter().any(|r| r.contains("跑 +")), "{rows:#?}");
-        // 一个都不列了:行没了,也不再记着展开 —— 下回再派还是先收着
+        // None listed anymore: the rows are gone and unfolded is no longer remembered — the next dispatch starts folded again
         app.set_sessions(sessions());
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "错"]);
         app.set_sessions(with_agents());
         assert_eq!(order(&app), ["问", "未读", "跑", "zsh", "闲", "错"]);
-        // 没派子代理的会话上 l 照旧不动
+        // On a session with no subagents, l still does nothing
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('l'));
         assert_eq!(order(&app), ["问", "未读", "跑", "zsh", "闲", "错"]);
@@ -16353,24 +16658,24 @@ mod tests {
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('l'));
         press(&mut app, KeyCode::Char('l'));
-        // ⏎:不是进会话(它没有窗格),是开会话的记录
+        // ⏎: doesn't enter a session (it has no pane), opens the session's record
         press(&mut app, KeyCode::Enter);
         assert!(app.attach.is_none() && app.start.is_none());
         assert_eq!(app.trace_request().map(|s| s.title), Some("跑".to_string()));
         let (p, _, _) = crate::trace_claude::tests::with_subs("ui-agent-row");
         app.set_trace("跑", Ok(crate::trace::Trace::open_born(p.clone(), Agent::Claude, 0).unwrap()));
-        // 读好了就在它那一层
+        // Once loaded, it's at that subagent's level
         let rows = reader_rows(&mut app, 120, 30);
         assert!(rows[0].contains("子代理 · Explore · 找 width"), "{}", rows[0]);
         assert_eq!(app.trace.as_ref().unwrap().path.len(), 1);
         let (left, right) = trace_panes(&mut app, 120, 30);
         shows(&left, &["任务  找出所有 width( 的调用", "Claude  找到 4 处:"]);
         shows(&right, &["Bash  rg -n 'width\\('"]);
-        // Esc 一下就回列表,高亮还在那一行
+        // One Esc goes back to the list, highlight still on that row
         press(&mut app, KeyCode::Esc);
         assert!(app.trace.is_none());
         assert_eq!(app.current().unwrap().title, "Explore · 找 width");
-        // 再起的那个:一路进两层。Z 和 ⏎ 一样
+        // The nested one: two levels in at once. Z is the same as ⏎
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('Z'));
         let _ = app.trace_request();
@@ -16378,7 +16683,8 @@ mod tests {
         let rows = reader_rows(&mut app, 120, 30);
         assert!(rows[0].contains("子代理 · general-purpose · 细看 ui.rs"), "{}", rows[0]);
         assert_eq!(app.trace.as_ref().unwrap().path.len(), 2);
-        // ← 往上一层:起它的那个子代理(停在右边它的过程上)。从那 Esc 是照旧的走法:先回左边,再退到会话自己的记录,再回列表
+        // ← up one level: the subagent that started it (on its steps on the right). Esc from there goes the usual way: first to the
+        // left, then out to the session's own record, then back to the list
         press(&mut app, KeyCode::Left);
         let rows = reader_rows(&mut app, 120, 30);
         assert!(rows[0].contains("子代理 · Explore · 找 width"), "{}", rows[0]);
@@ -16395,9 +16701,10 @@ mod tests {
     fn shift_z_shows_the_chat_on_the_left_and_the_turns_steps_on_the_right() {
         let (mut app, _) = trace_app("shows");
         let (left, right) = trace_panes(&mut app, 120, 30);
-        // 记录里那一轮在 UTC 01:00 那一分钟,画的是本地时刻(东八区是 09:00)
+        // That turn in the record is in the 01:00 UTC minute; drawn in local time (09:00 in UTC+8)
         let numbers = format!("{} · 20.0s · $0.03", crate::trace::clock(3_600_000, crate::usage::local_offset(), false));
-        // 左边是对话:你说的、Claude 最后说的(Markdown 排过)、一行数字;中间说的话不在这
+        // The left is the conversation: what you said, what Claude said last (Markdown laid out), a line of numbers; what it said in
+        // between isn't here
         shows(
             &left,
             &[
@@ -16414,13 +16721,13 @@ mod tests {
             ],
         );
         assert!(!left.iter().any(|r| r.contains("先看 bill.rs")), "中间说的在右边:{left:#?}");
-        // 右边是选中那一轮(跟着最新 = 在跑的那一轮)的过程
+        // The right is the steps of the selected turn (following the latest = the running turn)
         shows(
             &right,
             &["1 调用 · 2 工具", "── 4.1s", "▸ Read  src/usage.rs", "5 行", "· Bash  cargo build --release", "运行中 · ", "● 运行中…"],
         );
         shows(&reader_rows(&mut app, 120, 30), &["记录 · 跑", "3 轮", "→ 查看过程"]);
-        // 在按左边:左边选中那块头一行淡紫底,右边不铺
+        // Keys on the left: the first line of the selected block on the left gets a pale purple background, the right gets none
         let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
         let buf = t.backend().buffer();
@@ -16435,7 +16742,7 @@ mod tests {
                 assert!(!matches!(c.fg, Color::Yellow | Color::Gray | Color::White | Color::DarkGray), "({x},{y}) {:?}", c.fg);
             }
         }
-        // 各种宽度折好的都放得下
+        // Wrapped at every width, it all fits
         let v = app.trace.as_ref().unwrap();
         let tr = v.t.as_ref().unwrap();
         for w in [20, 34, 43, 60, 80] {
@@ -16448,19 +16755,20 @@ mod tests {
                 }
             }
         }
-        // 手机上照样有标题和钱
+        // On a phone the title and the cost still show
         shows(&reader_rows(&mut app, 46, 20), &["记录 · 跑", "3 轮 · $"]);
     }
 
     #[test]
     fn shift_z_keys_move_through_turns_step_into_the_process_and_back() {
         let (mut app, _) = trace_app("keys");
-        // p:上一轮(压缩那行不停)
+        // p: previous turn (doesn't stop on the compaction line)
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(trace_sel(&app), "再试一次");
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(trace_sel(&app), "看看两栏为什么对不齐");
-        // 右边换成这一轮的过程:每次调用的数字、想的、中间说的、工具带改动和输出的开头;回复在左边,这里只留一句
+        // The right switches to this turn's steps: each call's numbers, thinking, what it said in between, tools with their diffs and
+        // the start of their output; the reply is on the left, only one line of it here
         let right = trace_panes(&mut app, 120, 40).1;
         shows(
             &right,
@@ -16481,7 +16789,7 @@ mod tests {
             ],
         );
         assert!(!right.iter().any(|r| r.contains("• 测试全过了")), "回复全文在左边:{right:#?}");
-        // → 进右边,一步步走;⏎ 整屏看这一步
+        // → into the right pane, step by step; ⏎ shows this step full screen
         press(&mut app, KeyCode::Right);
         assert!(app.trace.as_ref().unwrap().in_steps);
         shows(&reader_rows(&mut app, 120, 20), &["← Esc 返回对话"]);
@@ -16491,7 +16799,7 @@ mod tests {
         assert_eq!(trace_sel(&app), "width(");
         press(&mut app, KeyCode::Enter);
         shows(&reader_rows(&mut app, 100, 24), &["Grep · 第 1 轮", "── 输入 ──", "── 输出 ──", "src/ui.rs:90:"]);
-        // 整屏里 n:过程里的下一步
+        // n in full screen: the next step
         press(&mut app, KeyCode::Char('n'));
         shows(&reader_rows(&mut app, 100, 24), &["第 1 轮 · 第 2 次调用", " · 缓存写 100 · ", "── 调用了 ──", "▸ Edit  src/bill.rs"]);
         press(&mut app, KeyCode::Esc);
@@ -16502,7 +16810,7 @@ mod tests {
             &["Edit · 第 1 轮", "── 改动 ──", "11   fn col(s: &str)", "12 +     let w = s.width();", "┈┈┈┈┈", "41 +     pad(w.max(1))"],
         );
         press(&mut app, KeyCode::Esc);
-        // 第一次调用的整屏:先想、再说,token 分开写
+        // The first call full screen: thinking first, then what it said, tokens listed separately
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
@@ -16511,18 +16819,18 @@ mod tests {
             &["第 1 轮 · 第 1 次调用", "claude-opus-5-5", "── 思考 ──", "中文一个字占两格", "── 回复 ──", "── 调用了 ──"],
         );
         press(&mut app, KeyCode::Esc);
-        // 右边 n / p 换轮,还在右边、从头看
+        // n / p on the right change turns, staying on the right, from the top
         press(&mut app, KeyCode::Char('n'));
         assert!(app.trace.as_ref().unwrap().in_steps);
         assert_eq!(trace_sel(&app), "再试一次");
         shows(&trace_panes(&mut app, 120, 20).1, &["出错", "529 server_error"]);
-        // ← / Esc 回对话,再 Esc 才回列表
+        // ← / Esc back to the conversation; only another Esc goes back to the list
         press(&mut app, KeyCode::Esc);
         assert!(!app.trace.as_ref().unwrap().in_steps);
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Left);
         assert!(app.trace.is_some() && !app.trace.as_ref().unwrap().in_steps);
-        // Tab 看输出,Z 回来;Esc 回到列表
+        // Tab shows the output, Z comes back; Esc back to the list
         press(&mut app, KeyCode::Tab);
         assert!(app.trace.is_none() && app.reader.is_some());
         press(&mut app, KeyCode::Char('Z'));
@@ -16562,17 +16870,17 @@ mod tests {
     #[test]
     fn shift_z_o_opens_and_closes_a_step_and_shift_o_the_whole_turn() {
         let (mut app, _) = trace_app("fold");
-        // 按键照上次画的走:每下画一遍,同真用
+        // Keys go by the last draw: draw after each one, as in real use
         let key = |app: &mut App, k: KeyCode| {
             press(app, k);
             trace_panes(app, 120, 50)
         };
         key(&mut app, KeyCode::Char('p'));
         key(&mut app, KeyCode::Char('p'));
-        // 左边:本来就是全文的一轮,o 说一声
+        // Left: a turn that's already in full, o says so
         key(&mut app, KeyCode::Char('o'));
         assert!(app.msg.is_none());
-        // 右边选到 Edit:收着只有改动的行
+        // Edit selected on the right: folded, only the changed lines
         key(&mut app, KeyCode::Right);
         for _ in 0..4 {
             key(&mut app, KeyCode::Down);
@@ -16581,16 +16889,16 @@ mod tests {
         let right = trace_panes(&mut app, 120, 50).1;
         shows(&right, &["▸ Edit  src/bill.rs", "12 -     let w = s.len();"]);
         assert!(!right.iter().any(|r| r.contains("fn col(s: &str)")), "{right:#?}");
-        // o:带上下文、两处中间点线;再 o 收回去
+        // o: with context and a dotted line between the two hunks; o again folds it
         let right = key(&mut app, KeyCode::Char('o')).1;
         shows(&right, &["▾ Edit  src/bill.rs", "11   fn col(s: &str) -> usize {", "┈┈┈┈┈", "42   }"]);
         let right = key(&mut app, KeyCode::Char('o')).1;
         assert!(!right.iter().any(|r| r.contains("fn col(s: &str)")), "{right:#?}");
-        // 没有别的内容的一步(只有数字的那次调用):说一声
+        // A step with nothing else (the call with only numbers): says so
         key(&mut app, KeyCode::Up);
         key(&mut app, KeyCode::Char('o'));
         assert!(app.msg.is_none());
-        // O:这一轮全部展开(想的全文、搜到的全部、整条命令和全部输出),再 O 全收
+        // O: unfold the whole turn (all the thinking, every search hit, the whole command and all output), O again folds everything
         let right = key(&mut app, KeyCode::Char('O')).1;
         shows(
             &right,
@@ -16606,7 +16914,7 @@ mod tests {
         );
         let right = key(&mut app, KeyCode::Char('O')).1;
         shows(&right, &["▸ Grep", "▸ Edit", "▸ Bash", "… 还有 3 行"]);
-        // 想的短,收着也是全文,摊成一行
+        // Short thinking: in full even folded, flattened to one line
         shows(&right, &["思考 先确认是不是宽字符的问题。中文一个字占两格"]);
     }
 
@@ -16619,7 +16927,8 @@ mod tests {
         };
         key(&mut app, KeyCode::Char('p'));
         key(&mut app, KeyCode::Char('p'));
-        // 右边选到 Bash(记录里的文件不在本机):写成一份 Markdown 的临时文件,看完删
+        // Bash selected on the right (the record's files aren't on this machine): written to a temporary Markdown file, deleted
+        // after viewing
         key(&mut app, KeyCode::Right);
         for _ in 0..6 {
             key(&mut app, KeyCode::Down);
@@ -16631,12 +16940,12 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("# Bash · cargo test --release") && text.contains("test result: ok. 220 passed"), "{text}");
         let _ = std::fs::remove_file(&path);
-        // 整屏里也能 e
+        // e works in full screen too
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Char('e'));
         assert!(matches!(app.external.take(), Some(External::View { temp: true, .. })));
         key(&mut app, KeyCode::Esc);
-        // 左边:一轮看整轮;压缩那行没有可看的
+        // Left: a turn shows the whole turn; the compaction line has nothing to view
         key(&mut app, KeyCode::Esc);
         key(&mut app, KeyCode::Char('e'));
         let Some(External::View { path, .. }) = app.external.take() else { panic!() };
@@ -16654,7 +16963,7 @@ mod tests {
         let (mut app, _) = trace_app("color");
         press(&mut app, KeyCode::Char('p'));
         press(&mut app, KeyCode::Char('p'));
-        // 矮屏:右边只露出上面几块,底下的先不上色
+        // Short screen: the right shows only the top few blocks, the ones below aren't colored yet
         reader_rows(&mut app, 120, 12);
         let v = app.trace.as_ref().unwrap();
         let c = v.steps_cache.as_ref().unwrap();
@@ -16663,7 +16972,7 @@ mod tests {
             let seen = e > top && s < top + h;
             assert_eq!(b.colored > 0, seen, "块 {} 在 {s}..{e},屏幕 {top}..{}", b.node, top + h);
         }
-        // 高屏:Edit 露出来了,屏幕上 let 是关键字的颜色
+        // Tall screen: Edit is in view, and on screen let has the keyword color
         let mut term = Terminal::new(TestBackend::new(120, 50)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer().clone();
@@ -16681,7 +16990,7 @@ mod tests {
     #[test]
     fn shift_z_ctrl_keys_are_not_letters_and_ctrl_l_restarts() {
         let (mut app, _) = trace_app("ctrl");
-        // ^Z 不是 z(看输出)、^O 不是 o
+        // ^Z isn't z (view output), ^O isn't o
         app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
         app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(app.trace.is_some() && app.reader.is_none());
@@ -16707,7 +17016,7 @@ mod tests {
             (buf[(x, y)].fg, buf[(x, y)].bg)
         };
         assert_eq!(kw_at(&mut app), (theme::pal().syn_kw, theme::pal().add_bg));
-        // 设置页里预览别的主题:排好的行是旧颜色,要重排
+        // Previewing another theme on the settings page: already laid-out lines have the old colors and need laying out again
         let mut p = *theme::pal();
         (p.syn_kw, p.add_bg) = (Color::Rgb(1, 2, 3), Color::Rgb(4, 5, 6));
         theme::set(Box::leak(Box::new(p)));
@@ -16721,7 +17030,7 @@ mod tests {
         press(&mut app, KeyCode::Char('p'));
         let (_, right) = trace_panes(&mut app, 120, 12);
         assert!(right.iter().any(|r| r.contains("↓") && r.contains("行")), "右边底下还有要说:{right:#?}");
-        // 滚轮:鼠标在哪边滚哪边
+        // Wheel: scrolls whichever side the mouse is on
         let wheel = |app: &mut App, column: u16| {
             app.on_mouse(MouseEvent { kind: MouseEventKind::ScrollDown, column, row: 5, modifiers: KeyModifiers::NONE })
         };
@@ -16731,7 +17040,7 @@ mod tests {
         let chat_top = v.chat.top;
         wheel(&mut app, 5);
         assert!(app.trace.as_ref().unwrap().chat.top > chat_top);
-        // 换了轮,右边从头看
+        // Turn changed: the right starts from the top
         press(&mut app, KeyCode::Char('n'));
         trace_panes(&mut app, 120, 12);
         assert_eq!(app.trace.as_ref().unwrap().steps.top, 0);
@@ -16740,7 +17049,7 @@ mod tests {
     #[test]
     fn shift_z_on_a_phone_is_the_chat_and_a_turns_steps_open_full_screen() {
         let (mut app, _) = trace_app("phone");
-        // 刚打开:整屏是对话,贴着最新
+        // Just opened: the whole screen is the conversation, at the latest
         let rows = reader_rows(&mut app, 46, 16);
         shows(&rows, &["你  跑一下测试", "● 运行中", "⏎ 查看过程"]);
         assert!(!rows[1..rows.len() - 1].iter().any(|r| r.contains('│')), "手机上不分两栏:{rows:#?}");
@@ -16748,13 +17057,13 @@ mod tests {
         press(&mut app, KeyCode::Char('p'));
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(trace_sel(&app), "看看两栏为什么对不齐");
-        // 一块比一屏高:↓ 先在块里滚
+        // A block taller than the screen: ↓ scrolls inside it first
         reader_rows(&mut app, 46, 8);
         let top = app.trace.as_ref().unwrap().chat.top;
         press(&mut app, KeyCode::Down);
         assert_eq!(trace_sel(&app), "看看两栏为什么对不齐");
         assert_eq!(app.trace.as_ref().unwrap().chat.top, top + 1);
-        // ⏎ 整屏看这一轮的过程,顶上写第几轮
+        // ⏎ shows this turn's steps full screen, with the turn number on top
         press(&mut app, KeyCode::Enter);
         let rows = reader_rows(&mut app, 46, 30);
         shows(&rows, &["第 1 轮", "── 4.0s", "▸ Grep  width(", "▸ Edit  src/bill.rs", "o 展开", "Esc 返回对话"]);
@@ -16766,7 +17075,7 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
         shows(&reader_rows(&mut app, 46, 16), &["你  看看两栏为什么对不齐", "⏎ 查看过程"]);
-        // G 回到最新
+        // G back to the latest
         press(&mut app, KeyCode::Char('G'));
         reader_rows(&mut app, 46, 16);
         assert_eq!(trace_sel(&app), "跑一下测试");
@@ -16781,19 +17090,19 @@ mod tests {
         add(crate::trace_claude::tests::done("r3", "a5", 50_000, "t3", false));
         add(crate::trace_claude::tests::prompt("u4", Some("r3"), 60_000, "下一句"));
         app.trace_tail();
-        // 新的一轮来了:左边选到它、贴底,右边换成它的过程
+        // A new turn arrives: the left selects it, stuck to the bottom; the right switches to its steps
         let (left, right) = trace_panes(&mut app, 120, 20);
         assert_eq!(trace_sel(&app), "下一句");
         shows(&left, &["你  下一句"]);
         assert!(!right.iter().any(|r| r.contains("cargo build")), "{right:#?}");
         shows(&reader_rows(&mut app, 120, 20), &["4 轮"]);
-        // 往上挪了就不跟:再来新的不动
+        // Moved up: no longer follows; another new one doesn't move it
         press(&mut app, KeyCode::Up);
         add(crate::trace_claude::tests::prompt("u5", Some("u4"), 70_000, "又一句"));
         app.trace_tail();
         trace_panes(&mut app, 120, 20);
         assert_ne!(trace_sel(&app), "又一句");
-        // 手机上跟着最新也是贴底
+        // On a phone, following the latest also sticks to the bottom
         let (mut app, p) = trace_app("follows2");
         reader_rows(&mut app, 46, 10);
         writeln!(
@@ -16815,13 +17124,13 @@ mod tests {
         let _ = app.trace_request();
         app.set_trace("跑", Err("找不到记录".into()));
         shows(&reader_rows(&mut app, 60, 10), &["记录 · 跑", "找不到记录"]);
-        // 换了会话后才回来的旧结果不要
+        // An old result coming back after the session changed is dropped
         press(&mut app, KeyCode::Char('J'));
         app.set_trace("跑", Err("旧的".into()));
         assert!(app.trace.as_ref().unwrap().err.is_none());
     }
 
-    /// 手动看样子:cargo test --release trace_look -- --ignored --nocapture
+    /// Look at it by hand: cargo test --release trace_look -- --ignored --nocapture
     #[test]
     #[ignore]
     fn trace_look() {
@@ -16851,8 +17160,8 @@ mod tests {
         show(&mut app, 46, 40, "手机 · 第 1 轮的过程");
     }
 
-    /// 手动看颜色:ACA_TRACE_HTML=<目录> cargo test --release trace_html -- --ignored。把几屏画成网页
-    /// 画一屏,转成带颜色的 HTML(自查排版用)
+    /// Check the colors by hand: ACA_TRACE_HTML=<dir> cargo test --release trace_html -- --ignored. Draws a few screens into a web page
+    /// Draw one screen and turn it into colored HTML (for checking the layout yourself)
     fn html_page(app: &mut App, w: u16, h: u16) -> String {
         let css = |c: Color| match c {
             Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
@@ -16905,16 +17214,16 @@ mod tests {
             press(&mut app, KeyCode::Down);
         }
         html += &page(&mut app, 120, 30);
-        // o 展开 Edit
+        // o unfolds Edit
         press(&mut app, KeyCode::Char('o'));
         html += &page(&mut app, 120, 30);
-        // 最后一轮的 Read 展开(按键照上次画的走,每下都画一遍)
+        // Unfold Read in the last turn (keys go by the last draw, so draw after each)
         for k in [KeyCode::Char('n'), KeyCode::Char('n'), KeyCode::Down, KeyCode::Down, KeyCode::Char('o')] {
             press(&mut app, k);
             page(&mut app, 120, 30);
         }
         html += &page(&mut app, 120, 30);
-        // 刚够两栏的宽度
+        // Just wide enough for two panes
         for k in [KeyCode::Char('p'), KeyCode::Char('p'), KeyCode::Char('O')] {
             press(&mut app, k);
             page(&mut app, 90, 40);
@@ -16936,7 +17245,7 @@ mod tests {
             .unwrap();
     }
 
-    /// 子代理那几屏:ACA_TRACE_HTML=<目录> cargo test --release trace_html_subs -- --ignored
+    /// The subagent screens: ACA_TRACE_HTML=<dir> cargo test --release trace_html_subs -- --ignored
     #[test]
     #[ignore]
     fn trace_html_subs() {
@@ -16973,7 +17282,7 @@ mod tests {
         let buf = t.backend().buffer().clone();
         (0..h)
             .map(|y| {
-                // 宽字符后面那格是占位,跳过
+                // The cell after a wide character is a placeholder, skip it
                 let (mut line, mut x) = (String::new(), 0);
                 while x < w {
                     let cell = &buf[(x, y)];
@@ -16992,16 +17301,16 @@ mod tests {
         press(&mut app, KeyCode::Char('e'));
         assert!(app.typing());
         typ(&mut app, "先跑测试");
-        press(&mut app, KeyCode::Enter); // 回车是换行
+        press(&mut app, KeyCode::Enter); // ⏎ is a newline
         typ(&mut app, "再提交");
-        assert_eq!(app.notes.get("id-闲"), Some("先跑测试\n再提交")); // 边写边存,不用等 Esc
+        assert_eq!(app.notes.get("id-闲"), Some("先跑测试\n再提交")); // Saved as you type, no waiting for Esc
         let rows = reader_rows(&mut app, 100, 24);
         assert!(rows.iter().any(|r| r.contains("✎ 便签")), "{rows:#?}");
         assert!(rows.iter().any(|r| r.contains("再提交▏")), "光标在预览里:{rows:#?}");
-        // 写在预览里了,底栏只剩按键,不再重复一遍内容
+        // Written in the preview, so the bottom bar only has the keys, without repeating the text
         assert!(rows.last().unwrap().trim_start().starts_with("Esc 保存"), "{rows:#?}");
         assert!(!rows.last().unwrap().contains("先跑测试"), "{rows:#?}");
-        // 没有预览(关了)时,在弹窗里写
+        // With no preview (off), written in a popup
         app.preview = Preview::Off;
         shows(&reader_rows(&mut app, 100, 24), &["便签 · 闲", "先跑测试", "再提交▏", "Esc 保存"]);
         app.preview = Preview::Auto;
@@ -17013,7 +17322,7 @@ mod tests {
         for want in ["空闲 · 10 秒前", "/p/work", "✎ 先跑测试", "再提交"] {
             assert!(rows.iter().any(|r| r.contains(want)), "缺「{want}」:{rows:#?}");
         }
-        // 再按 e:原来的先填好;^U 清空当场就删
+        // e again: the old note prefilled; ^U clears it and deletes it on the spot
         press(&mut app, KeyCode::Char('e'));
         assert_eq!(app.prompt.as_ref().unwrap().text, "先跑测试\n再提交");
         ctrl(&mut app, 'u');
@@ -17026,7 +17335,7 @@ mod tests {
     fn ctrl_g_hands_the_note_to_the_editor() {
         let mut app = fixture();
         select(&mut app, "闲");
-        // 写到一半按 ^G:带着写了的去编辑器,回来接着在底栏写
+        // ^G halfway through: takes what's written to the editor, then back to writing in the bottom bar
         press(&mut app, KeyCode::Char('e'));
         typ(&mut app, "草稿");
         ctrl(&mut app, 'g');
@@ -17037,7 +17346,7 @@ mod tests {
         assert_eq!(app.notes.get("id-闲"), Some("草稿\n编辑器里补的"));
         assert_eq!(app.prompt.as_ref().unwrap().text, "草稿\n编辑器里补的");
         press(&mut app, KeyCode::Esc);
-        // 列表里直接 ^G;编辑器没正常退出(:cq)= 不改
+        // ^G straight from the list; the editor not exiting cleanly (:cq) = no change
         ctrl(&mut app, 'g');
         let ed = app.edit_note.take().unwrap();
         assert_eq!(ed.text, "草稿\n编辑器里补的");
@@ -17046,7 +17355,7 @@ mod tests {
         assert!(app.prompt.is_none());
         ctrl(&mut app, 'g');
         let ed = app.edit_note.take().unwrap();
-        app.note_editor_done(ed, Ok(String::new())); // 编辑器里删光 = 删便签
+        app.note_editor_done(ed, Ok(String::new())); // Emptied in the editor = note deleted
         assert_eq!(app.notes.get("id-闲"), None);
     }
 
@@ -17059,24 +17368,24 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         typ(&mut app, "再看性能");
         assert_eq!(app.notes.get("group:work"), Some("这一组:先把测试补齐\n再看性能"));
-        // 写在分组的预览里,光标在最后;预览关着时在弹窗里
+        // Written in the group's preview, cursor at the end; in a popup when the preview is off
         shows(&reader_rows(&mut app, 100, 24), &["✎ 便签", "再看性能▏"]);
         app.preview = Preview::Off;
         shows(&reader_rows(&mut app, 100, 24), &["便签 · work", "再看性能▏"]);
         app.preview = Preview::Auto;
         press(&mut app, KeyCode::Esc);
         assert_eq!(said(&app), "便签已保存");
-        // 组名后面标 ✎,预览里显示;组里的会话自己没有便签
+        // ✎ after the group name, shown in the preview; the group's sessions have no note of their own
         let rows = reader_rows(&mut app, 100, 24);
         assert!(rows.iter().any(|r| r.contains("▾ work") && r.contains('✎')), "{rows:#?}");
         shows(&rows, &["✎ 这一组:先把测试补齐", "再看性能"]);
         assert!(app.all.iter().filter(|s| s.group == "work").all(|s| s.group_noted && !s.noted));
-        // 会话上的 e 还是写会话自己的
+        // e on a session still writes the session's own
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('e'));
         assert_eq!(app.prompt.as_ref().unwrap().text, "");
         press(&mut app, KeyCode::Esc);
-        // 折叠行上一样:标 ✎,原来的先填好;^Z 撤回改的
+        // Same on the fold row: marked ✎, the old note prefilled; ^Z undoes the edit
         jump_to_group(&mut app, "work");
         press(&mut app, KeyCode::Char('o'));
         assert!(app.on_fold_row());
@@ -17089,7 +17398,7 @@ mod tests {
         ctrl(&mut app, 'z');
         assert_eq!(said(&app), "已撤销修改便签「work」");
         assert_eq!(app.notes.get("group:work"), Some("这一组:先把测试补齐\n再看性能"));
-        // ^G:编辑器里写的也是组的;删光 = 删便签
+        // ^G: what's written in the editor is the group's too; emptied = note deleted
         ctrl(&mut app, 'g');
         let ed = app.edit_note.take().unwrap();
         assert_eq!(ed.text, "这一组:先把测试补齐\n再看性能");
@@ -17107,7 +17416,7 @@ mod tests {
         assert_eq!(got[..3], ["/p/work", "✎ 第1行", "  第2行"]);
         assert_eq!(got.len(), 10, "{got:#?}");
         assert_eq!(got[9], "  … 还有 12 行");
-        // 正在写:光标在最后,也是一半
+        // While writing: cursor at the end, still half
         let got = text(&group_pane(&sp, None, Some(&long), true, 30, 20));
         assert_eq!((got.len(), got[1].as_str(), got[9].as_str()), (10, "✎ 便签", "  第20行▏"));
     }
@@ -17128,12 +17437,12 @@ mod tests {
             app.job_done(&job, Outcome::Done("已恢复分组 fun · 4 个会话".into()), life_and_work());
         };
         bin(&mut app);
-        // 记进回收站的那一条,便签里清掉:再建一个 fun 是空的
+        // Kept in the Trash entry and cleared from the notes: a new fun starts empty
         assert_eq!(app.trash.get("x1").unwrap().groups.iter().map(|g| g.note.as_str()).collect::<Vec<_>>(), ["整体的想法", ""]);
         assert_eq!(app.notes.get("group:fun"), None);
         restore(&mut app);
         assert_eq!(app.notes.get("group:fun"), Some("整体的想法"));
-        // 这期间新建的 fun 写了便签:拿回来的接在后面
+        // A fun created in the meantime got a note: the restored one is appended after it
         bin(&mut app);
         app.notes.set("group:fun", "新的").unwrap();
         restore(&mut app);
@@ -17147,29 +17456,29 @@ mod tests {
             app.notes.set(&format!("id-{t}"), &format!("给{t}的")).unwrap();
         }
         app.set_sessions(sessions());
-        press(&mut app, KeyCode::Char('a')); // 全部(「未读」五天没动)
+        press(&mut app, KeyCode::Char('a')); // All (「未读」 has been quiet for five days)
         select(&mut app, "闲");
-        press(&mut app, KeyCode::Enter); // 回车:便签照旧是便签
+        press(&mut app, KeyCode::Enter); // ⏎: the note stays a note
         assert_eq!((app.attach.take().as_deref(), app.fill.take()), (Some("闲"), None));
         press(&mut app, KeyCode::Char('E'));
         assert_eq!(app.attach.take().as_deref(), Some("闲"));
         assert_eq!(app.fill.take(), Some(("id-闲".into(), "给闲的".into())));
-        select(&mut app, "跑"); // 在跑也能填(Claude 边跑边打字,回车就排队);kitty 里 Shift+Enter 一样
+        select(&mut app, "跑"); // Fills while running too (Claude takes typing as it runs, ⏎ queues it); Shift+Enter in kitty too
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         assert_eq!(app.fill.take().map(|f| f.0), Some("id-跑".into()));
         app.attach = None;
-        select(&mut app, "问"); // 在等你选:字会被当成选项 → 不进去,说为什么
+        select(&mut app, "问"); // Waiting for your choice: text would be taken as an option → doesn't go in, says why
         press(&mut app, KeyCode::Char('E'));
         assert_eq!((app.attach.take(), app.fill.take()), (None, None));
         assert!(app.msg.as_ref().unwrap().0.contains("等待回应"));
-        select(&mut app, "未读"); // 没便签:和回车一样
+        select(&mut app, "未读"); // No note: same as ⏎
         press(&mut app, KeyCode::Char('E'));
         assert_eq!((app.attach.take().as_deref(), app.fill.take()), (Some("未读"), None));
-        // 填完删掉,✎ 跟着没了
+        // Deleted once filled, and the ✎ goes with it
         app.note_filled("id-闲");
         assert_eq!(app.notes.get("id-闲"), None);
         assert!(!app.all.iter().find(|s| s.title == "闲").unwrap().noted);
-        // 不是内置的 agent:不知道前台是什么程序,不填
+        // Not a built-in agent: no telling what program is in front, so no fill
         let mut v = sessions();
         v.iter_mut().find(|s| s.title == "跑").unwrap().agent = Agent::None;
         app.set_sessions(v);
@@ -17186,13 +17495,13 @@ mod tests {
             app.notes.set(&format!("id-{t}"), &format!("给{t}的\n第二行")).unwrap();
         }
         app.set_sessions(sessions());
-        select(&mut app, "跑"); // 没便签:什么都不发,只说一声
+        select(&mut app, "跑"); // No note: sends nothing, just says so
         press(&mut app, KeyCode::Char('s'));
         assert!(app.confirm.is_none() && app.take_job().is_none());
         assert!(app.msg.as_ref().unwrap().0.contains("没有便签"), "{:?}", app.msg);
-        app.msg = None; // 提示占着底栏
+        app.msg = None; // The message holds the bottom bar
         assert!(!reader_rows(&mut app, 120, 20).iter().any(|r| r.contains("发便签")));
-        // 有便签也先问:发给谁、发什么(多行照样分行);有便签时底栏才出现 s
+        // With a note it still asks first: to whom and what (multiple lines kept as lines); s shows in the bottom bar only with a note
         select(&mut app, "闲");
         let rows = reader_rows(&mut app, 120, 20);
         assert!(rows.iter().any(|r| r.contains("s 发送")), "{rows:#?}");
@@ -17200,7 +17509,7 @@ mod tests {
         let rows = reader_rows(&mut app, 46, 16);
         let at = |t: &str| rows.iter().position(|r| r.contains(t)).unwrap_or_else(|| panic!("缺「{t}」:{rows:#?}"));
         assert!(at("发送便签？") < at("给闲的") && at("给闲的") < at("第二行") && at("第二行") < at("y 发送"), "{rows:#?}");
-        press(&mut app, KeyCode::Char('s')); // 误触两下:第二下只是取消
+        press(&mut app, KeyCode::Char('s')); // Pressed twice by mistake: the second one just cancels
         assert!(app.confirm.is_none() && app.take_job().is_none());
         assert_eq!(app.msg.as_ref().unwrap().0, "未发送");
         press(&mut app, KeyCode::Char('s'));
@@ -17208,10 +17517,10 @@ mod tests {
         let job = app.take_job().unwrap();
         let Job::Send { t, pane, text, key } = &job else { panic!("{job:?}") };
         assert_eq!((t.name.as_str(), pane.as_str(), text.as_str(), key.as_str()), ("闲", "=闲:", "给闲的\n第二行", "id-闲"));
-        // 发出去了便签就删
+        // Once sent, the note is deleted
         app.job_done(&job, Outcome::Done("已发给「闲」".into()), sessions());
         assert_eq!(app.notes.get("id-闲"), None);
-        // 在等你选:字会被当成选项,不发
+        // Waiting for your choice: text would be taken as an option, so not sent
         select(&mut app, "问");
         press(&mut app, KeyCode::Char('s'));
         assert!(app.confirm.is_none());
@@ -17224,31 +17533,31 @@ mod tests {
         s.dir = "/p/work".into();
         s.info = "Repo: /r\nPath: /p/work\nBranch: feat".into();
         let text = |l: &[Line]| l.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
-        // 状态 · 多久以前、目录、分支,最后空一行再接屏幕内容
+        // State · how long ago, directory, branch, then a blank line before the screen content
         assert_eq!(text(&preview_head(&s, None, None, false, 60, 10)), ["空闲 · 1 分钟前   /p/work  feat", ""]);
-        // 会话 id、别处打开不上预览(B 复制 id;⇄ 列表那行有)
+        // Session id and open-elsewhere aren't in the preview (B copies the id; ⇄ is on the list row)
         s.info.push_str("\nSession: 0000aaaa-1111-2222-3333-444455556666");
         s.attached = true;
         assert_eq!(text(&preview_head(&s, None, None, false, 60, 10)), ["空闲 · 1 分钟前   /p/work  feat", ""]);
-        // 窄了从后面截
+        // Narrow: cut from the end
         assert_eq!(text(&preview_head(&s, None, None, false, 24, 10))[0], "空闲 · 1 分钟前   /p/wo…");
-        // 子会话:谁派的;父会话删了也说
+        // Child session: who dispatched it; also says so when the parent is deleted
         s.up = Up::Apart("p".into(), "派活的".into());
         assert_eq!(text(&preview_head(&s, None, None, false, 60, 10))[1], "「派活的」的子会话");
         s.up = Up::Gone;
         assert_eq!(text(&preview_head(&s, None, None, false, 60, 10))[1], "子会话 · 父会话已删除");
         s.up = Up::Top;
-        // 分叉出来的:分自谁;原会话删了也说
+        // A fork: forked from whom; also says so when the original is deleted
         s.fork = Fork::Of("原来的".into());
         assert_eq!(text(&preview_head(&s, None, None, false, 60, 10))[1], "分叉自「原来的」");
         s.fork = Fork::Gone;
         assert_eq!(text(&preview_head(&s, None, None, false, 60, 10))[1], "分叉 · 原会话已删除");
         s.fork = Fork::No;
-        // 便签最多三行,多的写还有几行
+        // A note gets at most three lines; beyond that, says how many more
         let long = (1..=20).map(|i| format!("第{i}行")).collect::<Vec<_>>().join("\n");
         let got = text(&preview_head(&s, None, Some(&long), false, 30, 20));
         assert_eq!(got[1..], ["✎ 第1行", "  第2行", "  第3行", "  … 还有 17 行", ""]);
-        // 正在写:短的也固定占上半区;长了留住最后几行(光标在那)
+        // While writing: even a short one takes the fixed top half; a long one keeps its last lines (where the cursor is)
         let got = text(&preview_head(&s, None, Some("一行"), true, 30, 20));
         assert_eq!(got.len(), 10, "{got:#?}");
         assert_eq!((got[1].as_str(), got[2].as_str()), ("✎ 便签", "  一行▏"));
@@ -17260,18 +17569,18 @@ mod tests {
     fn preview_holds_still_while_sliding_and_catches_up_after() {
         let mut app = fixture();
         press(&mut app, KeyCode::Char('a'));
-        select(&mut app, "跑"); // 往下两个都是会话,不经过分组标题
+        select(&mut app, "跑"); // The next two down are both sessions, no group header in between
         let border = |app: &mut App| reader_rows(app, 100, 24).into_iter().find(|r| r.contains('╭')).unwrap();
         let cur = |app: &App| app.current().unwrap().title.clone();
         border(&mut app);
-        press(&mut app, KeyCode::Down); // 单独挪一下:马上换
+        press(&mut app, KeyCode::Down); // A single move: switches at once
         let one = cur(&app);
         assert!(border(&mut app).contains(&one));
-        press(&mut app, KeyCode::Down); // 紧接着又挪:在滑动,预览先停在上一个
+        press(&mut app, KeyCode::Down); // Another move right after: sliding, the preview stays on the previous one for now
         assert_ne!(cur(&app), one);
         assert!(border(&mut app).contains(&one), "滑动途中不换预览");
         assert!(app.settle_left().is_some());
-        // 停下来够久了:换上
+        // Stopped long enough: switch
         app.moved = app.moved.map(|(_, gap)| (Instant::now() - SETTLE * 2, gap));
         assert!(app.settle_left().is_none());
         let now = cur(&app);
@@ -17281,14 +17590,14 @@ mod tests {
     #[test]
     fn preview_title_and_list_show_vendor_and_account() {
         let mut v = sessions();
-        v[0].who = "team".into(); // 问,高亮的第一个
+        v[0].who = "team".into(); // 问, the first one highlighted
         v[2].who = "alt".into();
         v[2].agent = Agent::Codex;
         let mut app = App::new(String::new(), v);
         let rows = reader_rows(&mut app, 46, 20);
-        // 手机上预览在下面:标题嵌在分隔线上,后面是哪家·哪个账号
+        // On a phone the preview is below: the title sits in the divider, followed by vendor·account
         assert!(rows.iter().any(|r| r.starts_with("─ ◆ 问 ─") && r.ends_with(" Claude·team ─")), "{rows:#?}");
-        // 列表里的账号名按哪家上色
+        // Account names in the list are colored by vendor
         select(&mut app, "闲");
         let mut t = Terminal::new(TestBackend::new(46, 20)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
@@ -17300,7 +17609,7 @@ mod tests {
         };
         assert_eq!(fg_of("team"), theme::pal().claude);
         assert_eq!(fg_of("alt"), theme::pal().codex);
-        // 高亮的那行:整行铺淡紫底,各段自己的颜色照留
+        // The highlighted row: a pale purple background across the whole row, each span keeping its own color
         let y = rows.iter().position(|r| r.contains(" 闲")).unwrap() as u16;
         let (mut x, mut bad) = (0u16, vec![]);
         while x < 46 {
@@ -17308,7 +17617,7 @@ mod tests {
             if c.bg != theme::pal().sel {
                 bad.push(x);
             }
-            x += c.cell_width().max(1); // 宽字符后面那格是占位,终端里被前一格盖住
+            x += c.cell_width().max(1); // The cell after a wide character is a placeholder, covered by the one before in a terminal
         }
         assert_eq!(buf[(2, y)].fg, theme::pal().muted, "图标 ○ 是灰的,不是反色");
         assert!(bad.is_empty(), "{:?} {bad:?}", rows[y as usize]);
@@ -17316,31 +17625,31 @@ mod tests {
 
     #[test]
     fn z_reads_without_attaching_and_scrolls_history() {
-        let mut app = fixture(); // 近一天:问 跑 闲
+        let mut app = fixture(); // 1 day: 问 跑 闲
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('z'));
         assert!(app.reader_load && app.attach.is_none());
-        assert_eq!(app.reader_target().as_deref(), Some("=跑:")); // 假会话没有窗格 id,按会话名抓
+        assert_eq!(app.reader_target().as_deref(), Some("=跑:")); // Fake sessions have no pane id, so capture by session name
         app.reader_load = false;
-        // run 循环抓回来的历史:100 行 + 底部输入框(要去掉)
+        // History captured by the run loop: 100 lines + the input box at the bottom (to be stripped)
         let bar = "─".repeat(20);
         let mut hist: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
         hist.extend([bar.clone(), "❯ ".into(), bar]);
         app.set_reader_lines(hist);
-        let rows = reader_rows(&mut app, 30, 10); // 标题 + 8 行 + 底栏
+        let rows = reader_rows(&mut app, 30, 10); // Title + 8 lines + bottom bar
         assert!(rows[0].contains("跑") && rows[0].contains("2/3 · 最新"), "{rows:?}");
-        assert_eq!(rows[8], "line 100"); // 输入框去掉了,最后一行是内容
+        assert_eq!(rows[8], "line 100"); // Input box stripped, the last line is content
         press(&mut app, KeyCode::Char('k'));
-        press(&mut app, KeyCode::Char('b')); // 1 + 一页(10 - 3 = 7)
+        press(&mut app, KeyCode::Char('b')); // 1 + one page (10 - 3 = 7)
         let rows = reader_rows(&mut app, 30, 10);
         assert_eq!(rows[8], "line 92");
         assert!(rows[0].contains("↑8 行"), "{rows:?}");
-        // 往上翻着时底下长出新内容,画面停在原处
+        // New content grows at the bottom while scrolled up: the view stays put
         let mut more: Vec<String> = (1..=105).map(|i| format!("line {i}")).collect();
         more.push(String::new());
         app.set_reader_lines(more);
         assert_eq!(reader_rows(&mut app, 30, 10)[8], "line 92");
-        press(&mut app, KeyCode::Char('g')); // 到顶,不会越界
+        press(&mut app, KeyCode::Char('g')); // To the top, no overrun
         press(&mut app, KeyCode::Char('k'));
         assert_eq!(reader_rows(&mut app, 30, 10)[1], "line 1");
         press(&mut app, KeyCode::Char('G'));
@@ -17352,14 +17661,14 @@ mod tests {
         let mut app = fixture();
         press(&mut app, KeyCode::Char('z'));
         press(&mut app, KeyCode::Char('J'));
-        assert_eq!(app.reader_target().as_deref(), Some("=跑:")); // 假会话没有窗格 id,按会话名抓
+        assert_eq!(app.reader_target().as_deref(), Some("=跑:")); // Fake sessions have no pane id, so capture by session name
         press(&mut app, KeyCode::Char('J'));
-        press(&mut app, KeyCode::Char('J')); // 到头了:提示,还在看闲
+        press(&mut app, KeyCode::Char('J')); // At the end: a message, still viewing 闲
         assert_eq!(app.reader_target().as_deref(), Some("=闲:"));
         assert!(app.msg.is_none());
-        press(&mut app, KeyCode::Char('q')); // q 只是退出阅读,不退出 aca
+        press(&mut app, KeyCode::Char('q')); // q only leaves reading, doesn't quit aca
         assert!(app.reader.is_none() && !app.quit);
-        assert_eq!(at(&app), "闲"); // 回到列表,高亮停在最后看的那个
+        assert_eq!(at(&app), "闲"); // Back on the list, highlight on the last one viewed
         press(&mut app, KeyCode::Char('z'));
         press(&mut app, KeyCode::Enter);
         assert!(app.reader.is_none());
@@ -17371,16 +17680,16 @@ mod tests {
         let mut app = fixture();
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('x'));
-        assert!(app.reader_target().is_none()); // 不去 tmux 抓输出
+        assert!(app.reader_target().is_none()); // Doesn't capture output from tmux
         let (name, _, mode) = app.diff_request(false).unwrap();
         assert_eq!((name.as_str(), mode), ("跑", Mode::Uncommitted));
-        assert!(app.diff_request(false).is_none()); // 读过了
-        assert!(app.diff_request(true).is_none()); // 定时刷新,它没新动静:不重读
-        app.all.iter_mut().find(|s| s.name == "跑").unwrap().active_at += 1; // 有了动静才重读
+        assert!(app.diff_request(false).is_none()); // Already read
+        assert!(app.diff_request(true).is_none()); // Timed refresh, nothing new from it: no reread
+        app.all.iter_mut().find(|s| s.name == "跑").unwrap().active_at += 1; // Reread only once there's activity
         assert!(app.diff_request(true).is_some());
         assert!(app.diff_request(true).is_none());
         shows(&reader_rows(&mut app, 40, 12), &["改动 · 跑", "未提交 · 读取中…", "正在读取 git…"]);
-        // 三个文件,各 10 行
+        // Three files, 10 lines each
         let patch = |files: &[&str]| {
             files
                 .iter()
@@ -17394,11 +17703,11 @@ mod tests {
         };
         let head = diff::Head { dir: "~/p".into(), branch: "main".into(), ..Default::default() };
         app.set_diff("跑", Mode::Uncommitted, diff::render(&head, &patch(&["f1", "f2", "f3"]), &[]));
-        let rows = reader_rows(&mut app, 40, 12); // 标题 + 10 行 + 底栏
+        let rows = reader_rows(&mut app, 40, 12); // Title + 10 lines + bottom bar
         shows(&rows, &["未提交 · 3 个文件", "n p 切换文件"]);
         assert_eq!(rows[1], " ~/p  main +30");
         let top = |app: &mut App| reader_rows(app, 40, 12)[1].clone();
-        // n:下一个文件的标题放到最顶上
+        // n: the next file's header goes to the very top
         press(&mut app, KeyCode::Char('n'));
         assert_eq!(top(&mut app), "▌M f1 +10");
         shows(&reader_rows(&mut app, 40, 12), &["文件 1/3"]);
@@ -17410,24 +17719,24 @@ mod tests {
         press(&mut app, KeyCode::Char('p'));
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(top(&mut app), "▌M f1 +10");
-        press(&mut app, KeyCode::Char('p')); // 翻过第一个:回到清单
+        press(&mut app, KeyCode::Char('p')); // Back past the first: to the file list
         assert_eq!(top(&mut app), " ~/p  main +30");
         press(&mut app, KeyCode::Char('p'));
         assert!(app.msg.is_none());
-        // 刷新时改动变多了(清单长了一行),顶上那行不动
+        // The diff grew on refresh (the file list gained a line): the top line stays
         press(&mut app, KeyCode::Char('n'));
-        press(&mut app, KeyCode::Char('j')); // 还没重画就来了新结果,这一下也算数
+        press(&mut app, KeyCode::Char('j')); // The new result comes before a redraw; this key still counts
         app.set_diff("跑", Mode::Uncommitted, diff::render(&head, &patch(&["f0", "f1", "f2", "f3"]), &[]));
-        // 按行号钉住(顶上原来是第 7 行,f1 的 @@):清单多了一行,第 7 行现在是 f0 的标题
+        // Pinned by line number (the top was line 7, f1's @@): the file list gained a line, so line 7 is now f0's header
         let rows = reader_rows(&mut app, 40, 12);
         assert_eq!(rows[1], "▌M f0 +10", "{rows:#?}");
-        // m:换成连同提交,重新读;还在路上的旧结果不要
+        // m: switch to with commits, read again; an old result still on its way is dropped
         press(&mut app, KeyCode::Char('m'));
         assert_eq!(app.diff_request(false).map(|r| r.2), Some(Mode::Branch));
         app.set_diff("跑", Mode::Uncommitted, diff::render(&head, &patch(&["old"]), &[]));
-        app.msg = None; // 底栏别被提示占着
+        app.msg = None; // Keep the bottom bar free of messages
         shows(&reader_rows(&mut app, 46, 12), &["连同提交 · 读取中…", "m 仅未提交"]);
-        // Tab 轮换:改动 → 记录 → 输出 → 改动,模式沿用
+        // Tab cycles: diff → record → output → diff, the mode carried over
         press(&mut app, KeyCode::Tab);
         assert!(app.trace.is_some() && app.reader.is_none());
         press(&mut app, KeyCode::Tab);
@@ -17435,7 +17744,7 @@ mod tests {
         assert_eq!(app.reader_target().as_deref(), Some("=跑:"));
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.diff_request(false).map(|r| r.2), Some(Mode::Branch));
-        // J 换会话还是看改动
+        // J switches session, still on the diff
         press(&mut app, KeyCode::Char('J'));
         assert_eq!(app.diff_request(false).map(|r| r.0), Some("闲".to_string()));
         press(&mut app, KeyCode::Char('x'));
@@ -17457,13 +17766,13 @@ mod tests {
         d.top = tmp.to_string_lossy().into_owned();
         let name = app.reader.as_ref().unwrap().name.clone();
         app.set_diff(&name, Mode::Uncommitted, d);
-        // 一屏只放 3 行,才滚得动
+        // Only 3 lines per screen, so it can scroll
         reader_rows(&mut app, 40, 5);
         let f1 = tmp.join("f1").to_string_lossy().into_owned();
-        // 顶上是清单:打开第一个文件的第一处改动
+        // File list on top: opens the first change in the first file
         press(&mut app, KeyCode::Char('e'));
-        assert_eq!(app.external.take(), Some(External::Edit { path: f1.clone(), line: 6 })); // -b 在第 6 行
-        // 滚到 +C 那行在最顶上:第 7 行
+        assert_eq!(app.external.take(), Some(External::Edit { path: f1.clone(), line: 6 })); // -b is on line 6
+        // Scrolled so the +C line is at the very top: line 7
         press(&mut app, KeyCode::Char('n'));
         for _ in 0..5 {
             press(&mut app, KeyCode::Char('j'));
@@ -17471,14 +17780,14 @@ mod tests {
         assert_eq!(reader_rows(&mut app, 40, 5)[1], "+C");
         press(&mut app, KeyCode::Char('e'));
         assert_eq!(app.external.take(), Some(External::Edit { path: f1, line: 7 }));
-        // 删掉的文件打不开
+        // A deleted file can't be opened
         press(&mut app, KeyCode::Char('n'));
         press(&mut app, KeyCode::Char('e'));
         assert!(app.external.is_none());
         assert_eq!(app.msg.as_ref().unwrap().0, "该文件已被删除");
         press(&mut app, KeyCode::Char('l'));
         assert_eq!(app.external.take(), Some(External::Lazygit(tmp.to_string_lossy().into_owned())));
-        // 回来以后重读改动
+        // The diff is reread after coming back
         let _ = app.diff_request(false);
         app.external_done(None);
         assert!(app.diff_request(false).is_some());
@@ -17496,12 +17805,12 @@ mod tests {
             repo: Some(diff::Stat { branch: "main".into(), files: 3, add: 12, del: 4 }),
             files: None,
         };
-        // 用它真正干活的目录和那里的分支
+        // Uses the directory it really works in and the branch there
         assert_eq!(
             text(&preview_head(&s, Some(&g), None, false, 80, 10))[0],
             "空闲 · 1 分钟前  3 个文件 +12 −4   /p/ws/some-long-project-name/app  main"
         );
-        // 窄了:统计和分支留着,目录从左边截
+        // Narrow: stats and branch stay, the directory is cut from the left
         assert_eq!(text(&preview_head(&s, Some(&g), None, false, 46, 10))[0], "空闲 · 1 分钟前  3 个文件 +12 −4   …/app  main");
         let clean = Glance { repo: Some(diff::Stat { branch: "main".into(), ..Default::default() }), ..g };
         assert_eq!(
@@ -17516,20 +17825,20 @@ mod tests {
         assert_ne!(app.mode(), Preview::Off);
         let first = app.glance_request(false).map(|r| r.0);
         assert!(first.is_some());
-        assert!(app.glance_request(false).is_none()); // 同一个,不重复读
-        assert!(app.glance_request(true).is_none()); // 定时刷新,它没新动静:不读(停在大仓库上不每两秒跑 git)
-        // 它有了动静(在跑时是窗格有输出,闲着时是 hook 报了事):再读一次
+        assert!(app.glance_request(false).is_none()); // Same one, not read again
+        assert!(app.glance_request(true).is_none()); // Timed refresh, nothing new: no read (no git every 2s while on a big repo)
+        // It has activity (running: pane output; idle: a hook reported something): read again
         let i = app.view[app.list.selected().unwrap()];
         app.all[i].active_at += 1;
         assert!(app.glance_request(true).is_some());
         assert!(app.glance_request(true).is_none());
-        // 隔了 GLANCE_EVERY 也读:别处改的文件也看得到
+        // Also read once GLANCE_EVERY has passed: files changed elsewhere show up too
         app.glance_for.as_mut().unwrap().2 = Instant::now() - GLANCE_EVERY;
         assert!(app.glance_request(true).is_some());
         select(&mut app, "跑");
         let next = app.glance_request(false).map(|r| r.0);
         assert!(next.is_some() && next != first);
-        press(&mut app, KeyCode::Char('z')); // 全屏里不读
+        press(&mut app, KeyCode::Char('z')); // Not read in full screen
         assert!(app.glance_request(true).is_none());
     }
 
@@ -17543,7 +17852,7 @@ mod tests {
     }
 
     thread_local! {
-        /// 设置页写进 config.toml 的(假的 config_set 记在这)
+        /// What the settings page writes to config.toml (the fake config_set records it here)
         static WROTE: std::cell::RefCell<Vec<(String, String, String)>> = const { std::cell::RefCell::new(vec![]) };
     }
 
@@ -17576,10 +17885,10 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(wrote(), [("ime".to_string(), "auto".to_string(), "false".to_string())]);
             assert!(!app.settings.as_ref().unwrap().ime && app.ime_changed);
-            press(&mut app, KeyCode::Enter); // 高亮停在刚按的那行:⏎ 再切回来
+            press(&mut app, KeyCode::Enter); // Highlight stays on the row just pressed: ⏎ switches back
             assert_eq!(wrote()[0].2, "true");
         } else {
-            // 切输入法只有 macOS 上有:别处没这一行,按了什么都不写
+            // Auto English input is macOS-only: elsewhere the row isn't there, and pressing writes nothing
             assert!(wrote().is_empty() && !app.ime_changed);
         }
         ctrl(&mut app, 's');
@@ -17599,7 +17908,7 @@ mod tests {
             press(&mut app, KeyCode::Char('l'));
             assert_eq!(wrote(), [("ui".to_string(), "lang".to_string(), "\"en\"".to_string())]);
             assert_eq!(i18n::lang(), Lang::En);
-            // 设置页还开着,已经是英文
+            // Settings page still open, already in English
             shows(&reader_rows(&mut app, 100, 30), &["Settings", "l  language", "zh  en"]);
             press(&mut app, KeyCode::Enter);
             assert_eq!((wrote()[0].2.as_str(), i18n::lang()), ("\"zh\"", Lang::Zh));
@@ -17607,7 +17916,8 @@ mod tests {
         });
     }
 
-    /// 功能自己加的行打开设置页时就问好了名字和值:换了语言(run 循环看到了就调 lang_changed)当场重问
+    /// A row a feature adds has its name and value asked when the settings page opens: a language change (the run loop calls
+    /// lang_changed when it sees one) asks again on the spot
     struct SaysRow;
 
     impl Setting for SaysRow {
@@ -17637,7 +17947,7 @@ mod tests {
         });
     }
 
-    /// 一个功能自己加的设置行和弹窗(见 overlay.rs):弹窗记着自己是第几层,重读一次加 10
+    /// A settings row and popup a feature adds itself (see overlay.rs): the popup remembers which layer it is, +10 per reload
     struct FakeRow;
     struct FakePage(u8);
 
@@ -17688,47 +17998,47 @@ mod tests {
         let mut app = settings_app().with_setting(Box::new(FakeRow));
         ctrl(&mut app, 's');
         shows(&reader_rows(&mut app, 100, 30), &["d  假功能", "现在关着"]);
-        // 按它的键:设置页收起,进它的弹窗,键都归它(j 不是挪高亮)
+        // Pressing its key: the settings page closes, its popup opens, and all keys go to it (j doesn't move the highlight)
         press(&mut app, KeyCode::Char('d'));
         assert!(app.settings.is_none() && app.modal_open());
         shows(&reader_rows(&mut app, 100, 30), &["假页面 0"]);
         shows(&reader_rows(&mut app, 44, 30), &["假页面 0"]);
         press(&mut app, KeyCode::Char('f'));
         assert_eq!(app.msg.as_ref().unwrap().0, "说一句");
-        // 手机上弹窗盖着底栏:这句话写在弹窗里
+        // On a phone the popup covers the bottom bar: the message goes inside the popup
         let rows = reader_rows(&mut app, 44, 30);
         let at = |want: &str| rows.iter().position(|r| r.contains(want)).unwrap_or_else(|| panic!("没有「{want}」:{rows:#?}"));
         assert!(at("说一句") > at("假页面 0") && rows[at("说一句")].starts_with('│'), "{rows:#?}");
-        // 再开一层,关了回到上一层
+        // Open another layer; closing it goes back to the one before
         press(&mut app, KeyCode::Char('n'));
         shows(&reader_rows(&mut app, 100, 30), &["假页面 1"]);
-        // 最上面那层说它在打字:一下到好几个键是粘贴,run 循环不丢
+        // The top layer says it's typing: several keys at once are a paste, which the run loop doesn't drop
         assert!(app.typing());
         press(&mut app, KeyCode::Esc);
         assert!(!app.typing());
         shows(&reader_rows(&mut app, 100, 30), &["假页面 0"]);
-        // 后台的活交给 run 循环;还没做完再来一个不接;做完弹窗重读
+        // Background work goes to the run loop; another one before it's done is refused; when it's done the popup reloads
         press(&mut app, KeyCode::Char('j'));
         let job = app.take_job().unwrap();
         assert_eq!(job, Job::Stop { t: target("闲") });
-        // 在做的时候弹窗里写着「正在…」
+        // While it's being done, the popup says 「正在…」 (e.g. "stopping …")
         shows(&reader_rows(&mut app, 44, 30), &["│ 正在停止「闲」…"]);
         press(&mut app, KeyCode::Char('j'));
         assert!(app.job.is_none());
         assert_eq!(app.msg.as_ref().unwrap().0, "请稍候:正在停止「闲」…");
         app.job_done(&job, Outcome::Done("好了".into()), sessions());
         shows(&reader_rows(&mut app, 100, 30), &["假页面 10"]);
-        // 要复制的交给 run 循环(它去写剪贴板,底栏说复制了什么),弹窗还开着
+        // What to copy goes to the run loop (it writes the clipboard, the bottom bar says what was copied); the popup stays open
         press(&mut app, KeyCode::Char('c'));
         assert_eq!(app.clip.take(), Some(Clip::Text("https://a.ts.net/".into())));
         assert!(!app.overlays.is_empty());
-        // 开编辑器:回来还在弹窗里,重读
+        // Opening an editor: back in the popup afterwards, reloaded
         press(&mut app, KeyCode::Char('e'));
         assert_eq!(app.external.take(), Some(External::Lazygit("/p".into())));
         app.external_done(None);
         assert!(app.settings.is_none());
         shows(&reader_rows(&mut app, 100, 30), &["假页面 20"]);
-        // 关了:回设置页,高亮还在它那一行
+        // Closed: back to the settings page, highlight still on its row
         press(&mut app, KeyCode::Esc);
         assert!(app.overlays.is_empty());
         let s = app.settings.as_ref().unwrap();
@@ -17739,19 +18049,19 @@ mod tests {
 
     #[test]
     fn shift_p_opens_the_plugins_page_from_the_list_not_from_settings() {
-        // 列表上直接开(停在分组上也行),关了回列表,不经过设置页
+        // Opens straight from the list (on a group too), closing goes back to the list, never via the settings page
         let mut app = fixture().with_plugins(|| Box::new(FakePage(0)));
         press(&mut app, KeyCode::Char('P'));
         assert!(app.modal_open() && app.settings.is_none());
         shows(&reader_rows(&mut app, 100, 30), &["假页面 0"]);
-        // 菜单里进一页(再开一层),Esc 退回菜单,再 Esc 回列表
+        // Into a page from the menu (another layer), Esc back to the menu, another Esc to the list
         press(&mut app, KeyCode::Char('n'));
         shows(&reader_rows(&mut app, 100, 30), &["假页面 1"]);
         press(&mut app, KeyCode::Esc);
         shows(&reader_rows(&mut app, 100, 30), &["假页面 0"]);
         press(&mut app, KeyCode::Esc);
         assert!(!app.modal_open() && app.settings.is_none() && !app.quit);
-        // 设置页里没有它的行
+        // The settings page has no row for it
         let mut app = settings_app().with_plugins(|| Box::new(FakePage(0)));
         ctrl(&mut app, 's');
         assert!(!reader_rows(&mut app, 100, 30).iter().any(|r| r.contains("tailnet")));
@@ -17790,7 +18100,7 @@ mod tests {
         assert!(app.settings.as_ref().is_some_and(|s| s.rows()[s.sel] == SetRow::Tools));
         press(&mut app, KeyCode::Char('e'));
         assert!(matches!(app.external.take(), Some(External::Config { path, .. }) if path.ends_with("config.toml")));
-        // 不是从设置页开的编辑器,回来不弹设置页
+        // An editor not opened from the settings page doesn't bring the settings page back on return
         app.external_done(None);
         app.settings = None;
         app.external_done(None);
@@ -17801,16 +18111,16 @@ mod tests {
     fn a_in_settings_opens_the_accounts_page_and_closing_it_comes_back() {
         let mut app = settings_app().with_accounts(|adding| Box::new(FakePage(if adding { 7 } else { 0 })));
         ctrl(&mut app, 's');
-        // 设置页那一行只数各有几个;管账号在它自己的弹窗里(acctpage.rs)
+        // The settings row only counts how many of each; accounts are managed in their own popup (acctpage.rs)
         shows(&reader_rows(&mut app, 100, 30), &["a  账号", "Claude 1  Codex 1"]);
         press(&mut app, KeyCode::Char('a'));
         assert!(app.settings.is_none() && app.modal_open());
         shows(&reader_rows(&mut app, 100, 30), &["假页面 0"]);
-        // 关了:回设置页,高亮还在账号那一行
+        // Closed: back to the settings page, highlight still on the accounts row
         press(&mut app, KeyCode::Esc);
         assert!(app.overlays.is_empty());
         assert_eq!(app.settings.as_ref().map(|s| (s.page, s.rows()[s.sel])), Some((SetPage::Main, SetRow::Accounts)));
-        // 没接账号页的(单元测试默认):按了不动
+        // Without an accounts page hooked up (the unit test default): pressing does nothing
         let mut plain = settings_app();
         ctrl(&mut plain, 's');
         press(&mut plain, KeyCode::Char('a'));
@@ -17825,7 +18135,7 @@ mod tests {
         app.settings = None;
         app.sync_failed = vec!["config.toml 有误".into()];
         ctrl(&mut app, 's');
-        press(&mut app, KeyCode::Char('k')); // 从顶上往上 = 最后一行
+        press(&mut app, KeyCode::Char('k')); // Up from the top = the last row
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.settings.as_ref().unwrap().page, SetPage::Problems);
         let rows = reader_rows(&mut app, 120, 36);
@@ -17850,11 +18160,11 @@ mod tests {
         ] {
             at(t);
         }
-        // 切输入法只有 macOS 上有
+        // Auto English input is macOS-only
         assert_eq!(rows.iter().any(|r| r.contains("i  自动切英文   开")), cfg!(target_os = "macos"), "{rows:#?}");
-        // 居中,底下变灰(和 Tab / S 一样)
+        // Centered, the layer below dimmed (like Tab / S)
         let top = at("设置") - 2;
-        // 按显示宽度数(左边可能有中文)
+        // Counted by display width (there may be Chinese on the left)
         let col = |c: char| rows[top][..rows[top].find(c).unwrap()].width();
         let (l, r) = (col('╭'), col('╮'));
         assert!((l as i32 - (120 - 1 - r as i32)).abs() <= 1, "{l} {r}: {rows:#?}");
@@ -17904,7 +18214,7 @@ mod tests {
             app.plugin_done(plugin_req("ci", ItemKind::Command), false, String::new());
             assert_eq!(app.msg.as_ref().map(|m| m.0.as_str()), Some("✕ PX · 看 CI 出错"));
             assert!(app.reader.is_none());
-            // 视图:哪怕只有一行也进阅读页;r 重跑,c 复制全部,Esc 回来
+            // A view: opens the reading page even for a single line; r reruns, c copies all, Esc comes back
             app.plugin_done(plugin_req("ci", ItemKind::View), true, "build  ok\ntest   ok".into());
             app.msg = None;
             let rows = reader_rows(&mut app, 100, 20);
@@ -17914,7 +18224,7 @@ mod tests {
             assert_eq!(app.plugin_q.len(), 1);
             press(&mut app, KeyCode::Char('c'));
             assert_eq!(app.clip, Some(Clip::Text("build  ok\ntest   ok".into())));
-            // 进不去:回车只是关掉
+            // Nothing to go into: ⏎ just closes it
             press(&mut app, KeyCode::Enter);
             assert!(app.reader.is_none() && app.external.is_none());
         });
@@ -17932,7 +18242,8 @@ mod tests {
             assert_eq!(app.overlays.len(), 1);
             assert!(app.reader.is_none());
             shows(&reader_rows(&mut app, 100, 30), &["● nas  备份", "在等"]);
-            // 它的一个键跑完了:结果写在那一页下面,列表排队重读;不弹底栏、不进阅读页
+            // One of its keys finished: the result goes at the bottom of that page, the list is queued to reload; no bottom-bar
+            // message, no reading page
             let refresh = crate::caps::Req { refresh: true, ..view.clone() };
             let rm = crate::caps::Req { then: Some(Box::new(refresh.clone())), ..plugin_req("rm", ItemKind::Command) };
             app.plugin_done(rm, true, "已撤 nas 上的「备份」".into());
@@ -17941,7 +18252,7 @@ mod tests {
             app.plugin_done(refresh.clone(), true, r#"{"empty":"没有远端任务"}"#.into());
             assert_eq!(app.overlays.len(), 1);
             shows(&reader_rows(&mut app, 100, 30), &["没有远端任务", "已撤 nas 上的「备份」"]);
-            // 关了以后才回来的重读:不再开一页
+            // A reload that comes back after it closed: doesn't open another page
             app.overlays.clear();
             app.plugin_done(refresh, true, list.into());
             assert!(app.overlays.is_empty());
@@ -17954,11 +18265,12 @@ mod tests {
         v[3].tokens = vec![("pr".into(), "#12".into()), ("ci".into(), "✓".into()), ("_float".into(), "▣2".into())];
         let mut app = App::new(String::new(), v);
         let rows = reader_rows(&mut app, 100, 30);
-        // 名字以 _ 开头的只写值
+        // Names starting with _ show only the value
         assert!(rows.iter().any(|r| r.contains("闲 [pr #12] [ci ✓] ▣2")), "{rows:#?}");
     }
 
-    /// 分叉出来的:标题后面灰字写分自谁,排在插件的字前面;标题里已经带着原会话名字的(默认起的)不再写一遍
+    /// A fork: gray text after the title says what it was forked from, before the plugin text; not repeated when the title
+    /// already has the original session's name (the default one)
     #[test]
     fn a_fork_says_who_it_came_from_after_its_title_unless_the_title_already_does() {
         let mut v = sessions();
@@ -17967,12 +18279,12 @@ mod tests {
         let mut app = App::new(String::new(), v.clone());
         let rows = reader_rows(&mut app, 100, 30);
         assert!(rows.iter().any(|r| r.contains("闲 分叉自 跑 [pr #12]")), "{rows:#?}");
-        // 默认的标题「跑 (分叉)」:名字已经在标题里了
+        // The default title 「跑 (分叉)」 ("跑 (fork)"): the name is already in the title
         v[3].title = "跑 (分叉)".into();
         let mut app = App::new(String::new(), v.clone());
         let rows = reader_rows(&mut app, 100, 30);
         assert!(rows.iter().any(|r| r.contains("跑 (分叉) [pr #12]")) && !rows.iter().any(|r| r.contains("分叉自")), "{rows:#?}");
-        // 原会话删了:行上不写(预览里说)
+        // Original session deleted: nothing on the row (the preview says so)
         v[3].fork = Fork::Gone;
         let mut app = App::new(String::new(), v);
         assert!(!reader_rows(&mut app, 100, 30).iter().any(|r| r.contains("分叉自")));

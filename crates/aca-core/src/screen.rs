@@ -1,22 +1,26 @@
-//! 读屏幕判断状态:在等你操作(附它问的那句)、在跑(附已跑秒数)。
-//! 每家的屏幕长得不一样,怎么认在各自的 `agent/<名字>.rs` 里;这里只有共用的结果类型和窗格标题那个转圈的字符。
+//! Reading the screen to tell the state: waiting for you (with the question it asks) or running (with seconds run so far).
+//! Each tool's screen looks different, and how to read it lives in its own `agent/<name>.rs`; this file only has the shared
+//! result type and the spinner character in the pane title.
 //!
-//! hook 知道的事更准,但有两样 Claude 的 hook 不知道:按 Esc 打断不发任何事件;权限框点了同意之后也没有事件。
-//! 这两样屏幕上看得出来,所以列表里以屏幕为准、hook 补屏幕看不出的(跑完没看、出错、对话 id)。
+//! Hooks know things more precisely, but there are two things Claude's hooks don't know: pressing Esc to interrupt sends
+//! no event, and neither does approving a permission prompt. Both show on the screen, so the list goes by the screen, and
+//! hooks fill in what the screen can't show (unread, error, conversation id).
 
-/// agent 干活时窗格标题开头转的那个字符(Claude、Codex 都这么做)
+/// The character that spins at the start of the pane title while an agent works (Claude and Codex both do this)
 const SPINNER: &str = "⠁⠂⠄⡀⢀⠠⠐⠈⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Seen {
     Ask(String),
     Running(u64),
-    /// 看得懂这家的屏幕,上面既没在问也没在跑
+    /// We can read this tool's screen, and it is neither asking nor running
     Quiet,
-    /// 同 Quiet,只是正文的尾巴这几秒还在变(见 [`crate::status::look`]):Claude 2.1.300 往外吐正文时屏幕上没有别的记号。
-    /// hook 说在跑时才算在跑 —— 跑完那一下最后几行也会重画
+    /// Like Quiet, except the tail of the text has been changing these last seconds (see [`crate::status::look`]): while
+    /// Claude 2.1.300 streams text there's no other mark on the screen. It only counts as running when the hook says so —
+    /// the last few lines are also redrawn right when a turn ends
     Moving,
-    /// 这家的屏幕看不出在不在跑(没有读法、声明式工具没写 `busy`):状态听 hook 的
+    /// We can't tell from this tool's screen whether it's running (no reader, or a declared tool without `busy`): the state
+    /// follows the hook
     Unsure,
 }
 

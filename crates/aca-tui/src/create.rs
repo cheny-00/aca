@@ -1,7 +1,9 @@
-//! 新建会话:路径默认是选中会话的目录(可改,Tab 补全,↓ / ^F 用 fzf 找、回车就开在那,不存在就建),分组跟着
-//! 选中会话。工具 / 账号沿用选中会话的,参数走 config.toml 里那个工具、那个账号写的(`[tools.X] args`、账号的 `args`)。
+//! New session: the path defaults to the selected session's directory (editable; Tab completes, ↓ / ^F searches with fzf, Enter
+//! opens it right there, a missing directory is created), and the group follows the selected session. Tool / account carry over
+//! from the selected session; args come from what config.toml sets for that tool and that account (`[tools.X] args`, the account's
+//! `args`).
 //!
-//! 登记和启动是 aca-core 的 `session::create`:窗格里直接跑的就是 agent(不经过 shell),建好就能进。
+//! Registering and starting is aca-core's `session::create`: the pane runs the agent directly (no shell), ready to enter once made.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -35,7 +37,7 @@ pub fn tilde(dir: &str) -> String {
     }
 }
 
-/// 输入的路径 → 绝对路径:~ 展开,相对路径算在家目录下,去掉结尾的 /
+/// Typed path → absolute path: expand ~, relative paths count from the home directory, drop the trailing /
 pub(crate) fn expand(text: &str) -> String {
     let t = text.trim();
     let abs = if t == "~" {
@@ -51,36 +53,39 @@ pub(crate) fn expand(text: &str) -> String {
     if trimmed.is_empty() { "/".into() } else { trimmed.to_string() }
 }
 
-/// 按了 N 之后正在编辑的新会话:路径默认是 N 的对象(选中会话)的目录,分组跟着它
+/// The new session being edited after N: the path defaults to the directory of N's target (the selected session), the group follows it
 #[derive(Clone, Debug, PartialEq)]
 pub struct Draft {
     pub text: String,
-    /// 定分组用(`group()`):分组跟着输入的路径走
+    /// For picking the group (`group()`): the group follows the typed path
     pub hints: GroupHints,
-    /// 选中会话的目录(输入框的初始值)和分组:路径没改就还用这个组 —— N 就是「照这个会话再开一个」
+    /// The selected session's directory (the input box's initial value) and group: while the path is unchanged it stays in this group —
+    /// N means "open another one like this session"
     origin: Option<(String, String)>,
-    /// 沿用选中会话的工具 / 账号(`n` 从菜单选的会换掉),工具空 = 默认的(claude)
+    /// Tool / account carried over from the selected session (what `n` picks from the menu replaces them); empty tool = the default
+    /// (claude)
     pub tool: String,
     pub account: String,
-    /// 选中会话的「Claude·账号」(`n` 选的工具名),新建弹窗的「工具」写的就是它,新会话也会是这个
+    /// The selected session's "Claude·account" (the tool name `n` picked); the new-session popup's "tool" shows it, and the new
+    /// session uses it
     pub label: String,
-    /// 输入框下面那行:错误提示,空 = 列补全候选(menu)
+    /// The line under the input box: an error message; empty = list completion candidates (menu)
     pub hint: String,
-    /// Tab 补全有多个候选时:候选的目录名、它们所在的目录(输入的样子,如 "~/code/")、现在换到了第几个。
-    /// 一改输入就清掉
+    /// With several Tab-completion candidates: their directory names, the directory they're in (as typed, e.g. "~/code/"), and which one
+    /// is current. Cleared on any edit
     pub menu: Vec<String>,
     menu_head: String,
     pub sel: Option<usize>,
-    /// `G` 起的名字:不管路径,就进这个组(没有就建)
+    /// Name given with `G`: go into this group regardless of the path (create it if missing)
     pub group_override: Option<String>,
-    /// `^N` 的默认目录(绝对路径):fzf 里它和它往下两层排最前
+    /// `^N`'s default directory (absolute path): in fzf it and two levels below it come first
     pub base: Option<String>,
-    /// ^T 换成了 shell:开个 shell,自己在里面 cd、起 cc / codex(不用沿用的工具 / 菜单选的)
+    /// ^T switched to a shell: open a shell, cd and start cc / codex yourself (not the carried-over tool / the one picked from the menu)
     pub shell: bool,
 }
 
 impl Draft {
-    /// `hints` 取「路径 → 分组」的线索(run 时读库,单元测试里给假的)
+    /// `hints` fetches the "path → group" clues (read from the db at run time, faked in unit tests)
     pub fn from(s: Option<&Session>, hints: fn() -> GroupHints) -> Self {
         let text = match s {
             Some(s) if !s.dir.is_empty() => tilde(&s.dir),
@@ -108,7 +113,8 @@ impl Draft {
         }
     }
 
-    /// `^N`:进起好名字的组,从默认目录开始挑(输入框里是它,没改路径时 fzf 不带搜索词)
+    /// `^N`: go into the named group, picking from its default directory (the input box holds it; fzf has no query while the path is
+    /// unchanged)
     pub fn start_group(&mut self, name: String, base: &str) {
         let base = expand(base);
         self.text = format!("{}/", tilde(&base).trim_end_matches('/'));
@@ -118,7 +124,8 @@ impl Draft {
         self.edited();
     }
 
-    /// 在分组上 N / n:路径填组的路径 dir,没改就进这个组;工具、账号沿用组里的会话 s
+    /// N / n on a group: the path is filled with the group's path dir, unchanged means into this group; tool and account carry over from
+    /// the group's session s
     pub fn in_group(s: &Session, group: &str, dir: &str, hints: fn() -> GroupHints) -> Self {
         let mut d = Draft::from(Some(s), hints);
         d.text = tilde(dir);
@@ -128,7 +135,7 @@ impl Draft {
         d
     }
 
-    /// 目录还不存在(回车会新建它)
+    /// The directory doesn't exist yet (Enter will create it)
     pub fn is_new_dir(&self) -> bool {
         !self.text.trim().is_empty() && !std::path::Path::new(&expand(&self.text)).exists()
     }
@@ -150,28 +157,30 @@ impl Draft {
         })
     }
 
-    /// 分组是按路径推出来的(没用 ^N 起名、路径也改过了):建的时候和 `aca new -g .` 一样认领,记上默认目录
+    /// The group was inferred from the path (no ^N name, path changed): on creation claim it as `aca new -g .` does and record the default
+    /// directory
     pub fn by_dir(&self) -> bool {
         let (g, _) = self.group();
         self.group_override.is_none() && !g.is_empty() && !self.origin.as_ref().is_some_and(|(o, _)| expand(o) == expand(&self.text))
     }
 
-    /// `^N` 起名的新组:建完把这个目录记成它的默认路径(已有的组不动)
+    /// New group named with `^N`: once created, record this directory as its default path (existing groups untouched)
     pub fn binds_dir(&self) -> bool {
         self.group_override.is_some() && self.group().1
     }
 
-    /// 新会话开的是不是 shell(^T 换的,或者 n 里选的 shell)
+    /// Whether the new session opens a shell (switched with ^T, or shell picked in n)
     pub fn is_shell(&self) -> bool {
         self.shell || self.tool == "shell"
     }
 
-    /// 新会话落在哪个分组、是不是新分组:路径没改 → 选中会话的组;改了 → 按路径定(见 `group_for`)
+    /// Which group the new session lands in and whether it's new: path unchanged → the selected session's group; changed → decided by the
+    /// path (see `group_for`)
     pub fn group(&self) -> (String, bool) {
         self.group_at(&self.text)
     }
 
-    /// 路径换成 dir 的话会进哪个组(fzf 里每一行都要标)
+    /// Which group the path would go into if it were dir (every fzf row is marked with it)
     pub fn group_at(&self, dir: &str) -> (String, bool) {
         if let Some(g) = &self.group_override {
             return (g.clone(), !self.hints.groups.iter().any(|(x, _)| x == g));
@@ -182,7 +191,7 @@ impl Draft {
         }
     }
 
-    /// ↓ 打开 fzf 时的搜索词:路径没改过是空的,改过就拿各级目录名当关键词(~/code/we → "code we")
+    /// fzf's query when ↓ opens it: empty if the path was never changed, otherwise the directory names as keywords (~/code/we → "code we")
     pub fn pick_query(&self) -> String {
         if self.origin.as_ref().is_some_and(|(o, _)| expand(o) == expand(&self.text)) {
             return String::new();
@@ -191,7 +200,7 @@ impl Draft {
         t.trim_start_matches('~').split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ")
     }
 
-    /// 输入变了:提示和补全候选都作废
+    /// The input changed: the message and the completion candidates are void
     fn edited(&mut self) {
         self.hint.clear();
         self.menu.clear();
@@ -199,7 +208,7 @@ impl Draft {
     }
 
     pub fn push(&mut self, c: char) {
-        // 换到某个候选后打 / = 就要它(它已经带着 /),接着 Tab 补全它里面的
+        // Typing / = after cycling to a candidate takes it (it already ends in /), then Tab completes inside it
         let accept = c == '/' && self.sel.is_some() && self.text.ends_with('/');
         if !accept {
             self.text.push(c);
@@ -217,19 +226,19 @@ impl Draft {
         self.edited();
     }
 
-    /// → :就要现在换到的这个候选
+    /// → : take the candidate cycled to now
     pub fn accept(&mut self) {
         self.menu.clear();
         self.sel = None;
     }
 
-    /// fzf 选中的目录:结尾带 /,接着打字就是在它下面新建
+    /// The directory picked in fzf: ends in /, so typing on creates something under it
     pub fn set_dir(&mut self, dir: &str) {
         self.text = format!("{}/", dir.trim_end_matches('/'));
         self.edited();
     }
 
-    /// 删掉最后一级目录:~/code/proj → ~/code/
+    /// Delete the last directory level: ~/code/proj → ~/code/
     pub fn kill_segment(&mut self) {
         let t = self.text.trim_end_matches('/');
         self.text = match t.rfind('/') {
@@ -239,15 +248,15 @@ impl Draft {
         self.edited();
     }
 
-    /// Tab 补全目录。不分大小写(iOS 键盘会自动把首字母大写);唯一匹配补全并加 /;
-    /// 多个就补到公共前缀并在上面一行列出,之后每按一次 Tab 换成下一个候选(和 zsh 一样)
+    /// Tab-complete directories. Case-insensitive (the iOS keyboard capitalizes the first letter); a unique match completes and adds /;
+    /// several complete to the common prefix and are listed on the line above, then each Tab cycles to the next candidate (as zsh does)
     pub fn complete(&mut self) {
         if !self.cycle(1) {
             self.complete_fresh();
         }
     }
 
-    /// Shift-Tab:换回上一个候选
+    /// Shift-Tab: cycle back to the previous candidate
     pub fn complete_back(&mut self) {
         if !self.cycle(-1) {
             self.complete_fresh();
@@ -296,30 +305,30 @@ impl Draft {
     }
 }
 
-/// 路径定分组:和 `aca new -g .` 是同一份规则(`aca_core::store::group_by_dir`),只看分组,不看会话。
-/// 返回 (分组, 现在还没有这个组);定不了(`/`)是空的 = 不分组
+/// Group from path: the same rule as `aca new -g .` (`aca_core::store::group_by_dir`); only groups count, not sessions.
+/// Returns (group, the group doesn't exist yet); undecidable (`/`) is empty = no group
 pub(crate) fn group_for(text: &str, hints: &GroupHints) -> (String, bool) {
     aca_core::store::group_by_dir(&hints.groups, &aca_core::paths::real(text)).unwrap_or_default()
 }
 
-/// 候选目录是怎么来的
+/// Where a candidate directory came from
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Src {
-    /// 列表里会话的目录、登记过的项目目录
+    /// Directories of sessions in the list, registered project directories
     Known,
-    /// zoxide 记的常去目录
+    /// Frequent directories recorded by zoxide
     Zoxide,
-    /// 上面这些旁边扫到的
+    /// Found next to the ones above
     Near,
 }
 
-/// base 下以 prefix 开头(不分大小写)的目录名,排好序;prefix 不以 . 开头时不要隐藏目录
+/// Directory names under base starting with prefix (case-insensitive), sorted; no hidden directories unless prefix starts with .
 fn dirs_like(base: &str, prefix: &str) -> Vec<String> {
     let lower = prefix.to_lowercase();
     let mut names: Vec<String> = std::fs::read_dir(base)
         .map(|rd| {
             rd.flatten()
-                .filter(|e| e.path().is_dir()) // 跟随软链
+                .filter(|e| e.path().is_dir()) // follow symlinks
                 .filter_map(|e| e.file_name().into_string().ok())
                 .filter(|n| n.to_lowercase().starts_with(&lower) && (prefix.starts_with('.') || !n.starts_with('.')))
                 .collect()
@@ -335,7 +344,8 @@ fn common_prefix(many: &[String]) -> String {
     first[..n].iter().collect()
 }
 
-/// 单行输入框里的 Tab(设置页改新分组的默认目录):只有一个就补全并加 /,好几个补到公共前缀;补不动返回 None
+/// Tab in a single-line input box (setting a new group's default directory in the settings page): one match completes and adds /,
+/// several complete to the common prefix; None when nothing completes
 pub fn complete_path(text: &str) -> Option<String> {
     if text == "~" {
         return Some("~/".into());
@@ -354,7 +364,8 @@ pub fn complete_path(text: &str) -> Option<String> {
     (out != text && out.chars().count() >= text.chars().count()).then_some(out)
 }
 
-/// `N` 里按 ↓ / ^F 用 fzf 找目录的候选。`live` 是列表里各会话的目录(选中的在最前),`base` 是 `^N` 的默认目录
+/// Candidates for finding a directory with fzf via ↓ / ^F in `N`. `live` is the directories of sessions in the list (the selected one
+/// first), `base` is `^N`'s default directory
 pub fn dir_candidates(base: Option<&str>, live: &[String]) -> Vec<(String, Src)> {
     let known = live.iter().cloned().chain(crate::data::project_dirs()).collect();
     let zoxide = Command::new("zoxide")
@@ -365,7 +376,8 @@ pub fn dir_candidates(base: Option<&str>, live: &[String]) -> Vec<(String, Src)>
     base_first(base, candidates_from(known, zoxide, &home()), &home())
 }
 
-/// `^N` 的默认目录和它往下两层挪到最前(平时的候选里有的保留原来的图标,没有的算「附近」)
+/// Move `^N`'s default directory and two levels below it to the front (ones already among the usual candidates keep their icon, the
+/// rest count as 「附近」 ("nearby"))
 fn base_first(base: Option<&str>, rest: Vec<(String, Src)>, home: &str) -> Vec<(String, Src)> {
     let Some(b) = base.filter(|b| Path::new(b).is_dir()) else { return rest };
     let tilde_in = |d: String| match d.strip_prefix(home) {
@@ -379,9 +391,10 @@ fn base_first(base: Option<&str>, rest: Vec<(String, Src)>, home: &str) -> Vec<(
     out
 }
 
-/// 按这个顺序排(fzf 同分时靠前的优先,不输入时就是显示顺序),去重,写成 ~/…:
-/// 会话 / 登记过的项目目录 → zoxide 记的常去目录(它自己滤掉了已删的)→ 这些项目的上一级目录本身和往下两层
-/// (新项目多半和老项目挨着)。不扫整个家目录:慢,还会钻进 ~/Library 这类受保护的目录,所以上一级就是家目录的不扫
+/// In this order (fzf prefers earlier ones on equal score, and with no input it's the display order), deduplicated, written as ~/…:
+/// session / registered project directories → zoxide's frequent directories (it filters out deleted ones itself) → these projects'
+/// parent directories themselves and two levels below (new projects usually sit next to old ones). Not the whole home directory: slow,
+/// and it would dig into protected directories like ~/Library, so a parent that is the home directory isn't scanned
 fn candidates_from(known: Vec<String>, zoxide: Vec<String>, home: &str) -> Vec<(String, Src)> {
     let known: Vec<String> = known.into_iter().filter(|d| Path::new(d).is_dir()).collect();
     let mut roots: Vec<String> = vec![];
@@ -409,7 +422,8 @@ fn candidates_from(known: Vec<String>, zoxide: Vec<String>, home: &str) -> Vec<(
         .collect()
 }
 
-/// root 下 depth 层以内的目录,按名字排、父目录紧跟着子目录;跳过隐藏的、软链和常见的依赖 / 构建目录
+/// Directories within depth levels under root, sorted by name, parents right before their children; skips hidden ones, symlinks
+/// and common dependency / build directories
 fn subdirs(root: &str, depth: usize) -> Vec<String> {
     const SKIP: &[&str] = &["node_modules", "target", "dist", "build", "__pycache__", "venv"];
     let mut names: Vec<String> = std::fs::read_dir(root)
@@ -432,41 +446,41 @@ fn subdirs(root: &str, depth: usize) -> Vec<String> {
     out
 }
 
-/// fzf 里的一行目录
+/// One directory row in fzf
 #[derive(Clone, Debug, PartialEq)]
 pub struct DirRow {
     /// ~/…
     pub dir: String,
-    /// 行首的图标:● 有会话 ◇ 登记过 ↗ zoxide 常去 空格 = 旁边扫到的
+    /// Icon at the start of the row: ● has sessions ◇ registered ↗ zoxide frequent, space = found nearby
     pub mark: char,
-    /// 开在这会进哪个组、是不是新分组
+    /// Which group opening here goes into, and whether it's a new group
     pub group: (String, bool),
-    /// 这个目录里已有的会话:(状态图标, 标题)
+    /// Sessions already in this directory: (status icon, title)
     pub sessions: Vec<(String, String)>,
 }
 
-/// ↓ / ^F 打开的 fzf 要显示的东西
+/// What the fzf opened by ↓ / ^F shows
 pub struct DirPick {
     pub rows: Vec<DirRow>,
-    /// 新建的是什么(「Claude·主号」),空 = 默认工具
+    /// What's being created ("Claude·main"); empty = the default tool
     pub what: String,
-    /// 输入框里改过的路径变成的搜索词
+    /// The query made from the path edited in the input box
     pub query: String,
-    /// 终端大小:够大用桌面布局(右边带预览),不然用手机布局
+    /// Terminal size: big enough gets the desktop layout (preview on the right), otherwise the phone layout
     pub width: u16,
     pub height: u16,
 }
 
-/// fzf 里选了什么
+/// What was picked in fzf
 #[derive(Debug, PartialEq)]
 pub enum Picked {
-    /// 回车 / 双击:就开在这
+    /// Enter / double-click: open right here
     Open(String),
-    /// →:填回输入框(结尾带 /),接着打名字 = 在它下面新建
+    /// →: back into the input box (ending in /); typing a name then = create it under there
     Edit(String),
 }
 
-/// 字段里的换行(页脚、预览是多行的,但 fzf 一个候选只能占一行)
+/// Newline inside a field (footer and preview are multi-line, but an fzf candidate is one line)
 const NL: char = '\x1f';
 
 impl DirPick {
@@ -474,7 +488,8 @@ impl DirPick {
         self.width >= 100 && self.height >= 24
     }
 
-    /// 每行四个字段,用 Tab 分开:绝对路径(选中后输出、预览里 cd 进去)、显示的样子、手机页脚、桌面预览
+    /// Four Tab-separated fields per row: absolute path (output when picked, cd'd into by the preview), how it's shown, phone footer,
+    /// desktop preview
     fn lines(&self) -> Vec<String> {
         let wide = self.wide();
         let cap = if wide { 28 } else { (self.width as usize * 2 / 5).saturating_sub(4).max(8) };
@@ -486,7 +501,8 @@ impl DirPick {
                 let (leaf, parent) = split_dir(&r.dir);
                 let pad = " ".repeat(leafw.saturating_sub(leaf.width()));
                 let mark = if r.mark == '●' { format!("{green}●{off}") } else { r.mark.to_string() };
-                // 上级路径不截短:fzf 按显示的文字搜,截掉的字就搜不到了。太长的由 fzf 在行尾截,搜到时它会自己横移
+                // Parent paths aren't shortened: fzf searches the shown text, so cut characters couldn't be found. fzf cuts overlong
+                // ones at the end and scrolls sideways itself on a match
                 let tag = if wide {
                     let t = match r.mark {
                         '●' => tr!("会话 {}", "sessions {}", r.sessions.len()),
@@ -506,7 +522,7 @@ impl DirPick {
                 let (g, new) = &r.group;
                 let into = if *new { tr!("新分组 {g}", "new group {g}") } else { tr!("分组 {g}", "group {g}") };
                 let titles: Vec<String> = r.sessions.iter().map(|(_, t)| one_line(t)).collect();
-                // 手机页脚固定两行(换行时列表不跳)
+                // The phone footer is always two lines (so the list doesn't jump on wrap)
                 let foot = match titles.len() {
                     0 => tr!("→ {into}{NL}", "→ {into}{NL}"),
                     n => tr!("→ {into}{NL}  已有 {n} 个:{}", "→ {into}{NL}  already {n}: {}", titles.join(t!("、", ", "))),
@@ -527,9 +543,10 @@ impl DirPick {
             "--delimiter=\t",
             "--with-nth=2",
             "--accept-nth=1",
-            // → 也结束 fzf,输出第一行是按的哪个键:空 = 回车 / 双击
+            // → also ends fzf; the first output line is the key pressed: empty = Enter / double-click
             "--expect=right",
-            // 不用 --scheme=path:它给「/ 后面」的匹配加分,上级路径里的 /api-server 会压过行首的目录名 api-server
+            // No --scheme=path: it boosts matches "after a /", so /api-server in a parent path would beat the directory name
+            // api-server at the start of the row
             "--highlight-line",
             "--prompt=› ",
             t!("--ghost=搜索目录", "--ghost=search directories"),
@@ -544,12 +561,13 @@ impl DirPick {
                 "--margin=1,2".into(),
                 tr!("--input-label= 新建{what} ", "--input-label= New{what} "),
                 format!("--preview={PREVIEW}"),
-                // 预览窗不到 40 列就收起
+                // Hide the preview window below 40 columns
                 "--preview-window=right,40%,<40(hidden)".into(),
                 "--bind=ctrl-/:toggle-preview".into(),
             ]);
         } else {
-            // 手机:没有边框和预览,屏幕留给列表;页脚两行跟着光标说「进哪个组、这里已有什么」,输入行贴着键盘
+            // Phone: no border or preview, the screen goes to the list; the two footer lines follow the cursor saying "which group, what's
+            // already here", and the input line hugs the keyboard
             a.extend([
                 "--no-scrollbar".into(),
                 "--info=inline-right".into(),
@@ -564,7 +582,8 @@ impl DirPick {
     }
 }
 
-/// 桌面预览:预先算好的(字段 4:目录、进哪个组、已有的会话),再加 git 分支 / 未提交的改动数、目录里有什么
+/// Desktop preview: the precomputed part (field 4: directory, which group, existing sessions), plus the git branch / count of
+/// uncommitted changes, and what's in the directory
 const PREVIEW: Tr = Tr::new(
     r#"printf '%s\n' {4} | tr '\037' '\n'; cd {1} 2>/dev/null || exit 0; b=$(git branch --show-current 2>/dev/null); if [ -n "$b" ]; then n=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' '); if [ "$n" = 0 ]; then echo "git  $b"; else echo "git  $b · $n 个未提交"; fi; echo; fi; ls -p | head -40"#,
     r#"printf '%s\n' {4} | tr '\037' '\n'; cd {1} 2>/dev/null || exit 0; b=$(git branch --show-current 2>/dev/null); if [ -n "$b" ]; then n=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' '); if [ "$n" = 0 ]; then echo "git  $b"; else echo "git  $b · $n uncommitted"; fi; echo; fi; ls -p | head -40"#,
@@ -580,12 +599,12 @@ fn split_dir(d: &str) -> (&str, &str) {
     }
 }
 
-/// 会话标题放进 fzf 的字段:Tab、换行这类控制字符换成空格
+/// A session title going into an fzf field: control characters like Tab and newline become spaces
 fn one_line(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
-/// fzf 的输出(--expect 在前一行写按的键)→ 选了什么
+/// fzf's output (--expect writes the key on the line before) → what was picked
 fn parse_pick(out: &str) -> Option<Picked> {
     let (key, dir) = out.split_once('\n')?;
     let dir = tilde(dir.trim());
@@ -595,18 +614,19 @@ fn parse_pick(out: &str) -> Option<Picked> {
     Some(if key == "right" { Picked::Edit(dir) } else { Picked::Open(dir) })
 }
 
-/// 用 fzf 挑一个目录,Esc / 没有匹配时回车 → None。fzf 自己在 /dev/tty 上画界面,候选从 stdin 喂;
-/// 配色等随 FZF_DEFAULT_OPTS
+/// Pick a directory with fzf; Esc / Enter with no match → None. fzf draws its own UI on /dev/tty, candidates are fed via stdin;
+/// colors etc. follow FZF_DEFAULT_OPTS
 pub fn pick_dir(p: &DirPick) -> Result<Option<Picked>, String> {
     let args = p.args();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     Ok(fzf(&p.lines(), &args)?.as_deref().and_then(parse_pick))
 }
 
-/// 跑一次单选的 fzf,extra 接在公共参数后面(同名参数后面的算)
+/// Run a single-select fzf once; extra goes after the common args (on duplicate args the later one wins)
 pub fn fzf(cands: &[String], extra: &[&str]) -> Result<Option<String>, String> {
     let mut child = Command::new("fzf")
-        // 输入行固定在底下(靠近手机键盘),所以往上 = 下一个;单选时 Tab 本来什么都不做,拿来换候选
+        // The input line is fixed at the bottom (near the phone keyboard), so up = next; Tab does nothing in single-select, so it cycles
+        // candidates
         .args(["--tiebreak=index", "--no-multi", "--layout=default", "--bind=tab:up,btab:down"])
         .args(extra)
         .stdin(Stdio::piped())
@@ -621,7 +641,7 @@ pub fn fzf(cands: &[String], extra: &[&str]) -> Result<Option<String>, String> {
         })?;
     let mut stdin = child.stdin.take().unwrap();
     let text = cands.join("\n");
-    // 另起线程写:候选多了会塞满管道,而 fzf 可能没读完就被 Esc 掉了
+    // Write from another thread: many candidates would fill the pipe, and fzf may be Esc'd before reading them all
     let writer = thread::spawn(move || {
         let _ = stdin.write_all(text.as_bytes());
     });
@@ -634,46 +654,51 @@ pub fn fzf(cands: &[String], extra: &[&str]) -> Result<Option<String>, String> {
     }
 }
 
-/// `d` 要删的会话
+/// The session `d` is deleting
 #[derive(Clone, Debug, PartialEq)]
 pub struct Removal {
-    /// 会话的键(登记的是它的 id,普通 tmux 会话是会话名)
+    /// The session's key (its id if registered, the session name for a plain tmux session)
     pub name: String,
     pub title: String,
     pub profile: String,
-    /// 登记的会话 id,空 = 普通 tmux 会话
+    /// Registered session id; empty = plain tmux session
     pub id: String,
-    /// 确认时要说的:别处(桌面)正连着
+    /// To mention on confirm: it's attached elsewhere (desktop)
     pub worktree: bool,
     pub attached: bool,
-    /// 删的是会话里另开的窗口 / 分出来的窗格:(窗格 id, 窗口分了屏),只关这一格
+    /// Deleting a window opened inside the session / a split pane: (pane id, window is split); only that one pane closes
     pub pane: Option<(String, bool)>,
-    /// 普通 tmux 会话:删的是会话那行,但会话里还有别的窗口 / 窗格,只关它这一格,这里是接着当头的那格(「#2「zsh」」)
+    /// Plain tmux session: deleting the session's row, but the session has other windows / panes, so only its own pane closes; this is
+    /// the pane that becomes the head next ("#2 “zsh”")
     pub next: Option<String>,
-    /// 登记的会话:里面另开的窗口 / 窗格有几个,会跟着一起关(确认时说一声)
+    /// Registered session: how many windows / panes opened inside it, which close along with it (mentioned on confirm)
     pub others: usize,
-    /// 它有几个子会话(删父会话不连带子会话,确认时说一声)
+    /// How many child sessions it has (deleting the parent doesn't take the children, mentioned on confirm)
     pub kids: usize,
 }
 
-/// 删成了什么样
+/// How the deletion ended up
 #[derive(Clone, Debug, PartialEq)]
 pub enum Removed {
-    /// 登记的会话:归档了(was = 本来就归档着;group = 它在哪个组),进回收站,1 天后才真删(见 trash.rs)
+    /// Registered session: archived (was = already archived; group = its group), into the Trash, really deleted only after 1 day (see
+    /// trash.rs)
     Archived { was: bool, group: String },
-    /// 窗格 / 普通 tmux 会话:没了
+    /// Pane / plain tmux session: gone
     Gone,
 }
 
-/// 删会话。登记的先归档(tmux 会话关掉、登记留着),进回收站,1 天后才真删,见 trash.rs。Claude / Codex 的对话记录不动。
-/// 别的 tmux 会话直接 kill-session。要等会话里的进程退干净(最长几秒),所以在后台跑(`Job::Remove`)
+/// Delete a session. A registered one is archived first (tmux session closed, registration kept), goes into the Trash and is really
+/// deleted only after 1 day, see trash.rs. Claude / Codex conversation logs are untouched.
+/// Other tmux sessions are kill-session'd directly. Waits for the processes in the session to exit cleanly (a few seconds at most),
+/// so it runs in the background (`Job::Remove`)
 pub fn remove(t: &Target, pane: Option<&str>) -> Result<Removed, String> {
-    // tmux 关窗格只发 SIGHUP,不理它的进程会留下来接着跑、哪儿都找不到了:先收干净(见 park.rs)
+    // tmux closing a pane only sends SIGHUP; processes that ignore it stay running where nobody can find them: reap them first (see
+    // park.rs)
     if let Some(pane) = pane {
         return crate::park::close(pane).map(|()| Removed::Gone);
     }
     if t.id.is_empty() {
-        // 普通 tmux 会话的键就是它的会话名
+        // A plain tmux session's key is its session name
         let target = format!("={}", t.name);
         crate::park::close_session(&target);
         let o = tmux_cmd().args(["kill-session", "-t", &target]).output().map_err(|e| e.to_string())?;
@@ -689,29 +714,30 @@ pub fn remove(t: &Target, pane: Option<&str>) -> Result<Removed, String> {
 pub struct NewReq {
     pub dir: String,
     pub group: String,
-    /// aca 的工具名和账号;工具空 = 默认的(claude)
+    /// aca's tool name and account; empty tool = the default (claude)
     pub tool: String,
     pub account: String,
-    /// 目录不存在,先建
+    /// The directory doesn't exist; create it first
     pub create_dir: bool,
-    /// `^N` 建的新组:登记完把目录记成组的默认路径,以后 `N` 到这个目录就进这个组(规则第 1 条)
+    /// New group made with `^N`: after registering, record the directory as the group's default path, so `N` in this directory later goes
+    /// into this group (rule 1)
     pub bind: bool,
-    /// 分组是按路径推出来的:交给核心按目录认领(`-g .`),没记默认目录的组记上这个目录;
-    /// 同名的组记着别的目录时往后编号,下次同一个目录还进它
+    /// The group was inferred from the path: let core claim it by directory (`-g .`), recording this directory on a group with no default
+    /// directory; when a same-named group records another directory, number onward, and the same directory goes into it next time
     pub by_dir: bool,
 }
 
 impl NewReq {
-    /// 交给 `session::create` 的「工具[:账号]」
+    /// The "tool[:account]" handed to `session::create`
     pub fn spec(&self) -> String {
         crate::tools::spec(if self.tool.is_empty() { DEFAULT_TOOL } else { &self.tool }, &self.account)
     }
 }
 
-/// 没有可沿用的工具时(在普通 tmux 会话上按 N)起哪个
+/// What to start when there's no tool to carry over (N on a plain tmux session)
 const DEFAULT_TOOL: &str = "claude";
 
-/// 最后一条回复(`c` 复制):hook 在每一轮结束时记下的(很长的只留开头 4000 字)
+/// The last reply (copied with `c`): what the hook records at the end of each turn (only the first 4000 chars of a long one)
 pub fn last_response(id: &str) -> Option<String> {
     Some(aca_core::runtime::load(id).last).filter(|s| !s.trim().is_empty())
 }
@@ -720,7 +746,7 @@ pub(crate) fn first_line(b: &[u8]) -> String {
     String::from_utf8_lossy(b).lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string()
 }
 
-/// 登记 + 启动,返回会话 id
+/// Register + start, returns the session id
 pub fn create(req: &NewReq) -> Result<String, String> {
     if req.create_dir {
         std::fs::create_dir_all(&req.dir).map_err(|e| tr!("无法创建 {}:{e}", "can't create {}: {e}", tilde(&req.dir)))?;
@@ -731,13 +757,14 @@ pub fn create(req: &NewReq) -> Result<String, String> {
     let n = session::New { tool: req.spec(), dir: req.dir.clone(), group, parent: "-".into(), ..Default::default() };
     let s = session::create(&store, &cfg, n)?;
     if req.bind {
-        // 没绑上(这个目录已经是别的组的默认目录)也不耽误进会话,只是以后 N 到这里不会自动进这个组
+        // Failing to bind (the directory is already another group's default) doesn't stop the session; N here just won't go into this group
+        // automatically later
         let _ = store.group_set_dir(&s.group, &req.dir);
     }
     Ok(s.id)
 }
 
-/// 启动登记过的会话(D 停掉后按 ⏎ 的):窗格还在就在原地、接着原来的对话起
+/// Start a registered session (⏎ after stopping it with D): if the pane is still there, start in place, continuing the old conversation
 pub fn start(id: &str) -> Result<(), String> {
     session::start(&Store::open()?, &aca_core::config::load(), id).map(drop)
 }
@@ -757,7 +784,7 @@ mod tests {
             bind: false,
             by_dir: false,
         };
-        assert_eq!(r.spec(), "claude"); // 没有可沿用的:默认工具
+        assert_eq!(r.spec(), "claude"); // nothing to carry over: the default tool
         assert_eq!(NewReq { tool: "codex".into(), account: "team".into(), ..r.clone() }.spec(), "codex:team");
         assert_eq!(NewReq { tool: "shell".into(), ..r }.spec(), "shell");
     }
@@ -771,7 +798,7 @@ mod tests {
         assert_eq!(expand("/opt/x/"), "/opt/x");
         assert_eq!(expand("/"), "/");
         assert_eq!(tilde(&format!("{h}/a")), "~/a");
-        assert_eq!(tilde(&format!("{h}x/a")), format!("{h}x/a")); // 家目录后面紧跟别的字不算(/Users/me 之于 /Users/mex)
+        assert_eq!(tilde(&format!("{h}x/a")), format!("{h}x/a")); // home followed by more chars doesn't count (/Users/me vs /Users/mex)
     }
 
     fn draft(text: &str) -> Draft {
@@ -799,7 +826,7 @@ mod tests {
         d.shell = true;
         let r = d.finish().unwrap();
         assert_eq!((r.tool.as_str(), r.account.as_str(), r.group.as_str(), r.spec().as_str()), ("shell", "", "tmp", "shell"));
-        // n 里选的 shell、照着 shell 会话再开一个,都算
+        // shell picked in n, or opening another one like a shell session: both count
         assert!(Draft { tool: "shell".into(), ..draft("/tmp") }.is_shell());
     }
 
@@ -821,22 +848,22 @@ mod tests {
             [
                 "~/code/lib",
                 "~/top",
-                "~/Library/x", // 登记过的(删掉的不要)
-                "/elsewhere",  // zoxide,重复的只留前面那个
+                "~/Library/x", // registered (deleted ones dropped)
+                "/elsewhere",  // zoxide, duplicates keep only the first
                 "~/code",
                 "~/code/app",
-                "~/code/app/src", // 上一级往下两层;隐藏的、依赖目录、再深的不要
+                "~/code/app/src", // two levels below a parent; no hidden ones, dependency directories or anything deeper
             ]
         );
         let srcs: Vec<Src> = got.iter().map(|(_, s)| *s).collect();
         assert_eq!(srcs, [Src::Known, Src::Known, Src::Known, Src::Zoxide, Src::Near, Src::Near, Src::Near]);
-        // 上一级是家目录(~/top)或 ~/Library 的不扫
-        // ^N 的默认目录和往下两层排最前,原来有的图标不变
+        // A parent that is the home directory (~/top) or ~/Library isn't scanned
+        // ^N's default directory and two levels below come first; existing icons unchanged
         let front = base_first(Some(&format!("{h}/code")), got.clone(), &h);
         let dirs: Vec<&str> = front.iter().map(|(d, _)| d.as_str()).collect();
         assert_eq!(dirs, ["~/code", "~/code/app", "~/code/app/src", "~/code/lib", "~/top", "~/Library/x", "/elsewhere"]);
         assert_eq!(front[3].1, Src::Known);
-        // 默认目录不在:照旧
+        // Default directory missing: unchanged
         assert_eq!(base_first(Some(&format!("{h}/nope")), got.clone(), &h), got);
         let _ = std::fs::remove_dir_all(&h);
     }
@@ -880,15 +907,15 @@ mod tests {
         let phone = pick(40, 16).lines();
         let f: Vec<&str> = phone[0].split('\t').collect();
         assert_eq!(f.len(), 4, "Tab 只用来分字段(标题里的 Tab 换成了空格)");
-        assert_eq!(f[0], format!("{home}/code/app")); // 输出的、预览 cd 的都是绝对路径
-        assert_eq!(strip_ansi(f[1]), format!("● app{}~/code", " ".repeat(9 + 2))); // 名字那列 12 宽(40 列的 2/5 减 4)
-        // 太长的名字把这一行撑开也不截:fzf 按显示的文字搜,截掉的字就搜不到了
+        assert_eq!(f[0], format!("{home}/code/app")); // both the output and the preview's cd are absolute paths
+        assert_eq!(strip_ansi(f[1]), format!("● app{}~/code", " ".repeat(9 + 2))); // the name column is 12 wide (2/5 of 40 columns minus 4)
+        // A too-long name widens the row instead of being cut: fzf searches the shown text, cut characters couldn't be found
         assert_eq!(strip_ansi(phone[1].split('\t').nth(1).unwrap()), "◇ very-long-project-name  ~/work/far/away");
         assert_eq!(strip_ansi(phone[2].split('\t').nth(1).unwrap()), "↗ ~");
-        // 手机页脚两行:进哪个组、这里已有什么
+        // Phone footer, two lines: which group, what's already here
         assert_eq!(f[2], "→ 分组 app\x1f  已有 2 个:修 登录、加测试");
         assert_eq!(phone[1].split('\t').nth(2).unwrap(), "→ 新分组 far/very-long-project-name\x1f");
-        // 桌面:多一列来源;预览里列出会话和状态
+        // Desktop: one more column for the source; the preview lists sessions and their status
         let desk = pick(120, 30).lines();
         let f: Vec<&str> = desk[0].split('\t').collect();
         assert_eq!(strip_ansi(f[1]), "● app                     会话 2   ~/code");
@@ -901,7 +928,7 @@ mod tests {
         let phone = pick(40, 16);
         assert!(has(&phone, "--bind=focus:transform-footer") && !has(&phone, "--preview="));
         assert!(phone.args().contains(&"--border-label= 新建 Claude·甲 ".to_string()));
-        // 横过来的手机也是宽的,但太矮
+        // A phone turned sideways is wide too, but too short
         assert!(!has(&pick(110, 14), "--preview="));
         let desk = pick(120, 30);
         assert!(has(&desk, "--preview=") && has(&desk, "--style=full"));
@@ -924,7 +951,7 @@ mod tests {
     fn edited_path_becomes_the_fzf_query() {
         let mut d = draft("~/old");
         d.origin = Some(("~/old".into(), "g".into()));
-        assert_eq!(d.pick_query(), ""); // 没改过
+        assert_eq!(d.pick_query(), ""); // unchanged
         d.text = "~/code/we".into();
         assert_eq!(d.pick_query(), "code we");
         d.text = format!("{}/code/", std::env::var("HOME").unwrap());
@@ -959,20 +986,20 @@ mod tests {
             ("aca-2", "/w/b/aca"),
         ]);
         let g = |t: &str| group_for(t, &h);
-        // 1 默认路径:比同名的组优先
+        // 1 default path: wins over a same-named group
         assert_eq!(g("/w/my-notes"), ("notes".into(), false));
         assert_eq!(g("/w/b/aca"), ("aca-2".into(), false));
-        // 同名的记着别的目录:往后编号(和 aca new -g . 一样)
+        // A same-named one records another directory: number onward (as aca new -g . does)
         assert_eq!(g("/w/c/aca"), ("aca-3".into(), true));
-        // 2 目录名已是分组:顶层同名 / 唯一的「…/名字」
+        // 2 directory name is already a group: top-level same name / the unique ".../name"
         assert_eq!(g("/w/anywhere/fun/"), ("fun".into(), false));
         assert_eq!(g("/w/code/api"), ("work/api".into(), false));
-        // 3 上一级目录名是分组 → 嵌套
+        // 3 parent directory name is a group → nested
         assert_eq!(g("/w/work/newthing"), ("work/newthing".into(), true));
         assert_eq!(g("/w/x/deeper"), ("lab/x/deeper".into(), true));
-        // 同名的嵌套组不止一个:不算,往下走
+        // More than one same-named nested group: doesn't count, go on
         assert_eq!(g("/w/code/dup"), ("dup".into(), true));
-        // 4 都不是:顶层目录名
+        // 4 none of these: top-level directory name
         assert_eq!(g("/w/code/brand"), ("brand".into(), true));
     }
 
@@ -981,7 +1008,7 @@ mod tests {
         let mut d = draft("~/proj");
         d.origin = Some(("~/proj".into(), "team".into()));
         assert_eq!(d.group(), ("team".into(), false));
-        d.text = "~/proj/".into(); // 多个 / 也算没改
+        d.text = "~/proj/".into(); // extra /s still count as unchanged
         assert_eq!(d.group(), ("team".into(), false));
         d.text = "~/other".into();
         assert_eq!(d.group(), ("other".into(), true));
@@ -1004,13 +1031,13 @@ mod tests {
         for d in ["alpha", "alps", "Beta", ".hidden"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
         }
-        std::fs::write(dir.join("alfile"), "").unwrap(); // 文件不算
+        std::fs::write(dir.join("alfile"), "").unwrap(); // files don't count
         let root = dir.to_string_lossy().to_string();
         let mut d = draft(&format!("{root}/al"));
         d.complete();
         assert_eq!(d.text, format!("{root}/alp"));
         assert_eq!((d.menu.clone(), d.sel), (vec!["alpha".to_string(), "alps".to_string()], None));
-        // 再按 Tab 挨个换成候选,转一圈回来;Shift-Tab 往回
+        // More Tabs cycle through the candidates one by one, wrapping around; Shift-Tab goes back
         d.complete();
         assert_eq!((d.text.clone(), d.sel), (format!("{root}/alpha/"), Some(0)));
         d.complete();
@@ -1019,26 +1046,26 @@ mod tests {
         assert_eq!(d.text, format!("{root}/alpha/"));
         d.complete_back();
         assert_eq!(d.text, format!("{root}/alps/"));
-        // 打 / 就要它(不多出一个 /),再 Tab 是补它里面的
+        // Typing / takes it (no extra /), and the next Tab completes inside it
         std::fs::create_dir_all(dir.join("alps/inner")).unwrap();
         d.push('/');
         assert_eq!((d.text.clone(), d.menu.len()), (format!("{root}/alps/"), 0));
         d.complete();
         assert_eq!(d.text, format!("{root}/alps/inner/"));
-        // 列着候选时接着打字:候选作废,按新输入补
+        // Typing on while candidates are listed: candidates void, complete against the new input
         let mut d = draft(&format!("{root}/al"));
         d.complete();
         d.push('h');
         assert!(d.menu.is_empty());
         d.complete();
         assert_eq!(d.text, format!("{root}/alpha/"));
-        // → 也是就要现在这个
+        // → also takes the current one
         let mut d = draft(&format!("{root}/al"));
         d.complete();
         d.complete();
         d.accept();
         assert_eq!((d.text.clone(), d.menu.len()), (format!("{root}/alpha/"), 0));
-        let mut d = draft(&format!("{root}/b")); // 小写也能补出 Beta
+        let mut d = draft(&format!("{root}/b")); // lowercase still completes to Beta
         d.complete();
         assert_eq!(d.text, format!("{root}/Beta/"));
         let mut d = draft(&format!("{root}/zz"));

@@ -1,10 +1,10 @@
 /target
 __pycache__/
 
-# 编辑器、系统留下的
+# Left behind by editors and the OS
 *.swp
 *.swo
 .DS_Store
 
-# Claude Code 在仓库里留下的本地状态
+# Local state Claude Code leaves in the repo
 /.claude/

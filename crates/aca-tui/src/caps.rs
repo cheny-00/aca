@@ -1,14 +1,22 @@
-//! `:` 命令面板:aca 自己的动作(acts.rs 那张表,挑中 = 在主列表上按了那个键)和开着的插件露给界面的命令(清单的
-//! `[[commands]]`,界面上就叫命令;给 agent 的叫「给 agent 的工具」)、窗格、视图(见 `aca_core::plugin::menu`),按高亮的那行
-//! 挑在这里有意义的。诊断用的(试一下、测连通)不进这里,清单里只露给 cli。
+//! The `:` command panel: aca's own actions (the table in acts.rs; picking one = pressing that key on the main list) and the
+//! commands enabled plugins expose to the interface (the manifest's `[[commands]]`, called commands in the interface; the
+//! ones for agents are called "tools for agents"), panes and views (see `aca_core::plugin::menu`), narrowed by the
+//! highlighted row to the ones that make sense here. Diagnostic ones (try it, test connectivity) don't go here; the manifest
+//! exposes them to the cli only.
 //!
-//! - ↑↓ 挑,⏎ 做;行首的键直接按(aca 的就是主列表上那个键;清单 `[[keys]]` 给插件绑的键只在这里按,和 aca 的撞了归插件);`/` 打字筛
-//! - 能力有参数的先弹一张表单(`Form`);跑完输出短的写在底栏,长的放进全屏阅读页
-//! - 视图:输出放进全屏阅读页,`r` 重跑。列表视图(`rows = true`)开成一页 [`List`]:一行一条,
-//!   停在哪行按清单 `[[views.keys]]` 的键(复制一个字段、带着这一行跑这个插件的一个能力),跑完写在下面、列表重读
-//! - 窗格:tmux 弹窗 / 分屏 / 新窗口(界面不在 tmux 里就让出终端,在前台跑)
+//! - ↑↓ to pick, ⏎ to run; or press the key at the start of a row directly (aca's is the same key as on the main list; keys
+//!   the manifest's `[[keys]]` binds for a plugin work only here, and a clash with aca's goes to the plugin); `/` to type a
+//!   filter
+//! - A command with parameters first pops up a form (`Form`); once it has run, short output goes to the bottom bar, long
+//!   output into the full-screen reading page
+//! - Views: output goes into the full-screen reading page, `r` reruns. A list view (`rows = true`) opens as a [`List`]
+//!   page: one item per row, the keys from the manifest's `[[views.keys]]` act on the highlighted row (copy a field, run one
+//!   of this plugin's commands with that row), the result is written below and the list reloads
+//! - Panes: tmux popup / split / new window (when the interface isn't in tmux, it gives up the terminal and runs in the
+//!   foreground)
 //!
-//! 能力、视图都在后台跑(run 循环收 `Fx::plugin`,一个请求一个线程),不占界面那个一次只做一件的后台活。
+//! Commands and views all run in the background (the run loop picks up `Fx::plugin`, one thread per request), not taking
+//! the interface's one-at-a-time background job.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
@@ -21,42 +29,42 @@ use aca_core::{t, tr};
 use crate::overlay::{Flow, Fx, Overlay, kit};
 use crate::theme;
 
-/// 一页最多列这么多个,再多跟着高亮滚
+/// At most this many per page; beyond that, the list scrolls with the highlight
 const SHOWN: usize = 14;
-/// 一个参数最多输这么长
+/// The longest input for one parameter
 const INPUT_MAX: usize = 2000;
 
-/// 冲着什么跑
+/// What it runs against
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Target {
     /// session / group / global
     pub on: &'static str,
-    /// 会话 id(登记的会话);分组、别处是空的
+    /// Session id (a registered session); empty for a group or elsewhere
     pub session: String,
-    /// 菜单标题里写的:会话标题 / 分组名
+    /// What the menu title says: session title / group name
     pub label: String,
 }
 
-/// 要跑的一个
+/// One thing to run
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Req {
     pub item: MenuItem,
     pub session: String,
     pub args: Vec<(String, String)>,
-    /// 列表视图的键跑的:跑完结果交给那个列表,再重读它
+    /// Run by a list view's key: the result goes to that list, which then reloads
     pub then: Option<Box<Req>>,
-    /// 列表重读:只换开着的那一页,它已经关了就算了(不再开一页)
+    /// A list reload: replaces only the open page; if it's already closed, never mind (no new page)
     pub refresh: bool,
 }
 
 impl Req {
-    /// 底栏、阅读页标题里叫它
+    /// What the bottom bar and the reading page title call it
     pub fn title(&self) -> String {
         format!("{} · {}", self.item.plugin_name, self.item.title)
     }
 }
 
-/// 冲着这个会话的上下文(目录、tmux 里的号和窗格);没有会话就是空的
+/// The context for this session (dir, its tmux session id and pane); empty without a session
 pub fn context(session: &str) -> plugin::Context {
     let mut ctx = plugin::Context { session: session.to_string(), source: "menu".into(), ..Default::default() };
     if session.is_empty() {
@@ -71,7 +79,8 @@ pub fn context(session: &str) -> plugin::Context {
     ctx
 }
 
-/// 跑一个:能力、视图收下输出;窗格开出来(弹窗关了才回来)。后台线程里调;窗格在界面不在 tmux 里时由让出终端那里调
+/// Run one: commands and views capture the output; a pane is opened (returns once the popup closes). Called on a background
+/// thread; for a pane while the interface isn't in tmux, called from where the terminal is given up
 pub fn run(req: &Req) -> (bool, String) {
     let ctx = context(&req.session);
     match req.item.kind {
@@ -84,7 +93,7 @@ pub fn run(req: &Req) -> (bool, String) {
     }
 }
 
-/// 跑起来:窗格在界面不在 tmux 里时要让出终端,别的放后台
+/// Start it: a pane while the interface isn't in tmux has to give up the terminal; everything else goes to the background
 fn start(req: Req, fx: &mut Fx) {
     if req.item.kind == ItemKind::Pane && std::env::var_os("TMUX").is_none() {
         fx.external = Some(crate::ui::External::Plugin(req));
@@ -94,14 +103,15 @@ fn start(req: Req, fx: &mut Fx) {
     fx.plugin = Some(req);
 }
 
-/// 面板里的一行:aca 自己的动作(acts.rs),或插件给的。插件在 `:` 里绑的键和 aca 的撞了,键归插件,aca 那行不画键(shadowed)
+/// One row of the panel: an aca action (acts.rs), or one a plugin provides. When a key a plugin binds in `:` clashes with
+/// aca's, the key goes to the plugin and the aca row shows no key (shadowed)
 enum Entry {
     Act(&'static crate::acts::Act, bool),
     Plugin(MenuItem),
 }
 
 impl Entry {
-    /// 行首的键;没有就空着
+    /// The key at the start of the row; blank if none
     fn key(&self) -> String {
         match self {
             Entry::Act(a, false) => a.key.to_string(),
@@ -110,7 +120,7 @@ impl Entry {
         }
     }
 
-    /// 叫什么(插件的有参数加 …)
+    /// Its name (a plugin one with parameters gets …)
     fn title(&self) -> String {
         match self {
             Entry::Act(a, _) => a.name().to_string(),
@@ -118,7 +128,7 @@ impl Entry {
         }
     }
 
-    /// 右边:谁的
+    /// Right side: whose it is
     fn from(&self) -> String {
         match self {
             Entry::Act(..) => "aca".to_string(),
@@ -133,7 +143,7 @@ impl Entry {
         }
     }
 
-    /// 按下的是它的直达键
+    /// The key pressed is its direct key
     fn hit(&self, k: KeyEvent) -> bool {
         match self {
             Entry::Act(a, shadowed) => !shadowed && a.hit(k),
@@ -142,17 +152,18 @@ impl Entry {
     }
 }
 
-/// `:` 那一层
+/// The `:` layer
 pub struct Menu {
     items: Vec<Entry>,
     target: Target,
     sel: usize,
-    /// `/` 之后在输的筛选词
+    /// The filter text being typed after `/`
     filter: Option<String>,
 }
 
 impl Menu {
-    /// `all` = 开着的插件给菜单的全部;只留在这种行上有意义的,后面接 aca 自己在这种行上能做的
+    /// `all` = everything enabled plugins give the menu; keep only what makes sense on this kind of row, followed by what
+    /// aca itself can do on it
     pub fn new(all: Vec<MenuItem>, target: Target) -> Menu {
         let mut items: Vec<Entry> = all.into_iter().filter(|i| i.fits(target.on)).map(Entry::Plugin).collect();
         let bound: Vec<char> = items.iter().filter_map(|e| if let Entry::Plugin(it) = e { it.key } else { None }).collect();
@@ -170,7 +181,7 @@ impl Menu {
         self.items.iter().filter_map(|e| if let Entry::Plugin(it) = e { Some(it.id.as_str()) } else { None }).collect()
     }
 
-    /// 筛过的(下标)
+    /// The filtered ones (indices)
     fn shown(&self) -> Vec<usize> {
         let f = self.filter.as_deref().unwrap_or("").to_lowercase();
         (0..self.items.len()).filter(|&i| f.is_empty() || self.items[i].matches(&f)).collect()
@@ -189,7 +200,8 @@ impl Menu {
 
     fn row(&self, it: &Entry, w: usize) -> Line<'static> {
         let key = format!("{:<3}", it.key());
-        // 右边只写是谁的:aca 自己的,或哪个插件的(窗格 / 视图 / 命令是实现上的分法,按下去都是「跑它」)
+        // The right side only says whose it is: aca's own, or which plugin's (pane / view / command is an implementation
+        // split; pressing any of them just "runs it")
         let right = it.from();
         let right_w = right.width();
         let title = kit::clip(&it.title(), w.saturating_sub(right_w + 7)).trim_end().to_string();
@@ -252,7 +264,7 @@ impl Overlay for Menu {
                 KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => f.push(c),
                 _ => {}
             }
-            // 筛完高亮落在第一个对得上的上
+            // After filtering, the highlight lands on the first match
             let shown = self.shown();
             if !shown.contains(&self.sel) {
                 self.sel = shown.first().copied().unwrap_or(0);
@@ -267,7 +279,7 @@ impl Overlay for Menu {
             KeyCode::Down => self.sel = step(1).unwrap_or(0),
             KeyCode::Char('/') if !k.modifiers.contains(KeyModifiers::CONTROL) => self.filter = Some(String::new()),
             _ => {
-                // 直达键:插件绑的、aca 的;j k 没人用,挪高亮
+                // Direct keys: plugin-bound ones, aca's; j k, when nobody takes them, move the highlight
                 if let Some(i) = self.items.iter().position(|i| i.hit(k)) {
                     return self.pick(i, fx);
                 }
@@ -286,14 +298,14 @@ impl Overlay for Menu {
     }
 }
 
-/// 有参数的能力:一个参数一格,填完跑
+/// A command with parameters: one field per parameter, runs once filled in
 pub struct Form {
     item: MenuItem,
     target: Target,
     vals: Vec<String>,
     at: usize,
     err: Option<String>,
-    /// 从列表视图的键来的:跑完交回那个列表
+    /// Came from a list view's key: hand the result back to that list
     then: Option<Box<Req>>,
 }
 
@@ -303,7 +315,8 @@ impl Form {
         Form { item, target, vals, at: 0, err: None, then: None }
     }
 
-    /// 列表视图的键开的:这一行已经给了的先填上,高亮落在第一个空着的;跑完交回列表
+    /// Opened by a list view's key: what this row already gives is filled in, the highlight lands on the first empty one;
+    /// the result goes back to the list
     fn from_list(item: MenuItem, session: &str, given: &[(String, String)], then: Req) -> Form {
         let mut f = Form::new(item, Target { on: "session", session: session.to_string(), label: String::new() });
         for (i, (name, ..)) in f.item.args.iter().enumerate() {
@@ -316,7 +329,7 @@ impl Form {
         f
     }
 
-    /// 照类型查一遍;不填的可选参数不给
+    /// Check each against its type; optional ones left empty aren't passed
     fn given(&self) -> Result<Vec<(String, String)>, String> {
         let mut out = vec![];
         for ((name, ty, opt), v) in self.item.args.iter().zip(&self.vals) {
@@ -350,7 +363,7 @@ impl Overlay for Form {
         let mut out = vec![kit::modal_title(&title, theme::accent(), kit::esc_hint(t!("取消", "cancel")), w), Line::raw("")];
         for (i, ((name, ty, opt), v)) in self.item.args.iter().zip(&self.vals).enumerate() {
             let on = i == self.at;
-            // 类型写人话(字符串不写),可以不填的标出来
+            // Types in plain words (none for strings), optional ones marked
             let kind = match ty.as_str() {
                 "int" => t!("整数", "integer"),
                 "path" => t!("路径", "path"),
@@ -426,27 +439,28 @@ impl Overlay for Form {
     }
 }
 
-/// 列表里一页最多列这么多行,再多跟着高亮滚
+/// At most this many rows per list page; beyond that, the list scrolls with the highlight
 const LIST_SHOWN: usize = 14;
-/// 键跑出来的最多留这么多行
+/// Keep at most this many lines of what a key's run printed
 const SAID_MAX: usize = 6;
 
-/// 插件的列表视图:命令输出的一行行(见 `aca_core::plugin::ViewRows`),停在哪行按清单 `[[views.keys]]` 的键
+/// A plugin's list view: the rows of a command's output (see `aca_core::plugin::ViewRows`), with the manifest's
+/// `[[views.keys]]` keys acting on the highlighted row
 pub struct List {
-    /// 跑出这份列表的那个请求:`r` 重读、键跑完了再跑它
+    /// The request that produced this list: `r` reloads with it, and it runs again after a key's run
     req: Req,
     list: plugin::ViewRows,
-    /// 跑失败、读不懂时说的
+    /// What to say when the run failed or the output couldn't be understood
     err: Option<String>,
     sel: usize,
-    /// 按了一次要按两次的键(它的名字),等再按一次
+    /// A press-twice key that was pressed once (its name), waiting for the second press
     armed: Option<String>,
-    /// 上一个键跑出来的(撤掉之后怎么加回去这类)
+    /// What the last key's run printed (such as how to add back what was removed)
     said: Vec<String>,
     said_ok: bool,
 }
 
-/// 键的名字(清单里写的):⏎ 是 `enter`,别的就是那个字符
+/// A key's name (as the manifest writes it): ⏎ is `enter`, anything else is the character itself
 fn key_name(k: &KeyEvent) -> Option<String> {
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         return None;
@@ -473,7 +487,8 @@ impl List {
         self.req.item.acts.iter().find(|a| a.key == name)
     }
 
-    /// 这个键在这一行上能不能按:要停在行上的得有行,模板里用到的字段都得有
+    /// Whether this key works on this row: one that acts on a row needs a row, and every field its template uses must be
+    /// there
     fn usable(&self, a: &plugin::RowAct) -> Option<Vec<(String, String)>> {
         let row = if a.row { Some(self.cur()?) } else { None };
         if a.run.is_none() {
@@ -487,7 +502,7 @@ impl List {
         Req { refresh: true, then: None, ..self.req.clone() }
     }
 
-    /// 高亮往下挪几行(往上挪 = 挪 n - 1 行),绕回头
+    /// Move the highlight down by some rows (up = by n - 1 rows), wrapping around
     fn step(&mut self, by: usize) -> Flow {
         let n = self.list.rows.len();
         self.sel = (self.sel + by) % n;
@@ -504,7 +519,7 @@ impl List {
             _ => Style::new(),
         };
         let mark = if r.mark.is_empty() { "·".to_string() } else { r.mark.clone() };
-        // 右边那段最多占一半(手机上),剩下的给正文
+        // The right part takes at most half (on a phone), the rest goes to the text
         let right = kit::clip(&r.right, (w / 2).max(8)).trim_end().to_string();
         let room = w.saturating_sub(mark.width() + 1 + right.width() + 3);
         kit::spread(
@@ -637,7 +652,7 @@ impl Overlay for List {
         let parsed = if ok { plugin::ViewRows::parse(out) } else { Err(out.trim().to_string()) };
         match parsed {
             Ok(list) => {
-                // 高亮跟着原来那一行(按 id);它没了就留在原来的位置上
+                // The highlight follows the same row (by id); if it's gone, it stays at the same position
                 let was = self.cur().map(|r| r.id.clone());
                 self.list = list;
                 self.err = None;
@@ -693,7 +708,8 @@ mod tests {
         ];
         let mut m = Menu::new(all, on_session());
         assert_eq!(m.plugin_ids(), ["stat", "ci"]);
-        // 后面接 aca 自己的动作;插件绑了 c,aca 的「复制回复」那行不画键,c 归插件
+        // aca's own actions follow; the plugin binds c, so aca's 「复制回复」 (copy the reply) row shows no key, c goes to the
+        // plugin
         let t = text(&m, 70);
         assert!(t.contains("n  新建") && t.contains("aca"), "{t}");
         let shadowed = m.items.iter().find(|e| matches!(e, Entry::Act(a, _) if a.key == "c")).unwrap();
@@ -729,12 +745,12 @@ mod tests {
         assert_eq!(m.pick(0, &mut fx), Flow::Close);
         assert!(fx.open.is_some() && fx.plugin.is_none());
         let mut f = Form::new(it, on_session());
-        // 类型写人话,字符串不写;bool 写开 / 关
+        // Types in plain words, none for strings; bool says on / off
         let t = text(&f, 70);
         assert!(t.contains(" host\n") && t.contains(" n (整数,选填)") && t.contains(" dry (空格 开/关,选填)"), "{t}");
         assert!(!t.contains("string") && !t.contains("int") && !t.contains("bool"), "{t}");
         let mut fx = Fx::default();
-        // 必填的没填:不跑
+        // A required one left empty: doesn't run
         for _ in 0..3 {
             f.on_key(key(KeyCode::Enter), &mut fx);
         }
@@ -761,10 +777,10 @@ mod tests {
     fn without_plugins_the_panel_still_lists_acas_own_actions_for_the_row() {
         let t = text(&Menu::new(vec![], on_session()), 70);
         assert!(t.contains("命令 · 对「主线」") && t.contains("n  新建") && t.contains("⏎ 执行"), "{t}");
-        // 分组行上只剩在分组上能做的:删除在,分叉不在
+        // A group row keeps only what can be done on a group: delete is there, fork isn't
         let t = text(&Menu::new(vec![], Target { on: "group", session: String::new(), label: "组".into() }), 70);
         assert!(t.contains("命令 · 对分组 组") && t.contains("d  删除") && !t.contains("分叉"), "{t}");
-        // / 筛:打键也找得到;挑中 = 主列表上按了那个键
+        // / filter: typing the key finds it too; picking it = pressing that key on the main list
         let mut m = Menu::new(vec![], on_session());
         let mut fx = Fx::default();
         m.on_key(key(KeyCode::Char('/')), &mut fx);
@@ -776,7 +792,8 @@ mod tests {
         assert_eq!(fx.key, Some(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)));
     }
 
-    /// 挂载那样的一个列表视图:⏎ 复制地址、x 撤(按两次)、a 挂端口(要填)、p 开关发布(列表上的字段)
+    /// A list view like the mounts one: ⏎ copies the URL, x takes one down (press twice), a mounts a port (needs input), p
+    /// toggles publishing (a list-level field)
     fn mounts() -> Req {
         let cmd = |id: &str, args: &[(&str, &str, bool)]| Some(item(id, ItemKind::Command, None, &[], args));
         let act =
@@ -822,7 +839,7 @@ mod tests {
         assert!(t.contains("✕ :443 / → 127.0.0.1:8420") && t.contains("没在听") && t.contains("https://mac.ts.net/"), "{t}");
         assert!(t.contains("⏎ 复制地址") && t.contains("x 撤掉") && t.contains("a 挂一个本机端口") && t.contains("p 开关发布"), "{t}");
         assert!(t.contains("r 重新读取"), "{t}");
-        // 前台那行:没有 drop,x 不列;手机宽度不出界
+        // The foreground row: no drop, so x isn't listed; phone width doesn't overflow
         let mut l = l;
         press(&mut l, KeyCode::Char('j'));
         let t = text(&l, 80);
@@ -830,10 +847,10 @@ mod tests {
         assert!(l.lines(40).iter().all(|x| x.width() <= 40));
         let (fx, _) = press(&mut l, KeyCode::Char('x'));
         assert!(fx.plugin.is_none() && fx.flash.unwrap().contains("此行不支持:撤掉"));
-        // 没装 tpub(列表上没有 publish_to):p 不列
+        // tpub not installed (no publish_to on the list): p isn't listed
         let bare = List::new(mounts(), true, &OUT.replace(r#""fields":{"publish_to":"on"},"#, ""));
         assert!(!text(&bare, 80).contains("p 开关发布"));
-        // 空的:写它说的那句;跑失败 / 读不懂:写出来
+        // Empty: shows the line it gives; a failed run / unreadable output: shown
         assert!(text(&List::new(mounts(), true, r#"{"empty":"没有挂载"}"#), 80).contains("没有挂载"));
         assert!(text(&List::new(mounts(), false, "tailscale isn't installed"), 80).contains("tailscale isn't installed"));
         assert!(text(&List::new(mounts(), true, "oops"), 80).contains("无法解析列表"));
@@ -843,7 +860,8 @@ mod tests {
     fn row_keys_copy_run_with_the_row_ask_twice_and_hand_the_result_back_to_the_list() {
         let mut l = List::new(mounts(), true, OUT);
         assert_eq!(press(&mut l, KeyCode::Enter).0.copy.as_deref(), Some("https://mac.ts.net/"));
-        // x:第一次只提醒,第二次带着这一行跑 drop;跑完交回这个列表(只重读,不另开)
+        // x: the first press only warns, the second runs drop with this row; the result goes back to this list (reload
+        // only, no new page)
         let (fx, _) = press(&mut l, KeyCode::Char('x'));
         assert!(fx.plugin.is_none() && text(&l, 80).contains("再按 x:撤掉"));
         let req = press(&mut l, KeyCode::Char('x')).0.plugin.expect("跑了");
@@ -853,14 +871,14 @@ mod tests {
         );
         let then = req.then.expect("交回列表");
         assert!(then.refresh && l.takes(&then) && then.item.id == "mounts");
-        // 中间按了别的就不算
+        // Pressing something else in between doesn't count
         press(&mut l, KeyCode::Char('x'));
         press(&mut l, KeyCode::Char('k'));
         assert!(press(&mut l, KeyCode::Char('x')).0.plugin.is_none());
-        // p:读列表上的字段,不用停在哪一行
+        // p: reads the list-level field, no row needed
         let req = press(&mut l, KeyCode::Char('p')).0.plugin.unwrap();
         assert_eq!(req.args, vec![("to".into(), "on".into())]);
-        // a:端口要填,先弹表单;填完跑,也交回列表
+        // a: the port needs input, so a form pops up first; runs once filled in, also handed back to the list
         let (mut fx, _) = press(&mut l, KeyCode::Char('a'));
         let mut form = fx.open.take().expect("表单");
         assert!(fx.plugin.is_none());
@@ -870,7 +888,7 @@ mod tests {
         let req = press(form.as_mut(), KeyCode::Enter).0.plugin.unwrap();
         assert_eq!((req.item.id.as_str(), req.args.clone()), ("add", vec![("port".into(), "3000".into())]));
         assert!(req.then.is_some_and(|t| l.takes(&t)));
-        // r(插件没绑):重读这个列表
+        // r (not bound by the plugin): reloads this list
         let req = press(&mut l, KeyCode::Char('r')).0.plugin.unwrap();
         assert!(req.refresh && l.takes(&req));
         assert_eq!(press(&mut l, KeyCode::Char('q')).1, Flow::Close);
@@ -880,18 +898,18 @@ mod tests {
     fn a_reloaded_list_keeps_the_highlight_on_the_same_row_and_shows_what_the_last_key_said() {
         let mut l = List::new(mounts(), true, OUT);
         press(&mut l, KeyCode::Char('j'));
-        // 上面那行撤掉了:高亮还在前台那行上
+        // The row above was taken down: the highlight stays on the foreground row
         let after = OUT.replace(r#"{"id":"https:443/","mark":"✕","tone":"bad","text":":443 / → 127.0.0.1:8420","right":"没在听","detail":["https://mac.ts.net/"],"fields":{"url":"https://mac.ts.net/","drop":"https:443/"}},"#, "");
         l.said(true, "已撤 https://mac.ts.net/\n要加回去:tailscale serve --bg --https=443 http://127.0.0.1:8420");
         l.feed(true, &after);
         assert_eq!(l.cur().map(|r| r.id.as_str()), Some("fg:https:9000/"));
         let t = text(&l, 80);
         assert!(t.contains("已撤 https://mac.ts.net/\n要加回去:tailscale serve --bg --https=443 http://127.0.0.1:8420"), "{t}");
-        // 别的会话、别的视图的不归它
+        // Results for other sessions or other views aren't its
         let mut other = mounts();
         other.session = "s2".into();
         assert!(!l.takes(&other) && l.takes(&mounts()));
-        // 跑失败的:警告色写着,列表留着上一份
+        // A failed run: shown in the warning color, the list keeps the previous copy
         l.feed(false, "tailscale didn't answer");
         assert!(text(&l, 80).contains("tailscale didn't answer") && l.list.rows.len() == 1);
     }

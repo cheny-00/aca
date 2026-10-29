@@ -1,12 +1,16 @@
-//! 计费面板里每个账号的颜色位子:第一次见到的账号拿最小的空位,之后不变。颜色跟着账号走,
-//! 不跟「这个时段谁花得多」走 —— 切时段、只看几个账号、以后再加账号,老账号都不换色。
-//! 位子只有色盘那么多(theme 的 series,默认 5 个,config.toml 里可以多写几个):满了之后来的账号画灰色,在走势里并进「其他」;
-//! 色盘改小了,超出去的位子作废,那几个账号跟新来的一样等空位;
-//! 记录里没了的账号(账号目录删了)把位子让出来。记在 ~/.local/state/aca/ui/colors,一行一个:`<位子>\t<账号>`
+//! Each account's color slot on the billing page: an account seen for the first time takes the lowest free slot and keeps it.
+//! The color follows the account, not "who spent most in this period": switching periods, showing only some accounts, adding
+//! accounts later, existing accounts never change color.
+//! There are only as many slots as palette colors (theme's series, 5 by default, more can be listed in config.toml): accounts
+//! arriving once they're full are drawn gray and merged into 「其他」 (other) in the trend;
+//! when the palette shrinks, slots beyond it are void and those accounts wait for a free slot like newcomers;
+//! accounts gone from the records (account directory deleted) give up their slots. Kept in ~/.local/state/aca/ui/colors, one
+//! per line: `<slot>\t<account>`
 
 use std::path::Path;
 
-/// names:现在有的账号,先来的先拿位子(传进来时按总花费从多到少);size:色盘有几个颜色。path 为 None 时不读不写,只按顺序分
+/// names: the accounts there are now, first come first served (passed in by total spend, most first); size: how many colors
+/// the palette has. With path None, nothing is read or written, slots just go in order
 pub fn assign(path: Option<&Path>, names: &[String], size: usize) -> Vec<(String, usize)> {
     let text = path.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
     let mut got: Vec<(String, usize)> = vec![];
@@ -47,18 +51,18 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(assign(Some(&p), &v(&["Claude work", "Claude home"]), 5), vec![("Claude work".into(), 0), ("Claude home".into(), 1)]);
-        // home 花得更多了、又来了个新账号:老的不换位子,新的拿空位
+        // home now spends more and a new account came: the old ones keep their slots, the new one takes a free slot
         let got = assign(Some(&p), &v(&["Claude home", "Codex x", "Claude work"]), 5);
         assert_eq!(got, vec![("Claude work".into(), 0), ("Claude home".into(), 1), ("Codex x".into(), 2)]);
-        // work 的目录删了:位子让出来给下一个新账号
+        // work's directory was deleted: its slot goes to the next new account
         let got = assign(Some(&p), &v(&["Claude home", "Codex x", "Codex y"]), 5);
         assert_eq!(got, vec![("Codex y".into(), 0), ("Claude home".into(), 1), ("Codex x".into(), 2)]);
-        // 满了的不给位子
+        // Once full, no slot
         let many = v(&["Claude home", "Codex x", "Codex y", "a", "b", "c"]);
         let got = assign(Some(&p), &many, 5);
         assert_eq!(got.len(), 5);
         assert!(!got.iter().any(|(n, _)| n == "c"));
-        // 色盘改小:超出去的位子作废;再改大,等着的按顺序拿空位
+        // Palette shrunk: slots beyond it are void; grown again, the waiting ones take free slots in order
         let got = assign(Some(&p), &many, 3);
         assert_eq!(got.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["Codex y", "Claude home", "Codex x"]);
         let got = assign(Some(&p), &many, 6);

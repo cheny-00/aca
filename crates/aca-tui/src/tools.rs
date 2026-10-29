@@ -1,15 +1,16 @@
-//! `n` 的工具菜单:最上面总是 shell,然后是 config.toml 里登记的每个账号(名字就是账号名,先 Claude 再 Codex;
-//! 哪家一个账号都没有就放它本身),最后是自己起名的工具(`[tools.<名>]`)。
+//! The `n` tool menu: shell always on top, then every account registered in config.toml (named after the account, Claude
+//! first, then Codex; a family with no account at all is listed as itself), and last the named tools (`[tools.<name>]`).
 //!
-//! 顺序和藏哪些在 config.toml 里调(都可以不写):
+//! Order and what to hide are set in config.toml (both optional):
 //!
 //! ```toml
 //! [ui]
-//! menu = ["work", "team"]            # 写了的按这个顺序排在前面,没写到的接在后面
-//! hide = ["official"]                # 菜单里不列(`aca new claude:official` 照样能用)
+//! menu = ["work", "team"]            # listed ones go first in this order, the rest follow
+//! hide = ["official"]                # not listed in the menu (`aca new claude:official` still works)
 //! ```
 //!
-//! 要带参数的做成一个工具(`[tools.ccx] kind = "claude"`、`args = […]`、`account = "sub"`),见 aca-core 的 config.rs。
+//! One that needs args is made a tool (`[tools.ccx] kind = "claude"`, `args = […]`, `account = "sub"`), see aca-core's
+//! config.rs.
 
 use aca_core::config::Config;
 use aca_core::t;
@@ -18,22 +19,23 @@ use crate::data::{Agent, agent_of_tool};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tool {
-    /// 菜单里显示的名字
+    /// Name shown in the menu
     pub name: String,
-    /// aca 的工具名(claude / codex / shell / 自己起名的)和账号(空 = 这个工具默认的)
+    /// aca's tool name (claude / codex / shell / a named one) and account (empty = this tool's default)
     pub tool: String,
     pub account: String,
-    /// 哪家,菜单里上色用
+    /// Which family, for coloring in the menu
     pub agent: Agent,
-    /// 菜单里名字后面那句:自己起名的工具写它的命令;账号不写(菜单在那写哪家和额度)
+    /// The text after the name in the menu: a named tool shows its command; an account shows nothing (the menu puts the
+    /// family and quota there)
     pub note: String,
-    /// 用不了的原因(工具写的默认账号没登记),菜单里代替说明显示
+    /// Why it can't be used (the tool's default account isn't registered), shown in the menu in place of the note
     pub problem: Option<String>,
 }
 
 #[cfg(test)]
 impl Tool {
-    /// 交给 `aca new` 的写法:`工具` / `工具:账号`
+    /// The form passed to `aca new`: `tool` / `tool:account`
     pub fn spec(&self) -> String {
         spec(&self.tool, &self.account)
     }
@@ -43,14 +45,14 @@ pub fn spec(tool: &str, account: &str) -> String {
     if account.is_empty() { tool.to_string() } else { format!("{tool}:{account}") }
 }
 
-/// 菜单的顺序和藏起来的(config.toml 的 `[ui]`)
+/// Menu order and hidden entries (config.toml's `[ui]`)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Layout {
     pub menu: Vec<String>,
     pub hide: Vec<String>,
 }
 
-/// 读菜单(藏起来的不要)
+/// Read the menu (hidden ones left out)
 pub fn load() -> Vec<Tool> {
     menu(&aca_core::config::load(), &Layout { menu: crate::config::list("ui", "menu"), hide: crate::config::list("ui", "hide") })
 }
@@ -60,7 +62,7 @@ fn entry(cfg: &Config, name: String, tool: &str, account: &str, note: String) ->
     Tool { name, tool: tool.into(), account: account.into(), agent: agent_of_tool(cfg, tool), note, problem }
 }
 
-/// 自己起名的工具:哪一家、什么命令、带什么参数、用哪个账号
+/// A named tool: which family, what command, which args, which account
 fn tool_note(name: &str, t: &aca_core::config::Tool) -> String {
     let cmd = if !t.cmd.is_empty() {
         t.cmd.iter().map(|c| crate::create::tilde(c)).collect::<Vec<_>>().join(" ")
@@ -78,33 +80,34 @@ fn tool_note(name: &str, t: &aca_core::config::Tool) -> String {
 }
 
 pub fn menu(cfg: &Config, lay: &Layout) -> Vec<Tool> {
-    // 测试里不看这台机器装了什么
+    // Tests don't look at what this machine has installed
     menu_with(cfg, lay, if cfg!(test) { |_| false } else { crate::accounts::on_path })
 }
 
-/// `installed` 问一个程序装了没有(测试里换掉)
+/// `installed` asks whether a program is installed (swapped out in tests)
 fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Tool> {
     let mut out: Vec<Tool> = vec![];
-    // 登记的账号:照内置的先后(Claude、Codex、pi、opencode),各自按名字
+    // Registered accounts: in built-in order (Claude, Codex, pi, opencode), each family's by name
     for fam in aca_core::agent::kinds().filter(|k| *k != "shell") {
         let all = cfg.accounts.get(fam);
         for n in all.into_iter().flat_map(|m| m.keys()) {
             out.push(entry(cfg, n.clone(), fam, n, String::new()));
         }
-        // 哪家一个账号都没有:放它本身(用它自己默认的配置目录)。Claude、Codex 总在;
-        // 后加的几家装了(或者 config.toml 里写了它那一段)才放,没装的人菜单里不多出用不了的几行
+        // A family with no account at all: list it as itself (with its own default config dir). Claude and Codex always;
+        // the later-added families only when installed (or given their section in config.toml), so people without them
+        // don't get unusable rows in the menu
         let prog = cfg.tool(fam).and_then(|t| t.cmd.first().cloned()).unwrap_or_else(|| fam.to_string());
         let wanted = matches!(fam, "claude" | "codex") || cfg.tools.contains_key(fam) || installed(&prog);
         if all.is_none_or(|m| m.is_empty()) && wanted {
             out.push(entry(cfg, fam.into(), fam, "", String::new()));
         }
     }
-    // 自己起名的工具
+    // Named tools
     for (name, t) in cfg.tools.iter().filter(|(k, _)| aca_core::agent::builtin(k).is_none()) {
         out.push(entry(cfg, name.clone(), name, "", tool_note(name, t)));
     }
     out.retain(|t| !lay.hide.contains(&t.name));
-    // 写了顺序的排前面(稳定排序:没写到的保持上面的先后)
+    // Ones given an order go first (stable sort: the rest keep the order above)
     out.sort_by_key(|t| lay.menu.iter().position(|n| *n == t.name).unwrap_or(usize::MAX));
     let shell = Tool {
         name: "shell".into(),
@@ -140,15 +143,15 @@ mod tests {
     #[test]
     fn accounts_are_listed_then_named_tools_and_shell_comes_first() {
         let v = menu_with(&cfg(), &Layout::default(), none);
-        // 不换配置目录的账号(bed:只带环境变量)也在
+        // An account that doesn't change the config dir (bed: env vars only) is there too
         assert_eq!(names(&v), ["shell", "bed", "team", "alt", "aider", "bad", "mycx"]);
         assert_eq!(v[1].spec(), "claude:bed");
         assert_eq!((v[2].spec(), v[2].agent, v[2].note.as_str()), ("claude:team".to_string(), Agent::Claude, ""));
         assert_eq!((v[3].spec(), v[3].agent), ("codex:alt".to_string(), Agent::Codex));
-        // 自己起名的工具认 kind;声明式的算别家
+        // A named tool goes by its kind; a declared tool counts as Other
         assert_eq!((v[6].spec(), v[6].agent, v[6].note.as_str()), ("mycx".to_string(), Agent::Codex, "codex · alt"));
         assert_eq!((v[4].agent, v[4].note.as_str()), (Agent::Other, "aider"));
-        // 工具写的默认账号没登记:标出来
+        // The tool's default account isn't registered: flagged
         assert!(v[5].problem.as_ref().is_some_and(|p| p.contains("nope")), "{:?}", v[5].problem);
         assert!(v.iter().enumerate().all(|(i, t)| i == 5 || t.problem.is_none()));
     }
@@ -170,7 +173,7 @@ mod tests {
         let v = menu_with(&cfg, &Layout::default(), none);
         assert_eq!(names(&v), ["shell", "claude", "codex", "work", "opencode"]);
         assert_eq!((v[3].spec(), v[3].agent, v[4].agent), ("pi:work".to_string(), Agent::Pi, Agent::Opencode));
-        // 自己定了命令的看那个命令装了没有
+        // One with its own cmd: whether that command is installed
         let wrapped = aca_core::config::parse("[tools.pi]\ncmd = [\"/opt/pi/bin/pi\"]\n");
         assert_eq!(names(&menu_with(&wrapped, &Layout::default(), none)), ["shell", "claude", "codex", "pi"]);
     }

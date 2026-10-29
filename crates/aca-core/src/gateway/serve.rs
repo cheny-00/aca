@@ -1,9 +1,11 @@
-//! gateway 进程(`aca plugin gateway serve`,由第一个转接拉起来,见 [`super::connect`])。
+//! The gateway process (`aca plugin gateway serve`, started by the first relay, see [`super::connect`]).
 //!
-//! 一个连接一个线程。连接的第一行说它是谁:`{"aca":"hello","session":…}` 是转接(后面是 agent 的 MCP 消息),
-//! `{"aca":"ctl","cmd":…}` 是控制命令(status / stop / restart)。对 agent 这头只做工具:握手、列工具(下面各个服务的合起来,
-//! 名字加上 `<服务>__` 前缀,按这个会话够得着的过滤)、调工具(换回原来的名字转下去,`_meta` 里加上会话)。
-//! 下面的服务、配置改了,告诉连着的 agent 工具列表变了(Claude 会重新拉,Codex 要重启才看得到)。
+//! One thread per connection. A connection's first line says who it is: `{"aca":"hello","session":…}` is a relay (followed by
+//! the agent's MCP messages), `{"aca":"ctl","cmd":…}` is a control command (status / stop / restart). Toward agents it only does
+//! tools: handshake, listing tools (those of the servers below put together, names prefixed with `<server>__`, filtered by what
+//! this session can reach), calling tools (forwarded under the original name, with the session added to `_meta`).
+//! When the servers below or the configuration change, it tells connected agents the tool list changed (Claude fetches it again,
+//! Codex only sees it after a restart).
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -23,13 +25,13 @@ use crate::tr;
 const KNOWN: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 const PROTOCOL: &str = "2025-11-25";
 
-/// 一个连上来的 agent(经转接)
+/// A connected agent (through a relay)
 pub(crate) struct Client {
     pub id: u64,
     pub session: String,
     since: Instant,
     out: Mutex<UnixStream>,
-    /// 上次列给它的工具:名字 → (哪个服务, 原来的名字)
+    /// The tools last listed to it: name → (which server, the original name)
     names: Mutex<HashMap<String, (Arc<Down>, String)>>,
 }
 
@@ -42,7 +44,7 @@ impl Client {
 }
 
 struct Gw {
-    /// (服务名, 会话):共用的会话是空的
+    /// (server name, session): the session is empty for shared ones
     downs: Mutex<HashMap<(String, String), Arc<Down>>>,
     specs: Mutex<Vec<Spec>>,
     clients: Mutex<Vec<Arc<Client>>>,
@@ -51,11 +53,11 @@ struct Gw {
     started: Instant,
 }
 
-/// `aca plugin gateway serve`:跑到没人连着超过设置的分钟数,或者有人发了 stop
+/// `aca plugin gateway serve`: runs until nobody has been connected for longer than the set minutes, or someone sends stop
 pub fn serve() -> Res<i32> {
     std::fs::create_dir_all(dir()).map_err(|e| e.to_string())?;
     let sock = sock_path();
-    // 留下来的 socket 文件:连不上就是没人在听,删掉重建
+    // A leftover socket file: if it can't be connected to, nobody is listening, so delete it and create it again
     if sock.exists() {
         if UnixStream::connect(&sock).is_ok() {
             return Err(tr!("gateway 已在运行({})", "the gateway is already running ({})", sock.display()));
@@ -127,7 +129,7 @@ impl Gw {
             names: Mutex::new(HashMap::new()),
         });
         self.clients.lock().unwrap().push(client.clone());
-        // 没先打招呼的(直接连 socket 的):第一行就是 MCP 消息
+        // One that didn't say hello first (connected straight to the socket): the first line is already an MCP message
         if hello["aca"] != "hello" {
             self.on_message(&client, &hello);
         }
@@ -144,7 +146,7 @@ impl Gw {
         self.gone(&client);
     }
 
-    /// 连接断了:这个会话没有别的连接了,它那几个每会话一份的服务收掉
+    /// A connection closed: if this session has no other connections, clean up its per-session servers
     fn gone(&self, client: &Arc<Client>) {
         let mut cs = self.clients.lock().unwrap();
         cs.retain(|c| c.id != client.id);
@@ -195,7 +197,8 @@ impl Gw {
         }
     }
 
-    /// 配置变了(config.toml、plugins.toml、插件登记):换掉变了的服务,告诉连着的 agent
+    /// The configuration changed (config.toml, plugins.toml, plugin registrations): replace the servers that changed and tell
+    /// connected agents
     fn refresh(&self) {
         let now = catalog();
         let mut specs = self.specs.lock().unwrap();
@@ -216,7 +219,7 @@ impl Gw {
         self.changed();
     }
 
-    /// 工具列表变了:告诉每个连着的
+    /// The tool list changed: tell everyone connected
     fn changed(&self) {
         for c in self.clients.lock().unwrap().iter() {
             c.send(&json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }));
@@ -245,14 +248,15 @@ impl Gw {
             .clone()
     }
 
-    /// 列给这个连接的工具:每个够得着它的服务(没起的先起,几个一起起),工具名加上前缀
+    /// The tools listed to this connection: every server that can reach it (starting ones not yet started, several at once), tool
+    /// names prefixed
     fn list(self: &Arc<Self>, client: &Arc<Client>) -> Vec<Value> {
         self.refresh();
         *self.last.lock().unwrap() = Instant::now();
         let (tool, kind, account) = facts(&client.session);
         let wants = decl::wants().unwrap_or_default();
         let reaches = |id: &str| client.session.is_empty() || wants.get(id).is_none_or(|w| w.reaches(&tool, &kind, &account));
-        // M 页里对这个会话关掉的不给
+        // Ones switched off for this session on the M page aren't offered
         let off = super::off_for(&client.session);
         let specs: Vec<Spec> = self
             .specs
@@ -277,7 +281,7 @@ impl Gw {
             for t in d.tools() {
                 let orig = t["name"].as_str().unwrap_or("").to_string();
                 let shown = if d.spec.tools {
-                    // 能力服务的工具名是 <插件>__<能力>:插件够不着这个会话的不给
+                    // The plugin-commands server's tool names are <plugin>__<command>: not offered if the plugin can't reach this session
                     let owner = reg.iter().find(|e| orig.starts_with(&format!("{}__", mount::safe(&e.id))));
                     if owner.is_some_and(|e| !reaches(&e.id)) {
                         continue;
@@ -301,7 +305,7 @@ impl Gw {
         let name = params["name"].as_str().unwrap_or("").to_string();
         let mut found = client.names.lock().unwrap().get(&name).cloned();
         if found.is_none() {
-            // 还没列过(或者列表变了):重列一遍再找
+            // Not listed yet (or the list changed): list again, then look again
             self.list(client);
             found = client.names.lock().unwrap().get(&name).cloned();
         }
@@ -344,11 +348,12 @@ impl Gw {
                             State::Ready => ("ready", String::new(), false),
                             State::Failed { msg, fails, .. } => ("failed", format!("{msg} (×{fails})"), fails >= super::down::GIVE_UP),
                         };
-                        // stopped:连着失败停下了,不会再自己起(状态栏、插件页标出来,见 plugin::health)
+                        // stopped: stopped after failing repeatedly, won't start itself again
+                        // (the status bar and the plugins page mark it, see plugin::health)
                         json!({ "name": d.spec.name, "session": d.session, "state": state, "tools": d.tools().len(), "error": error, "stopped": stopped })
                     })
                     .collect();
-                // 还没人要过、没起的也列上
+                // Ones nobody has asked for yet and that aren't started are listed too
                 for s in self.specs.lock().unwrap().iter() {
                     if !servers.iter().any(|x| x["name"] == json!(s.name)) {
                         servers.push(json!({ "name": s.name, "session": "", "state": "idle", "tools": 0, "error": "" }));
@@ -368,7 +373,7 @@ impl Gw {
                 json!({ "ok": true, "restarted": n })
             }
             "stop" => json!({ "ok": true }),
-            // 给谁看什么变了(M 页按会话关了一个):连着的都重新来拉工具列表
+            // What someone sees changed (one switched off for a session on the M page): everyone connected fetches the tool list again
             "changed" => {
                 self.changed();
                 json!({ "ok": true })
@@ -378,7 +383,7 @@ impl Gw {
     }
 }
 
-/// 会话的工具、按哪家起、账号(决定它够得着哪些插件)
+/// The session's tool, which tool kind it starts as, and its account (deciding which plugins can reach it)
 pub(crate) fn facts(session: &str) -> (String, String, String) {
     let Some(s) = (!session.is_empty()).then(|| crate::store::Store::open().ok()?.get(session).ok()).flatten() else {
         return Default::default();

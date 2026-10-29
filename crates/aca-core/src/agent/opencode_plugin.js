@@ -1,21 +1,24 @@
-// aca 起 opencode 时带进来的插件(crates/aca-core/src/agent/opencode.rs),不装进 opencode 的配置目录。
-// 只转发:opencode 的事件换成 hook 协议的形状交给 `aca hook opencode`,状态怎么变在 aca 那边(agent/lifecycle.rs)。
-// 不是 aca 起的(环境里没有 ACA_SESSION_ID)什么都不做。出什么错都不吭声:报不上不该碍着对话。
+// The plugin passed in when aca starts opencode (crates/aca-core/src/agent/opencode.rs), not installed into opencode's config directory.
+// Only forwards: opencode's events become hook-protocol shape and go to `aca hook opencode`; how the state changes is on
+// aca's side (agent/lifecycle.rs).
+// Does nothing when not started by aca (no ACA_SESSION_ID in the environment). Silent on any error: failing to report
+// mustn't get in the way of the conversation.
 import { spawn } from "node:child_process";
 
 export const AcaPlugin = async () => {
   const { ACA_SESSION_ID: id, ACA_BIN: bin, ACA_TOOL: tool } = process.env;
   if (!id || !bin) return {};
-  // task 工具派出去的子 agent 也是一段会话、也报 idle:不是这段对话本身
+  // Subagents spawned by the task tool are sessions too and also report idle: not this conversation itself
   const children = new Set();
   const titles = new Map();
-  // 每段对话最后一条回复:回复的 id,和各条回复里的字
+  // Each conversation's last reply: the reply's id, and the text of each reply
   const lastReply = new Map();
   const texts = new Map();
-  // 这一轮:哪段对话、结束报过没有、你在权限框上点了拒绝没有(拒绝了它就停下,不报错)
+  // This turn: which conversation, whether its end was reported, whether you denied on a permission prompt (denying stops
+  // it, without an error)
   let turn = null;
 
-  // 一个报完再报下一个:aca 那边收到的先后和这边发生的一样
+  // Report one after another: aca receives them in the same order they happen here
   let chain = Promise.resolve();
   const report = (event, sid, extra = {}) => {
     const payload = { hook_event_name: event, session_id: sid ?? "", title: titles.get(sid) ?? "", ...extra };
@@ -36,9 +39,9 @@ export const AcaPlugin = async () => {
     return chain;
   };
   const mine = (sid) => sid && !children.has(sid);
-  // 还没起好标题时它叫「New session - <时刻>」
+  // Before it has a title it's called "New session - <time>"
   const named = (t) => (t && !/^New session - \d{4}-\d\d-\d\dT/.test(t) ? t : "");
-  // 一轮结束只报一次(它连着报两次 idle;出错、打断之后也还有一次 idle)
+  // Report a turn's end only once (it reports idle twice in a row; there's another idle after an error or interrupt too)
   const end = (sid, event, extra) => {
     if (!turn || turn.sid !== sid || turn.over) return;
     turn.over = true;

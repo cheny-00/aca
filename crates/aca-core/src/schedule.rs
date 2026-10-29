@@ -1,17 +1,23 @@
-//! agent 在会话里给自己定的「到点再来」:Claude 的 CronCreate(定时)和 ScheduleWakeup(`/loop` 的下一次)。
-//! 两样都只在那个 Claude 进程的内存里(CronCreate 的 `durable` 写明了没用),进程一退就没了,接着对话再起也不回来。
-//! 所以还有没到点的,闲着也不能停(见 `session::stop_idle`)。
+//! What an agent schedules for itself in a session to "come back when it's due": Claude's CronCreate (scheduled) and
+//! ScheduleWakeup (the next `/loop` run).
+//! Both live only in that Claude process's memory (CronCreate's `durable` is documented as having no effect): gone once the
+//! process exits, and they don't come back when the conversation is resumed.
+//! So while something isn't due yet, it can't be stopped even when idle (see `session::stop_idle`).
 //!
-//! 从对话记录里认,只算这次起来(`Run::started`)之后的:
-//! - CronCreate:输入 `{cron, prompt, recurring}`,结果「Scheduled one-shot task 0df328a0 (17 3 1 1 *). Next run: …」里是任务号;
-//!   CronDelete `{id}` 删掉的不算。循环的(不写 recurring 就是)建了 7 天后 Claude 自己删掉;一次性的到点跑一次就没了,
-//!   几点按 cron 在本地时区算,认不出来的写法当它 7 天。认不出任务号的删不掉,一直算着 —— 宁可不停
-//! - ScheduleWakeup:最后那一次不是 `{stop: true}` 的话,`delaySeconds`(60–3600)之后叫它
+//! Recognized from the conversation record, counting only what came after this start (`Run::started`):
+//! - CronCreate: input `{cron, prompt, recurring}`; the result "Scheduled one-shot task 0df328a0 (17 3 1 1 *). Next run: …" holds
+//!   the job id; ones deleted by CronDelete `{id}` don't count. A recurring one (the default without recurring) is deleted by
+//!   Claude itself 7 days after it's created; a one-shot runs once when due and is gone, its time worked out from the cron in the
+//!   local time zone; a form that isn't recognized counts as 7 days. One whose job id isn't recognized can't be deleted and keeps
+//!   counting — better not to stop it
+//! - ScheduleWakeup: unless the last one is `{stop: true}`, it's woken `delaySeconds` (60–3600) later
 //!
-//! 到点之后再多算 [`SLACK`]:它忙着的时候不跑,循环的还会往后挪(最多 30 分钟)。
-//! 照 Claude Code 2.1.300 写进记录的样子(2026-10-15 在本机建了一个再删掉看的)。
+//! [`SLACK`] more is counted past the due time: it doesn't run while it's busy, and a recurring one also gets pushed back (up to
+//! 30 minutes).
+//! Follows what Claude Code 2.1.300 writes into the record (seen on this machine on 2026-10-15 by creating one and deleting it).
 //!
-//! 界面每次刷新都问(列表上标 ◷):记录一份一百多 MB,所以每份读过的记着读到哪了,下回只读后面新写的(见 [`scan`])。
+//! The interface asks on every refresh (marked ◷ in the list): a record can be over 100 MB, so for each one read, how far it got
+//! is kept, and next time only what was written after is read (see [`scan`]).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -24,35 +30,45 @@ use serde_json::Value;
 
 use crate::runtime::Run;
 
-/// 循环的定时建了多久之后 Claude 自己删掉
+/// How long after a recurring job is created Claude deletes it itself
 const RECURRING_LIFE: u64 = 7 * 86400;
-/// 到点之后再多算这么久
+/// How much longer to count past the due time
 const SLACK: u64 = 3600;
-/// 记录里这几样字都没有的行不用解析(大的记录一百多 MB)
+/// Lines of the record with none of these strings don't need parsing (a big record is over 100 MB)
 const NEEDLES: &[&str] = &["\"CronCreate\"", "\"CronDelete\"", "\"ScheduleWakeup\"", "Scheduled "];
 static JOB: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^Scheduled\b[^.]*?\btask ([0-9A-Za-z_-]+)").unwrap());
 
-/// 还没到点的一样
+/// One thing not due yet
 #[derive(Clone, Debug, PartialEq)]
 pub struct Due {
-    /// cron;`/loop` 的下一次是空的
+    /// The cron; empty for the next `/loop` run
     pub cron: String,
-    /// 循环的(cron 才有)
+    /// Recurring (only cron ones can be)
     pub recurring: bool,
-    /// 到点交给它的那句话
+    /// What it's handed when due
     pub prompt: String,
-    /// 下一次到点;cron 认不出来是 None
+    /// When it's next due; None if the cron isn't recognized
     pub next: Option<u64>,
+    /// A scheduled message in the aca inbox (`aca msg --in`), not one in its process
+    pub inbox: bool,
 }
 
-/// 这次起来之后定下、还没到点的,先到点的在前
+/// Scheduled messages in the inbox that aren't due yet (see [`crate::inbox::scheduled`]), listed like the ones it scheduled itself
+pub fn inbox(id: &str) -> Vec<Due> {
+    crate::inbox::scheduled(id)
+        .into_iter()
+        .map(|m| Due { cron: String::new(), recurring: false, prompt: m.text, next: Some(m.at), inbox: true })
+        .collect()
+}
+
+/// What was scheduled since this start and isn't due yet, soonest first
 pub fn due(r: &Run, now: u64) -> Vec<Due> {
     let mut seen = Seen::default();
     for f in records(r) {
-        // 这次起来之前就没再写过的,里面不会有这次定的
+        // One not written since before this start can't hold anything scheduled this time
         let written = f.metadata().and_then(|m| m.modified()).ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok());
         if written.is_some_and(|w| w.as_secs() >= r.started) {
-            // 起的时候就有的那份:它那时的长度之前的内容里不会有这次定的,从那往后读
+            // The one already there at start: nothing scheduled this time lies before its length then, so read from there on
             let from = if f == Path::new(&r.started_file) { r.started_len } else { 0 };
             seen.merge(&scan(&f, from, now));
         }
@@ -60,12 +76,13 @@ pub fn due(r: &Run, now: u64) -> Vec<Due> {
     seen.due(r.started, now, &|cron, at| next_fire(cron, at, &local, &at_local))
 }
 
-/// 有没有还没到点的
+/// Whether anything isn't due yet
 pub fn pending(r: &Run, now: u64) -> bool {
     !due(r, now).is_empty()
 }
 
-/// 一份记录读到哪了(读到的最后一个换行之后)、那时候认出来的。文件换了一个(inode 变了)、变短了就从头读
+/// How far a record has been read (just past the last newline read) and what was recognized by then. If the file was replaced
+/// (inode changed) or got shorter, read from the start
 struct Scan {
     ino: u64,
     read: u64,
@@ -74,8 +91,9 @@ struct Scan {
 
 static SCANS: LazyLock<Mutex<HashMap<PathBuf, Scan>>> = LazyLock::new(Default::default);
 
-/// 一份记录里认出来的:读过的部分记着,只读后面新写的;第一次读从 `from` 起(文件比它短 = 换过了,从头)。
-/// 两个线程同时读同一份也没事,各读各的,后放回去的留下
+/// What's recognized in a record: the part already read is kept, only what was written after is read; the first read starts at
+/// `from` (file shorter than that = replaced, from the start).
+/// Two threads reading the same one at once is fine: each reads on its own, the one put back last stays
 fn scan(path: &Path, from: u64, now: u64) -> Seen {
     let Ok(meta) = path.metadata() else { return Seen::default() };
     let (ino, len) = (meta.ino(), meta.len());
@@ -92,7 +110,8 @@ fn scan(path: &Path, from: u64, now: u64) -> Seen {
     out
 }
 
-/// 这段对话和这次起来之后换过的每一段(/clear 换了对话,进程和它的定时还在)的记录
+/// The records of this conversation and of every one switched to since this start (/clear switches the conversation; the process
+/// and its scheduled jobs stay)
 fn records(r: &Run) -> Vec<PathBuf> {
     if r.transcript.is_empty() {
         return vec![];
@@ -110,7 +129,7 @@ fn records(r: &Run) -> Vec<PathBuf> {
     v
 }
 
-/// CronCreate 的一次调用
+/// One CronCreate call
 #[derive(Clone, Debug)]
 struct Create {
     at: u64,
@@ -119,35 +138,33 @@ struct Create {
     prompt: String,
 }
 
-/// 记录里认出来的
+/// What's recognized in a record
 #[derive(Clone, Debug, Default)]
 struct Seen {
-    /// CronCreate 那次调用的 id → 它
+    /// CronCreate call id → the call
     creates: HashMap<String, Create>,
-    /// CronCreate 那次调用的 id → 结果里的任务号
+    /// CronCreate call id → the job id in its result
     jobs: HashMap<String, String>,
-    /// CronDelete 删掉的任务号
+    /// Job ids deleted by CronDelete
     deleted: HashSet<String>,
-    /// 最后一次 ScheduleWakeup:(什么时候, 隔几秒和那句话;`stop` = None)
-    wake: Option<(u64, Option<(u64, String)>)>,
+    /// ScheduleWakeup call id → (when, the delay in seconds and the prompt; `stop` = None). The latest one counts
+    wakes: HashMap<String, (u64, Option<(u64, String)>)>,
 }
 
 impl Seen {
-    /// 几份记录(/clear 之前那几段)认出来的合在一起
+    /// Merge what's recognized in several records (the conversations before /clear)
     fn merge(&mut self, o: &Seen) {
         for (call, c) in &o.creates {
             self.creates.entry(call.clone()).and_modify(|e| e.at = e.at.min(c.at)).or_insert_with(|| c.clone());
         }
         self.jobs.extend(o.jobs.iter().map(|(k, v)| (k.clone(), v.clone())));
         self.deleted.extend(o.deleted.iter().cloned());
-        if let Some(w) = &o.wake
-            && self.wake.as_ref().is_none_or(|(t, _)| w.0 >= *t)
-        {
-            self.wake = Some(w.clone());
+        for (call, w) in &o.wakes {
+            self.wakes.entry(call.clone()).and_modify(|e| e.0 = e.0.min(w.0)).or_insert_with(|| w.clone());
         }
     }
 
-    /// `fire`:cron 在这之后第一次到点是几时(认不出来 = None)
+    /// `fire`: when the cron is first due after that time (not recognized = None)
     fn due(&self, since: u64, now: u64, fire: &dyn Fn(&str, u64) -> Option<u64>) -> Vec<Due> {
         let mut v = vec![];
         for (call, c) in &self.creates {
@@ -158,20 +175,22 @@ impl Seen {
             let until = if c.recurring { c.at + RECURRING_LIFE } else { first.unwrap_or(c.at + RECURRING_LIFE) };
             if now < until + SLACK {
                 let next = if c.recurring { fire(&c.cron, now.max(c.at)) } else { first };
-                v.push(Due { cron: c.cron.clone(), recurring: c.recurring, prompt: c.prompt.clone(), next });
+                v.push(Due { cron: c.cron.clone(), recurring: c.recurring, prompt: c.prompt.clone(), next, inbox: false });
             }
         }
-        if let Some((at, Some((d, prompt)))) = &self.wake {
+        if let Some((at, Some((d, prompt)))) = self.wakes.values().max_by_key(|w| w.0) {
             let next = at + (*d).clamp(60, 3600);
             if *at >= since && now < next + SLACK {
-                v.push(Due { cron: String::new(), recurring: false, prompt: prompt.clone(), next: Some(next) });
+                v.push(Due { cron: String::new(), recurring: false, prompt: prompt.clone(), next: Some(next), inbox: false });
             }
         }
         v.sort_by_key(|d| d.next.unwrap_or(u64::MAX));
         v
     }
 
-    /// 一行记录。没带时刻的当成现在(宁可多留);同一次调用记了两行的,取早的那个时刻
+    /// One line of the record. One without a timestamp is taken as now (better to keep too much); a call recorded on two lines
+    /// takes the earlier time
+    /// (since 2.1.312 each message is first recorded as an `api-request-blob` line without a timestamp, then the line with one)
     fn line(&mut self, v: &Value, now: u64) {
         let at = v["timestamp"].as_str().and_then(iso).unwrap_or(now);
         let Some(items) = v["message"]["content"].as_array() else { return };
@@ -191,15 +210,14 @@ impl Seen {
                     }
                 }
                 (Some("tool_use"), Some("ScheduleWakeup")) => {
+                    let id = it["id"].as_str().unwrap_or_default().to_string();
                     let next = if input["stop"].as_bool() == Some(true) {
                         None
                     } else {
                         let prompt = input["prompt"].as_str().unwrap_or_default().to_string();
                         Some((input["delaySeconds"].as_f64().unwrap_or(0.0) as u64, prompt))
                     };
-                    if self.wake.as_ref().is_none_or(|(t, _)| at >= *t) {
-                        self.wake = Some((at, next));
-                    }
+                    self.wakes.entry(id).and_modify(|e| e.0 = e.0.min(at)).or_insert((at, next));
                 }
                 (Some("tool_result"), _) => {
                     let Some(call) = it["tool_use_id"].as_str().filter(|c| self.creates.contains_key(*c)) else { continue };
@@ -218,7 +236,8 @@ impl Seen {
     }
 }
 
-/// 从 `from` 读到最后一个换行,返回读了几个字节。还没写完的最后一行(没有换行)留到下回
+/// Read from `from` to the last newline and return how many bytes were read. A last line not fully written yet (no newline) is
+/// left for next time
 fn read(path: &Path, from: u64, now: u64, seen: &mut Seen) -> u64 {
     let Ok(mut f) = std::fs::File::open(path) else { return 0 };
     if f.seek(SeekFrom::Start(from)).is_err() {
@@ -231,7 +250,7 @@ fn read(path: &Path, from: u64, now: u64, seen: &mut Seen) -> u64 {
             Ok(n) if n > 0 && line.ends_with(b"\n") => done += n as u64,
             _ => return done,
         }
-        // 有一行不是 UTF-8 也只跳过那一行
+        // If a line isn't UTF-8, skip only that line
         let Ok(text) = std::str::from_utf8(&line) else { continue };
         if !NEEDLES.iter().any(|n| text.contains(n)) {
             continue;
@@ -242,7 +261,7 @@ fn read(path: &Path, from: u64, now: u64, seen: &mut Seen) -> u64 {
     }
 }
 
-/// `2026-10-15T08:00:36.843Z` → 秒。只认 UTC 的(Claude 写的就是)
+/// `2026-10-15T08:00:36.843Z` → seconds. Only UTC is recognized (it's what Claude writes)
 fn iso(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[10] != b'T' || !s.ends_with('Z') {
@@ -253,7 +272,7 @@ fn iso(s: &str) -> Option<u64> {
     u64::try_from(days * 86400 + n(11..13)? * 3600 + n(14..16)? * 60 + n(17..19)?).ok()
 }
 
-/// 公历日期 → 1970-01-01 起第几天(Howard Hinnant 的算法;日子超出那个月的照样往后数)
+/// Gregorian date → days since 1970-01-01 (Howard Hinnant's algorithm; a day past the end of the month just counts on)
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -263,7 +282,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-/// 本地时间的一刻:年、月(1–12)、日、星期几(0 = 星期天)、时、分
+/// A moment in local time: year, month (1–12), day, weekday (0 = Sunday), hour, minute
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Day {
     pub y: i64,
@@ -274,10 +293,10 @@ pub struct Day {
     pub mi: u32,
 }
 
-/// 秒 → 本地时间(跟着 TZ 走,夏令时也对)
+/// Seconds → local time (follows TZ, DST included)
 pub fn local(t: u64) -> Day {
     let tt = t as libc::time_t;
-    // SAFETY:tm 是纯数据,全 0 合法;localtime_r 只写我们给的那一个
+    // SAFETY: tm is plain data, all zeros is valid; localtime_r writes only the one we pass
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&tt, &mut tm) };
     Day {
@@ -290,9 +309,16 @@ pub fn local(t: u64) -> Day {
     }
 }
 
-/// 本地时间那一天(日子超出那个月的往后数)的几点几分 → 秒;夏令时由 mktime 自己定
+/// The time: today's as "08:57", other days as "10/16 08:57"
+pub fn clock(t: u64, now: u64) -> String {
+    let (a, b) = (local(t), local(now));
+    let hm = format!("{:02}:{:02}", a.h, a.mi);
+    if (a.y, a.m, a.d) == (b.y, b.m, b.d) { hm } else { format!("{}/{} {hm}", a.m, a.d) }
+}
+
+/// Hour and minute on that local day (a day past the end of the month counts on) → seconds; mktime works out DST itself
 fn at_local(y: i64, m: u32, d: i64, h: u32, mi: u32) -> u64 {
-    // SAFETY:同上
+    // SAFETY: as above
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     tm.tm_year = (y - 1900) as i32;
     tm.tm_mon = m as i32 - 1;
@@ -303,8 +329,10 @@ fn at_local(y: i64, m: u32, d: i64, h: u32, mi: u32) -> u64 {
     unsafe { libc::mktime(&mut tm) }.max(0) as u64
 }
 
-/// 五段的 cron(分 时 日 月 星期):每段能写 `*`、`5`、`1-5`、`*/15`、`0-30/10`、`1,15`,星期的 7 也是星期天。
-/// 日和星期两段都不是 `*` 开头的,对上一样就算;有一段是的,两段都要对上(和 Vixie cron 一样)
+/// A five-field cron (minute hour day month weekday): each field can be `*`, `5`, `1-5`, `*/15`, `0-30/10`, `1,15`; weekday 7 is
+/// Sunday too.
+/// If neither the day nor the weekday field starts with `*`, matching either is enough; if one does, both must match (as in
+/// Vixie cron)
 #[derive(Debug)]
 struct Cron {
     min: Vec<u32>,
@@ -342,7 +370,7 @@ fn field(s: &str, lo: u32, hi: u32) -> Option<Vec<u32>> {
             "*" => (lo, hi),
             r => match r.split_once('-') {
                 Some((a, b)) => (a.parse().ok()?, b.parse().ok()?),
-                // `5/10`:从 5 起每 10 个
+                // `5/10`: every 10th from 5 on
                 None if part.contains('/') => (r.parse().ok()?, hi),
                 None => (r.parse().ok()?, r.parse().ok()?),
             },
@@ -355,12 +383,13 @@ fn field(s: &str, lo: u32, hi: u32) -> Option<Vec<u32>> {
     Some(v)
 }
 
-/// `cron` 在 `after` 之后第一次到点是几时(一年里找不到、写法认不出来 = None)。按天往后看,那天对得上再看几点几分
+/// When `cron` is first due after `after` (none within a year, or a form not recognized = None). Goes forward day by day; on a day
+/// that matches, looks at the hours and minutes
 fn next_fire(cron: &str, after: u64, local: &dyn Fn(u64) -> Day, at: &dyn Fn(i64, u32, i64, u32, u32) -> u64) -> Option<u64> {
     let c = parse(cron)?;
     let start = local(after);
     for k in 0..=400 {
-        // 那天的中午:日子超出那个月的由 at 往后数,再读回来是哪年哪月几号、星期几
+        // Noon of that day: `at` counts a day past the end of the month on, then read back the year, month, day and weekday
         let day = local(at(start.y, start.m, start.d as i64 + k, 12, 0));
         let dom = c.dom.contains(&day.d);
         let dow = c.dow.contains(&day.w);
@@ -385,7 +414,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// 测试里拿 UTC 当本地时间,和机器的时区无关
+    /// Tests take UTC as local time, whatever the machine's time zone
     fn utc(t: u64) -> Day {
         let days = (t / 86400) as i64;
         let (z, w) = (days + 719468, ((days + 4).rem_euclid(7)) as u32);
@@ -423,24 +452,24 @@ mod tests {
 
     #[test]
     fn a_cron_fires_next_where_its_fields_say() {
-        // 一次性的:Claude 让它把几号几点写死
+        // One-shot: Claude hard-codes the day and time in it
         assert_eq!(next("17 3 1 1 *", "2026-10-15T08:00:00Z"), Some(t("2027-01-01T03:17:00Z")));
         assert_eq!(next("30 14 15 10 *", "2026-10-15T08:00:00Z"), Some(t("2026-10-15T14:30:00Z")));
-        // 每 5 分钟、每小时第 7 分、工作日早上(10-17 是星期六)
+        // Every 5 minutes, minute 7 of every hour, weekday mornings (10-17 is a Saturday)
         assert_eq!(next("*/5 * * * *", "2026-10-15T08:01:30Z"), Some(t("2026-10-15T08:05:00Z")));
         assert_eq!(next("7 * * * *", "2026-10-15T08:07:00Z"), Some(t("2026-10-15T09:07:00Z")));
         assert_eq!(next("57 8 * * 1-5", "2026-10-16T09:00:00Z"), Some(t("2026-10-19T08:57:00Z")));
-        // 星期的 7 是星期天;日和星期都限定了:对上一样就算
+        // Weekday 7 is Sunday; both day and weekday restricted: matching either is enough
         assert_eq!(next("0 9 * * 7", "2026-10-15T00:00:00Z"), Some(t("2026-10-18T09:00:00Z")));
         assert_eq!(next("0 9 20 * 6", "2026-10-15T00:00:00Z"), Some(t("2026-10-17T09:00:00Z")));
-        // 有一段是 * 开头的:两段都要对上(隔天的 9 点,16 号不是单数)
+        // One field starts with *: both must match (9:00 every other day; the 16th isn't odd)
         assert_eq!(next("0 9 */2 * *", "2026-10-15T10:00:00Z"), Some(t("2026-10-17T09:00:00Z")));
-        assert_eq!(next("0 9 */2 * 1", "2026-10-15T10:00:00Z"), Some(t("2026-10-19T09:00:00Z"))); // 单数日、星期一
-        // 列表、带起点的步长、跨年、2 月 29
+        assert_eq!(next("0 9 */2 * 1", "2026-10-15T10:00:00Z"), Some(t("2026-10-19T09:00:00Z"))); // an odd day and a Monday
+        // A list, a step with a start, into the next year, February 29
         assert_eq!(next("0,45 10 * * *", "2026-10-15T10:10:00Z"), Some(t("2026-10-15T10:45:00Z")));
         assert_eq!(next("5/20 * * * *", "2026-10-15T10:30:00Z"), Some(t("2026-10-15T10:45:00Z")));
-        assert_eq!(next("0 0 29 2 *", "2026-10-15T00:00:00Z"), None); // 2028 年的在一年多以后
-        // 认不出来的写法
+        assert_eq!(next("0 0 29 2 *", "2026-10-15T00:00:00Z"), None); // the 2028 one is more than a year away
+        // Forms that aren't recognized
         for bad in ["", "* * * *", "61 * * * *", "* * * JAN *", "*/0 * * * *", "5-1 * * * *", "@daily"] {
             assert_eq!(next(bad, "2026-10-15T00:00:00Z"), None, "{bad}");
         }
@@ -475,37 +504,37 @@ mod tests {
     fn a_job_scheduled_since_it_started_holds_it_until_it_is_deleted_fires_or_expires() {
         let since = t("2026-10-15T07:00:00Z");
         let pending = |s: &Seen, now: &str| !s.due(since, t(now), &|c, at| next_fire(c, at, &utc, &at_utc)).is_empty();
-        // 循环的(不写 recurring 就是):建了 7 天后没了,再多算一小时
+        // Recurring (the default without recurring): gone 7 days after it's created, plus an hour
         let daily = rec(&[&create("2026-10-15T08:00:00Z", "c1", "57 8 * * *", None)]);
         assert!(pending(&daily, "2026-10-21T08:00:00Z"));
         assert!(pending(&daily, "2026-10-22T08:59:00Z"));
         assert!(!pending(&daily, "2026-10-22T09:01:00Z"));
-        // 一次性的:到点(14:30)再多算一小时
+        // One-shot: due (14:30), plus an hour
         let once = rec(&[&create("2026-10-15T08:00:00Z", "c1", "30 14 15 10 *", Some(false))]);
         assert!(pending(&once, "2026-10-15T15:29:00Z"));
         assert!(!pending(&once, "2026-10-15T15:31:00Z"));
-        // 删掉了:结果里的任务号对上 CronDelete 的
+        // Deleted: the job id in the result matches CronDelete's
         let gone = [
             create("2026-10-15T08:00:00Z", "c1", "57 8 * * *", None),
             result("c1", "Scheduled recurring task 0df328a0 (57 8 * * *). Next run: Oct 16 8:57am."),
             tool("2026-10-15T09:00:00Z", "CronDelete", r#"{"id":"0df328a0"}"#),
         ];
         assert!(!pending(&rec(&gone.iter().map(String::as_str).collect::<Vec<_>>()), "2026-10-15T10:00:00Z"));
-        // 删的是别的任务、结果里认不出任务号:都还算着
+        // Another job deleted, or no job id recognized in the result: both still count
         let other = [gone[0].clone(), gone[1].clone(), tool("2026-10-15T09:00:00Z", "CronDelete", r#"{"id":"ffff0000"}"#)];
         assert!(pending(&rec(&other.iter().map(String::as_str).collect::<Vec<_>>()), "2026-10-15T10:00:00Z"));
         let odd = [gone[0].clone(), result("c1", "Created job #7"), gone[2].clone()];
         assert!(pending(&rec(&odd.iter().map(String::as_str).collect::<Vec<_>>()), "2026-10-15T10:00:00Z"));
-        // 这次起来之前定的:进程早换了,不算
+        // Scheduled before this start: the process has long been replaced, doesn't count
         let before = rec(&[&create("2026-10-15T06:00:00Z", "c1", "57 8 * * *", None)]);
         assert!(!pending(&before, "2026-10-15T10:00:00Z"));
-        // 没带时刻的那一行当成现在,同一次调用有带时刻的就取早的
+        // The line without a timestamp is taken as now; if the same call has one with a timestamp, the earlier time is taken
         let dup = rec(&[
             r#"{"message":{"content":[{"type":"tool_use","id":"c1","name":"CronCreate","input":{"cron":"30 14 15 10 *","recurring":false}}]}}"#,
             &create("2026-10-15T08:00:00Z", "c1", "30 14 15 10 *", Some(false)),
         ]);
         assert!(!pending(&dup, "2026-10-15T15:31:00Z"));
-        // 写法认不出来:当它 7 天
+        // Form not recognized: counts as 7 days
         let weird = rec(&[&create("2026-10-15T08:00:00Z", "c1", "@daily", Some(false))]);
         assert!(pending(&weird, "2026-10-21T08:00:00Z"));
     }
@@ -523,7 +552,8 @@ mod tests {
         assert_eq!(
             show,
             [
-                // /loop 的下一次:9:20;循环的每天 8:57:今天的过了,明天;认不出来的写法没有下一次,排最后
+                // The next /loop run: 9:20; the recurring one daily at 8:57: today's has passed, so tomorrow; the form that isn't
+                // recognized has no next run and goes last
                 ("", false, "接着看部署", Some(t("2026-10-15T09:20:00Z"))),
                 ("57 8 * * *", true, "看一眼", Some(t("2026-10-16T08:57:00Z"))),
                 ("@daily", false, "看一眼", None),
@@ -538,23 +568,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("c1.jsonl");
         let line = create("2026-10-15T08:00:00Z", "c1", "57 8 * * *", None);
-        // 最后一行还没写完(没有换行):这回不算,也不记成读过
+        // The last line isn't fully written yet (no newline): not counted this time, nor recorded as read
         std::fs::write(&f, format!("{{\"type\":\"user\"}}\n{}", &line[..40])).unwrap();
         assert!(scan(&f, 0, 0).creates.is_empty());
         std::fs::write(&f, format!("{{\"type\":\"user\"}}\n{line}\n")).unwrap();
         assert!(scan(&f, 0, 0).creates.contains_key("c1"));
-        // 后面又写了一行:读到的是两样;读过的那部分不再读(改掉它也看不出来)
+        // Another line written after it: both are read; the part already read isn't read again (changing it goes unnoticed)
         let mut text = std::fs::read_to_string(&f).unwrap().replace("57 8", "58 8");
         text.push_str(&tool("2026-10-15T09:00:00Z", "ScheduleWakeup", r#"{"delaySeconds":600}"#));
         text.push('\n');
         std::fs::OpenOptions::new().write(true).open(&f).unwrap().write_all(text.as_bytes()).unwrap();
         let s = scan(&f, 0, 0);
-        assert_eq!((s.creates["c1"].cron.as_str(), s.wake.as_ref().map(|w| w.0)), ("57 8 * * *", Some(t("2026-10-15T09:00:00Z"))));
-        // 换了一份(变短了、inode 变了):从头读
+        assert_eq!((s.creates["c1"].cron.as_str(), s.wakes.values().map(|w| w.0).max()), ("57 8 * * *", Some(t("2026-10-15T09:00:00Z"))));
+        // Replaced (got shorter, inode changed): read from the start
         std::fs::remove_file(&f).unwrap();
         std::fs::write(&f, "{\"type\":\"user\"}\n").unwrap();
         let s = scan(&f, 0, 0);
-        assert!(s.creates.is_empty() && s.wake.is_none());
+        assert!(s.creates.is_empty() && s.wakes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -565,15 +595,34 @@ mod tests {
         let loop_ = rec(&[&tool("2026-10-15T08:00:00Z", "ScheduleWakeup", r#"{"delaySeconds":1200,"prompt":"接着看"}"#)]);
         assert!(pending(&loop_, "2026-10-15T09:19:00Z"));
         assert!(!pending(&loop_, "2026-10-15T09:21:00Z"));
-        // 最后一次是 stop:不再叫它
+        // The last one is a stop: no longer woken
         let stopped = rec(&[
             &tool("2026-10-15T08:00:00Z", "ScheduleWakeup", r#"{"delaySeconds":1200}"#),
             &tool("2026-10-15T08:10:00Z", "ScheduleWakeup", r#"{"stop":true}"#),
         ]);
         assert!(!pending(&stopped, "2026-10-15T08:11:00Z"));
-        // 隔多久照 Claude 的夹在 60–3600 秒
+        // The delay is clamped to 60–3600 seconds, as Claude does
         let long = rec(&[&tool("2026-10-15T08:00:00Z", "ScheduleWakeup", r#"{"delaySeconds":86400}"#)]);
         assert!(!pending(&long, "2026-10-15T10:01:00Z"));
+        // The same call first recorded on a line without a timestamp (api-request-blob, 12:00 when read): the timestamped line
+        // counts, due at 8:02
+        let blob = |id: &str, input: &str| {
+            format!(
+                r#"{{"type":"api-request-blob","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"ScheduleWakeup","input":{input}}}]}}}}"#
+            )
+        };
+        let real = |at: &str, id: &str, input: &str| tool(at, "ScheduleWakeup", input).replace(&format!("t-{at}"), id);
+        let twice = rec(&[&blob("w1", r#"{"delaySeconds":120}"#), &real("2026-10-15T08:00:00Z", "w1", r#"{"delaySeconds":120}"#)]);
+        let due = twice.due(since, t("2026-10-15T08:01:00Z"), &|_, _| None);
+        assert_eq!(due.iter().map(|d| d.next).collect::<Vec<_>>(), [Some(t("2026-10-15T08:02:00Z"))]);
+        // Same for the later stop: its line without a timestamp doesn't bring the earlier one back
+        let then_stop = rec(&[
+            &blob("w1", r#"{"delaySeconds":1200}"#),
+            &real("2026-10-15T08:00:00Z", "w1", r#"{"delaySeconds":1200}"#),
+            &blob("w2", r#"{"stop":true}"#),
+            &real("2026-10-15T08:10:00Z", "w2", r#"{"stop":true}"#),
+        ]);
+        assert!(!pending(&then_stop, "2026-10-15T08:11:00Z"));
     }
 
     #[test]
@@ -587,7 +636,7 @@ mod tests {
             let s = secs % 86400;
             format!("{}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z", d.y, d.m, d.d, s / 3600, s / 60 % 60, s % 60)
         };
-        // /clear 之前那段对话里定的(进程还是这个),中间夹着一行不是 UTF-8 的
+        // Scheduled in the conversation before /clear (still this process), with a line that isn't UTF-8 in between
         let old = dir.join("c0.jsonl");
         let mut bytes = b"{\"type\":\"user\"}\n\xff\xfe broken\n".to_vec();
         bytes.extend(create(&stamp(now - 60), "c1", "57 8 * * *", None).as_bytes());
@@ -603,11 +652,12 @@ mod tests {
         };
         assert_eq!(records(&r), [dir.join("c1.jsonl"), dir.join("c0.jsonl")]);
         assert!(pending(&r, now));
-        // 这次起来之前就没再写过的记录不看
+        // A record not written since before this start isn't looked at
         assert!(!pending(&Run { started: now + 10, ..r.clone() }, now));
         assert!(!pending(&Run::default(), now));
-        // 起的时候记录已经有的那段里定的不算(上一个进程定的,它退了就没了):从记下的长度往后读,后面新写的照常认。
-        // 读过的偏移按文件记着(SCANS),所以每种情况各用一份文件
+        // What's scheduled in the part the record already had at start doesn't count (the previous process scheduled it, gone
+        // once it exited): read on from the recorded length, what's written after is recognized as usual.
+        // Read offsets are kept per file (SCANS), so each case uses its own file
         let before = format!("{}\n", create(&stamp(now - 60), "old", "57 8 * * *", None));
         let run = |name: &str, file: &str, len: u64| {
             std::fs::write(dir.join(name), &before).unwrap();
@@ -624,7 +674,8 @@ mod tests {
         assert!(!pending(&r2, now));
         std::fs::write(dir.join("c2.jsonl"), format!("{before}{}\n", create(&stamp(now - 30), "new", "58 8 * * *", None))).unwrap();
         assert!(pending(&r2, now));
-        // 记下的长度比文件还长 = 文件换过了,从头读;记的是别的文件(/clear 之后的新对话)的也不管它
+        // A recorded length longer than the file = the file was replaced, read from the start; one recorded for another file (the
+        // new conversation after /clear) is ignored too
         assert!(pending(&run("c3.jsonl", "c3.jsonl", before.len() as u64 + 1), now));
         assert!(pending(&run("c4.jsonl", "c9.jsonl", before.len() as u64), now));
         let _ = std::fs::remove_dir_all(&dir);

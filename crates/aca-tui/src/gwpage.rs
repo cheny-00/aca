@@ -1,12 +1,16 @@
-//! gateway 那一页(`P` 插件页里 gateway 那一行按 `m`):管 gateway 就是管 MCP。它下面的服务一行一个 ——
-//! 插件带的 MCP、插件能力的那个服务、config.toml 里 `[mcps.*]` 收进来的;还没收进来的 `[mcps.*]` 也列着(灰的)。
-//! 每行:在跑 / 没起 / 崩了、几个工具、最近一天调了几次、几个会话在用。
+//! The gateway page (`m` on the gateway row of the `P` plugins page): managing the gateway is managing MCPs. One row per
+//! server under it — MCPs that plugins bring, the server for plugin commands, `[mcps.*]` from config.toml that are served;
+//! `[mcps.*]` not served yet are listed too (dimmed).
+//! Each row: running / not started / crashed, how many tools, calls in the last day, how many sessions use it.
 //!
-//! - 空格:`[mcps.*]` 收进 / 移出 gateway(改 plugins.toml 里 gateway 的设置 `servers`;连着的 agent 重新拉工具列表)
-//! - `r` 重启这一个,`R` 全部重启(下次有人要时再起);`l` 看它的日志;`s` 停掉 gateway(下一个 agent 连上来时再起)
-//! - `o` 开 / 关 gateway(就是开停 `aca.gateway` 这个插件):关着时新起的 agent 不经它,各自直接挂 MCP
+//! - Space: serve / unserve an `[mcps.*]` through the gateway (edits the gateway's `servers` setting in plugins.toml;
+//!   connected agents re-fetch the tool list)
+//! - `r` restarts this one, `R` restarts all (started again when next needed); `l` shows its log; `s` stops the gateway
+//!   (started again when the next agent connects)
+//! - `o` turns the gateway on / off (i.e. enables / disables the `aca.gateway` plugin): while off, newly started agents
+//!   don't go through it and mount MCPs directly
 //!
-//! 这些都是本机的小动作(控制 socket、改一份文件),当场做完重读,不放后台。
+//! These are all small local actions (control socket, editing one file), done on the spot and reloaded, not in the background.
 
 use std::collections::HashMap;
 
@@ -26,36 +30,36 @@ use crate::theme;
 
 const SHOWN: usize = 12;
 
-/// 一个服务
+/// One server
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Srv {
     pub name: String,
-    /// 是什么:插件带的 / 插件给 agent 的工具 / `[mcps.*]` 的说明
+    /// What it is: from a plugin / plugin tools for agents / the `[mcps.*]` description
     pub what: String,
-    /// `[mcps.*]` 里的:能收进 / 移出
+    /// From `[mcps.*]`: can be served / unserved
     pub catalog: bool,
-    /// 在 gateway 下面
+    /// Under the gateway
     pub served: bool,
     pub per_session: bool,
-    /// ready / idle / failed;gateway 没在跑是空的
+    /// ready / idle / failed; empty when the gateway isn't running
     pub state: String,
     pub tools: u64,
     pub error: String,
-    /// 最近一天调了几次、几个会话在用
+    /// Calls in the last day, how many sessions use it
     pub calls: usize,
     pub users: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Info {
-    /// 开着(`aca.gateway` 装了、开着):新起的 agent 经它挂 MCP
+    /// On (`aca.gateway` installed and enabled): newly started agents mount MCPs through it
     pub on: bool,
-    /// 在跑:(连着几个, 起来多久秒);None = 没在跑
+    /// Running: (how many connected, seconds up); None = not running
     pub running: Option<(usize, u64)>,
     pub rows: Vec<Srv>,
 }
 
-/// 读:目录(该挂哪些)、在跑的那个说的状态、调用记录、config.toml 的 `[mcps.*]`
+/// Read: the catalog (what should be mounted), the status the running one reports, call records, config.toml's `[mcps.*]`
 pub fn load() -> Info {
     let status = gateway::ctl(json!({ "cmd": "status" })).ok();
     let usage = gateway::usage();
@@ -75,7 +79,7 @@ pub fn load() -> Info {
     Info { on: gateway::enabled(), ..info }
 }
 
-/// 拼成一行一个(分开写好测)
+/// Build one row each (kept separate so it's easy to test)
 pub fn build(
     catalog: Vec<gateway::Spec>,
     mcps: &[(String, String, bool)],
@@ -85,7 +89,7 @@ pub fn build(
 ) -> Info {
     let live = |name: &str| -> (String, u64, String) {
         let Some(v) = status else { return Default::default() };
-        // 每个会话一份的会有好几条:有一份在跑就算在跑,有一份崩了就说
+        // A per-session one has several entries: running if any copy runs, and say so if any copy crashed
         let mine: Vec<&Value> = v["servers"].as_array().into_iter().flatten().filter(|s| s["name"] == json!(name)).collect();
         let st = |x: &str| mine.iter().any(|s| s["state"] == json!(x));
         let state = if st("failed") {
@@ -102,7 +106,7 @@ pub fn build(
     let mut rows = vec![];
     for s in &catalog {
         let (what, cat) = match (&s.plugin, s.tools) {
-            // 名字已经是从插件 id 来的,不再写一遍
+            // The name already comes from the plugin id, so it isn't written again
             (Some(_), _) => (t!("来自插件", "from a plugin").to_string(), false),
             (None, true) => (t!("插件提供给 agent 的工具", "plugin tools for agents").to_string(), false),
             (None, false) => {
@@ -124,7 +128,7 @@ pub fn build(
             users,
         });
     }
-    // 收进来的 [mcps.*] 用的是原名;目录里的名字是换过字符的,两边都比
+    // A served [mcps.*] uses its original name; the catalog's name has characters replaced, so compare against both
     for (name, desc, per_session) in mcps {
         let safe = aca_core::plugin::mount::safe(name);
         if let Some(r) = rows.iter_mut().find(|r| r.catalog && r.name == safe) {
@@ -201,7 +205,8 @@ impl Overlay for Page {
 
     fn lines(&self, w: usize) -> Vec<Line<'static>> {
         let wrap = |text: &str, st: Style| crate::ui::wrap_width(text, w).into_iter().map(move |l| Line::styled(l, st)).collect::<Vec<_>>();
-        // 关着时新起的 agent 不经它、各自挂 MCP;没在跑是空闲,第一个 agent 连上来时自己起 —— 这些不上屏
+        // While off, new agents bypass it and mount MCPs themselves; not running means idle, it starts itself when the first
+        // agent connects — none of this goes on screen
         let head = match (self.info.on, self.info.running) {
             (false, Some((n, _))) => tr!("已关闭 · 仍有 {n} 个连接", "off · {n} still connected"),
             (false, None) => t!("已关闭", "off").to_string(),
@@ -286,7 +291,8 @@ impl Overlay for Page {
                     }
                 }
             }
-            // 开关 = 开停这个插件:放到后台(和插件页的空格一样),做完这一页重读
+            // On / off = enable / disable this plugin: in the background (like space on the plugins page), this page reloads
+            // when done
             KeyCode::Char('o') => fx.job = Some(Job::Plugins(Act::Enable(gateway::PLUGIN.into(), !self.info.on))),
             KeyCode::Char('s') => {
                 match gateway::ctl(json!({ "cmd": "stop" })) {
@@ -362,9 +368,9 @@ mod tests {
                     && t.contains("运行中 · 3 个工具 · 每天 7 次 · 2 个会话 · 每个会话独立"),
                 "{t}"
             );
-            // 空格做什么键栏里有,正文不再写
+            // What space does is in the key bar, not repeated in the body
             assert!(t.contains("✕ aca-delegate") && t.contains("○ github") && t.contains("未加入") && !t.contains("空格:"), "{t}");
-            // 插件带的不写插件 id;插件给 agent 的工具那个服务就这么叫
+            // A plugin's own doesn't show the plugin id; the server of plugin tools for agents is called just that
             assert_eq!((info_what(&p, 0), info_what(&p, 1)), ("来自插件", "插件提供给 agent 的工具"));
         });
     }
@@ -380,7 +386,7 @@ mod tests {
             let mut fx = Fx::default();
             p.on_key(KeyEvent::from(KeyCode::Char('o')), &mut fx);
             assert_eq!(fx.job, Some(Job::Plugins(Act::Enable("aca.gateway".into(), false))));
-            // 关了还连着的:说还连着几个
+            // Off with connections left: says how many are still connected
             p.info = Info { on: false, running: Some((2, 5)), rows: vec![] };
             assert!(text(&p).contains("已关闭 · 仍有 2 个连接\n") && text(&p).contains("o 开"), "{}", text(&p));
             p.info = Info { on: false, running: None, rows: vec![] };

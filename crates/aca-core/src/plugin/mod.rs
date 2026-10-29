@@ -1,25 +1,31 @@
-//! 插件:一个目录,里面一份 `aca-plugin.toml` 清单和它要跑的命令(照 herdr 的做法)。
+//! Plugins: a directory with an `aca-plugin.toml` manifest and the commands it runs (modeled on herdr).
 //!
-//! 没有 SDK,插件用什么语言写都行。清单里能写的几样见 [`manifest`]:能力(一条命令,界面里绑键 / 进菜单、
-//! 命令行调、给 agent 当工具)、事件钩子、定时、窗格、设置、给 agent 带的目录和 MCP。
-//! 插件要做什么就回头调 `aca` 命令行 —— 命令行就是插件的 API,`ACA_BIN` 指着现在这个程序。
+//! There's no SDK; a plugin can be written in any language. What a manifest can declare is in [`manifest`]: commands (one
+//! command each, bound to a key / put in the menu in the interface, called from the command line, given to agents as
+//! tools), event hooks, timers, panes, settings, and directories and MCP servers to bring to agents. When a plugin wants
+//! something done it calls back into the `aca` command line — the command line is the plugin API, and `ACA_BIN` points to
+//! the running program.
 //!
-//! 命令以插件目录为工作目录,不经过 shell。交给它的环境:`ACA_BIN`、`ACA_ENV=1`、`ACA_PLUGIN_ID`、
-//! `ACA_PLUGIN_ROOT`、`ACA_PLUGIN_CONFIG_DIR`、`ACA_PLUGIN_STATE_DIR`、`ACA_PLUGIN_CONTEXT_JSON`、`ACA_INVOKED_BY`、`ACA_LANG`(zh / en)、
-//! `ACA_PLUGIN_SETTINGS_JSON` 和每个设置一个 `ACA_SETTING_<名字>`,
-//! `ACA_SESSION_ID` / `ACA_SESSION_DIR` / `ACA_SESSION_PANE` / `ACA_SESSION_PARENT`(没有会话时是空的);
-//! 能力、视图、窗格多 `ACA_PLUGIN_ENTRYPOINT_ID`,能力再多 `ACA_PLUGIN_ACTION_ID`(老名字)、`ACA_PLUGIN_ARGS_JSON`
-//! 和每个给了的参数一个 `ACA_ARG_<名字>`,写了 `input` 的窗格多 `ACA_INPUT_FILE`,
-//! 事件钩子多 `ACA_PLUGIN_EVENT` / `ACA_PLUGIN_EVENT_JSON`,定时跑的能力多 `ACA_PLUGIN_TIMER`。这是插件接口的一部分(docs/plugins.md「接口约定」,e2e 里一样一样对)。
+//! Commands run with the plugin directory as their working directory, not through a shell. Their environment:
+//! `ACA_BIN`, `ACA_ENV=1`, `ACA_PLUGIN_ID`, `ACA_PLUGIN_ROOT`, `ACA_PLUGIN_CONFIG_DIR`, `ACA_PLUGIN_STATE_DIR`,
+//! `ACA_PLUGIN_CONTEXT_JSON`, `ACA_INVOKED_BY`, `ACA_LANG` (zh / en), `ACA_PLUGIN_SETTINGS_JSON` plus one
+//! `ACA_SETTING_<name>` per setting, `ACA_SESSION_ID` / `ACA_SESSION_DIR` / `ACA_SESSION_PANE` / `ACA_SESSION_PARENT`
+//! (empty when there's no session); commands, views and panes also get `ACA_PLUGIN_ENTRYPOINT_ID`, commands also
+//! `ACA_PLUGIN_ACTION_ID` (the old name), `ACA_PLUGIN_ARGS_JSON` and one `ACA_ARG_<name>` per argument given, panes with
+//! `input` also `ACA_INPUT_FILE`, event hooks also `ACA_PLUGIN_EVENT` / `ACA_PLUGIN_EVENT_JSON`, and commands run by a
+//! timer also `ACA_PLUGIN_TIMER`. This is part of the plugin API (docs/plugins.md, "The contract"; e2e checks each one).
 //!
-//! 要哪些插件写在 `plugins.toml`(见 [`decl`]);登记在 `~/.config/aca/plugins.json` 的是算出来的那份:目录、开没开、
-//! 订了哪些事件(hook 里靠这个一眼看出没人订,不用读清单)、给哪家 agent 带什么目录(起 agent 时不用读清单)、从哪装的。
+//! Which plugins you want is written in `plugins.toml` (see [`decl`]); what's registered in `~/.config/aca/plugins.json`
+//! is the computed version: the directory, enabled or not, which events it subscribes to (so the hook sees at a glance
+//! that nobody subscribes, without reading manifests), which directory goes to which agent (so starting an agent needs no
+//! manifest read), and where it was installed from.
 //!
-//! 怎么来的四种:`link` 一个本地目录(你自己写的,aca 不动它);`install` 一个 git 仓库,克隆到
-//! `~/.local/share/aca/plugins/<id>`,之后 `update` 拉新的、`remove` 连目录一起删(插件自己的配置、状态留着);
-//! `install aca.<名字>` 装 aca 自带的第一方插件(见 [`first_party`]);`~/.config/aca/user/` 放了清单就有(见 [`user`])。
+//! Four ways in: `link` a local directory (one you write yourself; aca doesn't touch it); `install` a git repository,
+//! cloned to `~/.local/share/aca/plugins/<id>`, after which `update` pulls and `remove` deletes it along with the directory
+//! (the plugin's own config and state stay); `install aca.<name>` installs a first-party plugin shipped with aca (see
+//! [`first_party`]); and `~/.config/aca/user/` is there as soon as it holds a manifest (see [`user`]).
 //!
-//! 插件想要什么(给 agent 的工具、`:` 菜单里的键)由你在 plugins.toml 里定,见 [`yours`]。
+//! What plugins would like (tools for agents, keys in the `:` menu) you decide in plugins.toml, see [`yours`].
 
 pub mod decl;
 pub mod dev;
@@ -49,7 +55,7 @@ pub use manifest::{
 use crate::paths::{self, Res};
 use crate::{t, tr};
 
-/// 会认 `[agents.<它>] plugin_dir`(老写法)的那几家
+/// The agents that accept `[agents.<it>] plugin_dir` (the old form)
 const AGENTS_WITH_PLUGINS: &[&str] = &["claude"];
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -58,25 +64,26 @@ pub struct Entry {
     pub id: String,
     pub path: String,
     pub enabled: bool,
-    /// 清单里订的事件,链接时抄下来
+    /// The events subscribed to in the manifest, copied when linking
     pub events: Vec<String>,
-    /// 给哪家 agent 带的目录(完整路径),链接时抄下来
+    /// The directory for each agent (full path), copied when linking
     pub agents: BTreeMap<String, String>,
-    /// 给 agent 的 MCP 服务(`[agent.mcp]`):怎么挂、几份。命令起的时候再读清单
+    /// The MCP server for agents (`[agent.mcp]`): how it's mounted and how many copies. The command is read from the manifest
+    /// when it starts
     pub mcp: Option<McpEntry>,
-    /// 露给 agent 当工具的能力(`expose` 里有 agent 的动作 id)
+    /// Commands exposed to agents as tools (action ids with agent in `expose`)
     pub tools: Vec<String>,
-    /// 能给 agent、但要你点名的(`expose` 里写 `agent?` 的)
+    /// Ones that can go to agents but only when you name them (`agent?` in `expose`)
     pub tools_ask: Vec<String>,
-    /// 从哪装的(git 地址,`--ref` 钉了版本的带着 `#版本`);空 = 链接的本地目录;[`first_party::SOURCE`] = aca 自带的;
-    /// [`user::SOURCE`] = 你自己的那份
+    /// Where it was installed from (a git URL, with `#version` when pinned with `--ref`); empty = a linked local directory;
+    /// [`first_party::SOURCE`] = shipped with aca; [`user::SOURCE`] = your own one
     pub source: String,
-    /// 你自己的那份:登记时清单的修改时间(变了就重新登记)
+    /// Your own one: the manifest's modification time when registered (re-registered when it changes)
     pub stamp: u64,
 }
 
 impl Entry {
-    /// git 装的(不是链接的、不是自带的)
+    /// Installed from git (not linked, not built in)
     pub fn from_git(&self) -> bool {
         !self.source.is_empty() && self.source != first_party::SOURCE
     }
@@ -85,11 +92,11 @@ impl Entry {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct McpEntry {
-    /// auto / direct / gateway(空 = auto)
+    /// auto / direct / gateway (empty = auto)
     pub via: String,
-    /// shared / session(空 = shared)
+    /// shared / session (empty = shared)
     pub scope: String,
-    /// 给哪几家(空 = 两家都给)
+    /// Which agents (empty = both)
     pub targets: Vec<String>,
 }
 
@@ -101,13 +108,15 @@ fn read_registry() -> Vec<Entry> {
     std::fs::read_to_string(registry_file()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
-/// 登记了的插件。你自己的那份(`~/.config/aca/user/`)跟着文件走:看一眼修改时间,变了先重新登记
+/// Registered plugins. Your own one (`~/.config/aca/user/`) follows its file: one look at the modification time,
+/// re-registered first if it changed
 pub fn registry() -> Vec<Entry> {
     let reg = read_registry();
     if user::refresh(&reg) { read_registry() } else { reg }
 }
 
-/// 登记(或者重新登记)你自己的那份。清单读不懂也留一个空的登记:列出来时看得到原因
+/// Registers (or re-registers) your own one. An unreadable manifest still leaves an empty registration, so listings show
+/// the reason
 fn register_user(dir: &Path, stamp: u64) {
     if register(dir, Some(user::SOURCE.into())).is_err() && !read_registry().iter().any(|e| e.source == user::SOURCE) {
         let mut reg = read_registry();
@@ -123,7 +132,7 @@ fn register_user(dir: &Path, stamp: u64) {
     }
 }
 
-/// 你自己的那份没了(清单删了)
+/// Your own one is gone (the manifest was deleted)
 fn drop_user() {
     let mut reg = read_registry();
     reg.retain(|e| e.source != user::SOURCE);
@@ -132,7 +141,8 @@ fn drop_user() {
     health::clear(user::ID);
 }
 
-/// 登记表一变(装、删、开、停),tmux 上的热键跟着变:装上就绑,去掉就解
+/// Whenever the registry changes (install, remove, enable, disable), the hotkeys in tmux follow: bound when added, unbound
+/// when gone
 fn save(v: &[Entry]) -> Res<()> {
     paths::write_atomic(&registry_file(), &serde_json::to_string_pretty(v).unwrap())
         .map_err(|e| tr!("无法写入 plugins.json:{e}", "can't write plugins.json: {e}"))?;
@@ -140,20 +150,23 @@ fn save(v: &[Entry]) -> Res<()> {
     Ok(())
 }
 
-/// 本地目录(或者直接给清单的路径)→ 插件目录的完整路径
+/// A local directory (or a manifest's path given directly) → the plugin directory's full path
 fn plugin_dir(path: &str) -> Res<PathBuf> {
     let p = PathBuf::from(paths::expand(path));
     let dir = if p.file_name().is_some_and(|n| n == MANIFEST) { p.parent().unwrap().to_path_buf() } else { p };
     dir.canonicalize().map_err(|e| format!("{}:{e}", dir.display()))
 }
 
-/// 登记(已经登记过的就地更新):读清单,抄下要的几样。`source` = 从哪装的(None = 照旧)。不碰 plugins.toml
+/// Registers (updates in place if already registered): reads the manifest and copies what's needed. `source` = where it
+/// was installed from (None = unchanged). Doesn't touch plugins.toml
 fn register(dir: &Path, source: Option<String>) -> Res<(Manifest, Vec<String>)> {
-    // 登记解开链接的路径(macOS 的 /var 是 /private/var):比给 agent 带的目录在不在插件里面时两边一样
+    // Register the path with links resolved (macOS's /var is /private/var): both sides match when checking whether the
+    // directories for agents are inside the plugin
     let dir = &dir.canonicalize().map_err(|e| format!("{}:{e}", dir.display()))?;
     let (m, mut warn) = read_manifest(dir)?;
     let mut reg = read_registry();
-    // 给 agent 的工具名、Codex 插件名、MCP 服务名都拿 id 换出来(点换成 -):换出来一样的两个分不开
+    // Tool names for agents, Codex plugin names and MCP server names are all derived from the id (dots become -): two that
+    // come out the same can't be told apart
     let name = mount::safe(&m.id);
     if let Some(other) = reg.iter().find(|e| e.id != m.id && mount::safe(&e.id) == name) {
         return Err(tr!(
@@ -169,7 +182,7 @@ fn register(dir: &Path, source: Option<String>) -> Res<(Manifest, Vec<String>)> 
     }
     let agents = agent_parts(dir, &m, &mut warn)?;
     let mcp = m.agent.mcp.as_ref().map(|x| McpEntry { via: x.via.clone(), scope: x.scope.clone(), targets: m.agent.targets.clone() });
-    // 开没开:plugins.toml 里写了的照它;没写的,登记过的照旧、新的开着
+    // Enabled or not: as plugins.toml says if written there; otherwise registered ones stay as they were and new ones are on
     let wanted = decl::wants().ok().and_then(|w| w.get(&m.id).map(decl::Want::on));
     let entry = Entry {
         id: m.id.clone(),
@@ -191,19 +204,20 @@ fn register(dir: &Path, source: Option<String>) -> Res<(Manifest, Vec<String>)> 
     for d in [config_dir(&m.id), state_dir(&m.id)] {
         let _ = std::fs::create_dir_all(d);
     }
-    // 钩子的记录按清单里第几个记:清单换了就对不上了
+    // Hook records are kept by index in the manifest: a new manifest makes them stale
     health::clear(&m.id);
-    // 定时照新的清单对一遍(没写 manual 的插件开着就开)
+    // Check the timers against the new manifest (ones without manual are on while the plugin is enabled)
     warn.extend(timer::sync(&m.id).into_iter().map(|p| tr!("定时任务设置失败:{p}", "timer not set up: {p}")));
     Ok((m, warn))
 }
 
-/// 清单变了(自带的插件随 aca 升级重写了):照原来的来源再登记一遍
+/// The manifest changed (a built-in plugin was rewritten by an aca upgrade): register it again with its old source
 fn reregister(dir: &Path) -> Res<(Manifest, Vec<String>)> {
     register(dir, None)
 }
 
-/// 链接一个本地目录(或者直接给清单的路径)。已经链接过的就地更新;plugins.toml 里记下这个目录
+/// Links a local directory (or a manifest's path given directly). Updates in place if already linked; records the
+/// directory in plugins.toml
 pub fn link(path: &str) -> Res<(Manifest, Vec<String>)> {
     let dir = plugin_dir(path)?;
     let (m, warn) = register(&dir, Some(String::new()))?;
@@ -211,7 +225,8 @@ pub fn link(path: &str) -> Res<(Manifest, Vec<String>)> {
     Ok((m, warn))
 }
 
-/// 给 agent 带的目录:得是插件目录里真有的一个目录。不认插件目录的那家、Claude 认不出的样子,提醒一声
+/// The directory for agents: must be a real directory inside the plugin directory. For an agent that doesn't accept
+/// plugin directories, or a layout Claude won't recognize, a warning
 fn agent_parts(dir: &Path, m: &Manifest, warn: &mut Vec<String>) -> Res<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for agent in AGENTS {
@@ -240,12 +255,13 @@ fn agent_parts(dir: &Path, m: &Manifest, warn: &mut Vec<String>) -> Res<BTreeMap
     Ok(out)
 }
 
-/// 这个目录是不是某个插件给 agent 带的(接管时认出哪些参数是 aca 带进去的):插件自己的目录,或者 aca 给 Claude 做的副本
+/// Whether this directory is one some plugin brings to agents (so adopting can tell which arguments aca added): the
+/// plugin's own directory, or the copy aca made for Claude
 pub fn is_agent_dir(d: &str) -> bool {
     Path::new(d).starts_with(mount::claude_root()) || registry().iter().any(|e| e.agents.values().any(|x| x == d))
 }
 
-/// git 装的插件放在这:`<数据目录>/plugins/<id>`
+/// Plugins installed from git live here: `<data dir>/plugins/<id>`
 pub fn installed_root() -> PathBuf {
     paths::data_dir().join("plugins")
 }
@@ -263,13 +279,14 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Res<String> {
     }
 }
 
-/// `owner/repo` 是 GitHub 上的;别的(https、ssh、file://)照原样交给 git
+/// `owner/repo` is on GitHub; anything else (https, ssh, file://) goes to git as it is
 fn git_url(src: &str) -> String {
     let short = src.split('/').count() == 2 && !src.contains(':') && !src.starts_with(['.', '/', '~']);
     if short { format!("https://github.com/{src}.git") } else { src.to_string() }
 }
 
-/// 克隆到 [`installed_root`] 下(`rev` 给了就切过去),登记。`want` = 只认这个 id(sync 照 plugins.toml 装时)
+/// Clones under [`installed_root`] (checking out `rev` if given) and registers. `want` = only accept this id (when sync
+/// installs from plugins.toml)
 fn clone_in(src: &str, rev: Option<&str>, want: Option<&str>) -> Res<(Manifest, Vec<String>, String)> {
     let local = PathBuf::from(paths::expand(src));
     let url = if local.is_dir() { local.canonicalize().map_err(|e| e.to_string())?.to_string_lossy().into_owned() } else { git_url(src) };
@@ -302,7 +319,7 @@ fn clone_in(src: &str, rev: Option<&str>, want: Option<&str>) -> Res<(Manifest, 
         Ok(dest)
     })();
     let dest = placed.inspect_err(|_| {
-        // 克隆了一半、清单不对的:那是 aca 自己刚建的临时目录
+        // Half cloned, or a bad manifest: that's a temp directory aca just made itself
         let _ = std::fs::remove_dir_all(&tmp);
     })?;
     let source = match rev {
@@ -315,9 +332,10 @@ fn clone_in(src: &str, rev: Option<&str>, want: Option<&str>) -> Res<(Manifest, 
     Ok((m, warn, commit))
 }
 
-/// `aca plugin install <来源> [--ref 版本]`:本地目录就是 [`link`](你正在写的插件,改了马上生效);
-/// git 仓库克隆到 [`installed_root`] 下再链接,plugins.toml 记下从哪来、plugins.lock 记下提交。
-/// `--ref` 钉在一个标签 / 分支 / 提交上(本地仓库带 `--ref` 也是克隆一份)
+/// `aca plugin install <source> [--ref version]`: a local directory is just [`link`] (a plugin you're writing; changes
+/// apply at once); a git repository is cloned under [`installed_root`] and then linked, with plugins.toml recording where
+/// it came from and plugins.lock the commit. `--ref` pins a tag / branch / commit (a local repository with `--ref` is
+/// cloned too)
 pub fn install(src: &str, rev: Option<&str>) -> Res<(Manifest, Vec<String>)> {
     let local = PathBuf::from(paths::expand(src));
     if first_party::known(src) && !local.is_dir() {
@@ -335,7 +353,8 @@ pub fn install(src: &str, rev: Option<&str>) -> Res<(Manifest, Vec<String>)> {
     Ok((m, warn))
 }
 
-/// 装 aca 自带的插件:写出来、登记,plugins.toml 里只写个表头(不写 source:换台机器 sync 也认得)
+/// Installs a plugin shipped with aca: written out and registered, with only a header in plugins.toml (no source: sync
+/// on another machine knows it too)
 fn install_bundled(id: &str) -> Res<(Manifest, Vec<String>)> {
     if let Some(e) = registry().into_iter().find(|e| e.id == id && e.source != first_party::SOURCE) {
         return Err(tr!(
@@ -351,7 +370,7 @@ fn install_bundled(id: &str) -> Res<(Manifest, Vec<String>)> {
     Ok((m, warn))
 }
 
-/// 清单里 `requires` 的第一方插件,还没有的装上;返回给人看的提醒
+/// Installs the first-party plugins in the manifest's `requires` that aren't there yet; returns notes for people
 fn install_requires(m: &Manifest) -> Vec<String> {
     let have: Vec<String> = registry().into_iter().map(|e| e.id).collect();
     let mut out = vec![];
@@ -364,7 +383,8 @@ fn install_requires(m: &Manifest) -> Vec<String> {
     out
 }
 
-/// `aca plugin update <id>`:git 装的拉新的(只快进;钉了版本的不动),再重新读一遍清单、记下新的提交。返回给人看的一句
+/// `aca plugin update <id>`: pulls a git-installed plugin (fast-forward only; pinned ones are left alone), re-reads the
+/// manifest and records the new commit. Returns one sentence for people
 pub fn update(id: &str) -> Res<String> {
     let e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有插件 {id}", "no plugin {id}"))?;
     if e.source.is_empty() {
@@ -404,13 +424,15 @@ pub fn update(id: &str) -> Res<String> {
     })
 }
 
-/// 不再登记、删掉 git 装的目录(链接的本地目录是你的,不动)。插件自己的配置、状态都留着。不碰 plugins.toml
-/// 不再用一个插件时,aca 替它放的东西收走:交给它窗格的那份会话内容(`plugin-input/<插件>.<窗格>.txt`,里面是会话的回复),
-/// 和 aca 替它建的配置、状态两个目录 —— 只删空的,里面有东西的是插件自己的,留着
+/// Unregisters and deletes the directory of a git-installed plugin (a linked local directory is yours and left alone).
+/// The plugin's own config and state stay. Doesn't touch plugins.toml. When a plugin is no longer used, what aca put
+/// there for it is cleaned up: the session content handed to its panes (`plugin-input/<plugin>.<pane>.txt`, which holds
+/// the session's replies), and the config and state directories aca created for it — only if empty; anything in them
+/// belongs to the plugin and stays
 fn sweep(id: &str) {
     for f in std::fs::read_dir(paths::state_dir().join("plugin-input")).into_iter().flatten().flatten() {
         let name = f.file_name().to_string_lossy().into_owned();
-        // 窗格的 id 里没有点:`a.b` 的文件不会被当成 `a` 的
+        // Pane ids have no dots: a file of `a.b` is never taken for one of `a`
         let pane = name.strip_prefix(id).and_then(|r| r.strip_prefix('.')).and_then(|r| r.strip_suffix(".txt"));
         if pane.is_some_and(|p| !p.contains('.')) {
             let _ = std::fs::remove_file(f.path());
@@ -429,7 +451,7 @@ fn drop_entry(e: &Entry) -> Res<String> {
     sweep(&e.id);
     health::clear(&e.id);
     let dir = Path::new(&e.path);
-    // 登记的路径是解开链接的(macOS 的 /var 是 /private/var):比的时候两边一样
+    // Registered paths have links resolved (macOS's /var is /private/var): both sides match when comparing
     let root = if e.source == first_party::SOURCE { first_party::root() } else { installed_root() };
     let root = root.canonicalize().unwrap_or(root);
     let id = &e.id;
@@ -442,8 +464,8 @@ fn drop_entry(e: &Entry) -> Res<String> {
     }
 }
 
-/// `aca plugin remove <id>`:不再用它。git 装的连目录一起删;链接的本地目录是你的,不动。
-/// plugins.toml、plugins.lock 里也划掉;插件自己的配置、状态都留着
+/// `aca plugin remove <id>`: stop using it. A git-installed one is deleted with its directory; a linked local directory
+/// is yours and left alone. Also struck from plugins.toml and plugins.lock; the plugin's own config and state stay
 pub fn remove(id: &str) -> Res<String> {
     let e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有插件 {id}", "no plugin {id}"))?;
     mine_stays(&e)?;
@@ -453,7 +475,7 @@ pub fn remove(id: &str) -> Res<String> {
     Ok(said)
 }
 
-/// 你自己的那份删不掉(它跟着 ~/.config/aca/user/ 走)
+/// Your own one can't be removed (it follows ~/.config/aca/user/)
 fn mine_stays(e: &Entry) -> Res<()> {
     if e.source != user::SOURCE {
         return Ok(());
@@ -492,8 +514,9 @@ pub fn enable(id: &str, on: bool) -> Res<()> {
     decl::set(id, "enabled", (!on).then_some(false.into()))
 }
 
-/// `aca plugin sync`:让本机跟 plugins.toml 一致。缺的装(git 的照 plugins.lock 的提交)、没写的删、开关照它、
-/// 设置和给谁带的下次用到时就是新的。返回一行一件事;一件出错不耽误别的
+/// `aca plugin sync`: makes this machine match plugins.toml. Installs what's missing (git ones at the commit in
+/// plugins.lock), removes what isn't listed, enables / disables as written; settings and who gets what take effect the
+/// next time they're used. Returns one line per thing done; one failure doesn't hold up the rest
 pub fn sync() -> Res<Vec<String>> {
     decl::ensure()?;
     let wants = decl::wants()?;
@@ -503,7 +526,7 @@ pub fn sync() -> Res<Vec<String>> {
         .map(|id| tr!("{id}:已换成当前 aca 自带的版本", "{id}: now the version this aca ships"))
         .collect();
     for e in registry() {
-        // 你自己的那份不写在 plugins.toml 里也在
+        // Your own one is there even though it isn't in plugins.toml
         if !wants.contains_key(&e.id) && e.source != user::SOURCE {
             said.push(drop_entry(&e).unwrap_or_else(|err| format!("{}:{err}", e.id)));
             let _ = decl::lock(&e.id, None);
@@ -524,12 +547,13 @@ pub fn sync() -> Res<Vec<String>> {
             Err(err) => said.push(format!("{id}:{err}")),
         }
     }
-    // 你在 plugins.toml 里手改了热键:登记表没变,tmux 上的也要跟上
+    // You changed hotkeys by hand in plugins.toml: the registry didn't change, but tmux has to follow too
     bind_hotkeys();
     Ok(said)
 }
 
-/// plugins.toml 里有、本机还没有的:本地目录链接,git 的克隆(钉了 ref 的切到 ref,不然照锁里的提交)
+/// In plugins.toml but not on this machine yet: local directories are linked, git ones cloned (checked out at ref when
+/// pinned, otherwise at the commit in the lock)
 fn sync_add(id: &str, w: &decl::Want, commit: Option<&str>) -> Res<Option<String>> {
     if w.source.is_empty() && first_party::known(id) {
         install_bundled(id)?;
@@ -553,14 +577,15 @@ fn sync_add(id: &str, w: &decl::Want, commit: Option<&str>) -> Res<Option<String
         let rev = (!w.rev.is_empty()).then_some(w.rev.as_str()).or(commit);
         let (_, _, c) = clone_in(&w.source, rev, Some(id))?;
         if w.rev.is_empty() {
-            // 照锁装的不算钉住:以后 update 照样拉新的
+            // Installing from the lock doesn't count as pinned: update still pulls later
             let mut reg = registry();
             if let Some(e) = reg.iter_mut().find(|e| e.id == id) {
                 e.source = e.source.split('#').next().unwrap_or("").to_string();
                 let dir = PathBuf::from(&e.path);
                 save(&reg)?;
                 if commit.is_some() {
-                    // 切到锁里的提交时 HEAD 是游离的:回到默认分支、把它放到那个提交上,update 才能快进
+                    // Checking out the locked commit leaves HEAD detached: go back to the default branch and put it at that commit, so
+                    // update can fast-forward
                     let branch = git(Some(&dir), &["rev-parse", "--abbrev-ref", "origin/HEAD"]).unwrap_or_default();
                     if let Some(b) = branch.strip_prefix("origin/") {
                         git(Some(&dir), &["checkout", "--quiet", "-B", b, &c])?;
@@ -577,7 +602,8 @@ fn sync_add(id: &str, w: &decl::Want, commit: Option<&str>) -> Res<Option<String
     Ok(Some(r))
 }
 
-/// 本机已经有的:开关照 plugins.toml;git 装的、没钉 ref、锁里的提交和现在不一样,切过去
+/// Already on this machine: enabled / disabled as plugins.toml says; for a git-installed one that isn't pinned and whose
+/// locked commit differs from the current one, check that out
 fn sync_one(e: &Entry, w: &decl::Want, commit: Option<&str>) -> Res<Option<String>> {
     let mut said = vec![];
     if e.enabled != w.on() {
@@ -603,7 +629,7 @@ fn sync_one(e: &Entry, w: &decl::Want, commit: Option<&str>) -> Res<Option<Strin
     Ok((!said.is_empty()).then(|| format!("{}:{}", e.id, said.join(t!(",", ", ")))))
 }
 
-/// 只改登记表里的开关(plugins.toml 已经是这样了)
+/// Only changes the on/off in the registry (plugins.toml already says so)
 fn enable_quiet(id: &str, on: bool) -> Res<()> {
     let mut reg = registry();
     if let Some(e) = reg.iter_mut().find(|e| e.id == id) {
@@ -614,22 +640,22 @@ fn enable_quiet(id: &str, on: bool) -> Res<()> {
     Ok(())
 }
 
-/// 一个设置现在的样子
+/// A setting as it is now
 #[derive(Clone, Debug, PartialEq)]
 pub struct SettingNow {
     pub name: String,
-    /// 现在的值:清单的默认值,plugins.toml 里改过的盖上去;都没有 = 空字
+    /// The current value: the manifest's default, with what plugins.toml changed on top; neither = an empty string
     pub value: toml::Value,
     pub default: Option<toml::Value>,
     pub desc: String,
-    /// plugins.toml 里改过
+    /// Changed in plugins.toml
     pub changed: bool,
-    /// 不给人看全(清单的 `secret`)
+    /// Not shown in full (the manifest's `secret`)
     pub secret: bool,
 }
 
 impl SettingNow {
-    /// 给人看的值:字不带引号;secret 的打码(空的照样说空)
+    /// The value for people: strings without quotes; secret ones masked (an empty one is still shown as empty)
     pub fn shown(&self) -> String {
         let v = plain(&self.value);
         if !self.secret || v.is_empty() {
@@ -640,7 +666,7 @@ impl SettingNow {
     }
 }
 
-/// 一个插件现在的设置(清单里的顺序)
+/// A plugin's current settings (in manifest order)
 pub fn settings_of(id: &str) -> Res<Vec<SettingNow>> {
     let e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("没有插件 {id}", "no plugin {id}"))?;
     let (m, _) = read_manifest(Path::new(&e.path))?;
@@ -659,7 +685,7 @@ pub fn settings_of(id: &str) -> Res<Vec<SettingNow>> {
         .collect())
 }
 
-/// 设置的值给人 / 脚本看:字不带引号,别的照 TOML 写
+/// A setting's value for people / scripts: strings without quotes, everything else as TOML
 pub fn plain(v: &toml::Value) -> String {
     match v {
         toml::Value::String(s) => s.clone(),
@@ -667,7 +693,8 @@ pub fn plain(v: &toml::Value) -> String {
     }
 }
 
-/// 改一个设置(写进 plugins.toml);None = 回到默认值。给的字照默认值的类型读(见 [`typed`])
+/// Changes a setting (written to plugins.toml); None = back to the default. The given text is read as the default's type
+/// (see [`typed`])
 pub fn set_setting(id: &str, name: &str, value: Option<&str>) -> Res<()> {
     let all = settings_of(id)?;
     let s = all.iter().find(|s| s.name == name).ok_or_else(|| tr!("{id} 没有设置项 {name}", "{id} has no setting {name}"))?;
@@ -683,8 +710,9 @@ pub fn set_setting(id: &str, name: &str, value: Option<&str>) -> Res<()> {
     decl::set(id, "settings", (!table.is_empty()).then_some(toml::Value::Table(table)))
 }
 
-/// 照默认值的类型读你给的字:默认是字就当字(不用加引号,加了也认),整数、小数、开关要对得上,
-/// 数组、表照 TOML 写;没有默认值的照 TOML 读,读不懂当字
+/// Reads the text you give as the default's type: a string default takes it as a string (no quotes needed, quotes also
+/// accepted), integers, floats and on/off must match, arrays and tables are written as TOML; without a default it's read
+/// as TOML, and as a string if that fails
 pub fn typed(v: &str, default: Option<&toml::Value>) -> Res<toml::Value> {
     use toml::Value as V;
     let toml_of = |v: &str| format!("v = {v}").parse::<toml::Table>().ok().and_then(|mut t| t.remove("v"));
@@ -713,7 +741,8 @@ pub fn typed(v: &str, default: Option<&toml::Value>) -> Res<toml::Value> {
     }
 }
 
-/// plugins.toml 和本机对不上的地方(`sync` 会做的),一样一句。文件读不懂也说一句;还没有这个文件 = 没有对不上的
+/// Where plugins.toml and this machine differ (what `sync` would do), one sentence each. An unreadable file gets a
+/// sentence too; no file yet = no differences
 pub fn drift() -> Vec<String> {
     if !decl::decl_file().exists() {
         return vec![];
@@ -740,7 +769,7 @@ pub fn drift() -> Vec<String> {
     out
 }
 
-/// 插件放自己配置 / 状态的地方:aca 只管建目录,里面的东西归插件
+/// Where a plugin keeps its own config / state: aca only creates the directory, its content belongs to the plugin
 pub fn config_dir(id: &str) -> PathBuf {
     paths::config_dir().join("plugins").join(id)
 }
@@ -753,15 +782,15 @@ pub fn log_file(id: &str) -> PathBuf {
     paths::state_dir().join("plugin-logs").join(format!("{id}.log"))
 }
 
-/// 调动作 / 开窗格时是冲着哪个会话的
+/// Which session an action call / pane opening is aimed at
 #[derive(Clone, Debug, Default)]
 pub struct Context {
     pub session: String,
     pub dir: String,
-    /// 会话在 tmux 里的号(`$3`)和 agent 的窗格(`%5`);没在跑是空的
+    /// The session's id in tmux (`$3`) and the agent's pane (`%5`); empty when not running
     pub tmux: String,
     pub pane: String,
-    /// 派它的那个会话(`aca new` 在某个会话里建的就挂在它下面);自己开的是空的
+    /// The session that delegated it (one created by `aca new` inside some session hangs under it); empty for ones you started
     pub parent: String,
     /// menu / cli / event / agent / timer
     pub source: String,
@@ -769,7 +798,8 @@ pub struct Context {
 
 fn find(id: &str) -> Res<(Entry, Manifest)> {
     let mut e = registry().into_iter().find(|e| e.id == id).ok_or_else(|| tr!("未链接插件 {id}", "{id} isn't linked"))?;
-    // 自带的:刚升级了 aca 就先换成新写出来的那份(老的可能还在调已经没了的命令)
+    // Built-in: right after an aca upgrade, switch to the freshly written copy first (the old one may still call commands
+    // that are gone)
     if e.source == first_party::SOURCE && first_party::refresh_one(id) {
         e = registry().into_iter().find(|e| e.id == id).unwrap_or(e);
     }
@@ -780,12 +810,13 @@ fn find(id: &str) -> Res<(Entry, Manifest)> {
     Ok((e, m))
 }
 
-/// `./x`、`../x` 按插件目录算(不是调用的人所在的目录,也不是 `cwd = "session"` 的会话目录)
+/// `./x` and `../x` are relative to the plugin directory (not the caller's directory, nor the session's directory of
+/// `cwd = "session"`)
 fn program(e: &Entry, prog: &str) -> PathBuf {
     if prog.starts_with("./") || prog.starts_with("../") { Path::new(&e.path).join(prog) } else { PathBuf::from(prog) }
 }
 
-/// 在哪跑:`cwd = "session"` 且有会话 = 会话的目录,不然插件目录
+/// Where it runs: the session's directory if `cwd = "session"` and there is a session, otherwise the plugin directory
 fn workdir(e: &Entry, cwd: &str, ctx: &Context) -> String {
     if cwd == "session" && !ctx.dir.is_empty() && Path::new(&ctx.dir).is_dir() { ctx.dir.clone() } else { e.path.clone() }
 }
@@ -799,7 +830,7 @@ fn command(e: &Entry, m: &Manifest, argv: &[String], ctx: &Context, extra: &[(&s
     c
 }
 
-/// 设置名 → 环境变量名:`max_continue` → `ACA_SETTING_MAX_CONTINUE`
+/// Setting name → environment variable name: `max_continue` → `ACA_SETTING_MAX_CONTINUE`
 fn setting_var(name: &str) -> String {
     manifest::var("ACA_SETTING_", name)
 }
@@ -821,18 +852,19 @@ fn env(e: &Entry, m: &Manifest, ctx: &Context, extra: &[(&str, &str)]) -> Vec<(S
         ("ACA_PLUGIN_CONFIG_DIR".into(), config_dir(&e.id).to_string_lossy().into_owned()),
         ("ACA_PLUGIN_STATE_DIR".into(), state_dir(&e.id).to_string_lossy().into_owned()),
         ("ACA_PLUGIN_CONTEXT_JSON".into(), context.to_string()),
-        // 谁调的(menu / cli / agent …),shell 写的插件不用解上面那份 JSON
+        // Who called it (menu / cli / agent …), so plugins written in shell don't have to parse the JSON above
         ("ACA_INVOKED_BY".into(), ctx.source.clone()),
-        // 界面现在用哪种话:插件说的话照它(zh / en)
+        // Which language the interface speaks now: plugins speak the same (zh / en)
         ("ACA_LANG".into(), if crate::i18n::lang() == crate::i18n::Lang::Zh { "zh" } else { "en" }.into()),
         ("ACA_PLUGIN_SETTINGS_JSON".into(), serde_json::to_string(&settings).unwrap_or_else(|_| "{}".into())),
-        // 没有会话时也设成空的:从某个会话里调过来的,别把那个会话的 id 带给插件
+        // Set to empty even with no session: when called from inside some session, don't hand that session's id to the plugin
         ("ACA_SESSION_ID".into(), ctx.session.clone()),
         ("ACA_SESSION_DIR".into(), ctx.dir.clone()),
         ("ACA_SESSION_PANE".into(), ctx.pane.clone()),
-        // 派它的那个:钩子里要找 worker 的上级不用再问 aca show
+        // The session that delegated it: hooks looking for a worker's parent don't have to ask aca show
         ("ACA_SESSION_PARENT".into(), ctx.parent.clone()),
-        // 定时跑的是哪个(`插件.能力`);别的时候空着:定时跑的那一次里又起的插件命令不跟着带
+        // Which timer is running (`plugin.command`); empty otherwise: plugin commands started again inside a timer's run don't
+        // inherit it
         ("ACA_PLUGIN_TIMER".into(), String::new()),
     ];
     for (k, val) in &settings {
@@ -843,7 +875,7 @@ fn env(e: &Entry, m: &Manifest, ctx: &Context, extra: &[(&str, &str)]) -> Vec<(S
         v.push((setting_var(k), s));
     }
     v.extend(extra.iter().map(|(k, val)| (k.to_string(), val.to_string())));
-    // 参数再一个一个放一份(ACA_ARG_<名字>):shell 写的插件不用解 JSON
+    // The arguments once more, one by one (ACA_ARG_<name>): plugins written in shell don't have to parse JSON
     if let Some((_, args)) = extra.iter().find(|(k, _)| *k == "ACA_PLUGIN_ARGS_JSON")
         && let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(args)
     {
@@ -858,12 +890,13 @@ fn env(e: &Entry, m: &Manifest, ctx: &Context, extra: &[(&str, &str)]) -> Vec<(S
     v
 }
 
-/// `插件 id.动作 id` → (插件 id, 动作 id):插件 id 里可以有点,动作 id 里没有
+/// `plugin id.action id` → (plugin id, action id): plugin ids may contain dots, action ids don't
 fn split_qualified(q: &str) -> Res<(&str, &str)> {
     q.rsplit_once('.').ok_or_else(|| tr!("能力应写为 插件.能力:{q}", "an action is written PLUGIN.ACTION: {q}"))
 }
 
-/// 调的时候给的参数(`名字=值`)照清单里的类型变成 JSON;少了必须给的、多了没声明的、类型不对的都说
+/// Turns the arguments given on a call (`name=value`) into JSON by the manifest's types; missing required ones,
+/// undeclared extras and wrong types are all reported
 pub fn args_json(a: &Action, given: &[(String, String)]) -> Res<serde_json::Map<String, serde_json::Value>> {
     let mut out = serde_json::Map::new();
     let sorted: BTreeMap<&String, &String> = given.iter().map(|(k, v)| (k, v)).collect();
@@ -889,7 +922,8 @@ pub fn args_json(a: &Action, given: &[(String, String)]) -> Res<serde_json::Map<
     Ok(out)
 }
 
-/// 在前台跑一个动作(输出直接给调用的人),返回它的退出码。`given` = 参数(`名字=值`)
+/// Runs an action in the foreground (output goes straight to the caller) and returns its exit code. `given` = the
+/// arguments (`name=value`)
 pub fn invoke(qualified: &str, ctx: &Context, given: &[(String, String)]) -> Res<i32> {
     let (pid, aid) = split_qualified(qualified)?;
     let (e, m) = find(pid)?;
@@ -910,7 +944,8 @@ pub fn invoke(qualified: &str, ctx: &Context, given: &[(String, String)]) -> Res
     } else {
         let text = input_text(&a.input, ctx);
         let mut child = c.stdin(Stdio::piped()).spawn().map_err(started)?;
-        // 另起一个线程写:命令不读(回滚很长、管道满了)也只卡那个线程,不卡这边等它退出
+        // Written from another thread: if the command doesn't read (long scrollback, full pipe) only that thread blocks, not
+        // this side waiting for it to exit
         if let Some(mut w) = child.stdin.take() {
             std::thread::spawn(move || {
                 use std::io::Write;
@@ -922,7 +957,8 @@ pub fn invoke(qualified: &str, ctx: &Context, given: &[(String, String)]) -> Res
     Ok(st.code().unwrap_or(1))
 }
 
-/// 交给插件的会话内容(`input`):最后一条回复 / 屏幕上现在的字 / 连回滚一起。没有会话、会话没在跑 = 空的
+/// Session content handed to a plugin (`input`): the last reply / the text on screen now / the screen plus scrollback.
+/// No session, or the session isn't running = empty
 pub fn input_text(kind: &str, ctx: &Context) -> String {
     if kind.is_empty() || ctx.session.is_empty() {
         return String::new();
@@ -937,8 +973,9 @@ pub fn input_text(kind: &str, ctx: &Context) -> String {
     crate::tmux::text(&pane, kind == "scrollback")
 }
 
-/// 会话的最后一条回复:hook 记的那份(最长 4000 字)。没记到(接管来还没重启的会话没有 hook)、
-/// 或者被截短了(结尾是 …),就去它的对话记录里读全的(见 [`crate::agent::Agent::last_reply`])
+/// The session's last reply: the copy the hook recorded (at most 4000 characters). If none was recorded (an adopted
+/// session not restarted yet has no hooks) or it was cut short (ends with …), read the full one from its conversation
+/// record (see [`crate::agent::Agent::last_reply`])
 fn reply(session: &str) -> String {
     let r = crate::runtime::load(session);
     if !r.last.trim().is_empty() && !r.last.ends_with('…') {
@@ -951,7 +988,7 @@ fn reply(session: &str) -> String {
     full.unwrap_or(r.last)
 }
 
-/// 界面 `:` 菜单里的一项:一个露给菜单的能力、一个窗格或一个视图
+/// An entry in the interface's `:` menu: a command exposed to the menu, a pane or a view
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MenuItem {
     pub plugin: String,
@@ -959,14 +996,14 @@ pub struct MenuItem {
     pub id: String,
     pub kind: ItemKind,
     pub title: String,
-    /// `[[keys]]` 给它绑的键(在 `:` 菜单里按)
+    /// The key `[[keys]]` binds to it (pressed in the `:` menu)
     pub key: Option<char>,
     pub contexts: Vec<String>,
-    /// 能力的参数:(名字, 类型, 能不能不给)
+    /// The command's arguments: (name, type, optional)
     pub args: Vec<(String, String, bool)>,
-    /// 视图的输出是一份列表([`ViewRows`])
+    /// The view's output is a list ([`ViewRows`])
     pub rows: bool,
-    /// 列表视图里每行能按的键
+    /// The keys each row of a list view takes
     pub acts: Vec<RowAct>,
 }
 
@@ -978,60 +1015,61 @@ pub enum ItemKind {
     View,
 }
 
-/// 列表视图里的一个键(清单的 `[[views.keys]]`),要跑的能力已经找好
+/// A key in a list view (the manifest's `[[views.keys]]`), with the command it runs already looked up
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RowAct {
-    /// 一个字符,或者 `enter`
+    /// One character, or `enter`
     pub key: String,
     pub title: String,
-    /// 要跑的能力(露没露给菜单都行);复制的是 None
+    /// The command to run (whether or not it's in the menu); None for copying
     pub run: Option<MenuItem>,
-    /// 参数:(名字, 模板)
+    /// Arguments: (name, template)
     pub args: Vec<(String, String)>,
-    /// 复制的模板
+    /// The template to copy
     pub copy: String,
     pub confirm: bool,
-    /// 要停在某一行上才能按
+    /// Only works on a row
     pub row: bool,
 }
 
-/// 列表视图的命令输出的那份 JSON:`{"head": "…", "warn": "…", "empty": "…", "fields": {…}, "rows": [{…}]}`,都可以不写
+/// The JSON a list view's command prints: `{"head": "…", "warn": "…", "empty": "…", "fields": {…}, "rows": [{…}]}`, all
+/// optional
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ViewRows {
-    /// 列表上面一行灰字(现在怎样)
+    /// A gray line above the list (how things stand)
     #[serde(skip_serializing_if = "String::is_empty")]
     pub head: String,
-    /// 要留意的(标成警告色)
+    /// What needs attention (shown in the warning color)
     #[serde(skip_serializing_if = "String::is_empty")]
     pub warn: String,
-    /// 一行都没有时写的
+    /// What's shown when there are no rows
     #[serde(skip_serializing_if = "String::is_empty")]
     pub empty: String,
-    /// 不停在哪一行上也能用的字段(`row = false` 的键的模板读这里)
+    /// Fields usable without being on a row (templates of `row = false` keys read these)
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub fields: std::collections::BTreeMap<String, String>,
     pub rows: Vec<ViewRow>,
 }
 
-/// 列表里的一行
+/// A row in the list
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ViewRow {
     pub id: String,
-    /// 行首的记号(● ✕ ?…)
+    /// The mark at the start of the row (● ✕ ?…)
     pub mark: String,
-    /// 记号的颜色:ok / warn / bad / dim(不写 = 平常色)
+    /// The mark's color: ok / warn / bad / dim (not written = the normal color)
     #[serde(skip_serializing_if = "String::is_empty")]
     pub tone: String,
     pub text: String,
-    /// 靠右的那一小段(状态、时间)
+    /// The short bit on the right (state, time)
     #[serde(skip_serializing_if = "String::is_empty")]
     pub right: String,
-    /// 停在这一行时下面写的
+    /// What's shown below while on this row
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub detail: Vec<String>,
-    /// 键的模板读的字段
+    /// Fields the key templates read
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub fields: std::collections::BTreeMap<String, String>,
 }
@@ -1041,7 +1079,7 @@ impl ViewRows {
         serde_json::from_str(out.trim()).map_err(|e| tr!("无法解析列表:{e}", "can't parse the list: {e}"))
     }
 
-    /// 给人看的几行(`aca plugin view`)
+    /// Lines for people (`aca plugin view`)
     pub fn text(&self) -> String {
         let mut out = vec![];
         out.extend([&self.head, &self.warn].into_iter().filter(|s| !s.is_empty()).cloned());
@@ -1057,8 +1095,9 @@ impl ViewRows {
     }
 }
 
-/// 填模板:`{名字}` 换成字段(`id`、`text` 是行自己的,别的在 `fields` 里;`row` 是 None 时只读列表的 `fields`)。
-/// 用到的字段有一个没有、是空的,就是 None(这一行上这个键不能按)
+/// Fills a template: `{name}` becomes the field (`id` and `text` are the row's own, the rest are in `fields`; when `row`
+/// is None only the list's `fields` are read). If any field used is missing or empty, None (the key can't be pressed on
+/// this row)
 pub fn fill(tpl: &str, list: &ViewRows, row: Option<&ViewRow>) -> Option<String> {
     let get = |name: &str| -> Option<String> {
         let v = match (name, row) {
@@ -1082,42 +1121,44 @@ pub fn fill(tpl: &str, list: &ViewRows, row: Option<&ViewRow>) -> Option<String>
 }
 
 impl MenuItem {
-    /// `插件.id`
+    /// `plugin.id`
     pub fn qualified(&self) -> String {
         format!("{}.{}", self.plugin, self.id)
     }
 
-    /// 在这种行上(session / group / global)有没有意义
+    /// Whether it makes sense on this kind of row (session / group / global)
     pub fn fits(&self, on: &str) -> bool {
         self.contexts.is_empty() || self.contexts.iter().any(|c| c == on || c == "global")
     }
 }
 
-/// 开着的插件给菜单的全部:露给 menu 的能力、窗格、视图,按插件、清单里的顺序。
-/// 键:plugins.toml 的 `keys` 先拿,再是清单的 `[[keys]]`(见 [`yours::settle`])
+/// Everything enabled plugins give the menu: commands exposed to menu, panes and views, by plugin and in manifest order.
+/// Keys: `keys` in plugins.toml first, then the manifest's `[[keys]]` (see [`yours::settle`])
 pub fn menu() -> Vec<MenuItem> {
     menu_and_notes().0
 }
 
-/// 键没拿到 / plugins.toml 里写得不对的:(插件 id, 一句话)。`:` 菜单的键和会话里的热键都在这
+/// Keys not gotten / written wrong in plugins.toml: (plugin id, one sentence). Both `:` menu keys and hotkeys inside
+/// sessions are here
 pub fn key_notes() -> Vec<(String, String)> {
     let mut notes = menu_and_notes().1;
     notes.extend(hotkeys().1);
     notes
 }
 
-/// 会话里面的一个热键(键已经分好):按了开哪个插件的哪个窗格
+/// A hotkey inside sessions (keys already handed out): which plugin's which pane it opens
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HotkeyItem {
     pub plugin: String,
     pub pane: String,
     pub title: String,
-    /// tmux 的键名
+    /// A tmux key name
     pub key: String,
 }
 
-/// 开着的插件的热键:清单的 `[[hotkeys]]`,你在 plugins.toml 的 `hotkeys` 里写的盖在上面(清单没给热键的窗格你也能给)。
-/// 分法和 `:` 菜单的键一样(见 [`yours::settle_hotkeys`])。第二样是没拿到 / 写得不对的:(插件 id, 一句话)
+/// Hotkeys of enabled plugins: the manifest's `[[hotkeys]]`, with what you wrote in `hotkeys` in plugins.toml on top (you
+/// can give one to a pane the manifest gave none). Handed out the same way as `:` menu keys (see
+/// [`yours::settle_hotkeys`]). The second value is the ones not gotten / written wrong: (plugin id, one sentence)
 pub fn hotkeys() -> (Vec<HotkeyItem>, Vec<(String, String)>) {
     hotkeys_in(registry())
 }
@@ -1158,7 +1199,8 @@ fn hotkeys_in(reg: Vec<Entry>) -> (Vec<HotkeyItem>, Vec<(String, String)>) {
     (items, notes)
 }
 
-/// 热键按下去跑的那条命令(交给 tmux 的 run-shell:里面的 `#{…}` 它会换成按键的那个会话、那台终端)
+/// The command a hotkey runs (given to tmux's run-shell, which replaces the `#{…}` in it with the session and terminal
+/// where the key was pressed)
 fn hotkey_command(exe: &str, h: &HotkeyItem) -> String {
     format!(
         "{} plugin pane {} {} {} {} --session '#{{@aca_id}}' --client '#{{client_name}}'",
@@ -1170,24 +1212,28 @@ fn hotkey_command(exe: &str, h: &HotkeyItem) -> String {
     )
 }
 
-/// 没绑上的那几句话里,aca 自己的键(`[keys]`)记在这个名字下(插件的记在插件 id 下)
+/// In the notes about what didn't get bound, aca's own keys (`[keys]`) are listed under this name (plugins' under the
+/// plugin id)
 pub const OWN_KEYS: &str = "aca";
 
-/// aca 自己的那个键按下去跑的命令:进下一个在等你的会话(`aca next`)
+/// The command aca's own key runs: go to the next session that needs you (`aca next`)
 fn next_command(exe: &str, key: &str) -> String {
     format!("{} next {} {key} --session '#{{@aca_id}}' --client '#{{client_name}}'", crate::agent::sh_quote(exe), crate::tmux::HOTKEY_MARK)
 }
 
-/// 让 tmux 上绑的热键跟现在要的一致:要的绑上;aca 以前绑的、现在没人要的(插件停了、删了、换了键)解掉。
-/// 要的 = aca 自己的那个键(config.toml 的 `[keys] next`)和开着的插件的热键;两边要同一个键,给 aca 的。
-/// 返回没绑上的:(插件 id 或 [`OWN_KEYS`], 一句话) —— 那个键你自己在 tmux 里绑了别的,不动它。
-/// tmux 没在跑就什么都不做:绑定跟着 Ctrl+Q,建会话后、进会话前都会再来一遍(见 [`crate::tmux::bind_detach`])
+/// Makes the hotkeys bound in tmux match what's wanted now: binds the wanted ones; unbinds ones aca bound before that
+/// nobody wants now (plugin disabled, removed, key changed). Wanted = aca's own key (`[keys] next` in config.toml) and the
+/// hotkeys of enabled plugins; when both want the same key, aca gets it. Returns what didn't get bound: (plugin id or
+/// [`OWN_KEYS`], one sentence) — you bound that key to something else in tmux yourself, and it's left alone. Does nothing
+/// when tmux isn't running: bindings go along with Ctrl+Q and are redone after creating a session and before entering one
+/// (see [`crate::tmux::bind_detach`])
 pub fn bind_hotkeys() -> Vec<(String, String)> {
-    // 单元测试没有自己的 tmux 服务:不去碰真的那个
+    // Unit tests have no tmux server of their own: don't touch the real one
     if cfg!(test) {
         return vec![];
     }
-    // 照登记表现在的样子,不去看你自己的那份清单变没变([`registry`] 会看:变了它要重新登记、存登记表,又绕回这里)
+    // Go by the registry as it is, without checking whether your own manifest changed ([`registry`] would: a change makes it
+    // re-register and save the registry, which loops back here)
     let (items, _) = hotkeys_in(read_registry());
     let (next, mut notes) = match crate::config::load().keys.next_key() {
         Ok(k) => (k, vec![]),
@@ -1238,8 +1284,9 @@ pub fn bind_hotkeys() -> Vec<(String, String)> {
     notes
 }
 
-/// tmux 上该绑的热键,和 [`bind_hotkeys`] 绑的同一份:(键, 按了跑的命令)。不说哪些没绑上 ——
-/// 进会话前补绑定(见 [`crate::tmux::bind_detach`])只要这一份。单元测试里是 None:不去碰真的那个 tmux 服务
+/// The hotkeys that should be bound in tmux, the same list [`bind_hotkeys`] binds: (key, command it runs). Doesn't say
+/// which ones didn't get bound — re-binding before entering a session (see [`crate::tmux::bind_detach`]) only needs this
+/// list. None in unit tests: don't touch the real tmux server
 pub fn hotkey_binds() -> Option<Vec<(String, String)>> {
     if cfg!(test) {
         return None;
@@ -1249,7 +1296,7 @@ pub fn hotkey_binds() -> Option<Vec<(String, String)>> {
     Some(want_keys(&items, next.as_ref()))
 }
 
-/// aca 自己的那个键,和开着的插件的热键;两边要同一个键,给 aca 的
+/// aca's own key, and the hotkeys of enabled plugins; when both want the same key, aca gets it
 fn want_keys(items: &[HotkeyItem], next: Option<&String>) -> Vec<(String, String)> {
     let exe = crate::agent::self_exe();
     let mut want: Vec<(String, String)> = next.iter().map(|k| (k.to_string(), next_command(&exe, k))).collect();
@@ -1334,7 +1381,7 @@ fn menu_and_notes() -> (Vec<MenuItem>, Vec<(String, String)>) {
     (out, notes)
 }
 
-/// 能力的参数,表单用:(名字, 类型, 能不能不给),必填的排前面
+/// A command's arguments, for the form: (name, type, optional), required ones first
 fn command_args(a: &Action) -> Vec<(String, String, bool)> {
     let mut args: Vec<(String, String, bool)> =
         a.args.keys().filter_map(|k| a.arg(k).map(|(t, opt)| (k.clone(), t.to_string(), opt))).collect();
@@ -1342,11 +1389,12 @@ fn command_args(a: &Action) -> Vec<(String, String, bool)> {
     args
 }
 
-/// 界面里跑的能力、视图最多等这么久
+/// How long commands and views run from the interface may take at most
 pub const CAPTURE_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// 跑一个能力(露给 menu 的,或者列表视图的键要跑的)或一个视图,收下输出:(成没成, 标准输出 + 标准错误)。界面在后台调它。
-/// 列表视图跑成了只交标准输出(那是一份 JSON;标准错误写进插件的日志),没跑成照样两样都交
+/// Runs a command (exposed to menu, or run by a list view's key) or a view and collects the output: (succeeded, stdout +
+/// stderr). The interface calls it in the background. A list view that succeeded hands over only stdout (that's the JSON;
+/// stderr goes to the plugin's log); one that failed hands over both
 pub fn capture(qualified: &str, ctx: &Context, given: &[(String, String)]) -> Res<(bool, String)> {
     let (pid, xid) = split_qualified(qualified)?;
     let (e, m) = find(pid)?;
@@ -1374,12 +1422,12 @@ pub fn capture(qualified: &str, ctx: &Context, given: &[(String, String)]) -> Re
     Ok((true, f.out))
 }
 
-/// 跑一个能力时交给它的:哪个(新旧两个名字)、参数
+/// What a command gets when run: which one (under the new and the old name), and the arguments
 pub(crate) fn command_ids<'a>(id: &'a str, args: &'a str) -> [(&'static str, &'a str); 3] {
     [("ACA_PLUGIN_ENTRYPOINT_ID", id), ("ACA_PLUGIN_ACTION_ID", id), ("ACA_PLUGIN_ARGS_JSON", args)]
 }
 
-/// 往插件的日志里记一段(钩子的输出也在那;`aca plugin log` 看)
+/// Writes a section to the plugin's log (hook output goes there too; see it with `aca plugin log`)
 fn log_line(id: &str, text: &str) {
     use std::io::Write;
     let log = log_file(id);
@@ -1389,8 +1437,9 @@ fn log_line(id: &str, text: &str) {
     }
 }
 
-/// `aca plugin mcp <插件 id>`:agent 起这个插件的 MCP 服务时跑的就是这个(见 [`mount`])。
-/// 切到插件目录、带上插件的环境(设置;会话 id 是 agent 给的环境里那个),换成清单里 `[agent.mcp]` 的命令
+/// `aca plugin mcp <plugin id>`: what runs when an agent starts this plugin's MCP server (see [`mount`]). Changes to the
+/// plugin directory, adds the plugin's environment (settings; the session id is the one in the environment the agent
+/// gave), and replaces itself with the `[agent.mcp]` command from the manifest
 pub fn exec_mcp(id: &str) -> Res<i32> {
     let (e, m) = find(id)?;
     let spec = m.agent.mcp.as_ref().ok_or_else(|| tr!("{id} 没有 [agent.mcp]", "{id} has no [agent.mcp]"))?;
@@ -1399,12 +1448,12 @@ pub fn exec_mcp(id: &str) -> Res<i32> {
     Err(tr!("无法启动 {}:{err}", "can't start {}: {err}", spec.command[0]))
 }
 
-/// agent 那头调过来的(MCP):会话是它环境里的 `ACA_SESSION_ID`
+/// Called from the agent side (MCP): the session is `ACA_SESSION_ID` in its environment
 pub(crate) fn agent_context() -> Context {
     agent_context_for(&std::env::var("ACA_SESSION_ID").unwrap_or_default())
 }
 
-/// 冲着这个会话(gateway 转来的请求在 `_meta` 里说是谁)
+/// Aimed at this session (requests forwarded by the gateway say who in `_meta`)
 pub(crate) fn agent_context_for(session: &str) -> Context {
     let session = session.to_string();
     let s = (!session.is_empty()).then(|| crate::store::Store::open().ok()?.get(&session).ok()).flatten();
@@ -1420,13 +1469,15 @@ fn size(v: &Option<toml::Value>, default: &str) -> String {
     }
 }
 
-/// 开一个插件窗格。弹窗开在 `client` 那个终端上(不给 = tmux 自己挑现在这个);
-/// 人不在 tmux 里(手机上直接 ssh 进来跑的界面)就在当前终端前台跑,效果一样是「盖一层、关了回来」
+/// Opens a plugin pane. A popup opens on terminal `client` (not given = tmux picks the current one); when the person isn't
+/// in tmux (the interface run over a direct ssh from a phone) it runs in the foreground of the current terminal, with the
+/// same effect: "covers the screen, and closing it brings you back"
 pub fn open_pane(plugin: &str, pane: &str, placement: Option<&str>, client: Option<&str>, ctx: &Context) -> Res<i32> {
     let (e, m) = find(plugin)?;
     let p = m.panes.iter().find(|p| p.id == pane).ok_or_else(|| tr!("{plugin} 没有窗格 {pane}", "{plugin} has no pane {pane}"))?;
     let placement = placement.filter(|s| !s.is_empty()).unwrap_or(if p.placement.is_empty() { "popup" } else { &p.placement });
-    // 窗格是交互的程序,标准输入是终端:会话的内容写进一个文件(一个窗格一个,下次开时盖掉)
+    // A pane is an interactive program whose stdin is the terminal: the session content is written to a file (one per pane,
+    // overwritten the next time it opens)
     let input_file = if p.input.is_empty() {
         String::new()
     } else {
@@ -1456,7 +1507,7 @@ pub fn open_pane(plugin: &str, pane: &str, placement: Option<&str>, client: Opti
             }
             a
         }
-        // 清单里的宽高是给弹窗的;分屏固定占右边四成,agent 那格留大头
+        // The manifest's width and height are for popups; a split always takes the right 40%, leaving the agent's pane the bulk
         "split" if !ctx.pane.is_empty() => {
             vec!["split-window".into(), "-h".into(), "-l".into(), "40%".into(), "-t".into(), ctx.pane.clone()]
         }
@@ -1480,7 +1531,8 @@ pub fn open_pane(plugin: &str, pane: &str, placement: Option<&str>, client: Opti
     Ok(st.code().unwrap_or(1))
 }
 
-/// 事件那一行加上会话的几样(`if` 里能写的):`parent`、`tool`、`account`、`group`(事件里有同名字段的以事件为准)
+/// The event's line plus a few things about the session (usable in `if`): `parent`, `tool`, `account`, `group` (a field of
+/// the same name in the event wins)
 fn facts(line: &str, s: Option<&crate::store::Session>) -> serde_json::Value {
     let mut v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|_| json!({}));
     if let (Some(o), Some(s)) = (v.as_object_mut(), s) {
@@ -1491,15 +1543,16 @@ fn facts(line: &str, s: Option<&crate::store::Session>) -> serde_json::Value {
     v
 }
 
-/// 事件来了:订了它的每个插件各跑一条(`if` 对不上的不跑),**不等**(hook 里调的,不能拖住 agent),输出进插件自己的日志。
-/// 外面包一层 sh,跑完把退出码记下来(见 [`health`]):没跑成的状态栏、插件页标出来
+/// An event arrived: each plugin subscribed to it runs one command (skipped when `if` doesn't match), **not waited for**
+/// (called from the hook, it mustn't hold up the agent), with output going to the plugin's own log. Wrapped in an sh that
+/// records the exit code when done (see [`health`]): failed runs are flagged in the status bar and on the plugins page
 pub fn dispatch(event: &str, session: &str, line: &str) {
     let reg = registry();
     let subs: Vec<&Entry> = reg.iter().filter(|e| e.enabled && e.events.iter().any(|on| crate::event::matches(on, event))).collect();
     if subs.is_empty() {
         return;
     }
-    // 有人订才去查会话;窗格只有 hook 里知道(它就跑在那一格里)
+    // Only look up the session when someone subscribes; the pane is known only inside the hook (it runs in that very pane)
     let s = crate::store::Store::open().ok().and_then(|st| st.get(session).ok());
     let (dir, parent) = s.as_ref().map(|s| (s.dir.clone(), s.parent.clone())).unwrap_or_default();
     let in_hook = std::env::var("ACA_SESSION_ID").is_ok_and(|id| id == session);
@@ -1507,7 +1560,7 @@ pub fn dispatch(event: &str, session: &str, line: &str) {
     let ctx = Context { session: session.into(), dir, pane, parent, source: "event".into(), ..Default::default() };
     let facts = facts(line, s.as_ref());
     for e in subs {
-        // 自带的:刚升级了 aca 就先换成新写出来的那份(只读它自己那几个小文件)
+        // Built-in: right after an aca upgrade, switch to the freshly written copy first (only reads its own few small files)
         if e.source == first_party::SOURCE {
             first_party::refresh_one(&e.id);
         }
@@ -1532,7 +1585,8 @@ pub fn dispatch(event: &str, session: &str, line: &str) {
                 program(e, &h.command[0]).to_string_lossy().into_owned(),
             ];
             argv.extend(h.command[1..].iter().cloned());
-            // 三个口都接走、自成一组:调用它的 hook 退出后它接着跑,也不会让 agent 那头的管道一直开着
+            // All three streams taken and in a process group of its own: it keeps running after the hook that called it exits, and
+            // doesn't keep the agent's pipe open
             let _ = crate::proc::detach(
                 command(e, &m, &argv, &ctx, &[("ACA_PLUGIN_EVENT", event), ("ACA_PLUGIN_EVENT_JSON", line)], "")
                     .stdin(Stdio::null())
@@ -1563,7 +1617,7 @@ mod tests {
         assert!(typed("a", Some(&V::Array(vec![]))).is_err());
         assert_eq!(typed("3", None).unwrap(), V::Integer(3));
         assert_eq!(typed("hi there", None).unwrap(), V::String("hi there".into()));
-        // secret 的打码
+        // Secret ones are masked
         let mut n = SettingNow {
             name: "url".into(),
             value: V::String("https://discord.com/api/webhooks/1/abcd".into()),
@@ -1586,10 +1640,10 @@ mod tests {
         assert_eq!((l.rows.len(), l.rows[0].tone.as_str(), l.rows[1].mark.as_str()), (2, "ok", ""));
         assert_eq!(fill("{url}", &l, Some(&l.rows[0])).as_deref(), Some("https://m/"));
         assert_eq!(fill("rm {id} --to {next}", &l, Some(&l.rows[0])).as_deref(), Some("rm a1 --to on"));
-        // 空的、没有的字段:这一行上按不了
+        // Empty or missing fields: can't be pressed on this row
         assert_eq!(fill("{log}", &l, Some(&l.rows[0])), None);
         assert_eq!(fill("{url}", &l, Some(&l.rows[1])), None);
-        // 不停在行上:只读列表的字段
+        // Not on a row: only the list's fields are read
         assert_eq!(fill("{next}", &l, None).as_deref(), Some("on"));
         assert_eq!(fill("{id}", &l, None), None);
         assert_eq!(fill("plain", &l, None).as_deref(), Some("plain"));

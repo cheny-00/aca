@@ -1,17 +1,25 @@
-//! `aca statusline`:Claude 的状态栏,一个进程里记额度(见 limits)、画两行。
+//! `aca statusline`: Claude's status bar; one process records the quota (see limits) and draws two lines.
 //!
-//! 每个会话每回一条消息都跑一次(设了 refreshInterval 还按秒跑),几十个会话一起就不少,所以不起 bash / jq,要起 git 的也尽量少:
-//! - 分支每次直接读 HEAD 文件,不起 git、不进缓存:切了分支下次刷新就对,也读不到别的目录的
-//! - 改了几个文件、几行、领先落后要起 git(大仓库里两个 git 一百多毫秒 CPU),按工作区的根缓存:开在同一个工作区里的会话,
-//!   不管在哪一层目录,共用一份。这个会话在对话(对话记录刚动过)的缓存 5 秒;闲着的只是定时器在叫它,放宽到 60 秒 ——
-//!   旁边有会话在干活的话,它读到的还是那边 5 秒内算的。HEAD、index 动了(提交、暂存、切分支)不等到期,马上重算。
-//!   2026-10-14 实测:35 个会话(28 个闲着)光这两个 git 就占 15% 个核,闲了 20 小时的也在每 10 秒算一遍
-//! - Python 的版本读 .venv/pyvenv.cfg;node 的版本按 node 程序的路径和修改时间记着,换了才重问
+//! It runs once per message in every session (and every few seconds with refreshInterval set), which adds up across dozens of
+//! sessions, so no bash / jq, and as few git runs as possible:
+//! - the branch reads the HEAD file directly every time, no git, no cache: right on the next refresh after a branch switch, and
+//!   never another directory's
+//! - files changed, lines, ahead / behind need git (two gits cost 100+ ms of CPU in a big repo), cached per working-tree root:
+//!   sessions open in the same working tree, at whatever directory level, share one copy. While this session is talking (its
+//!   conversation record just changed) the cache lasts 5 s; idle, it's only the timer calling, so it's relaxed to 60 s:
+//!   if a session nearby is working, what it reads was still computed there within 5 s. When HEAD or index changes (commit,
+//!   stage, branch switch) it recomputes at once without waiting for expiry.
+//!   Measured 2026-10-14: 35 sessions (28 idle) spent 15% of a core on these two gits alone; ones idle for 20 hours were still
+//!   recomputing every 10 s
+//! - the Python version is read from .venv/pyvenv.cfg; the node version is remembered by the node binary's path and mtime, and
+//!   asked again only when those change
 //!
-//! 额度那段写的是这个账号所有会话里最新的那份,不是这个会话自己手里的(闲着的会话手里是旧数)。
-//! 闲着又没人连着看的会话不重算,照上次画的原样打(见 `still`):不然它们跟着别的会话一起重画,自动停也等不到它们闲下来。
-//! 出什么错都只是少画一段:状态栏命令一报错,Claude Code 就把整条画成空的。
-//! 配色是 Catppuccin Latte,图标要 Nerd Font。
+//! The quota segment shows the latest figures across all of this account's sessions, not what this session holds itself (an
+//! idle session holds old numbers).
+//! An idle session nobody is attached to isn't recomputed and prints exactly what it drew last time (see `still`): otherwise
+//! they all redraw along with other sessions, and auto-stop never sees them go idle.
+//! Whatever goes wrong only drops a segment: if the status line command errors, Claude Code draws the whole bar empty.
+//! The theme is Catppuccin Latte; icons need a Nerd Font.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -43,14 +51,16 @@ const I_DIR: char = '\u{F024B}';
 const I_PY: char = '\u{F0320}';
 const I_NODE: char = '\u{F0399}';
 
-/// git 的数多久重算一次(秒):这个会话在对话时
+/// How often git numbers are recomputed (seconds): while this session is talking
 const GIT_TTL: u64 = 5;
-/// 这个会话闲着时(别的会话算过的照样用,见 `git_ttl`)
+/// While this session is idle (what other sessions computed is still used, see `git_ttl`)
 const GIT_IDLE_TTL: u64 = 60;
-/// 对话记录这么久没动 = 闲着。比 refreshInterval(10 秒)长几拍:一轮刚完,格式化之类收尾的改动还赶得上
+/// Conversation record unchanged this long = idle. A few beats longer than refreshInterval (10 s): right after a turn, wrap-up
+/// changes like formatting still make it in
 const ACTIVE: u64 = 30;
 
-/// 工作区里的数:暂存了、改了没暂存、没跟踪的文件各几个,没暂存的改动加减几行,比上游领先落后几个提交
+/// Working-tree numbers: how many files are staged, modified but unstaged, untracked; lines added / removed in unstaged changes;
+/// commits ahead of / behind upstream
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Counts {
     staged: u32,
@@ -62,13 +72,13 @@ struct Counts {
     behind: u32,
 }
 
-/// 画之前查好的东西:画的那一步不碰磁盘
+/// What's looked up before drawing: the drawing step doesn't touch the disk
 #[derive(Default)]
 struct Facts {
-    /// 不在仓库里 = None,git 那段不画
+    /// Not in a repo = None, no git segment
     branch: Option<String>,
     git: Counts,
-    /// (名字, 版本)
+    /// (name, version)
     venv: Option<(String, String)>,
     node: Option<String>,
     quota: Option<Quota>,
@@ -90,7 +100,7 @@ pub fn run() -> i32 {
     let home = std::env::var("HOME").unwrap_or_default();
     let cache = std::env::temp_dir().join("aca-statusline");
     let transcript = path("/transcript_path");
-    // 闲着又没人在看:照上次画的原样打(见 `still`)
+    // Idle and nobody watching: print exactly what was drawn last time (see `still`)
     let last = v.pointer("/session_id").and_then(Value::as_str).filter(|id| plain(id)).map(|id| cache.join(format!("last-{id}")));
     if let Some(last) = &last
         && still(transcript.as_deref().and_then(idle_secs), watched)
@@ -129,36 +139,41 @@ pub fn run() -> i32 {
     if let Some(last) = &last {
         let _ = crate::state::write_atomic(last, &out);
     }
-    // Claude Code 等不及会把管道关掉:写不进去不算错
+    // Claude Code closes the pipe when it can't wait: a failed write isn't an error
     let _ = std::io::stdout().write_all(out.as_bytes());
     0
 }
 
-/// 照上次画的原样打、不重算:对话记录 ACTIVE 秒没动了(闲着),又没人在看(`watched`)。
-/// 状态栏里有几样闲着也会变:总时长按分钟走,额度跟着同账号别的会话变,git 的数跟着同目录别的会话变。一变 Claude 就重画,
-/// 屏幕上有了输出,自动停(`[idle] stop_after`)就一直认它没闲下来;几十个闲着的会话也一起陪着重画,白费电。
-/// 原样打 Claude 就不重画。有人连进去看,下一次刷新(refreshInterval 的 10 秒内)就是新的;在说话的会话照常每次重算
+/// Print exactly what was drawn last time, without recomputing: the conversation record hasn't changed for ACTIVE seconds
+/// (idle) and nobody is watching (`watched`).
+/// Some parts of the status bar change even while idle: the total duration ticks by the minute, the quota follows other
+/// sessions on the same account, git numbers follow other sessions in the same directory. Any change makes Claude redraw,
+/// the screen gets output, and auto-stop (`[idle] stop_after`) keeps seeing it as not idle; dozens of idle sessions redraw
+/// along with it too, wasting power.
+/// Printed unchanged, Claude doesn't redraw. When someone attaches to watch, the next refresh (within refreshInterval's 10 s)
+/// is fresh; a talking session recomputes every time as usual
 fn still(idle: Option<u64>, watched: impl FnOnce() -> bool) -> bool {
     idle.is_some_and(|s| s >= ACTIVE) && !watched()
 }
 
-/// 有没有人在看这个会话:它在的 tmux 会话连着客户端(aca 的弹窗开在它上面也算)。不在 tmux 里、问不到的都当有人在看,照常画
+/// Whether anyone is watching this session: its tmux session has a client attached (an aca popup open over it counts too).
+/// Not in tmux, or unable to ask: treated as watched, drawn as usual
 fn watched() -> bool {
     let Some(pane) = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty()) else { return true };
     !aca_core::tmux::run(&["display-message", "-p", "-t", &pane, "#{session_attached}"]).is_ok_and(|n| n.trim() == "0")
 }
 
-/// 会话号拿来起文件名:只认字母、数字和 -
+/// The session id goes into a file name: only letters, digits and - are accepted
 fn plain(id: &str) -> bool {
     !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// 一段带颜色的字;`attr` 是颜色前面的属性(`1;` 粗、`2;` 淡、`3;` 斜)
+/// A run of colored text; `attr` is the attributes before the color (`1;` bold, `2;` dim, `3;` italic)
 fn paint(c: Rgb, attr: &str, text: impl std::fmt::Display) -> String {
     format!("\x1b[{attr}38;2;{};{};{}m{text}\x1b[0m", c.0, c.1, c.2)
 }
 
-/// 用了百分之多少算什么颜色:上下文和额度一个标准
+/// Which color for what percent used: the same scale for context and quota
 fn level(pct: f64) -> Rgb {
     if pct >= 85.0 {
         RED
@@ -169,7 +184,8 @@ fn level(pct: f64) -> Rgb {
     }
 }
 
-/// 第一行:上下文 │ 模型 │ git │ 目录;第二行:额度 │ 花费和时长 │ Python │ node。没有的那段不画,整行都没有的那行不占地方
+/// Line one: context │ model │ git │ directory; line two: quota │ cost and duration │ Python │ node. Missing segments aren't
+/// drawn; a line with nothing in it takes no space
 fn render(v: &Value, f: &Facts) -> String {
     let s = |p: &str| v.pointer(p).and_then(Value::as_str).filter(|x| !x.is_empty());
     let n = |p: &str| v.pointer(p).and_then(Value::as_f64);
@@ -210,7 +226,7 @@ fn render(v: &Value, f: &Facts) -> String {
     [l1, l2].iter().filter(|l| !l.is_empty()).map(|l| l.join(&sep)).collect::<Vec<_>>().join("\n")
 }
 
-/// 设置页上给人看的样子:编的一份数,画法和真的一样
+/// The sample shown on the settings page: made-up numbers, drawn the same way as the real thing
 pub(crate) fn sample(who: &str) -> String {
     let v = serde_json::json!({
         "context_window": {"used_percentage": 42},
@@ -251,7 +267,7 @@ fn git(branch: &str, c: &Counts) -> String {
     out
 }
 
-/// 目录怎么写:项目名加项目里的相对路径;不在项目里的写全,家目录写成 ~
+/// How the directory is written: project name plus the path inside the project; outside a project in full, home as ~
 fn place(dir: &str, project: Option<&str>, home: &str) -> String {
     let under = |base: &str| dir.strip_prefix(base).filter(|rest| !base.is_empty() && (rest.is_empty() || rest.starts_with('/')));
     if let Some(p) = project.map(|p| p.trim_end_matches('/'))
@@ -262,7 +278,8 @@ fn place(dir: &str, project: Option<&str>, home: &str) -> String {
     under(home.trim_end_matches('/')).map_or_else(|| dir.to_string(), |rest| format!("~{rest}"))
 }
 
-/// 账号名和它还没到重置时间的窗口(过了重置时间的数是上一个窗口的,不写),窗口之间一个点;用到八成以上的带上还有多久重置
+/// The account name and its windows not yet past their reset time (numbers past the reset are the previous window's, left out),
+/// a dot between windows; one at 80% or more also shows the time until reset
 fn quota(q: &Quota, now: i64) -> Option<String> {
     let live: Vec<&Win> = q.wins.iter().filter(|w| w.resets.is_none_or(|r| r > now)).collect();
     if live.is_empty() {
@@ -283,7 +300,7 @@ fn quota(q: &Quota, now: i64) -> Option<String> {
     Some(out)
 }
 
-/// 多长一段时间,只写最大的两级:3d4h / 2h10m / 4m5s / 45s
+/// A length of time, only the two largest units: 3d4h / 2h10m / 4m5s / 45s
 fn span(secs: u64) -> String {
     match (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60, secs % 60) {
         (0, 0, 0, s) => format!("{s}s"),
@@ -293,13 +310,14 @@ fn span(secs: u64) -> String {
     }
 }
 
-/// 还有多久重置:同上,不到一小时的不写秒(45m)
+/// Time until reset: as above, but under an hour without seconds (45m)
 fn left(secs: i64) -> String {
     let s = secs.max(0) as u64;
     if s < 3600 { format!("{}m", s / 60) } else { span(s) }
 }
 
-/// 从这个目录往上找 `.git`,回(工作区的根, 它的 HEAD 文件)。`.git` 是文件的(worktree、子模块)里面写着真的在哪
+/// Look up from this directory for `.git`, returning (working-tree root, its HEAD file). A `.git` that is a file (worktree,
+/// submodule) says where the real one is
 fn repo(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     for d in dir.ancestors() {
         let g = d.join(".git");
@@ -314,20 +332,22 @@ fn repo(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-/// 这个文件多少秒没动了;没有这个文件、读不到 = None
+/// How many seconds this file has been unchanged; no such file or unreadable = None
 fn idle_secs(p: &Path) -> Option<u64> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs())
 }
 
-/// git 的数这一回认多久以内算过的:对话记录多久没动了(`idle`)。闲着的会话不为自己重算 ——
-/// 同一个工作区里有会话在干活,缓存就是它 5 秒内写的;都闲着,一分钟一次也看不出差别。
-/// 输入里没给对话记录(刚开的会话)的照原来的 5 秒
+/// How old a git count this run accepts, by how long the conversation record has been unchanged (`idle`). An idle session
+/// doesn't recompute for itself: if a session in the same working tree is working, the cache is what it wrote within 5 s; if
+/// all are idle, once a minute makes no visible difference.
+/// With no conversation record in the input (a just-opened session), the usual 5 s
 fn git_ttl(idle: Option<u64>) -> u64 {
     if idle.is_some_and(|s| s >= ACTIVE) { GIT_IDLE_TTL } else { GIT_TTL }
 }
 
-/// HEAD 和它旁边的 index 各自的修改时间:提交、暂存、切分支、变基都会动其中一个,对不上就不等到期。
-/// 光改工作区里的文件动不到它们,那个靠到期。自己起的 git 带 `--no-optional-locks`,不会去写 index
+/// The mtimes of HEAD and of the index next to it: commit, stage, branch switch, rebase each touch one of them, and a mismatch
+/// doesn't wait for expiry. Just editing files in the working tree touches neither; that relies on expiry. The git we run
+/// passes `--no-optional-locks`, so it never writes the index
 fn stamp(head: &Path) -> String {
     let at = |p: &Path| {
         let t = std::fs::metadata(p).and_then(|m| m.modified()).ok();
@@ -336,7 +356,7 @@ fn stamp(head: &Path) -> String {
     format!("{}:{}", at(head), at(&head.with_file_name("index")))
 }
 
-/// HEAD 里写的:分支名;没在分支上(变基到一半、检出了某个提交)是 `@` 加短提交号
+/// What HEAD says: the branch name; when not on a branch (mid-rebase, a commit checked out), `@` plus the short hash
 fn branch(head: &Path) -> Option<String> {
     let text = std::fs::read_to_string(head).ok()?;
     let text = text.trim();
@@ -346,7 +366,7 @@ fn branch(head: &Path) -> Option<String> {
     }
 }
 
-/// 两个 git 一起跑:状态(哪些文件、领先落后)和没暂存的改动行数
+/// Two gits run together: status (which files, ahead / behind) and the line counts of unstaged changes
 fn count(dir: &Path) -> Counts {
     let git = |args: &[&str]| {
         let mut c = Command::new("git");
@@ -361,8 +381,8 @@ fn count(dir: &Path) -> Counts {
     c
 }
 
-/// `git status --porcelain=v2 --branch`:`# branch.ab +领先 -落后`;`1` / `2` / `u` 开头的是跟踪着的文件,
-/// 后面两个字符是暂存区和工作区各自的状态(`.` = 没动);`?` 开头的没跟踪
+/// `git status --porcelain=v2 --branch`: `# branch.ab +ahead -behind`; lines starting with `1` / `2` / `u` are tracked files,
+/// the next two characters being the index and working-tree states (`.` = unchanged); lines starting with `?` are untracked
 fn parse_status(text: &str, c: &mut Counts) {
     for l in text.lines() {
         if let Some(ab) = l.strip_prefix("# branch.ab ") {
@@ -379,7 +399,7 @@ fn parse_status(text: &str, c: &mut Counts) {
     }
 }
 
-/// `git diff --numstat`:每行「加 减 文件」,二进制文件是 `-`,不算
+/// `git diff --numstat`: each line is "added removed file"; binary files have `-`, not counted
 fn parse_numstat(text: &str, c: &mut Counts) {
     for l in text.lines() {
         let mut it = l.split('\t').map(|x| x.parse::<u64>().unwrap_or(0));
@@ -388,7 +408,8 @@ fn parse_numstat(text: &str, c: &mut Counts) {
     }
 }
 
-/// 用的哪个 Python 环境:(名字, 版本)。开着的(VIRTUAL_ENV、conda)先算,再是这个目录、项目目录里的 `.venv`
+/// Which Python environment is in use: (name, version). An active one (VIRTUAL_ENV, conda) first, then `.venv` in this
+/// directory, then in the project directory
 fn venv(active: Option<PathBuf>, conda: Option<String>, dir: Option<&Path>, project: Option<&Path>) -> Option<(String, String)> {
     if let Some(v) = active {
         return Some((v.file_name()?.to_string_lossy().into_owned(), py_version(&v)));
@@ -400,7 +421,8 @@ fn venv(active: Option<PathBuf>, conda: Option<String>, dir: Option<&Path>, proj
     Some((".venv".into(), py_version(&v)))
 }
 
-/// 环境是哪版 Python 建的:`pyvenv.cfg` 里的 `version = 3.11.4`(venv、uv 写 `version_info`,virtualenv 写成 `3.11.4.final.0`)
+/// Which Python version the environment was built with: `version = 3.11.4` in `pyvenv.cfg` (venv and uv write `version_info`,
+/// virtualenv writes `3.11.4.final.0`)
 fn py_version(venv: &Path) -> String {
     let Ok(text) = std::fs::read_to_string(venv.join("pyvenv.cfg")) else { return String::new() };
     text.lines()
@@ -412,7 +434,8 @@ fn py_version(venv: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// PATH 里那个 node 的版本。问一次要起一个 node,所以按程序的真实路径和修改时间记着,换了版本(路径或文件变了)才重问
+/// The version of the node on PATH. Asking means starting a node, so it's remembered by the binary's real path and mtime, and
+/// asked again only when the version changes (path or file changed)
 fn node(cache: &Path) -> Option<String> {
     let bin = std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join("node")).find(|p| p.is_file())?;
     let real = std::fs::canonicalize(&bin).ok()?;
@@ -425,7 +448,8 @@ fn node(cache: &Path) -> Option<String> {
     Some(ver).filter(|v| !v.is_empty())
 }
 
-/// 存下来的一份:`key` 也写进去,读的时候对一遍(文件名只是它的散列);`stamp` 是算的时候它依据的东西的样子
+/// One stored entry: `key` is written in too and checked on read (the file name is only its hash); `stamp` is the state of what
+/// it was computed from, at the time
 #[derive(Serialize, Deserialize)]
 struct Entry<T> {
     key: String,
@@ -434,10 +458,11 @@ struct Entry<T> {
     value: T,
 }
 
-/// `ttl` 秒内算过这个 `key`、`stamp` 也还是那时的,就用算过的,不然算一次存下来。`stamp` 要在算之前取:
-/// 算的途中又变了的,下回对不上再算一次。一个 key 一个文件,放系统的临时目录:丢了只是重算
+/// If this `key` was computed within `ttl` seconds and `stamp` is still what it was then, use that; otherwise compute once and
+/// store it. Take `stamp` before computing: if it changes mid-computation, next time it won't match and is computed again.
+/// One file per key, in the system temp directory: losing it only means recomputing
 fn cached<T: Serialize + DeserializeOwned>(dir: &Path, kind: &str, key: &str, stamp: &str, ttl: u64, compute: impl FnOnce() -> T) -> T {
-    // FNV-1a:只用来起文件名
+    // FNV-1a: only used for the file name
     let hash = key.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
     let path = dir.join(format!("{kind}-{hash:016x}.json"));
     let fresh =
@@ -500,7 +525,7 @@ mod tests {
                 format!("sub 5h 9% · 7d 87% 2h10m │ $1.50 1m5s │ {I_PY} .venv(3.11.4) │ {I_NODE} v22.1.0"),
             ]
         );
-        // 分支是斜体的青色,模型是粗体的紫色
+        // The branch is italic teal, the model bold purple
         assert!(out.contains(&format!("\x1b[3;38;2;23;146;153m{I_GIT} dev_ye\x1b[0m")), "{out:?}");
         assert!(out.contains(&format!("\x1b[1;38;2;136;57;239m{I_MODEL} Opus\x1b[0m")), "{out:?}");
     }
@@ -508,14 +533,14 @@ mod tests {
     #[test]
     fn what_is_missing_is_left_out_and_nothing_at_all_prints_nothing() {
         assert_eq!(render(&Value::Null, &Facts::default()), "");
-        // 输入读不出来但账号有额度:只有额度那一行,前面不空一行
+        // Input unreadable but the account has quota: only the quota line, with no blank line before it
         let only_quota = Facts { quota: Some(quota_of(&[("5h", 9.0, 5000)])), now: 1000, ..Facts::default() };
         assert_eq!(crate::ansi::strip(&render(&Value::Null, &only_quota)), "sub 5h 9%");
-        // 没花钱、没额度、没环境:只有一行;干净的仓库只写分支
+        // No cost, no quota, no environment: a single line; a clean repo shows only the branch
         let v = serde_json::json!({"workspace": {"current_dir": "/home/me/x"}, "cost": {"total_cost_usd": 0}});
         let f = Facts { branch: Some("main".into()), home: "/home/me".into(), ..Facts::default() };
         assert_eq!(crate::ansi::strip(&render(&v, &f)), format!("{I_GIT} main │ {I_DIR} ~/x"));
-        // 上下文超过一百也只画满
+        // Context over 100 is drawn just full
         let full = crate::ansi::strip(&render(&serde_json::json!({"context_window": {"used_percentage": 130}}), &Facts::default()));
         assert_eq!(full, format!("{} 130%", "━".repeat(15)));
     }
@@ -531,7 +556,7 @@ mod tests {
     fn the_directory_reads_from_the_project_down() {
         assert_eq!(place("/w/app", Some("/w/app"), "/home/me"), "app");
         assert_eq!(place("/w/app/src/x", Some("/w/app/"), "/home/me"), "app/src/x");
-        // 名字只是前缀一样的不算在项目里
+        // A name that only shares the prefix isn't inside the project
         assert_eq!(place("/w/app-two", Some("/w/app"), "/w"), "~/app-two");
         assert_eq!(place("/elsewhere/x", Some("/w/app"), "/home/me"), "/elsewhere/x");
         assert_eq!(place("/home/me", None, "/home/me"), "~");
@@ -546,7 +571,7 @@ mod tests {
             Some("sub 5h 80% 45m · 7d 99% 3d4h")
         );
         assert_eq!(q(&[("5h", 9.0, 1000)]), None);
-        // 八成半以上红,六成以上黄
+        // 85% and up red, 60% and up yellow
         let colored = quota(&quota_of(&[("5h", 85.0, 5000), ("7d", 60.0, 5000)]), 1000).unwrap();
         assert!(colored.contains("\x1b[38;2;210;15;57m85%") && colored.contains("\x1b[38;2;223;142;29m60%"), "{colored:?}");
     }
@@ -561,10 +586,11 @@ mod tests {
         let at = |d: &Path| super::repo(d).and_then(|(_, h)| branch(&h));
         let root_of = |d: &Path| super::repo(d).map(|(r, _)| r);
         assert_eq!(at(&repo.join("src/deep")).as_deref(), Some("feature/x"));
-        // 在哪一层目录里,工作区的根都是同一个(git 的数按它缓存);worktree 的根是它自己,不是主仓库
+        // At any directory level the working-tree root is the same (git numbers are cached by it);
+        // a worktree's root is itself, not the main repo
         assert_eq!(root_of(&repo.join("src/deep")), Some(repo.clone()));
         assert_eq!(root_of(&repo), Some(repo.clone()));
-        // worktree:.git 是个文件,指到主仓库里它自己的那份 HEAD(绝对的、相对的都有)
+        // worktree: .git is a file pointing to its own HEAD inside the main repo (absolute and relative both)
         let wt = root.join("wt");
         std::fs::create_dir_all(wt.join("sub")).unwrap();
         std::fs::write(repo.join(".git/worktrees/wt/HEAD"), "ref: refs/heads/comms\n").unwrap();
@@ -577,7 +603,7 @@ mod tests {
         assert_eq!(at(&repo).as_deref(), Some("@8ebb433"));
         let bare = root.join("plain");
         std::fs::create_dir_all(&bare).unwrap();
-        // 临时目录的上级里要是有仓库,这条就测不了
+        // If a parent of the temp directory is a repo, this can't be tested
         if !root.ancestors().any(|d| d.join(".git").exists()) {
             assert_eq!(at(&bare), None);
         }
@@ -597,7 +623,7 @@ mod tests {
         parse_status(status, &mut c);
         parse_numstat("12\t3\tsrc/a.rs\n-\t-\tlogo.png\n5\t0\tsrc/c.rs\n", &mut c);
         assert_eq!(c, Counts { staged: 4, modified: 3, untracked: 2, added: 17, removed: 3, ahead: 10, behind: 3 });
-        // 没有上游的分支没有 branch.ab 那行
+        // A branch with no upstream has no branch.ab line
         let mut none = Counts::default();
         parse_status("# branch.oid 8ebb433\n# branch.head main\n", &mut none);
         assert_eq!(none, Counts::default());
@@ -609,10 +635,10 @@ mod tests {
         let of = |n: u32| Counts { modified: n, ..Counts::default() };
         assert_eq!(cached(&dir, "git", "/w/a", "1:1", 5, || of(1)), of(1));
         assert_eq!(cached(&dir, "git", "/w/b", "1:1", 5, || of(2)), of(2));
-        // 还没过期:不重算,也不是另一个目录的
+        // Not expired yet: not recomputed, and not the other directory's
         assert_eq!(cached(&dir, "git", "/w/a", "1:1", 5, || -> Counts { panic!("重算了") }), of(1));
         assert_eq!(cached(&dir, "git", "/w/b", "1:1", 5, || -> Counts { panic!("重算了") }), of(2));
-        // 过期了(ttl 0)重算;文件里记的 key 对不上的(散列撞了)不认
+        // Expired (ttl 0): recomputed; an entry whose stored key doesn't match (a hash collision) is rejected
         assert_eq!(cached(&dir, "git", "/w/a", "1:1", 0, || of(3)), of(3));
         let file = std::fs::read_dir(&dir)
             .unwrap()
@@ -629,12 +655,12 @@ mod tests {
     fn a_commit_or_a_checkout_recomputes_at_once_and_an_idle_session_waits_longer() {
         let dir = tmp("stamp");
         let of = |n: u32| Counts { modified: n, ..Counts::default() };
-        // 还没到期,但 HEAD / index 动过了(记号对不上):重算,存的是新记号,同一个文件(不是一动就多一个)
+        // Not expired, but HEAD / index changed (stamp mismatch): recomputed, the new stamp stored, same file (not one more per change)
         assert_eq!(cached(&dir, "git", "/w/a", "1:1", 60, || of(1)), of(1));
         assert_eq!(cached(&dir, "git", "/w/a", "1:2", 60, || of(2)), of(2));
         assert_eq!(cached(&dir, "git", "/w/a", "1:2", 60, || -> Counts { panic!("重算了") }), of(2));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
-        // 旧版存的没有记号那一项:读得了,当成空的记号(node 的版本一直这么存)
+        // Old entries without the stamp field: still readable, as an empty stamp (the node version is always stored like that)
         let file = std::fs::read_dir(&dir).unwrap().flatten().next().unwrap().path();
         std::fs::write(
             &file,
@@ -644,7 +670,7 @@ mod tests {
         assert_eq!(cached(&dir, "git", "/w/a", "", 60, || -> Counts { panic!("重算了") }), of(7));
         assert_eq!(cached(&dir, "git", "/w/a", "1:2", 60, || of(8)), of(8));
 
-        // 对话记录 30 秒内动过 = 在对话,5 秒;再久 = 闲着,60 秒;输入里没给的照 5 秒
+        // Conversation record changed within 30 s = talking, 5 s; longer = idle, 60 s; none in the input, 5 s
         assert_eq!([None, Some(0), Some(29), Some(30), Some(72000)].map(git_ttl), [5, 5, 5, 60, 60]);
         let log = dir.join("t.jsonl");
         assert_eq!(idle_secs(&log), None);
@@ -657,7 +683,7 @@ mod tests {
         ago(&log, 100);
         assert!(idle_secs(&log).is_some_and(|s| (100..110).contains(&s)));
 
-        // 记号 = HEAD 和它旁边 index 的修改时间:哪个动了都变;还没有 index 的新仓库也有记号
+        // Stamp = mtimes of HEAD and the index next to it: changes when either does; a new repo with no index yet still has a stamp
         let git = dir.join("repo/.git");
         std::fs::create_dir_all(&git).unwrap();
         let (head, index) = (git.join("HEAD"), git.join("index"));
@@ -688,7 +714,7 @@ mod tests {
         assert_eq!(py_version(&mk("a", "home = /usr/bin\nversion = 3.11.4\n")), "3.11.4");
         assert_eq!(py_version(&mk("b", "home = /usr/bin\nversion_info = 3.12.3.final.0\nuv = 0.4\n")), "3.12.3");
         assert_eq!(py_version(&root.join("none")), "");
-        // 开着的环境先算;conda 的 base 不算;再是目录里的 .venv,没有才看项目的
+        // An active environment first; conda's base doesn't count; then .venv in the directory, and only without it the project's
         let (proj, sub) = (root.join("proj"), root.join("proj/sub"));
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::create_dir_all(proj.join(".venv/bin")).unwrap();
@@ -703,10 +729,10 @@ mod tests {
 
     #[test]
     fn an_idle_session_nobody_watches_keeps_its_last_bar() {
-        // 在说话的:照常重算,不去问有没有人在看
+        // Talking: recomputed as usual, without asking whether anyone is watching
         assert!(!still(Some(ACTIVE - 1), || panic!("不该问")));
         assert!(!still(None, || panic!("不该问")));
-        // 闲着的:没人看才原样打
+        // Idle: printed unchanged only when nobody is watching
         assert!(still(Some(ACTIVE), || false));
         assert!(!still(Some(3600), || true));
         assert!(plain("78c6b838-1895-4f3b-b41f-d9308d892247"));

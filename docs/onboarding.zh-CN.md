@@ -25,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | ACA_
 
 这条命令只会在 `~/.local/bin/aca` 放一个文件,不安装任何别的东西。
 (`ACA_LANG=zh` 让安装脚本用中文提示,去掉则是英文。如果你的机器没有编译好的版本,或者想自己下载,
-README 的[安装](../README.zh-CN.md#安装)一章里有另外两种装法。)完成后你应该看到:
+[安装](install.zh-CN.md)一页里有另外两种装法。)完成后你应该看到:
 
 ```
 已安装 aca 0.1.0 (ceaf172 2026-10-19):/Users/you/.local/bin/aca
@@ -129,7 +129,7 @@ hook_trust = "bypass"
 | `Ctrl+S` | 设置:主题、语言、账号 |
 | `q` `q` | 退出 aca,会话继续运行 |
 
-README 的[按键](../README.zh-CN.md#按键)一节还列了更多的键、在会话里面能用的键,以及哪些键可以改。
+[按键](keys.zh-CN.md)一页还列了更多的键、在会话里面能用的键,以及哪些键可以改。
 
 ## 7. 使用多个账号
 
@@ -155,7 +155,7 @@ aca new claude:work ~/code/app
 ```
 
 `aca setup` 用一个页面展示同样的内容(按 `+` 添加账号);在界面里按 `Ctrl+S` 再按 `a` 可以打开账号页面,
-那里还能看到每个账号是否已登录。更多细节见 [README 的「账号」一节](../README.zh-CN.md#账号)。
+那里还能看到每个账号是否已登录。更多细节见[账号](accounts.zh-CN.md)。
 
 ## 8. 可选的增强
 
@@ -163,7 +163,7 @@ aca new claude:work ~/code/app
 
 **查看 Claude 的订阅额度。** 运行 `aca setup`,移动到某个 Claude 账号,用 `←` `→` 选择状态栏的连接方式,按 `回车`。
 `aca setup --statusline off` 可以撤销。各个选项的含义以及具体会改动什么,
-见 [README](../README.zh-CN.md#claude-的订阅额度和状态栏)。
+见 [Claude 的订阅额度和状态栏](accounts.zh-CN.md#claude-的订阅额度和状态栏)。
 
 **在任何会话里都能打开 aca。** `aca tmux install` 会添加 tmux 快捷键,让你在当前会话上直接弹出 aca
 (先按前缀键再按 `a`,或者直接按 `Ctrl+\`),并在 tmux 状态栏显示待处理会话的数量。
@@ -180,7 +180,7 @@ aca new claude:work ~/code/app
 [lazygit](https://github.com/jesseduffield/lazygit)(在改动页面按 `l`),
 并且会用 [fzf](https://github.com/junegunn/fzf) 和 [zoxide](https://github.com/ajeetdsouza/zoxide) 帮你选择目录。
 aca 不会替你安装这些工具,需要哪个请自行安装。完整的列表以及每个工具带来的功能,
-见 [README](../README.zh-CN.md#可选的工具)。
+见[可选的工具](install.zh-CN.md#可选的工具)。
 
 **插件。** 在界面里按 `P` 查看有哪些插件。例如 `aca.notify` 会在会话完成或等待回应时发送桌面通知。
 详见 [plugins.zh-CN.md](plugins.zh-CN.md)。
@@ -225,4 +225,4 @@ aca send "$id" -m '再给它补一个测试'
 
 ## 升级和卸载
 
-再运行一遍安装命令即可升级。要彻底删除 aca,请按 [README 的「卸载」一节](../README.zh-CN.md#卸载)操作。
+再运行一遍安装命令即可升级。要彻底删除 aca,请按[卸载](install.zh-CN.md#卸载)操作。

@@ -1,19 +1,24 @@
-//! opencode(opencode.ai)。hook 用一个插件带进去:旁边的 `opencode_plugin.js` 写进 `state/hooks/`,
-//! 启动时 `OPENCODE_CONFIG_CONTENT` 里写 `{"plugin": ["file://<它>"]}`。这份配置叠在你自己的配置上面,
-//! 你的插件、`OPENCODE_CONFIG_DIR` 照样加载;你自己设了 `OPENCODE_CONFIG_CONTENT` 的,aca 的插件合进去。
-//! 插件把 opencode 的事件换成 hook 协议的形状报给 `aca hook opencode`。
+//! opencode (opencode.ai). Hooks are passed through a plugin: the `opencode_plugin.js` next to this file is written into
+//! `state/hooks/`, and at startup `OPENCODE_CONFIG_CONTENT` holds `{"plugin": ["file://<it>"]}`. That config is layered on
+//! top of your own, so your plugins and `OPENCODE_CONFIG_DIR` still load; if you set `OPENCODE_CONFIG_CONTENT` yourself,
+//! aca's plugin is merged into it. The plugin turns opencode's events into hook-protocol shape and reports them to
+//! `aca hook opencode`.
 //!
-//! 1.19.3 上实测:
-//! - 对话 id(`ses_…`)是它自己起的,第一句话发出去才有(分叉的一起来就有):等 hook 报
-//! - `-s <id>` 接着,`-s <id> --fork` 分叉;`--prompt <话>` 起来就发
-//! - 标题它自己起(拿第一句话问一次模型),插件报上来,也写在窗格标题里(`OC | <标题>`)
-//! - 权限框:回车是「Allow once」,Esc 是拒绝(拒绝了这一轮就停下,不报错)
-//! - 打断要连按两下 Esc(第一下只提示「esc again to interrupt」),两下要分开按
-//! - 上游 5xx 它一直退避重试(屏幕上写着第几次),还算在跑;4xx 直接报错
-//! - task 工具派出去的子 agent 也是一段会话,插件认 `parentID` 滤掉
-//! - 退出时插件收不到任何事件:列表看窗格没了认出退出
-//! - 登录在 `$XDG_DATA_HOME/opencode/auth.json`,对话在同一个目录的 `opencode.db`:没有一个变量只换一个账号的目录,
-//!   账号里只能写 env / args(各家的 API key、`OPENCODE_AUTH_CONTENT`)
+//! Tested on 1.19.3:
+//! - The conversation id (`ses_…`) is its own, and only exists once the first message is sent (a fork has one on startup):
+//!   wait for the hook to report it
+//! - `-s <id>` resumes, `-s <id> --fork` forks; `--prompt <message>` sends it once it's up
+//! - It comes up with its title itself (asking the model once with the first message); the plugin reports it, and it's also
+//!   in the pane title (`OC | <title>`)
+//! - Permission prompt: Enter is "Allow once", Esc denies (denying stops the turn, without an error)
+//! - Interrupting takes two Escs (the first only hints "esc again to interrupt"), pressed separately
+//! - On upstream 5xx it keeps backing off and retrying (the screen shows which attempt), still counted as running; 4xx
+//!   errors out right away
+//! - Subagents spawned by the task tool are sessions too; the plugin filters them out by `parentID`
+//! - On exit the plugin gets no event at all: the list notices the exit when the pane is gone
+//! - Login is in `$XDG_DATA_HOME/opencode/auth.json`, conversations in `opencode.db` in the same directory: no variable
+//!   switches just one account's directory, so accounts can only set env / args (each provider's API key,
+//!   `OPENCODE_AUTH_CONTENT`)
 
 use std::sync::LazyLock;
 
@@ -32,7 +37,7 @@ pub struct Opencode;
 const PLUGIN: &str = include_str!("opencode_plugin.js");
 const CONTENT: &str = "OPENCODE_CONFIG_CONTENT";
 
-/// 在跑时底栏写着「esc interrupt」,按过一下 Esc 后是「esc again to interrupt」
+/// While running the bottom bar says "esc interrupt", and after one Esc "esc again to interrupt"
 static RUNNING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\besc (?:again to )?interrupt\b").unwrap());
 
 fn plan(tool: &Tool, s: &Session, how: &How) -> Vec<String> {
@@ -46,7 +51,8 @@ fn plan(tool: &Tool, s: &Session, how: &How) -> Vec<String> {
     argv
 }
 
-/// 叠上去的那份配置:你写的(有的话)加上 aca 的插件,和开着的 aca 插件给的 MCP 服务(同名的以 aca 的为准)
+/// The layered config: yours (if any) plus aca's plugin, and the MCP servers from enabled aca plugins (aca's wins on a name
+/// clash)
 fn content(theirs: Option<&str>, plugin: &str, mcp: serde_json::Map<String, Value>) -> String {
     let mut v: Value = theirs.and_then(|t| serde_json::from_str(t).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}));
     let top = v.as_object_mut().unwrap();
@@ -65,13 +71,13 @@ fn content(theirs: Option<&str>, plugin: &str, mcp: serde_json::Map<String, Valu
     v.to_string()
 }
 
-/// 你自己的那份:工具、账号里写的(`set`),没写就是外面环境里的
+/// Your own: what the tool or account sets (`set`), else the one in the outside environment
 fn theirs(set: &[(String, String)], outside: Option<String>) -> Option<String> {
     let mine = set.iter().rev().find(|(k, _)| k == CONTENT).map(|(_, v)| v.clone());
     mine.or(outside).filter(|v| !v.trim().is_empty())
 }
 
-/// 接管时不照搬的:接哪段对话的那几个开关
+/// Not carried over when adopting: the flags saying which conversation to resume
 fn not_carried(rest: &[String]) -> usize {
     match rest[0].as_str() {
         "-c" | "--continue" | "--fork" => 1,
@@ -79,13 +85,13 @@ fn not_carried(rest: &[String]) -> usize {
     }
 }
 
-/// 窗格标题 `OC | 修登录` → `修登录`;还没起标题时是 `OpenCode`
+/// Pane title `OC | 修登录` → `修登录` ("fix login"); before it has a title it's `OpenCode`
 fn pane_title(title: &str) -> Option<String> {
     let name = title.trim().strip_prefix("OC | ")?.trim();
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// 框线、左边那条竖线去掉
+/// Strip box lines and the vertical bar on the left
 fn bare(l: &str) -> &str {
     l.trim().trim_start_matches(['┃', '╹', '│']).trim()
 }
@@ -110,7 +116,8 @@ impl Agent for Opencode {
         Ok(vec![(CONTENT.to_string(), content(theirs(set, outside).as_deref(), &format!("file://{}", file.display()), mcp))])
     }
 
-    /// 知道对话 id 就接(第一句话发出去才有);分叉出来没说过话的从原来那段重新分
+    /// Resume if the conversation id is known (only once the first message is sent); a fork never talked to forks again from
+    /// the original
     fn resume(&self, conv: &str, r: &Run) -> How {
         match (conv.is_empty(), r.fork_from.is_empty()) {
             (false, _) => How::Resume(conv.to_string()),
@@ -119,7 +126,7 @@ impl Agent for Opencode {
         }
     }
 
-    /// 插件报的标题;没报(接管来还没重启的)看窗格标题
+    /// The title the plugin reports; if none (adopted, not restarted yet), the pane title
     fn title(&self, r: &Run, pane: &str) -> Option<String> {
         (!r.hook_title.is_empty()).then(|| r.hook_title.clone()).or_else(|| pane_title(pane))
     }
@@ -130,7 +137,7 @@ impl Agent for Opencode {
         Live { conv, args: super::carry(argv, not_carried), ..Default::default() }
     }
 
-    /// 「Allow once   Allow always   Reject」:光标一开始在 Allow once 上,回车同意;Esc 拒绝
+    /// "Allow once   Allow always   Reject": the cursor starts on Allow once, Enter approves; Esc denies
     fn permission_keys(&self) -> Option<(&'static str, &'static str)> {
         Some(("Enter", "Escape"))
     }
@@ -143,12 +150,13 @@ impl Agent for Opencode {
         true
     }
 
-    /// `--prompt <那句话>`:起来就发。横线开头的会被当成开关,那样的起来之后打字进去
+    /// `--prompt <message>`: sent once it's up. One starting with a dash would be taken as a flag, so it's typed in once it's up
     fn opening(&self, text: &str) -> Option<Vec<String>> {
         (!text.starts_with('-')).then(|| vec!["--prompt".to_string()])
     }
 
-    /// 权限框(问的那句取框里的命令),底栏的「esc interrupt」。别的(问你的题长什么样不一定)认不出,听 hook 的
+    /// The permission prompt (the question is the command in the box), and "esc interrupt" in the bottom bar. Anything else (a
+    /// question to you can look different) can't be recognized; follow the hook
     fn screen(&self, lines: &[String]) -> Seen {
         let rows: Vec<&str> = lines.iter().map(|l| bare(l)).filter(|l| !l.is_empty()).collect();
         let tail = &rows[rows.len().saturating_sub(12)..];
@@ -191,10 +199,10 @@ mod tests {
             v(content(Some(yours), "file:///p.js", none())),
             json!({ "model": "x/y", "plugin": ["opencode-wakatime", "file:///p.js"] })
         );
-        // 写坏了的、不是对象的:只放 aca 的
+        // Broken, or not an object: only aca's
         assert_eq!(v(content(Some("not json"), "file:///p.js", none())), json!({ "plugin": ["file:///p.js"] }));
         assert_eq!(v(content(Some(r#"{"plugin":"one"}"#), "file:///p.js", none())), json!({ "plugin": ["file:///p.js"] }));
-        // 插件的 MCP 服务:和你的放在一起
+        // Plugins' MCP servers: put together with yours
         let mcp = crate::plugin::mount::opencode_mcp("/bin/aca", &[("aca".into(), vec!["plugin".into(), "tools".into()])]);
         let yours = r#"{"mcp":{"gh":{"type":"remote","url":"https://x"}}}"#;
         assert_eq!(
@@ -213,7 +221,7 @@ mod tests {
 
     #[test]
     fn the_screen_shows_the_permission_box_and_the_interrupt_hint() {
-        // 1.19.3 上抓的
+        // Captured on 1.19.3
         let ask = "  ┃  RUN:echo hi-from-bash\n  ┃\n     $ echo hi-from-bash\n     ▣  Build · Fake One\n  ┃\n  ┃  △ Permission required\n  ┃    # Shell command\n  ┃\n  ┃  $ echo hi-from-bash\n  ┃\n  ┃\n  ┃   Allow once   Allow always   Reject                                 ctrl+f fullscreen  ⇆ select  enter confirm\n  ┃\n";
         assert_eq!(Opencode.screen(&lines(ask)), Seen::Ask("echo hi-from-bash".into()));
         let busy = "  ┃  Build · Fake One Fake\n  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n   ■■■■■■⬝⬝  esc interrupt                       tab agents  ctrl+p commands\n";

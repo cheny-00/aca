@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | sh
 ```
 
 This puts a single file at `~/.local/bin/aca` and installs nothing else. (No prebuilt binary for your machine,
-or you would rather download it yourself? [Install](../README.md#install) in the README has the other two ways.)
+or you would rather download it yourself? [Install](install.md) has the other two ways.)
 When it finishes you should see:
 
 ```
@@ -135,7 +135,7 @@ Press `?` in the interface for the full list. These cover most days:
 | `Ctrl+S` | Settings: theme, language, accounts |
 | `q` `q` | Quit aca. Sessions keep running |
 
-The README's [Keys](../README.md#keys) section lists a few more, the keys that work inside a session, and
+[Keys](keys.md) lists a few more, the keys that work inside a session, and
 which keys you can change.
 
 ## 7. More than one account
@@ -163,17 +163,17 @@ aca new claude:work ~/code/app
 ```
 
 `aca setup` shows the same thing as one screen (press `+` to add an account), and `Ctrl+S` then `a` in the
-interface opens the accounts page, which also shows which accounts are logged in. More detail is in the
-[Accounts section of the README](../README.md#accounts).
+interface opens the accounts page, which also shows which accounts are logged in. More detail is in
+[Accounts](accounts.md).
 
 ## 8. Optional extras
 
 Everything here is optional. Take what is useful.
 
 **See Claude's subscription limits.** Run `aca setup`, move to a Claude account, use `←` `→` to choose how
-to connect its status bar, and press `Enter`. `aca setup --statusline off` undoes it. The
-[README](../README.md#claudes-subscription-limits-and-status-bar) explains what the choices mean and
-exactly what gets changed.
+to connect its status bar, and press `Enter`. `aca setup --statusline off` undoes it.
+[Claude's subscription limits and status bar](accounts.md#claudes-subscription-limits-and-status-bar)
+explains what the choices mean and exactly what gets changed.
 
 **Open aca from inside any session.** `aca tmux install` adds tmux keys that pop aca up over the session
 you are in (prefix then `a`, or `Ctrl+\`), and shows how many sessions are waiting in the tmux status
@@ -191,7 +191,7 @@ them all.
 [lazygit](https://github.com/jesseduffield/lazygit) (`l` on the changes page), and uses
 [fzf](https://github.com/junegunn/fzf) and [zoxide](https://github.com/ajeetdsouza/zoxide) to help you pick
 directories. aca never installs these for you. Install the ones you want yourself; the full list with what
-each one adds is in the [README](../README.md#optional-tools).
+each one adds is in [Optional tools](install.md#optional-tools).
 
 **Plugins.** Press `P` in the interface to see what is available. For example `aca.notify` sends a desktop
 notification when a session finishes or needs you. See [plugins.md](plugins.md).
@@ -238,4 +238,4 @@ issue on GitHub.
 ## Upgrading and removing
 
 Run the install command again to upgrade. To remove aca completely, follow
-[Uninstall in the README](../README.md#uninstall).
+[Uninstall](install.md#uninstall).

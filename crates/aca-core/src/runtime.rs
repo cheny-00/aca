@@ -1,7 +1,8 @@
-//! 一个会话的运行时状态:`~/.local/state/aca/run/<id>.json`。hook 每个事件来了改它,列表、命令行读它。
+//! A session's runtime state: `~/.local/state/aca/run/<id>.json`. Hooks change it on every event; the list and the CLI read it.
 //!
-//! 一个会话一个文件,不进登记表:hook 写的时候不用等别的会话,也不会被界面查库挡住。
-//! 改 = 拿这个会话的锁 → 读 → 改 → 原子写回,所以同一个会话的两个事件前后脚到也不会丢一个。
+//! One file per session, not in the registry: a hook writing it doesn't wait for other sessions, and isn't held up by the
+//! interface querying the database. Changing = take this session's lock → read → change → write back atomically, so two events
+//! of the same session arriving back to back don't lose one.
 
 use std::collections::BTreeMap;
 
@@ -9,16 +10,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
-/// 插件挂在会话行上的一小段字(`aca meta set`),列表行里按名字取
+/// A short piece of text a plugin hangs on the session row (`aca meta set`), picked by name in the list row
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Token {
     pub value: String,
-    /// 过了这个时刻不再显示;0 = 一直留着
+    /// No longer shown after this moment; 0 = kept forever
     #[serde(default, skip_serializing_if = "is_zero")]
     pub until: u64,
 }
 
-/// 行上怎么写一个挂的字:「[pr #12]」;名字以 _ 开头的只写值,给图标、数字这种一看就懂的(「▣2」)
+/// How a hung piece of text is written on the row: "[pr #12]"; a name starting with _ writes only the value, for icons, numbers
+/// and the like that read at a glance ("▣2")
 pub fn mark(name: &str, value: &str) -> String {
     if name.starts_with('_') { value.into() } else { format!("[{name} {value}]") }
 }
@@ -30,80 +32,95 @@ fn is_zero(n: &u64) -> bool {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Run {
-    /// hook 说的状态:running / waiting / done / idle / error / ended;空 = 还没收到过事件
+    /// The state the hook reports: running / waiting / done / idle / error / ended; empty = no event received yet
     pub status: String,
-    /// 最后一个事件和它的时刻
+    /// The last event and its time
     pub event: String,
     pub ts: u64,
-    /// 现在这段对话的 id(/clear、压缩之后会换),和换过的每一个(计费把用量归到会话用)
+    /// The id of the current conversation (changes after /clear or compaction), and every one it has had (billing uses them to
+    /// assign usage to the session)
     pub conv: String,
     pub convs: Vec<String>,
     pub transcript: String,
     pub cwd: String,
-    /// 在等你时它问的那句
+    /// The question it asks when it needs you
     pub ask: String,
-    /// 问的是哪种:choice(选择题)/ permission(要不要让它跑)/ 空 = 看不出(只在屏幕上认出来的、启动时那几道关)
+    /// What kind of question: choice (multiple choice) / permission (whether to let it run) / empty = can't tell (recognized only on
+    /// the screen, the gates at startup)
     pub ask_kind: String,
-    /// 选择题的选项(只记第一题的);`ask_multi` = 一次问了好几题,或者能多选:按一个数字答不了
+    /// The options of a multiple-choice question (only the first question's); `ask_multi` = several questions at once, or
+    /// multi-select: can't be answered with one number
     pub ask_opts: Vec<String>,
     pub ask_multi: bool,
-    /// 这一轮你说的那句(截断)
+    /// What you said this turn (truncated)
     pub prompt: String,
-    /// 最后一条回复(截断):`c` 复制、通知、插件都从这拿,不用再去翻对话记录
+    /// The last reply (truncated): `c` copy, notices and plugins all take it from here, without digging through the conversation
+    /// record again
     pub last: String,
-    /// 这一轮结束时还挂着的后台任务数
+    /// Background tasks still running when this turn ended
     pub bg: u32,
-    /// 这一轮开始 / 最近一次跑完的时刻
+    /// When this turn started / last finished
     pub turn: u64,
     pub done: u64,
-    /// 看过的时刻:跑完在这之后的算「没看」
+    /// When it was last looked at: finishing after this counts as unread
     pub seen: u64,
-    /// agent 自己起的标题;`locked` = 人改过名,不再跟
+    /// The title the agent set itself; `locked` = renamed by a person, no longer followed
     pub auto_title: String,
-    /// hook 里报上来的标题(协议的 `title`)。报不报、`auto_title` 跟不跟它,看各家的 `Agent::title`
+    /// The title reported in the hook (the protocol's `title`). Whether it's reported, and whether `auto_title` follows it, depends on
+    /// each tool's `Agent::title`
     pub hook_title: String,
     pub locked: bool,
-    /// 上次交给 Claude 当它自己名字的(`aca hook-name`):它还叫这个、你又在 aca 里改了名,就跟过去
+    /// The name last handed to Claude as its own name (`aca hook-name`): if it's still called that and you renamed it in aca again,
+    /// follow along
     pub named: String,
     pub error: String,
-    /// 这一轮失败是哪一类:transient(过一会儿接着说就好)/ account(额度、登录,要人处理)/ fatal
-    /// (见 [`crate::agent::lifecycle::error_kind`])
+    /// What kind of failure this turn was: transient (just carry on in a while) / account (limits, login: needs a person) / fatal
+    /// (see [`crate::agent::lifecycle::error_kind`])
     pub error_kind: String,
-    /// 分叉出来的会话:从哪段对话分的。分出来还没说过话就停了的,自己没有对话记录,再起时得重新分一次
+    /// A forked session: which conversation it forked from. One stopped before saying anything after the fork has no conversation
+    /// record of its own, and has to be forked again when started
     pub fork_from: String,
-    /// 门铃接上了:这次起来时 SessionStart 让它盯着自己的门铃文件(`aca inbox watch`)。每次启动先放下,接上了再立起来
+    /// The doorbell is connected: on this start, SessionStart had it watch its own doorbell file (`aca inbox watch`). Lowered at
+    /// every start, raised once connected
     pub bell: bool,
-    /// 哪些事通知 parent(done,failed,exited,waiting 里的几个,逗号隔开;none = 都不);空 = 照配置的
+    /// Which events to tell the parent about (some of done,failed,exited,waiting, comma-separated; none = no events); empty = as
+    /// configured
     pub notify: String,
     pub tokens: BTreeMap<String, Token>,
-    /// 这次起来时插件给它带了什么(见 `plugin::mount::signature`):和现在的一比,不一样就是要重启才带上
+    /// What plugins gave it on this start (see `plugin::mount::signature`): compared with the current one, a difference means a
+    /// restart is needed to pick it up
     pub mounts: String,
-    /// 这次 agent 是什么时候起的(`session::launch`):刚起的那一会儿,启动时的关有人替你答(见 [`crate::trust`])
+    /// When the agent was started this time (`session::launch`): for a short while after starting, the startup gates get answered
+    /// for you (see [`crate::trust`])
     #[serde(skip_serializing_if = "is_zero")]
     pub started: u64,
-    /// 起的那一刻对话记录是哪一份、已经有多长(`session::launch`):这次定的只会写在后面,找定时时从这往后读就够
-    /// ([`crate::schedule::due`])。/clear 换的新对话是新文件,照旧从头
+    /// Which conversation record it was at the moment of starting, and how long it already was (`session::launch`): schedules set
+    /// this time are only written after that, so finding schedules only needs to read on from there ([`crate::schedule::due`]). A
+    /// new conversation from /clear is a new file, read from the start as usual
     #[serde(skip_serializing_if = "String::is_empty")]
     pub started_file: String,
     #[serde(skip_serializing_if = "is_zero")]
     pub started_len: u64,
-    /// 闲着被 aca 停掉的时刻([`crate::session::stop_idle`]):列表里画 ☾,和人停的 ■ 分开。再起、人再停一次就清掉
+    /// When aca stopped it for sitting idle ([`crate::session::stop_idle`]): the list draws ☾, apart from ■ for one a person stopped.
+    /// Cleared when it's started again or a person stops it again
     #[serde(skip_serializing_if = "is_zero")]
     pub idle_stopped: u64,
-    /// 从回收站拿回来 / 取消归档的时刻([`crate::session::archive`]):停着的算多久没动也算它,
-    /// 拿回来的不会下一轮又被自动删(`[idle] remove_after`)
+    /// When it was brought back from the trash / unarchived ([`crate::session::archive`]): also counts for how long a stopped one has
+    /// been untouched, so one brought back isn't auto-deleted again on the next round (`[idle] remove_after`)
     #[serde(skip_serializing_if = "is_zero")]
     pub restored: u64,
-    /// 开始压缩对话的时刻(Claude 的 PreCompact;手动 /compact、上下文满了、闲着快一小时它自己压的都报),压完就清掉。
-    /// 闲着自己压的那种 hook 状态一直是「跑完」,靠它才知道正在压,不在这时停([`crate::session::stop_idle`])
+    /// When compacting the conversation started (Claude's PreCompact; manual /compact, a full context, and the compaction it does
+    /// itself after nearly an hour idle are all reported), cleared once done. With compaction done on its own while idle, the hook
+    /// state stays "done" the whole time; only this tells it's compacting, so it isn't stopped then ([`crate::session::stop_idle`])
     #[serde(skip_serializing_if = "is_zero")]
     pub compacting: u64,
-    /// 换过账号接着跑的([`crate::session::rehome`]),一次一条。换之前的那几轮两个账号目录里都有,计费靠它归回原来那个
+    /// Account changes it carried on through ([`crate::session::rehome`]), one row each. The turns before a change are in both account
+    /// directories; billing uses this to assign them back to the original one
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub moves: Vec<Move>,
 }
 
-/// 一次换账号:什么时候、哪段对话、从哪个配置目录拷到哪个
+/// One account change: when, which conversation, which configuration directory it was copied from and to
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Move {
@@ -114,9 +131,11 @@ pub struct Move {
 }
 
 impl Run {
-    /// agent 最后真有动静的时刻(hook 一个事都没报过是 0):这一轮开始 / 跑完、aca 起它、开始问你。
-    /// 闲着的 Claude 换了设置、窗口变了大小也会重画、往对话记录里补几行,窗口的活动时间、记录的修改时间都会跟着变成「刚刚」;
-    /// 闲了一会儿的提醒(Notification)也不算动静。列表算多久没动、自动停都照它
+    /// The last time the agent really did something (0 if the hook never reported an event): this turn starting / finishing, aca
+    /// starting it, starting to ask you. An idle Claude also redraws and adds a few lines to the conversation record when settings
+    /// change or the window resizes, so the window's activity time and the record's modified time both become "just now"; the
+    /// reminder after a while idle (Notification) doesn't count either. How long the list says it's been untouched, and auto-stop,
+    /// both go by this
     pub fn hook_at(&self) -> u64 {
         if self.ts == 0 {
             return 0;
@@ -125,12 +144,12 @@ impl Run {
         [self.turn, self.done, self.started, asked].into_iter().max().unwrap_or(0)
     }
 
-    /// 还没过期的那些
+    /// The ones not expired yet
     pub fn live_tokens(&self, now: u64) -> BTreeMap<String, String> {
         self.tokens.iter().filter(|(_, t)| t.until == 0 || t.until > now).map(|(k, t)| (k.clone(), t.value.clone())).collect()
     }
 
-    /// 不在等你了:问的那句和选项一起清掉
+    /// No longer needs you: clear the question and the options together
     pub fn clear_ask(&mut self) {
         self.ask.clear();
         self.ask_kind.clear();
@@ -138,13 +157,13 @@ impl Run {
         self.ask_multi = false;
     }
 
-    /// 不算出错了:原文和类别一起清掉
+    /// No longer an error: clear the text and the kind together
     pub fn clear_error(&mut self) {
         self.error.clear();
         self.error_kind.clear();
     }
 
-    /// 出错的类别给人看的那几个字(没有类别是空的)
+    /// The few words shown to people for the error kind (empty when there's no kind)
     pub fn error_kind_said(&self) -> &'static str {
         match self.error_kind.as_str() {
             "transient" => crate::t!(
@@ -174,11 +193,11 @@ pub fn load(id: &str) -> Run {
     std::fs::read_to_string(paths::run_file(id)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
-/// 拿锁、读、改、写回;返回 (改之前的, 改之后的)
+/// Take the lock, read, change, write back; returns (before the change, after the change)
 pub fn update(id: &str, f: impl FnOnce(&mut Run)) -> (Run, Run) {
     let path = paths::run_file(id);
     let _ = std::fs::create_dir_all(path.parent().unwrap());
-    // 锁在旁边一个不动的文件上:状态文件自己每次都是换一个新的进来
+    // Lock a separate file that stays put: the state file itself is replaced by a new one every time
     let lock = std::fs::OpenOptions::new().create(true).append(true).open(path.with_extension("lock"));
     if let Ok(l) = &lock {
         let _ = l.lock();
@@ -198,7 +217,7 @@ pub fn remove(id: &str) {
     let _ = std::fs::remove_file(path);
 }
 
-/// 留开头的 n 个字
+/// Keep the first n characters
 pub fn clip(s: &str, n: usize) -> String {
     match s.char_indices().nth(n) {
         Some((i, _)) => format!("{}…", &s[..i]),

@@ -1,20 +1,22 @@
-//! 声明式工具:不写代码,在 config.toml 里写一段 `[tools.<名字>]` 就能接进来(照 agent-deck 的 `[tools.X]`)。
+//! Declared tools: no code, just a `[tools.<name>]` section in config.toml to plug one in (following agent-deck's
+//! `[tools.X]`).
 //!
 //! ```toml
 //! [tools.aider]
-//! cmd = ["aider"]                     # 不写就是工具名
-//! home_var = "AIDER_HOME"             # 账号的 home(配置目录)交给哪个环境变量;不写的话账号里只能用 env / args
-//! resume = ["--session", "{conv}"]    # 接着对话:{conv} 换成对话 id
-//! fork = ["--fork", "{conv}"]         # 从一段对话分叉;不写就不能分叉
-//! busy = ['Working\.\.\.']            # 屏幕底部出现就算在跑(正则,任一条)
-//! ask = ['\(y/n\)', 'Allow .*\?']     # 屏幕底部出现就算在等你
-//! title = "pane"                      # 标题取窗格标题(开头转圈的字符去掉);不写就只用 hook 报的
-//! env = { FOO = "1" }                 # 起的时候加的环境变量
+//! cmd = ["aider"]                     # defaults to the tool name
+//! home_var = "AIDER_HOME"             # which env variable gets the account's home (config dir); else accounts can only use env / args
+//! resume = ["--session", "{conv}"]    # resuming: {conv} becomes the conversation id
+//! fork = ["--fork", "{conv}"]         # forking a conversation; without it, no forking
+//! busy = ['Working\.\.\.']            # appears at the bottom of the screen = running (regexes, any one)
+//! ask = ['\(y/n\)', 'Allow .*\?']     # appears at the bottom of the screen = needs you
+//! title = "pane"                      # title from the pane title (leading spinner removed); without it only what the hook reports
+//! env = { FOO = "1" }                 # environment variables added on start
 //! ```
 //!
-//! 只写这些:能起、停、在原地重启,列表里看得出在跑 / 在等你。对话 id 要有人报上来才接得上对话:
-//! agent 自己有插件 / 扩展机制的,写一个小转发,事件来了跑 `"$ACA_BIN" hook "$ACA_TOOL"`,
-//! 标准输入给一个 hook 协议的 JSON(形状见 [`super::lifecycle`]),对话 id、最后一条回复、跑完没看、标题就都有了。
+//! With just these it can start, stop, restart in place, and the list shows running / needs you. Resuming a conversation
+//! needs someone to report the conversation id: if the agent has its own plugin / extension mechanism, write a small
+//! forwarder that runs `"$ACA_BIN" hook "$ACA_TOOL"` on events, with a hook-protocol JSON on stdin (shape: see
+//! [`super::lifecycle`]), and the conversation id, the last reply, unread and the title all work.
 
 use regex::Regex;
 
@@ -52,7 +54,7 @@ fn fill(template: &[String], conv: &str) -> Vec<String> {
     template.iter().map(|a| a.replace("{conv}", conv)).collect()
 }
 
-/// 窗格标题开头转圈 / 状态的字符去掉:盲文点阵那一段(⠋⠙…)和 Claude 那几个星号
+/// Strip spinner / status characters at the start of the pane title: the braille block (⠋⠙…) and Claude's asterisks
 fn strip_spinner(title: &str) -> &str {
     title.trim_start_matches(|c: char| c.is_whitespace() || ('\u{2800}'..='\u{28FF}').contains(&c) || "✳✶✻✽✢·*".contains(c)).trim_end()
 }
@@ -98,7 +100,8 @@ impl Agent for Declared {
         Ok(argv)
     }
 
-    /// 知道对话 id、也写了怎么接,就接;分叉出来还没报过 id 的,从原来那段重新分
+    /// Resume if the conversation id is known and how to resume is set; a fork that hasn't reported an id yet forks again
+    /// from the original
     fn resume(&self, conv: &str, r: &Run) -> How {
         if !conv.is_empty() && !self.resume.is_empty() {
             How::Resume(conv.to_string())
@@ -113,7 +116,7 @@ impl Agent for Declared {
         self.pane_title
     }
 
-    /// hook 报了标题就用它;没报、又说了看窗格标题,就取窗格标题
+    /// Use the title if the hook reported one; if not, and the pane is the title source, take the pane title
     fn title(&self, r: &Run, pane_title: &str) -> Option<String> {
         if !r.hook_title.is_empty() {
             return Some(r.hook_title.clone());
@@ -122,7 +125,7 @@ impl Agent for Declared {
         (self.pane_title && !t.is_empty()).then(|| t.to_string())
     }
 
-    /// 只看底部这些行:往上翻的历史里出现过的字不算
+    /// Only look at these bottom lines: words in the history scrolled up don't count
     fn screen(&self, lines: &[String]) -> Seen {
         let nonempty: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
         let tail = &nonempty[nonempty.len().saturating_sub(15)..];
@@ -130,10 +133,10 @@ impl Agent for Declared {
             return Seen::Ask(clip(l, 200));
         }
         if tail.iter().any(|l| self.busy.iter().any(|re| re.is_match(l))) {
-            // 跑了多久屏幕上不一定有:列表用 hook 报的那一轮开始的时刻
+            // How long it's been running isn't necessarily on screen: the list uses the turn start time the hook reports
             return Seen::Running(0);
         }
-        // 没写 busy 的,屏幕上看不出在不在跑:别把 hook 报的「在跑」盖掉
+        // Without busy, the screen can't tell whether it's running: don't override the hook's "running"
         if self.busy.is_empty() { Seen::Unsure } else { Seen::Quiet }
     }
 }
@@ -165,7 +168,7 @@ mod tests {
         assert_eq!(run(How::Resume("c-1".into())), "toy --session c-1 -q --model x");
         assert_eq!(run(How::Fork("c-1".into())), "toy fork --from=c-1 -q --model x");
         assert!(d.can_fork());
-        // 自己定了命令:模板接在命令后面
+        // Its own command: the template follows the command
         let wrapped = Tool { cmd: vec!["/w/run.sh".into()], ..t.clone() };
         assert_eq!(d.argv(&wrapped, &s, &How::Resume("c".into()), "aca").unwrap()[..3], ["/w/run.sh", "--session", "c"]);
     }
@@ -175,7 +178,7 @@ mod tests {
         let d = toy("resume = [\"--session\", \"{conv}\"]");
         assert_eq!(d.resume("c-1", &Run::default()), How::Resume("c-1".into()));
         assert_eq!(d.resume("", &Run::default()), How::Fresh);
-        // 不能分叉的,就算是分叉出来的也只能新开
+        // Can't fork: even a fork can only start fresh
         assert_eq!(d.resume("", &Run { fork_from: "c-0".into(), ..Default::default() }), How::Fresh);
         let bare = toy("");
         assert_eq!(bare.resume("c-1", &Run::default()), How::Fresh);
@@ -190,11 +193,11 @@ mod tests {
         assert_eq!(d.screen(&lines("> 改一下\n\n⠋ Working...\n")), Seen::Running(0));
         assert_eq!(d.screen(&lines("Working...\nRun rm -rf build? (y/n)\n")), Seen::Ask("Run rm -rf build? (y/n)".into()));
         assert_eq!(d.screen(&lines("done\n> ")), Seen::Quiet);
-        // 早就滚上去的不算
+        // Long scrolled up doesn't count
         let old = format!("Working...\n{}", "x\n".repeat(20));
         assert_eq!(d.screen(&lines(&old)), Seen::Quiet);
-        // 什么都没写的:屏幕上看不出东西
-        // 没写 busy:屏幕上看不出在不在跑,不说「没在跑」
+        // Nothing set: nothing to see on the screen
+        // No busy: the screen can't tell whether it's running, so it doesn't say "not running"
         assert_eq!(toy("").screen(&lines("Working...")), Seen::Unsure);
     }
 
@@ -206,7 +209,7 @@ mod tests {
         assert_eq!(pane.title(&Run::default(), "⠙ "), None);
         let said = Run { hook_title: "它报的".into(), ..Default::default() };
         assert_eq!(pane.title(&said, "⠙ 修登录").as_deref(), Some("它报的"));
-        // 没说看窗格:窗格标题多半是主机名,不拿
+        // Pane not chosen as the title source: the pane title is most likely the host name, don't take it
         assert_eq!(toy("").title(&Run::default(), "my-mac.local"), None);
     }
 

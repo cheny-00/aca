@@ -1,48 +1,53 @@
-//! `^Z` 撤销(做过能反悔的都撤):一步一步往回,最多记 `KEEP` 步,只在这个 aca 开着时有效,
-//! 不记重做。删会话、删分组撤得回,是因为 `d` 删的进回收站、1 天后才真删(见 trash.rs);挤出这 10 步的照样在回收站里。
-//! 重启、发便签、分叉做了就回不去,不记;关掉的窗格 / 普通 tmux 会话进程已经杀了,也记一步(`Gone`),
-//! `^Z` 到这只说撤不回 —— 免得越过它去撤更早的那步。
+//! `^Z` undo (anything that can be taken back is): one step at a time backwards, at most `KEEP` steps, only while this aca is
+//! open, no redo. Deleting a session or group can be undone because what `d` deletes goes to the trash and is only really
+//! deleted after 1 day (see trash.rs); steps pushed out of these 10 are still in the trash.
+//! Restart, sending a note, fork can't be taken back once done, so they aren't recorded; a closed pane / plain tmux session
+//! whose processes are already killed is still recorded as a step (`Gone`), and `^Z` there only says it can't be undone,
+//! so it doesn't skip past it to undo an earlier step.
 
 use crate::data::State;
 use crate::ops::Target;
 use crate::reads::Mark;
 use crate::spaces::Group;
 
-/// 最多记这么多步
+/// At most this many steps are kept
 pub const KEEP: usize = 10;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Undo {
-    /// d 删的登记的会话 / 分组:回收站里的那一条(id),label 是它叫什么;start:删之前在跑的会话,撤回后再启动
+    /// A registered session / group deleted with d: its entry (id) in the trash, label is its name; start: sessions that were
+    /// running before the delete, started again after the undo
     Bin { id: String, label: String, start: Vec<String> },
-    /// d 关掉的窗格 / 删掉的普通 tmux 会话:撤不回
+    /// A pane closed / plain tmux session deleted with d: can't be undone
     Gone { title: String },
-    /// D 停掉的:撤回 = 再启动
+    /// Stopped with D: undo = start again
     Stop { t: Target },
-    /// D 停下的那一格(会话里另开的窗口 / 普通 tmux 会话):撤回 = 在原地再启动(见 park.rs)
+    /// The pane stopped with D (an extra window inside a session / a plain tmux session): undo = start again in place (see park.rs)
     Park { t: Target, p: crate::park::Pane },
-    /// m:挪回 from
+    /// m: move back to from
     Move { t: Target, from: String, groups: Vec<String> },
-    /// r:改回 from;unlock:原来的标题没锁(改名会锁上)
+    /// r: rename back to from; unlock: the title wasn't locked before (renaming locks it)
     Rename { t: Target, from: String, unlock: bool },
-    /// M:反过来挂 / 卸
+    /// M: attach / detach the other way round
     Mcp { t: Target, dir: String, on: Vec<String>, off: Vec<String> },
-    /// p:原来置顶在第几个(None = 原来没置顶)。撤的时候按 key(`notes::key`)找现在的那一行
+    /// p: the position it was pinned at (None = it wasn't pinned). On undo the current row is found by key (`notes::key`)
     Pin { key: String, name: String, title: String, rank: Option<usize> },
-    /// u:已读文件里原来记的、原来的状态;what:当时标成了什么(已读 / 未读);seen:登记的会话标成已读时,核心那份原来记的「看过」的时刻
+    /// u: what the seen file recorded before, and the state before; what: what it was marked as then (seen / unread); seen: when
+    /// a registered session was marked seen, the "seen" time the core's copy recorded before
     Read { key: String, name: String, title: String, what: String, mark: Option<Mark>, state: State, seen: Option<u64> },
-    /// Q:工作区文件里这些会话 / 组原来记的
+    /// Q: what the workspace file recorded before for these sessions / groups
     Space { what: String, sessions: Vec<(String, Option<char>)>, groups: Vec<(Group, Option<char>)> },
-    /// e / ^G:原来的便签(空 = 原来没有)
+    /// e / ^G: the note before (empty = there was none)
     Note { key: String, title: String, text: String },
-    /// 分组上 r:改回去(名字、默认目录),就是反过来再改一次
+    /// r on a group: change it back (name, default folder), i.e. change it again the other way
     Group(crate::groups::Act),
-    /// v 多选后一起做的(停、挪分组、置顶、标已读 / 未读):一步全撤回。一起删的在回收站里是一条,记的是 `Bin`
+    /// Done together after selecting with v (stop, move group, pin, mark seen / unread): all undone in one step. Deleted
+    /// together is one entry in the trash, recorded as `Bin`
     Many(Vec<Undo>),
 }
 
 impl Undo {
-    /// 要在后台撤的那几种:撤的是哪个会话
+    /// The kinds that are undone in the background: which session the undo is for
     pub fn target(&self) -> Option<&Target> {
         match self {
             Undo::Stop { t, .. } | Undo::Move { t, .. } | Undo::Rename { t, .. } | Undo::Mcp { t, .. } => Some(t),
@@ -51,7 +56,7 @@ impl Undo {
     }
 }
 
-/// 最近做的在最后;超过 KEEP 步挤掉最早的
+/// The most recent is last; past KEEP steps the oldest is pushed out
 pub fn push(stack: &mut Vec<Undo>, u: Undo) {
     stack.push(u);
     if stack.len() > KEEP {

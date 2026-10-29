@@ -1,21 +1,26 @@
-//! 计费(`$`)的数据:这台电脑上 Claude / Codex 的每次调用,一律按官方 API 价折成美元 —— 订阅账号也照算,
-//! 算的是「这些量按 API 买要多少钱」,不管套餐月费;再加上订阅额度还剩多少。
+//! Billing (`$`) data: every Claude / Codex call on this machine, always priced in USD at the official API rates (subscription
+//! accounts too). It's "what this much would cost bought through the API", ignoring plan fees; plus how much subscription quota is left.
 //!
-//! 只读本地文件,不联网、不碰登录凭证:
-//! - 用量:账号目录里的对话记录。Claude 是 `projects/**/*.jsonl`(子代理的也在里面),Codex 是 `sessions/**/rollout-*.jsonl`
-//! - Claude 额度:statusLine 过 `aca limits` 时按会话记下的(带数据时间,见 limits)
-//! - Codex 额度:Codex 自己写在对话记录里的 rate_limits(最近一次用它时的)
-//! - 对话归哪个会话:登记表里记的对话 id,加上 hook 报过的每一个(/clear、压缩之后会换,见 `runtime::Run::convs`)
+//! Reads local files only; no network, never touches login credentials:
+//! - Usage: conversation records in the account directories. Claude: `projects/**/*.jsonl` (subagents' are in there too);
+//!   Codex: `sessions/**/rollout-*.jsonl`
+//! - Claude quota: recorded per session when the statusLine goes through `aca limits` (with the data's time, see limits)
+//! - Codex quota: the rate_limits Codex itself writes into the conversation record (from the last time it was used)
+//! - Which session a conversation belongs to: the conversation id in the registry, plus every one a hook has reported
+//!   (it changes after /clear or compaction, see `runtime::Run::convs`)
 //!
-//! 同一次调用会被记好几遍,要去重:
-//! - Claude:一条回复按内容块拆成几行,usage 抄在每一行上(最后一行的输出数最全);resume / 分叉把历史整段抄进新文件。
-//!   按 message.id + requestId 认,留输出最多的那行
-//! - Codex:分叉 / 子代理把父对话的记录连时间戳整段抄过去;额度刷新时把没变的累计数再报一遍。
-//!   按(时间, 累计数)认,同一个文件里累计数没变的跳过
+//! The same call is recorded several times, so dedupe:
+//! - Claude: one reply is split into several lines by content block, with usage copied onto each (the last line's output count is
+//!   the most complete); resume / fork copies the whole history into a new file.
+//!   Keyed by message.id + requestId, keeping the line with the most output
+//! - Codex: fork / subagent copies the parent conversation's records over, timestamps and all; a quota refresh re-reports the
+//!   unchanged running total.
+//!   Keyed by (time, running total); within one file, an unchanged running total is skipped
 //!
-//! 记录有好几个 G(几个线程一起读,一两秒),读的时候内存要一百来 MB:界面里不在自己进程读,
-//! 而是起一个 `aca ui --cost-json` 子进程读完把结果交回来,读完内存就还了。
-//! 读过的存一份在 ~/.cache/aca/cost(见 `Scanner::load`),下回只读新写的
+//! The records run to several GB (read by several threads at once, a second or two), and reading takes 100-odd MB of memory: the UI
+//! doesn't read them in its own process, but starts an `aca ui --cost-json` child process that reads them and hands the result back,
+//! so the memory is returned once it's done.
+//! What has been read is saved in ~/.cache/aca/cost (see `Scanner::load`); next time only what's newly written is read
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -33,11 +38,12 @@ use aca_core::{t, tr};
 
 use crate::data::Agent;
 
-// ---------- 价格 ----------
+// ---------- Prices ----------
 
-/// 美元 / 百万 token:输入、5 分钟缓存写、1 小时缓存写、缓存读、输出。
-/// 抄自 Anthropic、OpenAI 的官方价目表(2026-09-30)。OpenAI 的缓存写只有一档,两格一样;没有缓存写价的填输入价。
-/// Claude 4.6 起 100 万上下文也是这个价;Codex 的上下文(25.8 万)到不了 OpenAI 27.2 万以上的长上下文价
+/// USD per million tokens: input, 5-minute cache write, 1-hour cache write, cache read, output.
+/// Copied from Anthropic's and OpenAI's official price lists (2026-09-30). OpenAI has only one cache-write tier, so both columns
+/// match; models with no cache-write price get the input price.
+/// From Claude 4.6 on, the 1M context costs the same; Codex's context (258K) never reaches OpenAI's long-context price above 272K
 const PRICES: &[(&str, [f64; 5])] = &[
     ("claude-fable-5-1", [10.0, 12.5, 20.0, 0.25, 50.0]),
     ("claude-mythos-5-1", [10.0, 12.5, 20.0, 0.25, 50.0]),
@@ -79,11 +85,11 @@ const PRICES: &[(&str, [f64; 5])] = &[
     ("gpt-5-mini", [0.25, 0.25, 0.25, 0.025, 2.0]),
 ];
 
-/// 联网搜索:每次 1 美分(Claude 的 web_search,另算在 token 之外)
+/// Web search: 1 cent per search (Claude's web_search, billed on top of tokens)
 const SEARCH: f64 = 0.01;
 
-/// 记录里的模型名 → 价目表里的名字:去掉 `[1m]` 这类后缀、`-20251001` 这类日期、`azure:` / `openai/` 这类前缀;
-/// Claude 的版本号有写成 4.6 的,统一成 4-6
+/// Model name in the record → name in the price list: drop suffixes like `[1m]`, dates like `-20251001`, prefixes like
+/// `azure:` / `openai/`; Claude versions written as 4.6 become 4-6
 pub fn model_key(m: &str) -> String {
     let m = m.split('[').next().unwrap_or(m).trim();
     let m = m.rsplit(['/', ':']).next().unwrap_or(m).to_ascii_lowercase();
@@ -99,7 +105,7 @@ pub fn price(model: &str) -> Option<[f64; 5]> {
     PRICES.iter().find(|(n, _)| *n == k).map(|(_, p)| *p)
 }
 
-/// 快速模式的加价(官方价目表:这三个是两倍,缓存价跟着翻)
+/// Fast-mode surcharge (official price list: these three are doubled, cache prices along with them)
 fn fast_factor(model: &str) -> f64 {
     match model_key(model).as_str() {
         "claude-opus-5-5" | "claude-opus-5" | "claude-opus-4-8" => 2.0,
@@ -107,8 +113,8 @@ fn fast_factor(model: &str) -> f64 {
     }
 }
 
-/// 一次调用按 API 价多少钱(会话记录 `Z` 用,口径同这里):tok 是输入、5 分钟缓存写、1 小时缓存写、缓存读、输出。
-/// 价目表里没有这个模型 = None
+/// What one call costs at API prices (used by the session record's `Z`, same basis as here): tok is input, 5-minute cache write,
+/// 1-hour cache write, cache read, output. Model not in the price list = None
 pub fn call_cost(model: &str, tok: [u64; 5], fast: bool, us: bool, searches: u64) -> Option<f64> {
     let p = price(model)?;
     let mult = if fast { fast_factor(model) } else { 1.0 } * if us { 1.1 } else { 1.0 };
@@ -116,53 +122,55 @@ pub fn call_cost(model: &str, tok: [u64; 5], fast: bool, us: bool, searches: u64
     Some((0..5).map(|k| m(tok[k], p[k])).sum::<f64>() + searches as f64 * SEARCH)
 }
 
-// ---------- 记录 ----------
+// ---------- Records ----------
 
-/// 一次调用
+/// One call
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Rec {
-    /// 去重用(见文件头)
+    /// For dedup (see the file header)
     key: u64,
     ts: i64,
-    /// 这个文件的第几个模型(Seen.models)
+    /// Which of this file's models (Seen.models)
     model: u16,
-    /// 输入(不含缓存)、5 分钟缓存写、1 小时缓存写、缓存读、输出
+    /// Input (excluding cache), 5-minute cache write, 1-hour cache write, cache read, output
     tok: [u32; 5],
-    /// 快速模式、指定只在美国推理(Claude 的加价)
+    /// Fast mode, US-only inference (Claude's surcharges)
     fast: bool,
     us: bool,
     searches: u16,
 }
 
-/// 一个记录文件读到哪、读出了什么
+/// How far one record file has been read, and what came out of it
 #[derive(Debug, Default)]
 struct Seen {
     src: usize,
     agent: Agent,
-    /// 上次看到的文件大小;没变就不读
+    /// File size last seen; unchanged = don't read
     len: u64,
-    /// 读到哪(整行为止,写到一半的那行下次再读)
+    /// Read up to here (whole lines only; a half-written line is read next time)
     off: u64,
-    /// 这个文件记的是哪段对话:Claude 的 sessionId(子代理的记在父对话上),Codex 的线程 id(子代理的记在父线程上)
+    /// Which conversation this file records: Claude's sessionId (a subagent's is filed under the parent conversation),
+    /// Codex's thread id (a subagent's is filed under the parent thread)
     conv: String,
     conv_set: bool,
     cwd: String,
     models: Vec<String>,
     recs: Vec<Rec>,
-    /// key → recs 里的下标(同一个文件里的重复就地合并)。只在读的时候有,读完就扔(省内存,下次从 recs 重建)
+    /// key → index into recs (duplicates within one file merge in place). Only there while reading, dropped afterwards
+    /// (saves memory; rebuilt from recs next time)
     at: HashMap<u64, usize, Fast>,
-    /// Codex:最近一次 turn_context 的模型、上一次的累计数、最近一次的额度
+    /// Codex: the model from the latest turn_context, the previous running total, the latest quota
     cur: u16,
     total: Option<u64>,
     rate: Option<(i64, XRate)>,
-    /// Codex 的子线程 / 分叉出来的线程:开头抄的父线程历史写到这一秒为止(见 codex_line)
+    /// Codex child threads / forked threads: the parent-thread history copied in at the start runs up to this second (see codex_line)
     copied_until: i64,
 }
 
 impl Seen {
     fn new(src: usize, agent: Agent, path: &Path) -> Self {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        // Codex 的文件名是 rollout-<时间>-<线程 id>
+        // Codex file names are rollout-<time>-<thread id>
         let conv = if agent == Agent::Codex && stem.len() >= 36 { &stem[stem.len() - 36..] } else { stem };
         Seen { src, agent, conv: conv.to_string(), ..Default::default() }
     }
@@ -177,7 +185,7 @@ impl Seen {
         }
     }
 
-    /// 同一个 key 留输出最多的那条
+    /// For the same key, keep the one with the most output
     fn push(&mut self, r: Rec) {
         match self.at.entry(r.key) {
             Entry::Occupied(e) => {
@@ -198,8 +206,9 @@ impl Seen {
     }
 }
 
-/// 整数当键的表(去重、汇总里几百万次查表)用的哈希:同 rustc 的 FxHash。
-/// 默认的 SipHash 是防别人故意造碰撞的,这里的键都是自己算的,用不着,还慢好几倍
+/// Hash for integer-keyed maps (millions of lookups in dedup and totals): same as rustc's FxHash.
+/// The default SipHash guards against deliberately crafted collisions; these keys are all computed here, so it isn't needed,
+/// and it's several times slower
 #[derive(Default)]
 struct IntHash(u64);
 
@@ -233,7 +242,7 @@ fn u32s(v: [u64; 5]) -> [u32; 5] {
     v.map(|t| t.min(u32::MAX as u64) as u32)
 }
 
-/// null 当 0(有些字段写成 null)
+/// null counts as 0 (some fields are written as null)
 fn num<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
     Ok(Option::<u64>::deserialize(d)?.unwrap_or(0))
 }
@@ -302,7 +311,7 @@ static F_TURN: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"turn
 static F_META: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"session_meta\""));
 static F_SETTINGS: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\"thread_settings_applied\""));
 
-/// Claude 的一行:只要带 usage 的回复
+/// One Claude line: only replies that carry usage
 fn claude_line(s: &mut Seen, line: &[u8], at: u64) {
     if F_USAGE.find(line).is_none() || F_ASSISTANT.find(line).is_none() {
         return;
@@ -317,7 +326,7 @@ fn claude_line(s: &mut Seen, line: &[u8], at: u64) {
     if model == "<synthetic>" {
         return;
     }
-    // 老记录没有分 5 分钟 / 1 小时,算 5 分钟的
+    // Old records don't split 5 minutes / 1 hour; count them as 5 minutes
     let (w5, w1) = match &u.cache_creation {
         Some(c) if c.ephemeral_5m_input_tokens + c.ephemeral_1h_input_tokens > 0 => {
             (c.ephemeral_5m_input_tokens, c.ephemeral_1h_input_tokens)
@@ -383,7 +392,7 @@ struct XSettings {
     model: Option<String>,
 }
 
-/// token_count 的用量(会话记录 `trace_codex` 也照这个读,和这里算得一样)
+/// token_count usage (the session record, `trace_codex`, reads it the same way and gets the same numbers)
 #[derive(Deserialize)]
 pub(crate) struct XInfo {
     pub total_token_usage: Option<XUsage>,
@@ -407,7 +416,7 @@ pub(crate) struct XUsage {
     pub total_tokens: u64,
 }
 
-/// Codex 记下的额度
+/// Quota recorded by Codex
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct XRate {
     pub primary: Option<XWin>,
@@ -433,7 +442,7 @@ pub struct XCredits {
     pub balance: Option<serde_json::Value>,
 }
 
-/// Codex 的一行:自己的 session_meta(父线程、目录)、turn_context(模型)、token_count(用量和额度)
+/// One Codex line: its own session_meta (parent thread, directory), turn_context (model), token_count (usage and quota)
 fn codex_line(s: &mut Seen, line: &[u8]) {
     let meta = !s.conv_set && F_META.find(line).is_some();
     if !meta && F_TURN.find(line).is_none() && F_TOKEN_COUNT.find(line).is_none() && F_SETTINGS.find(line).is_none() {
@@ -442,7 +451,7 @@ fn codex_line(s: &mut Seen, line: &[u8]) {
     let Ok(l) = serde_json::from_slice::<XLine>(line) else { return };
     let Some(p) = l.payload else { return };
     match l.kind.as_deref() {
-        // 分叉 / 子代理的文件里后面还会抄进父对话的 session_meta,只认第一个
+        // Fork / subagent files later get the parent conversation's session_meta copied in as well; only the first one counts
         Some("session_meta") if !s.conv_set => {
             s.conv_set = true;
             let spawn = p
@@ -452,9 +461,11 @@ fn codex_line(s: &mut Seen, line: &[u8]) {
                 .and_then(|v| v.as_str())
                 .map(String::from);
             let parent = p.parent_thread_id.filter(|x| !x.is_empty()).or(spawn.filter(|x| !x.is_empty()));
-            // 子线程、分叉出来的线程开头整段抄了父线程的历史,连 token_count 一起、时间戳全改成新线程创建的时刻
-            // (去重的键对不上父线程的,会再算一遍)。本机 135 份:抄来的都在创建后 0.2 秒内,
-            // 它自己的第一次调用最早也在 4.8 秒后 —— 创建后 2 秒内的用量不算。分页分叉(history_base)没抄
+            // Child threads and forked threads start with a full copy of the parent thread's history, token_count included,
+            // with every timestamp changed to the moment the new thread was created (the dedup keys don't match the parent's,
+            // so it would count again). Across 135 files on this machine: the copies all fall within 0.2 s of creation, and
+            // the thread's own first call comes 4.8 s later at the earliest — so usage within 2 s of creation doesn't count.
+            // Paged forks (history_base) don't copy
             if (parent.is_some() || p.forked_from_id.is_some()) && p.history_base.is_none() {
                 s.copied_until = parse_ts(l.timestamp.as_deref().unwrap_or("")) + 2;
             }
@@ -468,7 +479,7 @@ fn codex_line(s: &mut Seen, line: &[u8]) {
                 learn(s, m);
             }
         }
-        // 没有 turn_context 的(子代理之类)模型写在这里,而且常常在第一次 token_count 之后
+        // Threads without a turn_context (subagents and such) write the model here, often after the first token_count
         Some("event_msg") if p.kind.as_deref() == Some("thread_settings_applied") => {
             if let Some(m) = p.thread_settings.and_then(|t| t.model).filter(|m| !m.is_empty()) {
                 learn(s, m);
@@ -477,7 +488,7 @@ fn codex_line(s: &mut Seen, line: &[u8]) {
         Some("event_msg") if p.kind.as_deref() == Some("token_count") => {
             let stamp = l.timestamp.unwrap_or_default();
             let ts = parse_ts(&stamp);
-            // 抄来的:额度和用量都是父线程当时的
+            // Copied: the quota and usage are the parent thread's at that time
             if ts <= s.copied_until {
                 if let Some(XInfo { total_token_usage: Some(total), .. }) = p.info {
                     s.total = Some(total.total_tokens);
@@ -490,7 +501,7 @@ fn codex_line(s: &mut Seen, line: &[u8]) {
                 s.rate = Some((ts, r));
             }
             let Some(XInfo { total_token_usage: Some(total), last_token_usage: Some(last) }) = p.info else { return };
-            // 额度刷新时重发的累计数:没有新调用
+            // Running total re-sent on a quota refresh: no new call
             if s.total == Some(total.total_tokens) {
                 return;
             }
@@ -511,7 +522,7 @@ fn codex_line(s: &mut Seen, line: &[u8]) {
     }
 }
 
-/// Codex 换了模型。之前的调用还不知道是哪个模型(占位的空名字)的话,就是它
+/// Codex switched models. If the earlier calls don't know their model yet (empty placeholder name), it's this one
 fn learn(s: &mut Seen, m: String) {
     match s.models.get(s.cur as usize) {
         Some(cur) if cur.is_empty() => s.models[s.cur as usize] = m,
@@ -519,14 +530,15 @@ fn learn(s: &mut Seen, m: String) {
     }
 }
 
-/// 从 off 读到文件尾,只处理整行
+/// Read from off to the end of the file, whole lines only
 fn read_file(path: &Path, s: &mut Seen, len: u64) {
     if len < s.off {
-        // 变短了 = 被重写过,从头读
+        // Got shorter = rewritten; read from the start
         *s = Seen::new(s.src, s.agent, path);
     }
     let Ok(mut f) = File::open(path) else { return };
-    // 接着读之前看一眼:上次读到的地方前面该是换行。不是 = 文件换过了(改名顶替、整个重写),从头读
+    // Before reading on, check: the byte before where the last read stopped should be a newline. If not = the file was replaced
+    // (renamed over, rewritten whole); read from the start
     let mut last = [0u8];
     if s.off > 0 && (f.seek(SeekFrom::Start(s.off - 1)).is_err() || f.read_exact(&mut last).is_err() || last[0] != b'\n') {
         *s = Seen::new(s.src, s.agent, path);
@@ -540,7 +552,7 @@ fn read_file(path: &Path, s: &mut Seen, len: u64) {
     let mut r = BufReader::with_capacity(1 << 16, f);
     let mut buf = Vec::new();
     loop {
-        // 带图片的行能有几十 MB,读过一行大的就把缓冲还回去
+        // Lines with images can be tens of MB; after a big one, give the buffer back
         if buf.capacity() > 1 << 20 {
             buf = Vec::new();
         }
@@ -565,26 +577,28 @@ fn read_file(path: &Path, s: &mut Seen, len: u64) {
     s.recs.shrink_to_fit();
 }
 
-// ---------- 账号目录 ----------
+// ---------- Account directories ----------
 
-/// 一个账号目录
+/// One account directory
 #[derive(Clone, Debug, PartialEq)]
 pub struct Source {
     pub agent: Agent,
-    /// 账号槽名,对不上就是目录名
+    /// Account slot name; the directory name if none matches
     pub who: String,
     pub dir: PathBuf,
 }
 
-/// 要读哪些账号目录:config.toml 里登记了配置目录的账号(`accounts`:哪家、名字、目录),再加上两家的默认目录(~/.claude、~/.codex)。
-/// 同一个目录只读一次,名字用登记的第一个账号。两个账号的记录目录(projects / sessions)链到同一处的,
-/// 分不出是谁的,合成一个、名字连起来(`甲·乙`;面板上写成「甲 / 乙」,`·` 留给后面接的套餐,见 `account_name`)
+/// Which account directories to read: accounts in config.toml that register a config directory (`accounts`: which agent, name,
+/// directory), plus both agents' default directories (~/.claude, ~/.codex). Each directory is read once, named after the first account
+/// registered for it. When two accounts' record directories (projects / sessions) link to the same place, there's no telling whose
+/// records are whose, so they merge into one with the names joined (`a·b`; the panel writes it "a / b", leaving `·` for the plan
+/// that follows, see `account_name`)
 pub fn sources(accounts: &[(Agent, String, String)], home: &str) -> Vec<Source> {
     let mut dirs: Vec<(Agent, String)> = accounts.iter().map(|(a, _, d)| (*a, d.clone())).collect();
     dirs.push((Agent::Claude, format!("{home}/.claude")));
     dirs.push((Agent::Codex, format!("{home}/.codex")));
     let mut out: Vec<Source> = vec![];
-    // 每个 out 的(配置目录, 记录目录),都是真实路径
+    // For each entry of out: (config directory, record directory), both real paths
     let mut seen: Vec<(PathBuf, Option<PathBuf>)> = vec![];
     for (agent, d) in dirs {
         let Ok(real) = std::fs::canonicalize(&d) else { continue };
@@ -607,7 +621,7 @@ pub fn sources(accounts: &[(Agent, String, String)], home: &str) -> Vec<Source> 
     out
 }
 
-/// 一个账号目录下的记录文件
+/// The record files under one account directory
 fn files_of(src: &Source) -> Vec<PathBuf> {
     let roots: Vec<PathBuf> = match src.agent {
         Agent::Codex => vec![src.dir.join("sessions"), src.dir.join("archived_sessions")],
@@ -635,19 +649,21 @@ fn files_of(src: &Source) -> Vec<PathBuf> {
     out
 }
 
-// ---------- 读 ----------
+// ---------- Reading ----------
 
-/// 读过的记录都记在这里。再 scan 只读新写的;界面每次起新的子进程,读过的存在磁盘上(见 `load` / `save`)
+/// Every record read so far is kept here. Another scan reads only what's newly written; the UI starts a new child process each time,
+/// so what's been read is saved on disk (see `load` / `save`)
 #[derive(Default)]
 pub struct Scanner {
     srcs: Vec<Source>,
     files: HashMap<PathBuf, Seen>,
-    /// 上次 scan 读到了新的 / 丢了文件:要存一份
+    /// The last scan read something new / lost files: needs saving
     dirty: bool,
 }
 
 impl Scanner {
-    /// 把新写的读进来:新文件从头读,变长的从上次读到的地方接着读,删掉的丢掉。几个线程一起读
+    /// Read in what's newly written: new files from the start, grown ones from where the last read stopped, deleted ones dropped.
+    /// Several threads read at once
     pub fn scan(&mut self, srcs: Vec<Source>) {
         let mut want: HashMap<PathBuf, (usize, Agent)> = HashMap::new();
         for (i, s) in srcs.iter().enumerate() {
@@ -655,7 +671,7 @@ impl Scanner {
                 want.entry(p).or_insert((i, s.agent));
             }
         }
-        // 账号目录换了(改了配置):从头来
+        // Account directories changed (config edited): start over
         if srcs != self.srcs {
             self.files.clear();
             self.srcs = srcs;
@@ -690,7 +706,7 @@ impl Scanner {
         });
     }
 
-    /// 各 Codex 账号最近一次记下的额度
+    /// Each Codex account's most recently recorded quota
     fn codex_rates(&self) -> Vec<(usize, i64, XRate)> {
         let mut best: HashMap<usize, (i64, XRate)> = HashMap::new();
         for s in self.files.values() {
@@ -706,12 +722,13 @@ impl Scanner {
     }
 }
 
-// ---------- 存一份 ----------
+// ---------- Saved copy ----------
 
-/// 读过的记录存在 ~/.cache/aca/cost(认 XDG_CACHE_HOME)。界面每次按 `$` 起的是新的子进程,
-/// 不存的话每次都要把几个 G 的记录从头读一遍;存了就只读新写的(变长的接着读,没变的不碰)。
-/// 文件头记着是哪个 aca 写的(程序文件的大小和修改时间):换装了 aca 就从头读一遍,
-/// 读法改了(去重、认模型的口径)也不会拿旧版读出来的接着用
+/// What has been read is saved in ~/.cache/aca/cost (honors XDG_CACHE_HOME). Each `$` in the UI starts a new child process;
+/// without the saved copy, every time would re-read several GB of records from the start; with it, only what's newly written is read
+/// (grown files are read on, unchanged ones aren't touched).
+/// The file header records which aca wrote it (the program file's size and mtime): once a different aca is installed everything
+/// is read again, so after a change in how records are read (dedup, model matching) nothing carries on from what an old version read
 const CACHE_MAGIC: &[u8; 8] = b"acacost1";
 
 fn cache_file() -> Option<PathBuf> {
@@ -722,7 +739,7 @@ fn cache_file() -> Option<PathBuf> {
     Some(base.join("aca/cost"))
 }
 
-/// 这个 aca 程序文件的(大小, 修改时间)
+/// This aca program file's (size, mtime)
 fn exe_stamp() -> Option<(u64, u64)> {
     let m = std::fs::metadata(aca_core::agent::self_path()?).ok()?;
     let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
@@ -800,12 +817,13 @@ fn path_bytes(p: &Path) -> &[u8] {
 const AGENTS: [Agent; 6] = [Agent::None, Agent::Claude, Agent::Codex, Agent::Other, Agent::Pi, Agent::Opencode];
 
 impl Scanner {
-    /// 读存着的那份;不是这个 aca 写的、坏了、没有,都当没有(从头读)
+    /// Read the saved copy; one not written by this aca, corrupt, or missing all count as none (read from the start)
     fn load(path: &Path) -> Option<Scanner> {
         Scanner::decode(&std::fs::read(path).ok()?, exe_stamp()?)
     }
 
-    /// 读到了新的才存。先写临时文件再改名(同时开着的 aca 各起一个子进程,各写各的临时文件)
+    /// Save only when something new was read. Write a temp file, then rename it (each open aca starts its own child process, each
+    /// writing its own temp file)
     fn save(&self, path: &Path) {
         let Some(stamp) = exe_stamp().filter(|_| self.dirty) else { return };
         let Some(dir) = path.parent() else { return };
@@ -906,37 +924,37 @@ impl Scanner {
     }
 }
 
-// ---------- 汇总 ----------
+// ---------- Totals ----------
 
-/// 一个额度窗口
+/// One quota window
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Win {
     /// 5h / 7d
     pub label: String,
-    /// 用掉的百分比(超额时会超过 100,照写)
+    /// Percent used (goes over 100 when over quota; written as is)
     pub used: f64,
     pub resets: Option<i64>,
 }
 
-/// 一个账号的订阅额度
+/// One account's subscription quota
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Quota {
     pub agent: Agent,
     pub who: String,
-    /// 套餐名(Codex 记着;Claude 的 statusLine 里没有)
+    /// Plan name (Codex records it; Claude's statusLine doesn't have it)
     pub plan: String,
     pub wins: Vec<Win>,
-    /// 这份数是什么时候的
+    /// When these numbers are from
     pub updated: i64,
-    /// 余额之类的补充
+    /// Extra notes such as a balance
     pub note: String,
 }
 
-/// 按什么分的一行
+/// One row of a breakdown
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Row {
     pub name: String,
-    /// 灰字补充:账号 / 目录
+    /// Gray note: account / directory
     pub note: String,
     pub agent: Agent,
     pub cost: f64,
@@ -944,58 +962,58 @@ pub struct Row {
     pub calls: u64,
 }
 
-/// 一个时段(哪个时段看它在 Report.ranges 里的位置,名字是 RANGES 里的)
+/// One period (which period it is comes from its position in Report.ranges; the names are in RANGES)
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Range {
     pub cost: f64,
-    /// 花在哪:输入、缓存写、缓存读、输出、联网搜索
+    /// Where it went: input, cache write, cache read, output, web search
     pub parts: [f64; 5],
     pub tokens: u64,
-    /// token 分开算:输入、缓存写、缓存读、输出
+    /// Tokens by kind: input, cache write, cache read, output
     pub toks: [u64; 4],
     pub calls: u64,
-    /// 缓存比不用缓存省下的钱:缓存读的折扣减掉缓存写的加价
+    /// Money caching saved versus no cache: the cache-read discount minus the cache-write surcharge
     pub saved: f64,
-    /// 前一个一样长的时段花了多少:昨天 / 再往前 7 天 / 再往前 30 天(全部没有)
+    /// Spent in the previous period of the same length: yesterday / the 7 days before / the 30 days before (none for All)
     pub prev: f64,
-    /// 这个时段有几天(全部从最早一条记录那天算)、其中花了钱的有几天
+    /// How many days this period has (All counts from the day of the earliest record), and on how many of them money was spent
     pub days: u32,
     pub active: u32,
-    /// 今天按小时(0 点到现在),7 / 30 天按天,全部按月(从第一个月到这个月);新的在前
+    /// Today by hour (midnight to now), 7 / 30 days by day, All by month (from the first month to this one); newest first
     pub series: Vec<(String, f64)>,
-    /// 各账号的走势:一格一格跟 series 对上(新的在前),账号按花费从多到少
+    /// Each account's trend: cell for cell in step with series (newest first), accounts by spend, highest first
     pub src_series: Vec<(String, Agent, Vec<f64>)>,
-    /// 星期几(0 = 周日)× 几点,花了多少
+    /// Weekday (0 = Sunday) × hour: amount spent
     pub heat: [[f64; 24]; 7],
     pub by_src: Vec<Row>,
     pub by_model: Vec<Row>,
     pub by_session: Vec<Row>,
-    /// 按对话在哪个目录(家目录写成 ~)
+    /// By which directory the conversation is in (home written as ~)
     pub by_dir: Vec<Row>,
-    /// 价目表里没有的模型:(模型, token 数),不算进花费
+    /// Models not in the price list: (model, tokens), not counted in the spend
     pub unpriced: Vec<(String, u64)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Report {
-    /// 生成的时间和当时的本地时区偏移(秒)
+    /// When it was generated, and the local UTC offset at the time (seconds)
     pub now: i64,
     pub off: i64,
     pub quotas: Vec<Quota>,
-    /// 今天、近 7 天、近 30 天、全部
+    /// Today, last 7 days, last 30 days, all
     pub ranges: Vec<Range>,
-    /// 最早一条记录
+    /// The earliest record
     pub first: Option<i64>,
-    /// 只看了哪些账号(空 = 全部;原样是 `--only` 给的)
+    /// Which accounts are shown (empty = all; verbatim from `--only`)
     #[serde(default)]
     pub only: Vec<String>,
-    /// 所有账号一共花了多少(不管只看哪些,都是全部时段),挑账号用
+    /// What each account spent in total (regardless of which are shown, always over all periods), for picking accounts
     #[serde(default)]
     pub accounts: Vec<Row>,
-    /// 每个账号的颜色位子(见 slots),没有的画灰色
+    /// Each account's color slot (see slots); those without one are drawn gray
     #[serde(default)]
     pub colors: Vec<(String, usize)>,
-    /// 额度那一段顶上要说的一句(开了 aca 的 mod、这一版 Claude 上却没带:为什么);没有就是空的
+    /// One line for the top of the quota section (aca's mod is on but this Claude build doesn't carry it: why); empty if none
     #[serde(default)]
     pub quota_note: String,
 }
@@ -1003,12 +1021,14 @@ pub struct Report {
 pub const RANGES: [Tr; 4] =
     [Tr::new("今天", "Today"), Tr::new("近 7 天", "7 days"), Tr::new("近 30 天", "30 days"), Tr::new("全部", "All")];
 
-/// 一个账号在面板里叫什么:「Claude 甲」「Codex 乙」(不是 Codex 的都按 Claude 的目录读,也就叫 Claude)
+/// What an account is called in the panel: "Claude a", "Codex b" (anything that isn't Codex is read as a Claude directory,
+/// so it's called Claude too)
 pub fn account_name(agent: Agent, who: &str) -> String {
     format!("{} {}", if agent == Agent::Codex { "Codex" } else { "Claude" }, who.replace('·', " / "))
 }
 
-/// 面板上怎么写一个账号(account_name 起的全名):账号名就是家名的(默认目录 ~/.claude、~/.codex)只写家名
+/// How the panel writes an account (the full name from account_name): when the account name is the agent's name
+/// (default directories ~/.claude, ~/.codex), just the agent's name
 pub fn account_shown(name: &str) -> &str {
     match name.split_once(' ') {
         Some((home, who)) if who.eq_ignore_ascii_case(home) => home,
@@ -1016,8 +1036,8 @@ pub fn account_shown(name: &str) -> &str {
     }
 }
 
-/// 这个账号在不在只看的里面:空 = 都在;写全名(「Claude 甲」,链在一起的写「Claude 甲 / 乙」,以前记下的「甲·乙」也认)
-/// 或账号名都认,链在一起的(`甲·乙`)写哪个都算
+/// Whether this account is among those shown: empty = all are. The full name ("Claude a"; linked ones "Claude a / b", and the
+/// "a·b" recorded earlier is accepted too) or the bare account name both match; for linked ones (`a·b`) either name counts
 pub fn picked(only: &[String], agent: Agent, who: &str) -> bool {
     only.is_empty() || {
         let name = account_name(agent, who);
@@ -1025,29 +1045,31 @@ pub fn picked(only: &[String], agent: Agent, who: &str) -> bool {
     }
 }
 
-/// 登记的会话:对话 id → (会话 id, 标题)
+/// Registered sessions: conversation id → (session id, title)
 #[derive(Default)]
 pub struct Deck {
     by_conv: HashMap<String, (String, String)>,
-    /// 换过账号接着跑的对话(`aca restart --as`):从什么时候起在哪个配置目录,头一个是换之前的(从最早算起)。
-    /// 换之前那几轮两个账号目录里都有一份,一模一样,归当时用的那个
+    /// Conversations carried on under another account (`aca restart --as`): from when on they're in which config directory, the first
+    /// being the one before the switch (counted from the very start). The turns before a switch are in both account directories,
+    /// identical; they belong to the one in use at the time
     homes: HashMap<String, Vec<(i64, PathBuf)>>,
 }
 
 impl Deck {
-    /// 这段对话在 ts 那一刻在哪个配置目录;没换过账号 = None
+    /// Which config directory this conversation was in at time ts; never switched accounts = None
     fn home_at(&self, conv: &str, ts: i64) -> Option<&Path> {
         let line = self.homes.get(conv)?;
         line.iter().take_while(|(since, _)| *since <= ts).last().map(|(_, h)| h.as_path())
     }
 }
 
-/// 比目录用:换了写法、经过链接的也对得上
+/// For comparing directories: matches even when written differently or reached through a link
 fn real(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// 读登记表里的会话(归档的也要:对话记录还在)。现在这段对话记在表里,换过的每一段在 hook 写的状态里
+/// Read the sessions in the registry (archived ones too: their conversation records are still there). The current conversation is
+/// in the table; every one it has moved past is in the state the hook writes
 pub fn deck() -> Deck {
     let mut d = Deck::default();
     let Ok(store) = aca_core::store::Store::open() else { return d };
@@ -1068,19 +1090,20 @@ pub fn deck() -> Deck {
     d
 }
 
-/// 这个 Codex 目录是用 API key 登录的(按量付费,没有订阅额度)
+/// This Codex directory is logged in with an API key (pay as you go, no subscription quota)
 fn api_key_login(dir: &Path) -> bool {
     let Ok(text) = std::fs::read(dir.join("auth.json")) else { return false };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&text) else { return false };
     match v.get("auth_mode").and_then(|m| m.as_str()) {
         Some(mode) => mode == "apikey",
-        // 老版本不写 auth_mode:有 key、没有 ChatGPT 的 tokens
+        // Old versions don't write auth_mode: has a key, no ChatGPT tokens
         None => v.get("OPENAI_API_KEY").is_some_and(|k| k.is_string()) && v.get("tokens").is_none_or(|t| t.is_null()),
     }
 }
 
-/// 几个 Codex 账号的 sessions 链到一处时(见 `sources`)额度记在一起,名字是「甲·乙」;记录里的额度只是其中订阅账号的,
-/// 用 API key 登录的那几个名字去掉,一个不剩的不要。accounts 同 `sources`
+/// When several Codex accounts' sessions link to one place (see `sources`), their quota is recorded together under the name "a·b";
+/// the quota in the records belongs only to the subscription accounts among them, so drop the names logged in with an API key,
+/// and drop the quota when none are left. accounts as in `sources`
 pub fn subscribed(quotas: Vec<Quota>, accounts: &[(Agent, String, String)], home: &str) -> Vec<Quota> {
     let dir_of = |n: &str| {
         let found = accounts.iter().find(|(a, name, _)| *a == Agent::Codex && name == n);
@@ -1122,9 +1145,10 @@ fn codex_quota(src: &Source, ts: i64, r: &XRate) -> Option<Quota> {
     Some(Quota { agent: Agent::Codex, who: src.who.clone(), plan: r.plan_type.clone().unwrap_or_default(), wins, updated: ts, note })
 }
 
-/// 一个 Codex 账号现在的额度,不扫整个目录(换账号的框里用,要快):最近三天里最近改过的几份对话记录,
-/// 从末尾往前找最后一次记下的 rate_limits。没有(API key 的账号不记、最近没用过)= None;
-/// 最后一次记的是空的(走中转的不带额度)也是 None,不拿更早的旧数顶上 —— 和 `codex_rates` 一样,只认最新的那次
+/// One Codex account's current quota without scanning the whole directory (used in the switch-account dialog, must be fast): the few
+/// most recently modified conversation records from the last three days, searched back from the end for the last recorded rate_limits.
+/// None if there isn't one (API-key accounts don't record it, or not used lately); also None if the last one recorded is empty
+/// (going through a relay carries no quota), rather than falling back to older numbers — like `codex_rates`, only the latest counts
 pub fn codex_now(src: &Source) -> Option<Quota> {
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = vec![];
     for day in newest_dirs(&src.dir.join("sessions"), 3, 3) {
@@ -1141,7 +1165,7 @@ pub fn codex_now(src: &Source) -> Option<Quota> {
     codex_quota(src, ts, &r)
 }
 
-/// `dir` 底下 `depth` 层的目录(年 / 月 / 日),名字大的(新的)在前,最多 n 个
+/// The directories `depth` levels under `dir` (year / month / day), largest name (newest) first, at most n
 fn newest_dirs(dir: &Path, depth: u32, n: usize) -> Vec<PathBuf> {
     let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
     subs.sort();
@@ -1158,7 +1182,7 @@ fn newest_dirs(dir: &Path, depth: u32, n: usize) -> Vec<PathBuf> {
     out
 }
 
-/// 一份 Codex 记录里最后一次记下的额度和时刻(只读最后 2 MB)
+/// The last quota recorded in one Codex record, and when (reads only the last 2 MB)
 fn last_rate(path: &Path) -> Option<(i64, XRate)> {
     let mut f = File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
@@ -1172,7 +1196,7 @@ fn last_rate(path: &Path) -> Option<(i64, XRate)> {
     })
 }
 
-/// 本地时区偏移(秒):借 SQLite 的 localtime,跟着 TZ 走
+/// Local UTC offset (seconds): borrowed from SQLite's localtime, follows TZ
 pub fn local_offset() -> i64 {
     rusqlite::Connection::open_in_memory()
         .and_then(|c| {
@@ -1183,19 +1207,20 @@ pub fn local_offset() -> i64 {
         .unwrap_or(0)
 }
 
-/// 一次调用按 API 价多少钱,分成输入、缓存写、缓存读、输出、搜索
+/// What one call costs at API prices, split into input, cache write, cache read, output, search
 fn cost_parts(r: &Rec, p: &[f64; 5], mult: f64) -> [f64; 5] {
     let m = |t: u32, per: f64| t as f64 * per / 1e6 * mult;
     [m(r.tok[0], p[0]), m(r.tok[1], p[1]) + m(r.tok[2], p[2]), m(r.tok[3], p[3]), m(r.tok[4], p[4]), r.searches as f64 * SEARCH]
 }
 
-/// 缓存比不用缓存省了多少:缓存读的那些按输入价要多花的,减掉缓存写比输入价多花的
+/// How much caching saved: what the cache reads would have cost extra at the input price, minus what the cache writes cost
+/// above the input price
 fn cache_saved(r: &Rec, p: &[f64; 5], mult: f64) -> f64 {
     let m = |t: u32, per: f64| t as f64 * per / 1e6 * mult;
     m(r.tok[3], p[0] - p[3]) - m(r.tok[1], p[1] - p[0]) - m(r.tok[2], p[2] - p[0])
 }
 
-/// 家目录换成 ~
+/// Home directory replaced by ~
 fn tilde(dir: &str, home: &str) -> String {
     match dir.strip_prefix(home) {
         Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
@@ -1205,8 +1230,8 @@ fn tilde(dir: &str, home: &str) -> String {
 }
 
 impl Scanner {
-    /// 汇总:去重(见文件头)、按时段分、各时段里按账号 / 模型 / 会话 / 目录分
-    /// only:只看这些账号(见 `picked`),空 = 全部
+    /// Totals: dedupe (see the file header), split by period, and within each period by account / model / session / directory.
+    /// only: show only these accounts (see `picked`); empty = all
     pub fn report(&self, now: i64, off: i64, deck: &Deck, mut quotas: Vec<Quota>, only: &[String]) -> Report {
         for (i, ts, r) in self.codex_rates() {
             if let Some(q) = self.srcs.get(i).and_then(|s| codex_quota(s, ts, &r)) {
@@ -1214,8 +1239,9 @@ impl Scanner {
             }
         }
         quotas.retain(|q| picked(only, q.agent, &q.who));
-        // 重复的留输出最多的;一样多的留先有的那个文件(分叉出来的文件晚,归到原来的对话上)。
-        // 换过账号的对话是例外:两个账号目录里一模一样的那几轮,归当时用的那个账号(见 `Deck::homes`)
+        // For duplicates keep the one with the most output; on a tie, the earlier file (a forked file is later, so it goes to the original
+        // conversation). Conversations that switched accounts are the exception: the turns identical in both account directories go to
+        // the account in use at the time (see `Deck::homes`)
         let mut files: Vec<&Seen> = self.files.values().filter(|s| !s.recs.is_empty()).collect();
         files.sort_by_cached_key(|s| (s.first_ts(), s.conv.clone(), s.off));
         let src_dirs: Vec<PathBuf> = if deck.homes.is_empty() { vec![] } else { self.srcs.iter().map(|s| real(&s.dir)).collect() };
@@ -1238,13 +1264,14 @@ impl Scanner {
                 }
             }
         }
-        // 对话从哪天开始(子代理的文件晚,按整段对话里最早的算),没登记的对话拿它当名字的一部分
+        // The day each conversation started (subagent files are later, so take the earliest across the whole conversation);
+        // unregistered conversations use it as part of their name
         let mut conv_first: HashMap<&str, i64> = HashMap::new();
         for s in &files {
             let f = conv_first.entry(s.conv.as_str()).or_insert(i64::MAX);
             *f = (*f).min(s.first_ts());
         }
-        // 账号 / 模型 / 会话 / 目录先换成编号(见 Keys);每个文件的每个模型的价格也先查好
+        // Turn account / model / session / directory into ids first (see Keys); also look up each file's price for each model up front
         let home = std::env::var("HOME").unwrap_or_default();
         let mut t = Tables::default();
         let src_ids: Vec<usize> = self
@@ -1257,7 +1284,7 @@ impl Scanner {
             .collect();
         let src_picked: Vec<bool> = self.srcs.iter().map(|s| picked(only, s.agent, &s.who)).collect();
         struct FileKeys {
-            /// 每个模型:编号、价格、快速模式的加价
+            /// Per model: id, price, fast-mode surcharge
             models: Vec<(usize, Option<[f64; 5]>, f64)>,
             session: usize,
             dir: usize,
@@ -1291,7 +1318,7 @@ impl Scanner {
         let day = |t: i64| (t + off).div_euclid(86400);
         let today = day(now);
         let starts = [today, today - 6, today - 29, i64::MIN];
-        // 前一个一样长的时段 [起, 止)
+        // The previous period of the same length, [start, end)
         let before = [(today - 1, today), (today - 13, today - 6), (today - 59, today - 29)];
         let mut acc: Vec<Acc> = RANGES.iter().map(|_| Acc::new(&t)).collect();
         let mut accounts = Acc::new(&t);
@@ -1323,7 +1350,7 @@ impl Scanner {
                 tok: [r.tok[0] as u64, r.tok[1] as u64 + r.tok[2] as u64, r.tok[3] as u64, r.tok[4] as u64],
                 cost,
             };
-            // 全部都看的时候,账号列表就是「全部」时段的按账号,不用另算
+            // When everything is shown, the account list is just the All period's by-account rows; no separate tally needed
             if !only.is_empty() {
                 accounts.add(&hit);
             }
@@ -1358,12 +1385,13 @@ impl Scanner {
     }
 }
 
-/// 汇总时的一种分法(账号 / 模型 / 会话 / 目录):名字先换成编号,每次调用按编号累加。
-/// 几十万次调用 × 4 个时段,每次都拼名字、按字符串查表的话,光这就要零点几秒
+/// One breakdown used for totals (account / model / session / directory): names become ids first, and each call adds up by id.
+/// Hundreds of thousands of calls × 4 periods: building the name and looking it up by string every time would take tenths of
+/// a second on its own
 #[derive(Default)]
 struct Keys {
     ids: HashMap<String, usize>,
-    /// 每个编号那一行的名字、灰字、哪家(数都是 0)
+    /// The name, gray note and agent of each id's row (numbers all 0)
     rows: Vec<Row>,
 }
 
@@ -1386,29 +1414,29 @@ struct Tables {
     dir: Keys,
 }
 
-/// 一次调用记到一个时段里要的东西
+/// What's needed to add one call to a period
 #[derive(Clone, Copy)]
 struct Hit<'a> {
-    /// 按小时 / 天 / 月的哪一格
+    /// Which hour / day / month cell
     bucket: i64,
     day: i64,
-    /// 星期几(0 = 周日)、几点
+    /// Weekday (0 = Sunday), hour
     wd: usize,
     hour: usize,
-    /// 记录里写的模型名(价目表里没有的照它列)
+    /// The model name written in the record (models not in the price list are listed under it)
     model_name: &'a str,
-    /// 账号、模型、会话、目录的编号(见 Tables)
+    /// Ids of the account, model, session, directory (see Tables)
     src: usize,
     model: usize,
     session: usize,
     dir: usize,
-    /// 输入、缓存写、缓存读、输出
+    /// Input, cache write, cache read, output
     tok: [u64; 4],
-    /// (分项花费, 缓存省的);模型不在价目表里就是 None
+    /// (cost by part, cache saving); None when the model isn't in the price list
     cost: Option<([f64; 5], f64)>,
 }
 
-/// 按编号累加的一行:花费、token、次数
+/// One row added up by id: spend, tokens, count
 #[derive(Clone, Copy, Default)]
 struct Tally {
     cost: f64,
@@ -1424,11 +1452,11 @@ impl Tally {
     }
 }
 
-/// 一个时段累加中
+/// One period, being added up
 struct Acc {
     r: Range,
     series: HashMap<i64, f64, Fast>,
-    /// (账号编号, 哪一格) → 花了多少
+    /// (account id, cell) → amount spent
     src_series: HashMap<(usize, i64), f64, Fast>,
     days: HashSet<i64, Fast>,
     src: Vec<Tally>,
@@ -1487,10 +1515,10 @@ impl Acc {
         self.dir[h.dir].bump(cost, tokens);
     }
 
-    /// hour = 现在几点;first = 最早一条记录是哪天
+    /// hour = the current hour; first = the day of the earliest record
     fn finish(self, t: &Tables, i: usize, today: i64, hour: usize, first: Option<i64>) -> Range {
         let mut r = self.r;
-        // 记到过的编号换回一行行,花得多的在前;带着编号(按账号的走势要)
+        // Turn the ids seen back into rows, biggest spend first; keep the ids (the per-account trend needs them)
         let sorted = |v: Vec<Tally>, k: &Keys| {
             let mut v: Vec<(usize, Row)> = v
                 .into_iter()
@@ -1517,7 +1545,7 @@ impl Acc {
             _ => since,
         };
         r.active = self.days.len() as u32;
-        // 没花钱的小时 / 天 / 月也列上,看得出哪会儿没用
+        // List hours / days / months with no spend too, so you can see when nothing was used
         let keys: Vec<(i64, String)> = match i {
             0 => (0..=hour as i64).rev().map(|h| (h, format!("{h:02}:00"))).collect(),
             1 | 2 => {
@@ -1541,7 +1569,7 @@ impl Acc {
     }
 }
 
-/// 同 `build`,读过的记录接着上次存的那份读(见 `Scanner::load`),读完再存回去
+/// Like `build`, but carries on from the saved copy of what was read before (see `Scanner::load`), and saves it back afterwards
 pub fn build_cached(only: &[String]) -> Report {
     let path = cache_file();
     let mut sc = path.as_deref().and_then(Scanner::load).unwrap_or_default();
@@ -1552,20 +1580,20 @@ pub fn build_cached(only: &[String]) -> Report {
     r
 }
 
-/// 整个流程:读配置 → 读新写的记录 → 汇总
+/// The whole flow: read the config → read newly written records → total up
 pub fn build(sc: &mut Scanner, only: &[String]) -> Report {
     let home = std::env::var("HOME").unwrap_or_default();
     let accounts = crate::data::accounts(&aca_core::config::load());
     let srcs = sources(&accounts, &home);
     sc.scan(srcs.clone());
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    // Claude 的额度是 statusLine 记下的(带数据时间,见 limits)
+    // Claude's quota is what the statusLine recorded (with the data's time, see limits)
     let quotas = crate::limits::dir().map(|d| crate::limits::quotas(&d, &srcs, now)).unwrap_or_default();
     let mut r = sc.report(now, local_offset(), &deck(), quotas, only);
     r.quotas = subscribed(std::mem::take(&mut r.quotas), &accounts, &home);
     r.quota_note = crate::limits::mod_note(&aca_core::config::load());
-    // 头一回分位子的顺序:近 30 天花得多的先拿(色盘前面几个挨着的颜色最好分),再是更早用过的、只有额度的。
-    // 已经有位子的不受这个顺序影响
+    // Order for handing out slots the first time: biggest spenders over the last 30 days first (the first few, adjacent palette colors
+    // are the easiest to tell apart), then those used earlier, then quota-only ones. Accounts that already have a slot aren't affected
     let mut names: Vec<String> = vec![];
     let recent = r.ranges.get(2).map(|g| g.by_src.iter().map(|x| x.name.clone()).collect::<Vec<_>>()).unwrap_or_default();
     let quota_names = r.quotas.iter().filter(|q| q.agent != Agent::Other).map(|q| account_name(q.agent, &q.who));
@@ -1578,9 +1606,9 @@ pub fn build(sc: &mut Scanner, only: &[String]) -> Report {
     r
 }
 
-// ---------- 时间 ----------
+// ---------- Time ----------
 
-/// "2026-09-29T02:38:54.270Z" → 秒。认 Z 和 ±hh:mm,认不出就是 0
+/// "2026-09-29T02:38:54.270Z" → seconds. Accepts Z and ±hh:mm; anything unrecognized is 0
 pub fn parse_ts(s: &str) -> i64 {
     let n = |a: usize, b: usize| s.get(a..b).and_then(|x| x.parse::<i64>().ok());
     let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(se)) = (n(0, 4), n(5, 7), n(8, 10), n(11, 13), n(14, 16), n(17, 19)) else {
@@ -1596,7 +1624,7 @@ pub fn parse_ts(s: &str) -> i64 {
     t
 }
 
-/// 公历日期 → 1970-01-01 起第几天
+/// Gregorian date → days since 1970-01-01
 pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -1607,7 +1635,7 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-/// 第几天 → (年, 月, 日)
+/// Day number → (year, month, day)
 pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719468;
     let era = z.div_euclid(146097);
@@ -1620,7 +1648,7 @@ pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
-/// 第几天是星期几(0 = 周日)
+/// Weekday of a day number (0 = Sunday)
 pub fn weekday(day: i64) -> usize {
     (day + 4).rem_euclid(7) as usize
 }
@@ -1635,19 +1663,19 @@ pub const WEEK: [Tr; 7] = [
     Tr::new("周六", "Sat"),
 ];
 
-/// 从 1970 年 1 月起第几个月
+/// Months since January 1970
 fn month(day: i64) -> i64 {
     let (y, m, _) = civil_from_days(day);
     y * 12 + m - 1
 }
 
-/// 9/30 周二
+/// 9/30 Tue
 fn day_label(day: i64) -> String {
     let (_, m, d) = civil_from_days(day);
     format!("{m}/{d} {}", WEEK[weekday(day)])
 }
 
-/// 本地的 9/30
+/// Local 9/30
 fn md(ts: i64, off: i64) -> String {
     if ts == i64::MAX || ts <= 0 {
         return "?".into();
@@ -1660,14 +1688,14 @@ fn md(ts: i64, off: i64) -> String {
 pub(crate) mod tests {
     use super::*;
 
-    /// `$` 读一份 Claude 记录读出来的每次调用(模型, token):会话记录(trace_claude)的测试拿它对钱
+    /// Every call (model, tokens) that `$` reads from one Claude record: the session record (trace_claude) tests check costs against it
     pub(crate) fn claude_seen(path: &Path) -> Vec<(String, [u64; 5])> {
         let mut s = Seen::new(0, Agent::Claude, path);
         read_file(path, &mut s, std::fs::metadata(path).unwrap().len());
         s.recs.iter().map(|r| (s.models[r.model as usize].clone(), r.tok.map(u64::from))).collect()
     }
 
-    /// `$` 读一份 Codex 记录读出来的每次调用(模型, token):会话记录(trace_codex)的测试拿它对钱
+    /// Every call (model, tokens) that `$` reads from one Codex record: the session record (trace_codex) tests check costs against it
     pub(crate) fn codex_seen(path: &Path) -> Vec<(String, [u64; 5])> {
         let mut s = Seen::new(0, Agent::Codex, path);
         for l in std::fs::read_to_string(path).unwrap().lines() {
@@ -1702,7 +1730,7 @@ pub(crate) mod tests {
         assert_eq!(price("gpt-6.1-sol").unwrap()[3], 0.1);
         assert_eq!(price("claude-opus-5").unwrap()[0], 5.0);
         assert_eq!(price("claude-opus-5-5").unwrap()[0], 4.0);
-        // 价目表里没有的不猜
+        // Nothing outside the price list is guessed
         assert_eq!(price("gpt-5.6-sol-ultra"), None);
         assert_eq!(price("gpt-5.5-codex"), None);
         assert_eq!(price("opus"), None);
@@ -1731,7 +1759,7 @@ pub(crate) mod tests {
         assert_eq!(s.recs[0].tok, [2, 100, 200, 1000, 700]);
         assert_eq!(s.cwd, "/w/proj");
         assert_eq!(s.conv, "s1");
-        // 2×4 + 100×5 + 200×8 + 1000×0.2 + 700×20 (每百万)
+        // 2×4 + 100×5 + 200×8 + 1000×0.2 + 700×20 (per million)
         let c: f64 = cost_parts(&s.recs[0], &price("claude-opus-5-5").unwrap(), 1.0).iter().sum();
         assert!((c - (8.0 + 500.0 + 1600.0 + 200.0 + 14000.0) / 1e6).abs() < 1e-12);
     }
@@ -1742,7 +1770,7 @@ pub(crate) mod tests {
         let mut s = Seen::new(0, Agent::Claude, Path::new("/p/s1/subagents/agent-a1.jsonl"));
         feed(&mut s, &[claude("m9", "r9", "2026-09-29T03:00:00Z", "claude-haiku-4-5-20251001", u)]);
         assert_eq!(s.conv, "s1");
-        // 没分 5 分钟 / 1 小时的老记录按 5 分钟算
+        // Old records without the 5-minute / 1-hour split count as 5 minutes
         assert_eq!(s.recs[0].tok, [1, 50, 0, 0, 1]);
     }
 
@@ -1768,7 +1796,7 @@ pub(crate) mod tests {
                 META.to_string(),
                 TURN.to_string(),
                 tc("2026-09-28T00:00:05Z", 1000, 900, 800, 100, "null"),
-                // 额度刷新重发的:累计数没变
+                // Re-sent on a quota refresh: running total unchanged
                 tc("2026-09-28T00:00:06Z", 1000, 900, 800, 100, RATE),
                 tc("2026-09-28T00:01:00Z", 2500, 1400, 1000, 100, "null"),
             ],
@@ -1823,7 +1851,8 @@ pub(crate) mod tests {
             )
         };
         let turn = r#"{"timestamp":"2026-09-28T00:00:00.100Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#.to_string();
-        // 新版本的子线程:父线程写在 source 里;开头抄的两次用量时间戳和创建时一样,自己的在几秒后
+        // Newer child threads: the parent thread is in source; the two copied usages at the start carry the creation timestamp,
+        // its own come a few seconds later
         let meta = r#"{"timestamp":"2026-09-28T00:00:00.000Z","type":"session_meta","payload":{"id":"k","cwd":"/w","source":{"subagent":{"thread_spawn":{"parent_thread_id":"p1","depth":1}}}}}"#;
         let mut s = Seen::new(0, Agent::Codex, Path::new("/h/sessions/rollout-k.jsonl"));
         feed(
@@ -1838,7 +1867,7 @@ pub(crate) mod tests {
         );
         assert_eq!(s.conv, "p1");
         assert_eq!(s.recs.iter().map(|r| r.tok[4]).collect::<Vec<_>>(), [30]);
-        // 分页分叉(history_base)没抄:从头都算
+        // Paged fork (history_base) didn't copy: everything counts from the start
         let meta = r#"{"timestamp":"2026-09-28T00:00:00.000Z","type":"session_meta","payload":{"id":"f","cwd":"/w","forked_from_id":"p1","history_base":{"thread_id":"p1"}}}"#;
         let mut s = Seen::new(0, Agent::Codex, Path::new("/h/sessions/rollout-f.jsonl"));
         feed(&mut s, &[meta.to_string(), turn, tc("2026-09-28T00:00:00.500Z", 110, 10)]);
@@ -1865,7 +1894,7 @@ pub(crate) mod tests {
         let mut fork = Seen::new(0, Agent::Claude, Path::new("/c/projects/p/b.jsonl"));
         fork.conv = "b".into();
         fork.models = vec!["claude-opus-5".into()];
-        // 抄过来的 1、2,加上自己的 3
+        // Copied 1 and 2, plus its own 3
         fork.recs = vec![rec(1, t, 1_000_000), rec(2, t + 60, 2_000_000), rec(3, t + 3600, 1_000_000)];
         let mut cx = Seen::new(1, Agent::Codex, Path::new("/x/sessions/rollout-z.jsonl"));
         cx.conv = "z".into();
@@ -1886,27 +1915,27 @@ pub(crate) mod tests {
         deck.by_conv.insert("b".into(), ("default/i2".into(), "分出来的".into()));
         let r = sc.report(t + 3600, 8 * 3600, &deck, vec![], &[]);
         let today = &r.ranges[0];
-        // 25 + 50 + 25 美元,Codex 那条模型没价格不算
+        // $25 + $50 + $25; the Codex one's model has no price, so it isn't counted
         assert!((today.cost - 100.0).abs() < 1e-9, "{}", today.cost);
         assert_eq!(today.calls, 3);
         assert_eq!(today.unpriced, vec![("gpt-5.5-codex".to_string(), 1000)]);
         let names: Vec<(&str, f64)> = today.by_session.iter().map(|x| (x.name.as_str(), x.cost)).collect();
         assert_eq!(names, vec![("proj · 9/30", 75.0), ("分出来的", 25.0)]);
         assert_eq!(today.by_src[0].name, "Claude work");
-        // 三天前那条只在 7 天、30 天、全部里
+        // The one from three days ago is only in 7 days, 30 days and All
         assert!((r.ranges[1].cost - 102.5).abs() < 1e-9);
         assert_eq!(r.ranges[1].series.len(), 7);
         assert_eq!(r.ranges[1].series[0].0, "9/30 周三");
         assert_eq!(r.ranges[1].series[3], ("9/27 周日".to_string(), 2.5));
         assert_eq!(r.ranges[3].series, vec![("2026-09".to_string(), 102.5)]);
-        // 今天按小时从 0 点列到现在(10 点),没花的也列上
+        // Today by hour from midnight to now (10:00), hours with no spend included
         assert_eq!(today.series.len(), 11);
         assert_eq!(today.series[..3], [("10:00".to_string(), 25.0), ("09:00".to_string(), 75.0), ("08:00".to_string(), 0.0)]);
         assert_eq!((today.heat[3][9], today.heat[3][10]), (75.0, 25.0));
         assert_eq!((today.src_series[0].0.as_str(), &today.src_series[0].2[..3]), ("Claude work", &[25.0, 75.0, 0.0][..]));
         let dirs: Vec<(&str, f64)> = today.by_dir.iter().map(|x| (x.name.as_str(), x.cost)).collect();
         assert_eq!(dirs, vec![("/w/proj", 75.0), ("?", 25.0)]);
-        // 最早一条是三天前:近 7 天只有 4 天,其中 2 天花了钱
+        // The earliest record is three days ago: last 7 days has only 4 days, 2 of them with spend
         assert_eq!((r.ranges[1].days, r.ranges[1].active), (4, 2));
         assert_eq!(r.quotas.len(), 1);
         assert_eq!((r.quotas[0].who.as_str(), r.quotas[0].wins[0].label.as_str()), ("cx", "5h"));
@@ -1923,7 +1952,7 @@ pub(crate) mod tests {
                 r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":{used},"window_minutes":300,"resets_at":1791990000}},"secondary":{{"used_percent":40.0,"window_minutes":10080}},"plan_type":"plus"}}}}}}"#
             )
         };
-        // 一份记了两次(取后面那次),一份没记过(API key 那种是 null)
+        // One file recorded twice (take the later), one never recorded (it's null for the API-key kind)
         let a = format!(
             "{}\n{}\n{{\"type\":\"turn_context\",\"payload\":{{}}}}\n",
             rate(10.0, "2026-10-14T01:00:00Z"),
@@ -1937,14 +1966,14 @@ pub(crate) mod tests {
         let wins: Vec<(&str, f64)> = q.wins.iter().map(|w| (w.label.as_str(), w.used)).collect();
         assert_eq!((q.who.as_str(), q.plan.as_str(), wins), ("cx", "plus", vec![("5h", 97.5), ("7d", 40.0)]));
         assert_eq!(q.updated, parse_ts("2026-10-14T02:00:00Z"));
-        // 后来走中转用的:记了 rate_limits 但里面是空的 —— 空着,不拿上面那份旧数顶
+        // Later used through a relay: rate_limits recorded but empty — stays empty, the old numbers above don't fill in
         let relay = day.join("rollout-2026-10-14T03-00-00-c.jsonl");
         std::fs::write(&relay, "{\"timestamp\":\"2026-10-14T03:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"limit_id\":\"codex\",\"primary\":null,\"secondary\":null,\"plan_type\":null}}}\n").unwrap();
         let later = std::fs::metadata(day.join("rollout-2026-10-14T01-00-00-a.jsonl")).unwrap().modified().unwrap()
             + std::time::Duration::from_secs(60);
         std::fs::File::options().write(true).open(&relay).unwrap().set_modified(later).unwrap();
         assert_eq!(codex_now(&src), None);
-        // sessions 链到这里的另一个账号用的是 API key(新老两种 auth.json):额度只是 cx 的
+        // Another account whose sessions link here uses an API key (new and old auth.json): the quota is cx's alone
         let quotas =
             |who: &str| vec![Quota { who: who.into(), ..q.clone() }, Quota { agent: Agent::Claude, who: "key".into(), ..q.clone() }];
         let key = d.join("key");
@@ -1977,7 +2006,8 @@ pub(crate) mod tests {
             (s.models, s.recs) = (vec!["claude-opus-5".into()], recs);
             s
         };
-        // 在 a 上跑了 1、2;换到 b 跑了 3;又换回 a 跑了 4。a 那份最后被 b 那份盖过,四轮都在,b 那份有前三轮
+        // Ran 1 and 2 on a; switched to b and ran 3; switched back to a and ran 4. a's copy was last overwritten by b's and has all
+        // four turns; b's has the first three
         let a = seen(0, "/ca/projects/p/c1.jsonl", vec![rec(1, t), rec(2, t + 60), rec(3, t + 3600), rec(4, t + 7200)]);
         let b = seen(1, "/cb/projects/p/c1.jsonl", vec![rec(1, t), rec(2, t + 60), rec(3, t + 3600)]);
         let srcs = vec![
@@ -2010,7 +2040,7 @@ pub(crate) mod tests {
             vec![],
             &[],
         );
-        // 今天只有子代理那条,名字还是按整段对话开始的那天
+        // Today has only the subagent's call; the name still uses the day the whole conversation started
         assert_eq!(r.ranges[0].by_session.iter().map(|x| (x.name.as_str(), x.cost)).collect::<Vec<_>>(), vec![("proj · 8/21", 25.0)]);
         assert_eq!(r.ranges[3].by_session.len(), 1);
     }
@@ -2039,7 +2069,7 @@ pub(crate) mod tests {
         let t = parse_ts("2026-09-30T01:00:00Z");
         let mut s = Seen::new(0, Agent::Claude, Path::new("/c/projects/p/a.jsonl"));
         (s.conv, s.cwd, s.models) = ("a".into(), "/w/p".into(), vec!["claude-opus-5".into()]);
-        // 今天:100 万缓存读 + 10 万 5 分钟缓存写;昨天、10 天前、40 天前各 100 万输出($25)
+        // Today: 1M cache read + 100K 5-minute cache write; yesterday, 10 days ago and 40 days ago: 1M output each ($25)
         s.recs = vec![
             Rec { key: 1, ts: t, tok: [0, 100_000, 0, 1_000_000, 0], ..Default::default() },
             Rec { key: 2, ts: t - 86400, tok: [0, 0, 0, 0, 1_000_000], ..Default::default() },
@@ -2047,16 +2077,16 @@ pub(crate) mod tests {
             Rec { key: 4, ts: t - 40 * 86400, tok: [0, 0, 0, 0, 1_000_000], ..Default::default() },
         ];
         let r = scanner_with(vec![("/c/projects/p/a.jsonl", s)]).report(t, 0, &Deck::default(), vec![], &[]);
-        // 缓存读按输入价要多花 100 万 × (5 − 0.5),缓存写比输入价多花 10 万 × (6.25 − 5)
+        // Cache reads would cost 1M × (5 − 0.5) more at the input price; cache writes cost 100K × (6.25 − 5) more than input
         assert!((r.ranges[0].saved - 4.375).abs() < 1e-9, "{}", r.ranges[0].saved);
         assert_eq!(r.ranges[0].toks, [0, 100_000, 1_000_000, 0]);
-        // 昨天、再往前 7 天(10 天前)、再往前 30 天(40 天前)各一条
+        // One each yesterday, in the 7 days before (10 days ago) and in the 30 days before (40 days ago)
         assert_eq!(r.ranges.iter().map(|g| g.prev).collect::<Vec<_>>(), vec![25.0, 25.0, 25.0, 0.0]);
         assert_eq!((r.ranges[1].days, r.ranges[1].active), (7, 2));
         assert_eq!((r.ranges[3].days, r.ranges[3].active), (41, 4));
-        // 全部按月:从最早那个月(8 月)列到这个月
+        // All by month: from the earliest month (August) to this one
         assert_eq!(r.ranges[3].series.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), vec!["2026-09", "2026-08"]);
-        // 昨天是周二,凌晨 1 点
+        // Yesterday was a Tuesday, 1 a.m.
         assert_eq!(r.ranges[1].heat[2][1], 25.0);
         assert_eq!(tilde("/home/u/w", "/home/u"), "~/w");
         assert_eq!(tilde("/home/u2/w", "/home/u"), "/home/u2/w");
@@ -2085,17 +2115,17 @@ pub(crate) mod tests {
         assert_eq!(cx.ranges[3].by_src.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["Codex cx"]);
         assert_eq!(cx.ranges[3].by_session.len(), 1);
         assert_eq!(cx.quotas.iter().map(|q| q.who.as_str()).collect::<Vec<_>>(), vec!["cx"]);
-        // 天数从只看的账号最早那条算
+        // Days count from the earliest record of the shown accounts
         assert_eq!(cx.ranges[3].days, 1);
         assert_eq!(all.ranges[3].days, 21);
-        // 挑账号用的列表不管只看哪个,都是全部账号
+        // The account-picking list is all accounts, whichever are shown
         assert_eq!(cx.accounts, all.accounts);
         assert_eq!(all.accounts.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["Claude work", "Codex cx"]);
         assert_eq!(sc.report(t, 0, &Deck::default(), vec![], &["Claude work".into()]).ranges[3].cost, all.accounts[0].cost);
-        // 链在一起的账号写哪个名字都认,全名要连着是哪家
+        // Linked accounts match by either name; a full name must include the right agent
         assert!(picked(&["b".into()], Agent::Codex, "a·b") && picked(&["Codex a·b".into()], Agent::Codex, "a·b"));
         assert!(!picked(&["Claude a·b".into()], Agent::Codex, "a·b") && !picked(&["a·".into()], Agent::Codex, "a·b"));
-        // 面板上链在一起的写「甲 / 乙」,点留给套餐;按那个名字只看也认
+        // The panel writes linked ones as "a / b", leaving the dot for the plan; showing only by that name works too
         assert_eq!(account_name(Agent::Codex, "a·b"), "Codex a / b");
         assert!(picked(&["Codex a / b".into()], Agent::Codex, "a·b"));
     }
@@ -2110,7 +2140,7 @@ pub(crate) mod tests {
             Rec { key: 2, ts: t, model: 1, tok: [1_000_000, 0, 0, 0, 0], fast: true, us: true, searches: 3 },
         ];
         let r = scanner_with(vec![("/c/projects/p/a.jsonl", s)]).report(t, 0, &Deck::default(), vec![], &[]);
-        // 4×2 + 1×1.1 + 3 次搜索
+        // 4×2 + 1×1.1 + 3 searches
         assert!((r.ranges[0].cost - (8.0 + 1.1 + 0.03)).abs() < 1e-9, "{}", r.ranges[0].cost);
     }
 
@@ -2131,11 +2161,11 @@ pub(crate) mod tests {
         for d in [".claude-a", ".claude", ".codex-b", ".codex/sessions", ".codex-c"] {
             std::fs::create_dir_all(home.join(d)).unwrap();
         }
-        // c 的记录目录链到 ~/.codex 的:分不出是谁的
+        // c's record directory links to ~/.codex's: no telling whose is whose
         std::os::unix::fs::symlink(home.join(".codex/sessions"), home.join(".codex-c/sessions")).unwrap();
         let h = home.to_string_lossy().to_string();
         let acct = |a: Agent, name: &str, dir: &str| (a, name.to_string(), format!("{h}/{dir}"));
-        // 目录不在的(nope)不读;同一个目录登记了两次(a、again)只读一次,用先登记的名字
+        // A missing directory (nope) isn't read; a directory registered twice (a, again) is read once, under the first registered name
         let accounts = [
             acct(Agent::Claude, "a", ".claude-a"),
             acct(Agent::Claude, "again", ".claude-a"),
@@ -2163,7 +2193,7 @@ pub(crate) mod tests {
         let mut main = Seen::new(0, Agent::Claude, Path::new("/c/projects/p/s1.jsonl"));
         (main.conv, main.cwd, main.models, main.recs) =
             ("s1".into(), "/w/proj".into(), vec!["claude-opus-5".into()], vec![rec(1, t - 86400)]);
-        // 子代理在别的目录里干活(worktree 之类),今天只有它那条
+        // The subagent works in another directory (a worktree or such); today has only its call
         let mut sub = Seen::new(0, Agent::Claude, Path::new("/c/projects/q/s1/subagents/agent-a.jsonl"));
         (sub.conv, sub.cwd, sub.models, sub.recs) = ("s1".into(), "/w/other".into(), vec!["claude-opus-5".into()], vec![rec(2, t)]);
         let r = scanner_with(vec![("/c/projects/p/s1.jsonl", main), ("/c/projects/q/s1/subagents/agent-a.jsonl", sub)]).report(
@@ -2212,7 +2242,7 @@ pub(crate) mod tests {
         }
         let t = parse_ts("2026-09-30T00:00:00Z");
         assert_eq!(back.report(t, 0, &Deck::default(), vec![], &[]), sc.report(t, 0, &Deck::default(), vec![], &[]));
-        // 别的 aca 写的、写到一半的、后面多了东西的:都当没有,从头读
+        // Written by another aca, half-written, extra bytes at the end: all count as none, read from the start
         assert!(Scanner::decode(&bytes, (7, 9)).is_none());
         assert!(Scanner::decode(&bytes[..bytes.len() - 1], (7, 8)).is_none());
         assert!(Scanner::decode(&[&bytes[..], b"x"].concat(), (7, 8)).is_none());
@@ -2231,12 +2261,12 @@ pub(crate) mod tests {
         let mut sc = Scanner::default();
         sc.scan(vec![src.clone()]);
         assert!(sc.dirty);
-        // 换成了另一份更长的:上次读到的地方落在一行中间
+        // Replaced by a different, longer file: where the last read stopped falls mid-line
         std::fs::write(&p, format!("{}\n{}\n", line("m2-longer"), line("m3"))).unwrap();
         sc.scan(vec![src.clone()]);
         let keys: HashSet<u64> = sc.files[&p].recs.iter().map(|r| r.key).collect();
         assert_eq!(keys, ["m2-longer", "m3"].map(|id| key_of(&["c", id, "r"])).into());
-        // 什么都没变:不用存
+        // Nothing changed: no need to save
         sc.scan(vec![src]);
         assert!(!sc.dirty);
         std::fs::remove_dir_all(&dir).unwrap();
