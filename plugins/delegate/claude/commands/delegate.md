@@ -74,7 +74,8 @@ and be woken when it ends (Claude Code):
 ```
 Bash(run_in_background: true, command: "aca wait <id>")
 ```
-`aca wait` returns when the worker's turn ends, and you are woken when it does. One call per
+`aca wait` returns when the worker's turn ends, and you are woken when it does. A turn it ends
+while its own background tasks still run doesn't count: those wake it again. One call per
 worker, so each one wakes you as it lands instead of all of them waiting on the slowest. Don't add
 `--notify` to `aca new`: the wait is the one wake-up channel, and it is the one that also catches a
 Codex turn that failed without a hook.

@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 
 use ratatui::style::{Modifier, Style};
 
+use aca_core::i18n::noun;
 use aca_core::{t, tr};
 
 use crate::ansi::{Seg, Styled};
@@ -501,10 +502,12 @@ pub fn render(h: &Head, patch: &str, new_files: &[(String, Option<String>)]) -> 
             Some(t) => {
                 let lines: Vec<&str> = t.lines().collect();
                 f.add = lines.len();
-                f.body.push(tr!("@@ 新文件,{} 行 @@", "@@ new file, {} lines @@", lines.len()));
+                let (n, w) = (lines.len(), noun(lines.len() as u64, "line", "lines"));
+                f.body.push(tr!("@@ 新文件,{n} 行 @@", "@@ new file, {n} {w} @@"));
                 f.body.extend(lines.iter().take(NEW_FILE_LINES).map(|l| format!("+{l}")));
                 if lines.len() > NEW_FILE_LINES {
-                    f.body.push(tr!("\\ 还有 {} 行未显示", "\\ {} more lines not shown", lines.len() - NEW_FILE_LINES));
+                    let (n, w) = (lines.len() - NEW_FILE_LINES, noun((lines.len() - NEW_FILE_LINES) as u64, "line", "lines"));
+                    f.body.push(tr!("\\ 还有 {n} 行未显示", "\\ {n} more {w} not shown"));
                 }
             }
             None => f.about = Some(t!("内容未显示(新文件过多)", "content not shown (too many new files)").into()),

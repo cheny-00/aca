@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aca"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aca-core",
  "aca-tui",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "aca-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "regex",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "aca-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aca-core",
  "anyhow",

@@ -218,7 +218,8 @@ fn head_lines(text: &str, max: usize, out: &mut Vec<String>) {
     out.extend(lines.iter().take(max).map(|l| format!("  {l}")));
     if lines.len() > max {
         let more = lines.len() - max;
-        out.push(paint(&aca_core::tr!("  … 还有 {more} 行", "  … {more} more lines"), crate::ui::dim()));
+        let w = aca_core::i18n::noun(more as u64, "line", "lines");
+        out.push(paint(&aca_core::tr!("  … 还有 {more} 行", "  … {more} more {w}"), crate::ui::dim()));
     }
 }
 
@@ -258,7 +259,8 @@ fn screen(t: &Trace, phase: Phase, task: &str) -> (Vec<String>, bool) {
     let tools: Vec<&crate::trace::Node> = t.nodes.iter().filter(|n| n.kind == Kind::Tool).collect();
     if tools.len() > STEPS {
         let more = tools.len() - STEPS;
-        out.push(paint(&aca_core::tr!("… 前面还有 {more} 步", "… {more} earlier steps"), dim));
+        let w = aca_core::i18n::noun(more as u64, "step", "steps");
+        out.push(paint(&aca_core::tr!("… 前面还有 {more} 步", "… {more} earlier {w}"), dim));
     }
     let name_w = tools.iter().rev().take(STEPS).map(|n| crate::trace::tool_name(&n.name).chars().count()).max().unwrap_or(0).min(10);
     for n in &tools[tools.len().saturating_sub(STEPS)..] {

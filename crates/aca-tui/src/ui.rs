@@ -829,9 +829,10 @@ fn row_segments(
     let flags: String = [(s.noted, '✎'), (s.attached, '⇄')].iter().filter(|f| f.0 && own).map(|f| f.1).collect();
     let flag_style = if s.noted { theme::warn() } else { dim() };
     let when = s.when();
-    let when = format!("{}{when}", " ".repeat(3usize.saturating_sub(when.width())));
+    let age_w = crate::data::age_w();
+    let when = format!("{}{when}", " ".repeat(age_w.saturating_sub(when.width())));
     let who_cols = if who_w > 0 { who_w + 1 } else { 0 };
-    let tail_w = 2 + 1 + who_cols + 3 + 1;
+    let tail_w = 2 + 1 + who_cols + age_w + 1;
     let pre = tree;
     let loc = row_loc(s);
     let badge = agents_badge(s);
@@ -1261,7 +1262,8 @@ fn note_lines(text: &str, editing: bool, w: usize, room: usize, cap: usize) -> V
             out.push(Line::from(vec![mark, Span::raw(l)]));
         }
         if more > 0 {
-            out.push(Line::styled(tr!("  … 还有 {more} 行", "  … {more} more lines"), dim()));
+            let w = noun(more as u64, "line", "lines");
+            out.push(Line::styled(tr!("  … 还有 {more} 行", "  … {more} more {w}"), dim()));
         }
     }
     out
@@ -8195,14 +8197,9 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
                 };
                 f.render_widget(Paragraph::new(tail.iter().map(ansi::to_line).collect::<Vec<_>>()), body);
                 ansi::paint_links(f.buffer_mut(), body, tail);
-                // Scrolled up: the bottom-right corner says how many lines are below (like the reader)
+                // Scrolled up: the bottom row says how many lines are below (like the reader)
                 if up > 0 {
-                    let tag = tr!(" ↓ {up} 行 ", " ↓ {up} lines ");
-                    let tw = tag.width() as u16;
-                    if body.width > tw + 2 && body.height > 0 {
-                        let r = Rect { x: body.x + body.width - tw, y: body.y + body.height - 1, width: tw, height: 1 };
-                        f.render_widget(Paragraph::new(Line::styled(tag, dim())).style(Style::new().bg(theme::pal().sel)), r);
-                    }
+                    below_tag(f, body, up);
                 }
                 let name = s.name.clone();
                 (app.preview_for, app.preview_up, app.preview_max) = (name, up, max);
@@ -9740,10 +9737,8 @@ fn clip_lines(mut ls: Vec<Styled>, max: usize, pad: &str) -> Vec<Styled> {
     if ls.len() > max {
         let more = ls.len() - max;
         ls.truncate(max);
-        ls.push(vec![crate::trace::seg(
-            tr!("{pad}… 还有 {} 行", "{pad}… {} more lines", crate::trace::thousands(more as u64)),
-            theme::faint(),
-        )]);
+        let (k, w) = (crate::trace::thousands(more as u64), noun(more as u64, "line", "lines"));
+        ls.push(vec![crate::trace::seg(tr!("{pad}… 还有 {k} 行", "{pad}… {k} more {w}"), theme::faint())]);
     }
     ls
 }
@@ -9937,16 +9932,26 @@ fn draw_blocks(f: &mut Frame, area: Rect, b: &Blocks, blocks: Vec<Vec<Line<'stat
         f.buffer_mut()
             .set_style(Rect { x: area.x, y: area.y + (s - top) as u16, width: area.width, height: 1 }, Style::new().bg(theme::pal().sel));
     }
-    // More below: the bottom-right corner says how many lines are left
     let below = b.total().saturating_sub(top + h);
     if below > 0 && !b.follow {
-        let tag = tr!(" ↓ {below} 行 ", " ↓ {below} lines ");
-        let tw = tag.width() as u16;
-        if area.width > tw + 2 {
-            let r = Rect { x: area.x + area.width - tw, y: area.y + area.height - 1, width: tw, height: 1 };
-            f.render_widget(Paragraph::new(Line::styled(tag, dim())).style(Style::new().bg(theme::pal().sel)), r);
-        }
+        below_tag(f, area, below);
     }
+}
+
+/// More below: the bottom row of `area` gives way to a tag at its right saying how many lines are left (that row counted
+/// too), rather than covering the end of a line
+fn below_tag(f: &mut Frame, area: Rect, below: usize) {
+    let n = below + 1;
+    let w = noun(n as u64, "line", "lines");
+    let tag = tr!(" ↓ {n} 行 ", " ↓ {n} {w} ");
+    let tw = tag.width() as u16;
+    if area.height < 2 || area.width <= tw + 2 {
+        return;
+    }
+    let row = Rect { y: area.y + area.height - 1, height: 1, ..area };
+    f.render_widget(ratatui::widgets::Clear, row);
+    let r = Rect { x: row.x + row.width - tw, width: tw, ..row };
+    f.render_widget(Paragraph::new(Line::styled(tag, dim())).style(Style::new().bg(theme::pal().sel)), r);
 }
 
 fn draw_chat(f: &mut Frame, v: &mut TraceView, area: Rect, live: bool, now: i64) {
@@ -12696,7 +12701,7 @@ mod tests {
             let r = row_of(&rows, t);
             r[..r.find(t).unwrap()].width()
         };
-        assert_eq!((col(" 10s"), col(" 30s")), (col(" 20s"), col(" 20s")), "{rows:#?}");
+        assert_eq!((col(" 10秒"), col(" 30秒")), (col(" 20秒"), col(" 20秒")), "{rows:#?}");
         // The account follows the title, colored by tool
         let t = rows.iter().find(|r| r.contains("#3 构建")).unwrap();
         assert!(t.contains(" cx "), "{t}");
@@ -14097,10 +14102,11 @@ mod tests {
         let has = |rows: &[String], t: &str| rows.iter().any(|r| r.contains(t));
         let rows = reader_rows(&mut app, 120, 36);
         assert!(has(&rows, "第 80 行") && !has(&rows, "↓"), "{rows:#?}");
-        // Scroll up: three rows at a time, the bottom-right corner says how many rows are below
+        // Scroll up: three rows at a time; the bottom row gives way to how many rows are below, itself included, rather than
+        // covering the end of one
         wheel(&mut app, MouseEventKind::ScrollUp);
         let rows = reader_rows(&mut app, 120, 36);
-        assert!(has(&rows, "第 77 行") && !has(&rows, "第 78 行") && has(&rows, "↓ 3 行"), "{rows:#?}");
+        assert!(has(&rows, "第 76 行") && !has(&rows, "第 77 行") && has(&rows, "↓ 4 行"), "{rows:#?}");
         assert!(app.msg.is_none() && app.current().unwrap().title == "跑");
         // At the top of this screen: further up points to full-screen reading
         for _ in 0..40 {
@@ -16043,12 +16049,15 @@ mod tests {
         let rows = text(&app);
         assert!(rows.iter().all(|r| r.width() == 46), "{rows:?}");
         let run = rows.iter().find(|r| r.contains("跑")).unwrap();
-        assert!(run.ends_with(" team  5s "), "{run}"); // 5s right-aligned to 3 cells
+        assert!(run.ends_with(" team  5秒 "), "{run}"); // 5秒 right-aligned to 4 cells
+        // In English the column is 3 cells
+        let en = i18n::with(Lang::En, || text(&app));
+        assert!(en.iter().all(|r| r.width() == 46) && en.iter().any(|r| r.ends_with(" team  5s ")), "{en:?}");
         // Only sessions without an account left on show: the column width stays (computed over all sessions), titles don't shift
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('}'));
         assert_eq!(titles(&app), ["未读", "问"]);
-        assert!(text(&app)[0].ends_with(&format!("{}11d ", " ".repeat(2 + 1 + 4 + 1))), "{:?}", text(&app)); // Mark col + empty account col
+        assert!(text(&app)[0].ends_with(&format!("{}11天 ", " ".repeat(2 + 1 + 4 + 1))), "{:?}", text(&app)); // Mark col + empty account col
         // Too long is cut; when no session has an account the column takes no space
         v[2].who = "a-very-long-slot".into();
         assert_eq!(App::new(String::new(), v.clone()).who_width(), 8);
@@ -16554,8 +16563,8 @@ mod tests {
             ],
         );
         let row = |rows: &[String], what: &str| rows.iter().find(|r| r.contains(what)).cloned().unwrap_or_default();
-        assert!(row(&rows, "├ ● Explore").contains(" 1m"), "{rows:#?}");
-        assert!(row(&rows, "├ ✓ fork").contains("40s"), "{rows:#?}");
+        assert!(row(&rows, "├ ● Explore").contains(" 1分"), "{rows:#?}");
+        assert!(row(&rows, "├ ✓ fork").contains("40秒"), "{rows:#?}");
         // Digit keys follow the numbers: 4 is the window, not a subagent
         press(&mut app, KeyCode::Char('4'));
         assert_eq!(app.current().unwrap().title, "zsh");
@@ -17044,6 +17053,21 @@ mod tests {
         press(&mut app, KeyCode::Char('n'));
         trace_panes(&mut app, 120, 12);
         assert_eq!(app.trace.as_ref().unwrap().steps.top, 0);
+    }
+
+    #[test]
+    fn one_line_left_is_a_line_in_english() {
+        let last = |n: usize| i18n::with(Lang::En, || clip_lines(vec![vec![]; n], 2, "").last().unwrap()[0].text.clone());
+        assert_eq!((last(3), last(4)), ("… 1 more line".to_string(), "… 2 more lines".to_string()));
+    }
+
+    #[test]
+    fn more_below_in_the_record_takes_the_bottom_row_rather_than_covering_a_line() {
+        let (mut app, _) = trace_app("phone");
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Char('p'));
+        let rows = reader_rows(&mut app, 46, 8);
+        assert!(rows.iter().any(|r| r.trim().starts_with("↓ ") && r.trim().ends_with('行')), "{rows:#?}");
     }
 
     #[test]

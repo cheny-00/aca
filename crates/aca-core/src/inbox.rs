@@ -883,7 +883,10 @@ fn outcome(cfg: &Config, s: &Session, since: u64, now: u64) -> Option<Outcome> {
             let busy = list(&s.id).iter().any(|(m, st)| m.wake && *st != Stage::Got);
             let never = r.turn == 0 && r.done == 0;
             let early = now.saturating_sub(since) < 3 && r.done < since;
-            (!busy && !never && !early).then_some(Outcome::Done)
+            // Ended the turn with background tasks still running (Claude): it's woken for a new turn when they end, so it
+            // isn't done yet. One that never ends (a server left running) is waited on until --timeout
+            let bg = r.status == "done" && r.bg > 0;
+            (!busy && !never && !early && !bg).then_some(Outcome::Done)
         }
     }
 }

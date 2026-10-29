@@ -1409,6 +1409,31 @@ fn waiting_for_a_worker_returns_when_its_turn_ends_and_its_notice_does_not_wake_
 }
 
 #[test]
+fn a_turn_ended_with_background_tasks_still_running_is_not_what_wait_returns_on() {
+    let Some(sb) = Sandbox::new("waitbg") else { return };
+    sb.screen_tools();
+    let w = sb.aca(&["new", "scr", &sb.proj()]);
+    let pane = sb.pane(&w);
+    sb.set_screen(&w, &pane, "✻ Pondering… (3s · ↓ 1k tokens)");
+    sb.hook(&w, &pane, r#"{"hook_event_name":"UserPromptSubmit","session_id":"c1","prompt":"录屏"}"#);
+    let mut child = sb.cmd().args(["wait", &w, "--timeout", "20"]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+
+    // Claude ends the turn while its own background task runs: it'll be woken when the task ends, so keep waiting
+    sb.set_screen(&w, &pane, "❯ ");
+    sb.hook(&w, &pane, r#"{"hook_event_name":"Stop","session_id":"c1","last_assistant_message":"等录完","background_tasks":[{"id":"b1"}]}"#);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(child.try_wait().unwrap().is_none(), "后台任务还在跑,不该等到");
+
+    // The task ends and wakes it for a new turn; this one ends with nothing left in the background
+    sb.set_screen(&w, &pane, "✻ Pondering… (1s · ↓ 1k tokens)");
+    sb.hook(&w, &pane, r#"{"hook_event_name":"UserPromptSubmit","session_id":"c1","prompt":"<task-notification>"}"#);
+    sb.set_screen(&w, &pane, "❯ ");
+    sb.hook(&w, &pane, r#"{"hook_event_name":"Stop","session_id":"c1","last_assistant_message":"录好了","background_tasks":[]}"#);
+    let o = child.wait_with_output().unwrap();
+    assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stdout).trim()), (Some(0), format!("{w} 完成一轮:「录好了」").as_str()));
+}
+
+#[test]
 fn a_plugin_installed_from_git_brings_its_claude_plugin_while_enabled_and_goes_away_cleanly() {
     let Some(sb) = Sandbox::new("plugins") else { return };
     // A plugin repo: the manifest says to pass Claude the plugin directory claude/

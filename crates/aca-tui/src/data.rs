@@ -20,6 +20,7 @@ use aca_core::proc::{self, Kids};
 use aca_core::runtime::Run;
 use aca_core::store::{self, Store};
 use aca_core::tmux::Pane;
+use aca_core::i18n::{self, Lang};
 use aca_core::{paths, status};
 use aca_core::{t, tr};
 use regex::Regex;
@@ -634,14 +635,23 @@ pub fn dur(sec: u64) -> String {
     }
 }
 
-/// Duration (short form, the list's last column, at most 3 cells wide): now / 40s / 12m / 2h / 3d
+/// Duration (short form, the list's last column, at most [`age_w`] cells wide): now / 40s / 12m / 2h / 3d, in Chinese
+/// 刚刚 / 40秒 / 12分 / 2时 / 3天 (the units `aca ls` uses)
 pub fn age(sec: u64) -> String {
     match sec {
-        0 => "now".into(),
-        1..=59 => format!("{sec}s"),
-        60..=3599 => format!("{}m", sec / 60),
-        3600..=86399 => format!("{}h", sec / 3600),
-        _ => format!("{}d", sec / 86400),
+        0 => t!("刚刚", "now").into(),
+        1..=59 => tr!("{sec}秒", "{sec}s"),
+        60..=3599 => tr!("{}分", "{}m", sec / 60),
+        3600..=86399 => tr!("{}时", "{}h", sec / 3600),
+        _ => tr!("{}天", "{}d", sec / 86400),
+    }
+}
+
+/// How wide the list's time column is: a Chinese unit takes two cells
+pub fn age_w() -> usize {
+    match i18n::lang() {
+        Lang::Zh => 4,
+        Lang::En => 3,
     }
 }
 

@@ -72,7 +72,8 @@ fn change_paras(ch: &[&Change], pre: &Styled, path: &str) -> Vec<Para> {
 }
 
 fn more(pre: &Styled, k: usize) -> Para {
-    Para::under(pre.clone(), vec![seg(tr!("… 还有 {} 行", "… {} more lines", thousands(k as u64)), theme::faint())])
+    let (n, w) = (thousands(k as u64), noun(k as u64, "line", "lines"));
+    Para::under(pre.clone(), vec![seg(tr!("… 还有 {n} 行", "… {n} more {w}"), theme::faint())])
 }
 
 /// Changes to several files: when more than one file changed, each file gets a path line first. open = show everything with

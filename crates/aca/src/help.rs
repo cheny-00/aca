@@ -682,6 +682,7 @@ More than 20 from one session to another within 10 minutes: the rest are kept, n
 出错的那一行会写明类别:临时性的(限流、过载、断流:过一会儿用 aca send 让它继续)、账号问题、重试也无效的。
 Codex 一轮出错时不上报 hook:aca 等待时从它的对话记录里读取。
 刚发给它的话还没送达、还没进入「运行中」的,不算一轮结束。
+结束一轮时还有自己的后台任务在跑的(Claude),也不算:任务结束后它会被叫醒接着做。一直不结束的(比如开着的服务)等到 --timeout。
 在某个会话里调用时:等到的那几个会话发来的通知记为已送达,不会再因为它们被唤醒一次。",
                     "  --any            return on the first one; default: wait for all
   --timeout SECS   wait at most this long (exit code 124)
@@ -689,6 +690,8 @@ Codex 一轮出错时不上报 hook:aca 等待时从它的对话记录里读取�
 Exit codes: 0 a turn finished  2 waiting for a confirmation  3 failed  4 exited / stopped  124 timed out.
 Waiting on several: the first one that isn't 0.
 Text just sent to it that hasn't arrived, or hasn't turned it into \"running\" yet, doesn't count as finished.
+Nor does a turn it ended with its own background tasks still running (Claude): it's woken to carry on when they
+end. One that never ends (a server left running) is waited on until --timeout.
 Called from inside a session: the notifications from the ones it waited for are marked delivered,
 so it isn't woken for them again.",
                 ),
