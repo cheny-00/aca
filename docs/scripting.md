@@ -15,7 +15,7 @@ A session id can be shortened to its first few characters, or replaced by the se
 | `aca new <tool[:account]> [dir] [-t title] [-g group] [--say text]` | Start a session. Prints its id, the only line on standard output. `--say` is the first message. `-w <branch>` starts it in a git worktree |
 | `aca send <id> -m <text>` | Type the text into its input box and press `Enter`. `--wait <secs>` first waits until it is idle |
 | `aca wait <id>…` | Block until it finishes a turn, asks something, fails or exits. The exit code says which |
-| `aca output <id>` | Its last reply |
+| `aca output <id>` | Its last reply. `--turns N`: what both sides said in the last N turns; `--file`: the whole conversation as text, written to a file whose path it prints. Both start with a line on its state, directory and branch |
 | `aca answer <id>` | Show what it is asking: the question and the numbered options, or the command it wants to run |
 | `aca answer <id> <number \| yes \| no>` | Answer it: pick that option, or allow / deny a permission prompt |
 | `aca interrupt <id>` | Stop the current turn (like pressing `Esc`), when it went the wrong way |

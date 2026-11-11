@@ -14,9 +14,9 @@
 //!   appended again); uninstall removes the keys aca bound and that segment
 //! - with `ACA_HOME` set (tests), "your tmux.conf" is `$ACA_HOME/tmux.conf`, so the real one is never touched
 //!
-//! `aca tmux key`: the keys aca binds on tmux itself that you can change: just one for now, go to the next session that
-//! needs you (`aca next`). It isn't in the file above: like Ctrl+Q and plugin hotkeys, aca binds it directly on the tmux
-//! server (`plugin::bind_hotkeys`); which key is kept in config.toml's `[keys] next`
+//! `aca tmux key`: the keys aca binds on tmux itself that you can change: go to the next session that needs you (`aca next`),
+//! put a session's reference where you type (`aca ui --ref`). They aren't in the file above: like Ctrl+Q and plugin
+//! hotkeys, aca binds them directly on the tmux server (`plugin::bind_hotkeys`); which keys is kept in config.toml's `[keys]`
 
 use std::path::{Path, PathBuf};
 
@@ -380,51 +380,73 @@ fn status() -> Res<String> {
             lines_text(&mine)
         ));
     }
-    say.extend(next_key());
+    say.extend(own_keys());
     Ok(say.join("\n"))
 }
 
-/// `aca tmux key [next [<key> | --none]]`: show / change the key that goes to the next session that needs you. A new key is
-/// bound right away
+/// `aca tmux key [next | ref [<key> | --none]]`: show / change the keys aca binds itself (go to the next session that needs
+/// you; put a session's reference where you type). A new key is bound right away
 fn key(args: &[String]) -> Res<String> {
     match args {
         [] => {}
-        [which, rest @ ..] if which == "next" => {
-            if let Some(k) = rest.first() {
-                let k = if k == "--none" { "" } else { k.as_str() };
+        [which, rest @ ..] if which == "next" || which == "ref" => {
+            // `prefix b` may come as one word or two
+            if !rest.is_empty() {
+                let k = if rest == ["--none"] { String::new() } else { rest.join(" ") };
                 if !k.is_empty() {
-                    aca_core::plugin::hotkey_ok(k)?;
+                    aca_core::plugin::hotkey_ok(&k)?;
                 }
-                crate::config::set("keys", "next", toml::Value::String(k.into()))?;
+                crate::config::set("keys", which, toml::Value::String(k))?;
             }
         }
-        [other, ..] => return Err(tr!("aca tmux key 不支持 {other}(仅支持 next)", "aca tmux key has no {other} (only next)")),
+        [other, ..] => {
+            return Err(tr!("aca tmux key 不支持 {other}(仅支持 next、ref)", "aca tmux key has no {other} (only next, ref)"));
+        }
     }
-    Ok(next_key().join("\n"))
+    Ok(own_keys().join("\n"))
 }
 
-/// Which key goes to the next session that needs you, and whether it's bound. Also brings tmux's bindings in line with the
-/// config (like `aca plugin hotkey`)
-fn next_key() -> Vec<String> {
+/// Which keys aca binds itself, and whether they're bound. Also brings tmux's bindings in line with the config (like `aca
+/// plugin hotkey`)
+fn own_keys() -> Vec<String> {
     let notes = aca_core::plugin::bind_hotkeys();
-    let mut say = vec![match aca_core::config::load().keys.next_key() {
-        Ok(Some(k)) => tr!(
-            "跳到下一个待处理会话:在会话中按 {}(aca next;更换:aca tmux key next <键>,取消:--none)",
-            "the next one waiting: press {} inside a session (aca next; another key: aca tmux key next <key>, none: --none)",
-            human(&k)
-        ),
-        _ => t!(
-            "跳到下一个待处理会话:未绑定按键(用 aca tmux key next <键> 绑定;也可直接运行 aca next)",
-            "the next one waiting: no key (aca tmux key next <key> binds one; aca next still works typed)"
-        )
-        .into(),
-    }];
+    let keys = aca_core::config::load().keys;
+    let mut say = vec![
+        match keys.next_key() {
+            Ok(Some(k)) => tr!(
+                "跳到下一个待处理会话:在会话中按 {}(aca next;更换:aca tmux key next <键>,取消:--none)",
+                "the next one waiting: press {} inside a session (aca next; another key: aca tmux key next <key>, none: --none)",
+                human(&k)
+            ),
+            _ => t!(
+                "跳到下一个待处理会话:未绑定按键(用 aca tmux key next <键> 绑定;也可直接运行 aca next)",
+                "the next one waiting: no key (aca tmux key next <key> binds one; aca next still works typed)"
+            )
+            .into(),
+        },
+        match keys.ref_key() {
+            Ok(Some(k)) => tr!(
+                "插入引用:在会话中按 {}(aca ui --ref;更换:aca tmux key ref <键>,取消:--none)",
+                "insert a reference: press {} inside a session (aca ui --ref; another key: aca tmux key ref <key>, none: --none)",
+                human(&k)
+            ),
+            _ => t!(
+                "插入引用:未绑定按键(用 aca tmux key ref <键> 绑定;也可直接运行 aca ui --ref)",
+                "insert a reference: no key (aca tmux key ref <key> binds one; aca ui --ref still works typed)"
+            )
+            .into(),
+        },
+    ];
     say.extend(notes.into_iter().filter(|(who, _)| who == aca_core::plugin::OWN_KEYS).map(|(_, n)| format!("⚠ {n}")));
     say
 }
 
-/// Write a tmux key name the way it looks on the keyboard: `C-M-n` → `Ctrl+Alt+N(C-M-n)`; unrecognized ones as they are
+/// Write a tmux key name the way it looks on the keyboard: `C-M-n` → `Ctrl+Alt+N(C-M-n)`, `prefix b` → `前缀键 + b`
+/// (prefix + b); unrecognized ones as they are
 fn human(k: &str) -> String {
+    if let Some(after) = k.strip_prefix(aca_core::tmux::PREFIX_KEY) {
+        return tr!("前缀键 + {}", "prefix + {}", human(after.trim()));
+    }
     let (mods, last) = match k {
         _ if k.starts_with("C-M-") => ("Ctrl+Alt+", &k[4..]),
         _ if k.starts_with("M-") => ("Alt+", &k[2..]),
@@ -486,6 +508,7 @@ mod tests {
     #[test]
     fn a_tmux_key_name_is_shown_the_way_it_is_on_the_keyboard() {
         assert_eq!(human("C-M-n"), "Ctrl+Alt+N(C-M-n)");
+        assert_eq!(human("prefix b"), "前缀键 + b");
         assert_eq!((human("M-y"), human("C-]"), human("F5")), ("Alt+Y(M-y)".into(), "Ctrl+](C-])".into(), "F5".into()));
     }
 

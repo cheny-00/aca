@@ -356,6 +356,11 @@ fn stamp(head: &Path) -> String {
     format!("{}:{}", at(head), at(&head.with_file_name("index")))
 }
 
+/// The branch of the repository (or worktree) this directory is in, read from HEAD without running git
+pub(crate) fn branch_at(dir: &Path) -> Option<String> {
+    branch(&repo(dir)?.1)
+}
+
 /// What HEAD says: the branch name; when not on a branch (mid-rebase, a commit checked out), `@` plus the short hash
 fn branch(head: &Path) -> Option<String> {
     let text = std::fs::read_to_string(head).ok()?;

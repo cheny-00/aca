@@ -90,6 +90,8 @@ the same row brings it back; `exit` closes it.
 ```sh
 aca show 3f2a          # state, directory, conversation id and its last reply
 aca output 3f2a        # only its last reply
+aca output 3f2a --turns 3   # what both sides said in the last 3 turns, after a line on its state, directory, branch
+aca output 3f2a --file      # the whole conversation as text, written to a file (the one H hands a new session)
 aca show 3f2a --json   # the same, for scripts
 ```
 

@@ -1387,8 +1387,10 @@ fn strip_prompt(mut styled: Vec<Styled>, asking: bool) -> Vec<Styled> {
 pub enum Clip {
     /// c: the last reply; for a registered session the one the hook recorded, falling back to the text on screen
     Last { profile: String, id: String, title: String, screen: String },
-    /// B: path / branch / session id
+    /// B on an unregistered or shell session (and `C`'s all): path / branch / session id / home
     Info { title: String, text: String },
+    /// B on a registered agent session: the two-line reference another agent acts on (see `data::reference`)
+    Ref { title: String, text: String },
     /// A piece of text handed back by a popup (`Fx::copy`): an address or such; the bottom bar says it as is
     Text(String),
 }
@@ -2469,6 +2471,18 @@ pub struct App {
     /// Paths of the group the highlight is on (see `spot`)
     spot: Option<Spot>,
     pub clip: Option<Clip>,
+    /// Picking a session whose reference goes into a pane (⏎ puts it there instead of going in): opened by `aca ui --ref`
+    /// (`--insert`, the key pressed inside a session), or the same key pressed here in the list, for the highlighted session
+    pub insert_to: Option<String>,
+    /// Picking started here in the list: the row it goes into (`name`, title), highlighted again once done. None = opened by
+    /// `aca ui --ref`, which closes once done
+    pub insert_back: Option<(String, String)>,
+    /// ⏎ pressed while picking: the text to put into `insert_to`, and the title of the session it refers to (the run loop pastes it)
+    pub put: Option<(String, String)>,
+    /// The reference key (`[keys] ref`) as the list sees it: `prefix b` is two presses, tmux's prefix key then b (no tmux in
+    /// between here); empty = none. How many of them were pressed so far
+    pub ref_keys: Vec<(KeyCode, KeyModifiers)>,
+    ref_got: usize,
     /// Folded groups (saved in the view)
     folded: BTreeSet<String>,
     /// What this rebuild actually folded: group → (how many, how many need you); nothing folds while filtering, so it's empty
@@ -2661,6 +2675,11 @@ impl App {
             glance_for: None,
             spot: None,
             clip: None,
+            insert_to: None,
+            insert_back: None,
+            put: None,
+            ref_keys: vec![],
+            ref_got: 0,
             folded: BTreeSet::new(),
             folds: HashMap::new(),
             agents_open: HashSet::new(),
@@ -7056,6 +7075,11 @@ impl App {
         if self.current().is_some_and(|s| s.subagent.is_some()) {
             return self.open_trace();
         }
+        // Picking (`aca ui --ref`, or the reference key here): what `B` would copy goes where you were typing
+        if self.insert_to.is_some() {
+            self.put = self.current().map(|s| (crate::data::reference(s).unwrap_or_else(|| crate::data::copy_text(s)), s.title.clone()));
+            return;
+        }
         if let Some(i) = self.list.selected().and_then(|p| self.view.get(p).copied()) {
             self.go(i);
         }
@@ -7356,8 +7380,37 @@ impl App {
             let screen = preview_lines(s).iter().map(ansi::plain).collect::<Vec<_>>().join("\n");
             Clip::Last { profile: s.profile.clone(), id: s.deck_id.clone(), title, screen }
         } else {
-            Clip::Info { title, text: crate::data::copy_text(s) }
+            match crate::data::reference(s) {
+                Some(text) => Clip::Ref { title, text },
+                None => Clip::Info { title, text: crate::data::copy_text(s) },
+            }
         });
+    }
+
+    /// The reference key pressed in the list: pick a session, its reference goes into the highlighted one's input box
+    fn start_insert(&mut self) {
+        if self.on_group(t!("插入引用", "insert a reference")) {
+            return;
+        }
+        let Some(s) = self.current().filter(|s| s.subagent.is_none()) else { return };
+        if s.state.gone() || s.state == State::Dead {
+            let m = tr!("「{}」未运行,无法插入", "“{}” isn't running; nothing to insert into", s.title);
+            return self.flash(&m);
+        }
+        // Its agent's pane; not known: the session's current one
+        let pane = if s.pane.is_empty() { format!("{}:", s.tmux) } else { s.pane.clone() };
+        self.insert_back = Some((s.name.clone(), s.title.clone()));
+        self.insert_to = Some(pane);
+    }
+
+    /// Stop picking started in the list, and highlight the row it was for again
+    pub fn end_insert(&mut self) {
+        self.insert_to = None;
+        if let Some((name, _)) = self.insert_back.take() {
+            self.selected = Some(name);
+            let all = std::mem::take(&mut self.all);
+            self.set_sessions(all);
+        }
     }
 
     /// C: pick one thing to copy (aca id / session id / path, see copies.rs)
@@ -7407,6 +7460,15 @@ impl App {
         }
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             self.quit = true;
+            return;
+        }
+        // Ctrl+Alt+letter is a key pressed inside a session (aca's own in tmux like Ctrl+Alt+N, and plugin hotkeys): reaching here
+        // (the interface opened outside tmux, or a popup open, where tmux doesn't apply bindings) it does nothing. Matched by its
+        // letter alone, Ctrl+Alt+B would open the trash
+        if k.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(k.code, KeyCode::Char(_))
+            && !self.ref_keys.first().is_some_and(|r| key_is(k, *r))
+        {
             return;
         }
         if self.new_draft.is_some() {
@@ -7539,6 +7601,54 @@ impl App {
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        // The reference key: pick a session, its reference goes into the highlighted one. After tmux's prefix key, another key does
+        // nothing (as in tmux)
+        if self.insert_to.is_none() && !self.ref_keys.is_empty() {
+            if key_is(k, self.ref_keys[self.ref_got]) {
+                self.ref_got += 1;
+                if self.ref_got == self.ref_keys.len() {
+                    self.ref_got = 0;
+                    self.start_insert();
+                }
+                return;
+            }
+            if std::mem::take(&mut self.ref_got) > 0 {
+                return;
+            }
+        }
+        // Ctrl+letter means only what's listed below (^Z ^S ^G ^L ^N ^R); any other does nothing rather than act as the bare letter:
+        // tmux's prefix key Ctrl+B pressed here, where no tmux is in between (the interface opened straight in the terminal, or in a
+        // tmux popup), would open the trash
+        if ctrl && matches!(k.code, KeyCode::Char(c) if !"zsglnr".contains(c)) {
+            return;
+        }
+        // Picking for `aca ui --ref`: only the keys for finding a session and taking it. The key that opened it, held a moment, repeats
+        // into the list as it appears (b, which would open the trash), and nothing here should change a session
+        if self.insert_to.is_some() {
+            let pick = matches!(
+                k.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Esc
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Char('j' | 'k' | 'h' | 'l' | 'J' | 'K' | 'g' | 'G' | '/' | ' ' | 'a' | 'W' | '{' | '}' | 'i' | 'q')
+                    | KeyCode::Char('!' | '@' | '#' | '%' | '&' | '^')
+            );
+            match k.code {
+                KeyCode::Enter => return self.enter(),
+                // Started here: Esc / q stop picking, back where it was (a search typed is cleared first)
+                KeyCode::Esc | KeyCode::Char('q') if self.insert_back.is_some() && self.filter.is_empty() => return self.end_insert(),
+                _ if !pick || ctrl => return,
+                _ => {}
+            }
+        }
         match k.code {
             KeyCode::Char(' ') if !self.view.is_empty() => self.jump = Some(String::new()),
             KeyCode::Char('z') if ctrl => self.undo_last(),
@@ -8241,6 +8351,16 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         _ if app.jump.is_some() => {
             Line::styled(t!("按字母打开或定位到分组 · Esc 取消", "press a letter to open / land on a group · Esc cancels"), theme::warn())
                 .centered()
+        }
+        // Picking (`aca ui --ref`, or the reference key here): only the keys that work here; started here, where it goes
+        _ if app.insert_to.is_some() => {
+            let into = app.insert_back.as_ref().map(|(_, t)| tr!("插入到「{}」", "insert into “{}”", clip(t, 12).trim_end()));
+            let enter = match () {
+                _ if app.head.is_some() => t!("折叠", "fold"),
+                _ if app.on_fold_row() => t!("展开", "unfold"),
+                _ => into.as_deref().unwrap_or(t!("插入", "insert")),
+            };
+            menu_bar(&[vec![("⏎", enter, 0), ("Esc", t!("取消", "cancel"), 0)], vec![("/", t!("搜索", "search"), 3)]], Some(0), w)
         }
         _ => {
             // Three groups: manage sessions │ act on the highlighted one (main actions) │ view. Only the most used, the rest are in ?; when
@@ -10383,12 +10503,45 @@ fn resume(t: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
 }
 
 /// Whether it's Ctrl+\. The terminal sends 0x1C, which crossterm reads as ^4; in terminals with keyboard enhancement it's ^\ itself
+/// Whether a key pressed is this one (Shift isn't compared: a terminal reports B as b with or without it)
+fn key_is(k: KeyEvent, (code, mods): (KeyCode, KeyModifiers)) -> bool {
+    let m = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    k.code == code && (k.modifiers & m) == (mods & m)
+}
+
+/// A tmux key name as the list receives it: `C-b`, `M-x`, `C-M-y`, `F6`, `b`; one it can't tell = None. `prefix b` is two keys:
+/// tmux's prefix key (`prefix`, its name in tmux), then b
+pub fn list_keys(key: &str, prefix: &str) -> Vec<(KeyCode, KeyModifiers)> {
+    fn one(k: &str) -> Option<(KeyCode, KeyModifiers)> {
+        if let Some(n) = k.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()).filter(|n| (1..=12).contains(n)) {
+            return Some((KeyCode::F(n), KeyModifiers::NONE));
+        }
+        let (mut rest, mut mods) = (k, KeyModifiers::NONE);
+        while rest.chars().count() > 1 {
+            let (m, r) = match rest.split_at_checked(2)? {
+                ("C-", r) => (KeyModifiers::CONTROL, r),
+                ("M-", r) => (KeyModifiers::ALT, r),
+                ("S-", r) => (KeyModifiers::SHIFT, r),
+                _ => return None,
+            };
+            (mods, rest) = (mods | m, r);
+        }
+        let c = rest.chars().next()?;
+        Some((KeyCode::Char(if mods.contains(KeyModifiers::CONTROL) { c.to_ascii_lowercase() } else { c }), mods))
+    }
+    let keys = match key.strip_prefix(aca_core::tmux::PREFIX_KEY) {
+        Some(after) => vec![one(prefix.trim()), one(after.trim())],
+        None => vec![one(key)],
+    };
+    keys.into_iter().collect::<Option<Vec<_>>>().unwrap_or_default()
+}
+
 fn closes_popup(k: KeyEvent) -> bool {
     k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('\\' | '4'))
 }
 
 /// Replace this process with itself (same path, i.e. the newly installed one) and keep going: exec, same process, same terminal. Only pass
-/// --client (the popup needs it) and --restarted (where to open); not the keywords from startup — they'd go straight into that session. The
+/// --client (the popup needs it), --insert (still picking a reference) and --restarted (where to open); not the keywords from startup — they'd go straight into that session. The
 /// view (groups, scope, layout, highlighted session) is saved anyway, and the new one restores it
 fn relaunch(state: &str) -> anyhow::Error {
     use std::os::unix::process::CommandExt;
@@ -10402,6 +10555,9 @@ fn relaunch(state: &str) -> anyhow::Error {
     }
     if crate::follow::asked() {
         cmd.arg("--follow");
+    }
+    if let Some(p) = crate::data::insert_to() {
+        cmd.args(["--insert", p]);
     }
     cmd.args(["--restarted", state]);
     anyhow::anyhow!("{}", tr!("重启界面失败:{}", "restarting the interface failed: {}", cmd.exec()))
@@ -10521,6 +10677,12 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
             aca_core::tmux::bind_detach();
             app.follow_from(&session, &pane);
         }
+    }
+    app.insert_to = crate::data::insert_to().map(String::from);
+    // The reference key works in the list too (no tmux in between: its prefix key arrives here as is)
+    if let Ok(Some(k)) = aca_core::config::load().keys.ref_key() {
+        let prefix = aca_core::tmux::run(&["show-options", "-gv", "prefix"]).unwrap_or_default();
+        app.ref_keys = list_keys(&k, &prefix);
     }
     // config.toml is broken: treat accounts and tools as unset; the settings page's Problems says where
     app.sync_failed = aca_core::config::problem().into_iter().collect();
@@ -10811,6 +10973,18 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                     let _ = tx.send((job, out, collect()));
                 });
             }
+            // Picked: into the pane. Opened by `aca ui --ref`: close (the popup goes with it); started in the list: back to the row it
+            // went into, its preview shows it
+            if let (Some((text, of)), Some(pane)) = (app.put.take(), app.insert_to.clone()) {
+                match crate::data::paste_into(&pane, &text) {
+                    Ok(()) if app.insert_back.is_none() => return Ok(()),
+                    Ok(()) => {
+                        app.end_insert();
+                        app.flash(&tr!("已插入「{of}」的引用", "inserted the reference to “{of}”"));
+                    }
+                    Err(e) => app.flash(&tr!("无法插入:{e}", "couldn't insert: {e}")),
+                }
+            }
             if let Some(c) = app.clip.take() {
                 let (_, what, text) = match c {
                     Clip::Last { id, title, screen, .. } => {
@@ -10820,6 +10994,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                         (title, what, got.unwrap_or(screen))
                     }
                     Clip::Info { title, text } => (title, t!("会话信息", "session info"), text),
+                    Clip::Ref { title, text } => (title, t!("引用", "the reference"), text),
                     Clip::Text(text) => (String::new(), "", text),
                 };
                 let m = if text.trim().is_empty() {
@@ -15565,7 +15740,7 @@ mod tests {
     }
 
     #[test]
-    fn c_copies_last_response_and_shift_b_the_session_info() {
+    fn c_copies_last_response_and_shift_b_a_reference_to_the_session() {
         let mut app = fixture();
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('c'));
@@ -15575,12 +15750,26 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        // B on a registered Claude: the reference another agent acts on
         press(&mut app, KeyCode::Char('B'));
-        // Then the config dir Claude uses (this machine's default / account): only that it's there
         match app.clip.take() {
-            Some(Clip::Info { title, text }) => {
+            Some(Clip::Ref { title, text }) => {
+                assert_eq!(title, "跑");
+                assert_eq!(
+                    text,
+                    "aca 会话 id-跑「跑」(Claude,/p/work)\n看它:aca output id-跑 --turns 5(整段:--file)　给它传话:aca msg id-跑 \"…\""
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // C's all: the lines B used to copy, ending with the config dir Claude uses (this machine's default / account): only
+        // that it's there
+        press(&mut app, KeyCode::Char('C'));
+        press(&mut app, KeyCode::Char('a'));
+        match app.clip.take() {
+            Some(Clip::Text(text)) => {
                 let v: Vec<&str> = text.lines().collect();
-                assert_eq!((title.as_str(), v[0], v.len()), ("跑", "Path: /p/work", 2));
+                assert_eq!((v[0], v.len()), ("Path: /p/work", 2));
                 assert!(v[1].starts_with("Home: /"), "{text}");
             }
             other => panic!("{other:?}"),
@@ -15595,6 +15784,90 @@ mod tests {
         press(&mut app, KeyCode::Char('z')); // Copying works in full-screen reading too
         press(&mut app, KeyCode::Char('c'));
         assert!(matches!(app.clip.take(), Some(Clip::Last { .. })));
+    }
+
+    #[test]
+    fn picking_for_aca_ref_puts_what_b_copies_instead_of_going_in() {
+        let mut app = fixture();
+        app.insert_to = Some("%7".into());
+        let foot = |app: &mut App| {
+            let mut t = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            let buf = t.backend().buffer();
+            let (mut out, mut x) = (String::new(), 0);
+            while x < 100 {
+                out.push_str(buf[(x, 19)].symbol());
+                x += buf[(x, 19)].cell_width().max(1);
+            }
+            out
+        };
+        select(&mut app, "跑");
+        assert!(foot(&mut app).contains("⏎ 插入 • Esc 取消"), "{}", foot(&mut app));
+        assert!(!foot(&mut app).contains("新建"), "{}", foot(&mut app));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.put.take().map(|p| p.0).as_deref(),
+            Some("aca 会话 id-跑「跑」(Claude,/p/work)\n看它:aca output id-跑 --turns 5(整段:--file)　给它传话:aca msg id-跑 \"…\"")
+        );
+        assert!(app.attach.is_none() && app.start.is_none() && !app.quit);
+        // The b that opened it, repeating into the list as it appears, and other keys that act on sessions: nothing
+        for c in ['b', 'B', 'd', 'n', 'e', 'c'] {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(!app.modal_open() && app.put.is_none() && app.clip.is_none(), "{:?}", app.clip);
+        // Finding one still works: j / k, / to search
+        press(&mut app, KeyCode::Char('j'));
+        assert_ne!(at(&app), "跑");
+        app.insert_to = None;
+        // Ctrl+B (tmux's prefix key, pressed where no tmux is in between) and Ctrl+Alt+B aren't b in the list either: no trash
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert!(!app.modal_open());
+        press(&mut app, KeyCode::Char('b'));
+        assert!(app.modal_open());
+    }
+
+    #[test]
+    fn the_reference_key_in_the_list_puts_a_picked_reference_into_the_highlighted_session() {
+        let mut app = fixture();
+        app.ref_keys = list_keys("prefix b", "C-b");
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        select(&mut app, "跑");
+        // After the prefix key another key does nothing (not even b's trash once it's a different one)
+        app.on_key(ctrl_b);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.insert_to.is_none() && !app.modal_open());
+        app.on_key(ctrl_b);
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!((app.insert_to.as_deref(), app.insert_back.as_ref().map(|b| b.1.as_str())), (Some("$跑:"), Some("跑")));
+        // b held, repeating: nothing; then pick another one
+        press(&mut app, KeyCode::Char('b'));
+        assert!(!app.modal_open());
+        press(&mut app, KeyCode::Char('j'));
+        let picked = at(&app);
+        assert_ne!(picked, "跑");
+        press(&mut app, KeyCode::Enter);
+        let (text, of) = app.put.take().unwrap();
+        assert!(text.starts_with(&format!("aca 会话 id-{picked}「{picked}」")) && of == picked, "{text}");
+        // Pasted (the run loop): back on the row it went into, picking over
+        app.end_insert();
+        assert_eq!((at(&app), app.insert_to.is_none()), ("跑".to_string(), true));
+        // Esc stops picking, back where it was; Enter goes in as usual again
+        app.on_key(ctrl_b);
+        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((at(&app), app.insert_to.is_none(), app.quit), ("跑".to_string(), true, false));
+    }
+
+    #[test]
+    fn tmux_key_names_are_read_as_the_list_receives_them() {
+        let k = |c: char, m| (KeyCode::Char(c), m);
+        assert_eq!(list_keys("prefix b", "C-b"), [k('b', KeyModifiers::CONTROL), k('b', KeyModifiers::NONE)]);
+        assert_eq!(list_keys("C-M-y", ""), [k('y', KeyModifiers::CONTROL | KeyModifiers::ALT)]);
+        assert_eq!(list_keys("F6", ""), [(KeyCode::F(6), KeyModifiers::NONE)]);
+        assert_eq!(list_keys("prefix B", "C-a"), [k('a', KeyModifiers::CONTROL), k('B', KeyModifiers::NONE)]);
+        assert!(list_keys("prefix b", "").is_empty() && list_keys("Space", "").is_empty());
     }
 
     #[test]

@@ -436,6 +436,138 @@ fn hooks_move_the_status_and_the_agents_own_title_becomes_the_session_name() {
     }
 }
 
+/// Another agent reads a session with `aca output --turns N` / `--file`: found through the transcript the hook reported, a line
+/// on where it is now first, then what both sides said (a message another Claude session sent it counts as something said to
+/// it); --file writes the whole text version and says where
+#[test]
+fn output_turns_and_file_read_the_conversation_the_hook_pointed_at() {
+    let Some(sb) = Sandbox::new("output-turns") else { return };
+    let id = sb.aca(&["new", "fake", &sb.proj()]);
+    let pane = sb.json(&["show", &id, "--json"])["pane"].as_str().unwrap().to_string();
+    let transcript = sb.home.join("c9.jsonl");
+    let lines = [
+        r#"{"type":"user","message":{"content":"登录页 500 了"},"timestamp":"2026-11-02T01:00:00Z"}"#,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"是 session 过期"}]},"timestamp":"2026-11-02T01:01:00Z"}"#,
+        r#"{"type":"user","isMeta":true,"message":{"content":"Another Claude session sent a message: …"},"origin":{"kind":"peer","name":"api-worker","body":"迁移跑完了"},"timestamp":"2026-11-02T01:02:00Z"}"#,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"收到,接着改"}]},"timestamp":"2026-11-02T01:03:00Z"}"#,
+    ];
+    write(&transcript, &(lines.join("\n") + "\n"));
+    let common = format!("\"session_id\":\"c9\",\"transcript_path\":\"{}\"", transcript.display());
+    // Claude hands its hooks its own inbox socket for messages from other sessions: kept, and shown while it's there
+    let sock = sb.home.join("cc-socks/4242.sock");
+    write(&sock, "");
+    let mut child = sb
+        .cmd()
+        .args(["hook", "claude"])
+        .env("ACA_SESSION_ID", &id)
+        .env("TMUX_PANE", &pane)
+        .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = format!("{{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",{common}}}");
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), start.as_bytes()).unwrap();
+    assert!(child.wait().unwrap().success());
+    sb.hook(&id, &pane, &format!("{{\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"收到,接着改\",{common}}}"));
+    let show = sb.json(&["show", &id, "--json"]);
+    assert_eq!((show["transcript"].as_str(), show["peer"].as_str()), (transcript.to_str(), sock.to_str()), "{show}");
+    assert!(show["home"].as_str().is_some_and(|h| h.ends_with(".claude")), "{show}");
+    std::fs::remove_file(&sock).unwrap();
+    assert_eq!(sb.json(&["show", &id, "--json"])["peer"], "");
+
+    let one = sb.aca(&["output", &id, "--turns", "1"]);
+    let mut it = one.lines();
+    let head = it.next().unwrap();
+    // A tool with no account is labelled by its name; the directory is the real path it's working in
+    assert!(head.starts_with(&format!("{id}「proj」· Claude·fake · 未读 · /")) && head.ends_with("/proj"), "{one}");
+    assert_eq!(it.next(), Some(format!("最近 1 轮(共 2 轮;整段:aca output {id} --file)").as_str()), "{one}");
+    assert!(one.contains("=== 别的会话发来 · api-worker · ") && one.contains("迁移跑完了") && one.ends_with("收到,接着改"), "{one}");
+    assert!(!one.contains("登录页 500 了"), "{one}");
+    let all = sb.aca(&["output", &id, "--turns", "5"]);
+    assert!(all.lines().nth(1) == Some("全部 2 轮") && all.contains("登录页 500 了") && all.contains("是 session 过期"), "{all}");
+
+    let file = sb.aca(&["output", &id, "--file"]);
+    let at = file.lines().nth(1).and_then(|l| l.strip_prefix("文字版:")).and_then(|l| l.split('(').next()).unwrap();
+    assert!(at.ends_with("/handoff/c9.md"), "{file}");
+    let text = std::fs::read_to_string(at).unwrap();
+    assert!(text.starts_with("# 「proj」的对话(文字版)") && text.contains("迁移跑完了") && text.contains("=== 它改过的文件 ==="), "{text}");
+
+    // Without the flags it's still the last reply; a count that isn't a positive number is refused
+    assert_eq!(sb.aca(&["output", &id]), "收到,接着改");
+    let o = sb.run(&["output", &id, "--turns", "0"]);
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("--turns 要一个正整数"));
+}
+
+#[test]
+fn messages_claude_passed_from_other_claude_sessions_land_in_the_inbox_once_with_who_sent_them() {
+    let Some(sb) = Sandbox::new("native-msg") else { return };
+    let spawn_hook = |id: &str, payload: &str, sock: Option<&std::path::Path>| {
+        let pane = sb.json(&["show", id, "--json"])["pane"].as_str().unwrap().to_string();
+        let mut c = sb.cmd();
+        c.args(["hook", "claude"]).env("ACA_SESSION_ID", id).env("TMUX_PANE", &pane).stdin(std::process::Stdio::piped());
+        if let Some(sock) = sock {
+            c.env("CLAUDE_CODE_MESSAGING_SOCKET", sock);
+        }
+        let mut child = c.spawn().unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), payload.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success());
+    };
+    // The sender: its Claude tells aca its inbox socket (the file name is its process id)
+    let api = sb.aca(&["new", "fake", &sb.proj(), "-t", "api"]);
+    let sock = sb.home.join("cc-socks/4242.sock");
+    spawn_hook(&api, r#"{"hook_event_name":"SessionStart","source":"startup","session_id":"s1"}"#, Some(&sock));
+    // The receiver: you said something earlier; then a message from api opened a turn, and one from a Claude aca doesn't know
+    // came in mid-turn
+    let web = sb.aca(&["new", "fake", &sb.proj(), "-t", "web"]);
+    let transcript = sb.home.join("r1.jsonl");
+    let lines = [
+        r#"{"type":"user","promptId":"p1","origin":{"kind":"human"},"message":{"content":"修一下登录"},"timestamp":"2026-11-02T01:00:00.000Z"}"#,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"好了"}]},"timestamp":"2026-11-02T01:01:00.000Z"}"#,
+        r#"{"type":"user","isMeta":true,"promptId":"p2","origin":{"kind":"peer","from":"uds:/tmp/cc-socks/4242.sock","verifiedPeerPid":4242,"msg_id":"bbbb2222-0000-4000-8000-000000000002","name":"api","body":"迁移跑完了"},"message":{"content":"Another Claude session sent a message: …"},"timestamp":"2099-01-01T00:00:00.000Z"}"#,
+        r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"…","origin":{"kind":"peer","from":"uds:/tmp/cc-socks/999.sock","verifiedPeerPid":999,"msg_id":"9999aaaa-0000-4000-8000-000000000009","name":"outsider","body":"顺便说一声"}},"timestamp":"2099-01-01T00:00:10.000Z"}"#,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"收到"}]},"timestamp":"2099-01-01T00:00:20.000Z"}"#,
+    ];
+    write(&transcript, &(lines.join("\n") + "\n"));
+    let common = format!("\"session_id\":\"r1\",\"transcript_path\":\"{}\"", transcript.display());
+    spawn_hook(
+        &web,
+        &format!(
+            "{{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"Another Claude session sent a message: …\",\"prompt_id\":\"p2\",{common}}}"
+        ),
+        None,
+    );
+    let stop = format!("{{\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"收到\",{common}}}");
+    spawn_hook(&web, &stop, None);
+    // Taken once each, even when the next turn's end reads the same lines again
+    spawn_hook(&web, &stop, None);
+    let inbox = sb.json(&["inbox", &web, "--json"]);
+    let got: Vec<(&str, &str, &str, &str, &str)> = inbox
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["id"].as_str().unwrap(),
+                m["from"].as_str().unwrap(),
+                m["via"].as_str().unwrap(),
+                m["stage"].as_str().unwrap(),
+                m["text"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [("cbbbb2222", api.as_str(), "claude", "got", "迁移跑完了"), ("c9999aaaa", "", "claude", "got", "顺便说一声")],
+        "{inbox}"
+    );
+    assert!(inbox[0]["who"].as_str().unwrap().starts_with(&format!("{api}「api」")), "{inbox}");
+    assert_eq!(inbox[1]["who"], "「outsider」claude");
+    let text = sb.aca(&["inbox", &web]);
+    assert!(text.contains("[已送达] cbbbb2222") && text.contains("说(SendMessage):迁移跑完了"), "{text}");
+    // The turn was opened by api's message: what the session says you said is still yours
+    assert_eq!(sb.json(&["show", &web, "--json"])["run"]["prompt"], "修一下登录");
+}
+
 #[test]
 fn a_tool_declared_only_in_config_starts_reports_through_the_hook_protocol_and_resumes() {
     let Some(sb) = Sandbox::new("declared") else { return };
@@ -1101,6 +1233,12 @@ fn a_finished_worker_rings_its_parents_doorbell_and_claude_takes_the_notice_itse
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
     let bell = v["hookSpecificOutput"]["watchPaths"][0].as_str().unwrap().to_string();
     assert!(bell.ends_with(&format!("inbox/{lead}.bell")), "{v}");
+    // Its working directory changed: Claude swaps its watch list for what CwdChanged returns, so the same file is reported
+    // again, under that event's name
+    let o = sb.as_session(&lead, &["inbox", "watch"], r#"{"hook_event_name":"CwdChanged","old_cwd":"/a","new_cwd":"/tmp"}"#);
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "CwdChanged");
+    assert_eq!(v["hookSpecificOutput"]["watchPaths"][0].as_str(), Some(bell.as_str()));
     let before = std::fs::read_to_string(&bell).unwrap();
 
     // The worker finished a turn: its own hook puts a notice in the lead's inbox, then rings the doorbell
@@ -3711,6 +3849,115 @@ fn the_next_key_also_goes_to_a_session_only_its_screen_says_is_waiting() {
     // Not in tmux, no terminal: it's the one picked, it just can't be attached to
     let o = sb.run(&["next", "--session", &here]);
     assert!(String::from_utf8_lossy(&o.stdout).contains("无法进入「门口」"), "{o:?}");
+}
+
+/// The key aca binds for putting a session's reference where you type (`[keys] ref`, the prefix key then b by default, `aca ui --ref`),
+/// really pressed inside a session, pops the list up on that client; ⏎ on a session pastes its reference (the two lines `B`
+/// copies) into the pane the key was pressed in, without Enter, and the list closes. The key changes and goes away like the
+/// next key
+#[test]
+fn the_ref_key_pops_up_the_list_and_puts_the_picked_reference_where_you_were_typing() {
+    let Some(sb) = Sandbox::new("ref") else { return };
+    let new = |t: &str| {
+        let id = sb.aca(&["new", "fake", &sb.proj(), "-t", t]);
+        let pane = sb.pane(&id);
+        sb.wait_screen(&pane, "fake agent up");
+        (id, pane)
+    };
+    let (here, here_pane) = new("我在这");
+    let (there, _) = new("对面");
+
+    // Bound when the session is created, beside the next key: in the prefix table alone, nothing passed on elsewhere
+    let keys =
+        |k: &str| sb.tmux(&["list-keys"]).lines().filter(|l| l.contains(" ui --ref --hotkey ") && l.contains(&format!(" {k} "))).count();
+    assert_eq!(keys("b"), 1);
+    let prefix = sb.tmux(&["list-keys", "-T", "prefix"]);
+    let line = prefix.lines().find(|l| l.contains(" ui --ref --hotkey ")).unwrap();
+    assert!(line.contains("#{?@aca_id,1,0}") && !line.contains("send-keys"), "{line}");
+    assert!(line.contains("ui --ref --hotkey 'prefix b' --client '#{client_name}' --pane '#{pane_id}'"), "{line}");
+
+    // A real client (a pane of another tmux server) on this session; the popup is drawn on it, so it shows in that pane
+    let outer = format!("{}-outer", sb.socket);
+    let out = |args: &[&str]| {
+        let mut c = Command::new("tmux");
+        let o = scrub(&mut c).args(["-L", &outer, "-f", "/dev/null"]).args(args).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    out(&["new-session", "-d", "-x", "160", "-y", "40", &format!("tmux -L {} attach-session -t {here_pane}", sb.socket)]);
+    assert!(sb.until(|| sb.tmux(&["list-clients", "-F", "#{@aca_id}"]) == here), "客户端没连上");
+    let seen = || out(&["capture-pane", "-p"]);
+    out(&["send-keys", &sb.tmux(&["show-options", "-gv", "prefix"])]);
+    out(&["send-keys", "b"]);
+    assert!(sb.until(|| seen().contains("⏎ 插入")), "列表没弹出来:\n{}", seen());
+    out(&["send-keys", "/"]);
+    out(&["send-keys", "-l", "对面"]);
+    out(&["send-keys", "Enter"]);
+    out(&["send-keys", "Enter"]);
+    let typed = || sb.tmux(&["capture-pane", "-p", "-t", &here_pane]);
+    assert!(sb.until(|| typed().contains(&format!("给它传话:aca msg {there} \"…\""))), "引用没插进来:\n{}", typed());
+    assert!(typed().contains(&format!("aca 会话 {there}「对面」(Claude,")), "{}", typed());
+    assert!(sb.until(|| !seen().contains("⏎ 插入")), "列表没关:\n{}", seen());
+    out(&["kill-server"]);
+
+    // Another key, then none
+    let said = sb.aca(&["tmux", "key", "ref", "prefix", "v"]);
+    assert!(said.contains("插入引用:在会话中按 前缀键 + v"), "{said}");
+    assert_eq!((keys("b"), keys("v")), (0, 1));
+    let said = sb.aca(&["tmux", "key", "ref", "F6"]);
+    assert!(said.contains("插入引用:在会话中按 F6"), "{said}");
+    assert_eq!((keys("b"), keys("F6")), (0, 3));
+    assert!(std::fs::read_to_string(sb.home.join("config/config.toml")).unwrap().contains("ref = \"F6\""));
+    let said = sb.aca(&["tmux", "key", "ref", "--none"]);
+    assert!(said.contains("插入引用:未绑定按键"), "{said}");
+    assert_eq!(sb.tmux(&["list-keys"]).lines().filter(|l| l.contains(" ui --ref ")).count(), 0);
+    // The next key wasn't touched
+    assert_eq!(sb.tmux(&["list-keys"]).lines().filter(|l| l.contains(" next --hotkey C-M-n ")).count(), 3);
+}
+
+/// The same key in the list (opened straight in a terminal, no tmux in between: the prefix key reaches it as is): pick a session,
+/// its reference goes into the highlighted one's input box, and the list goes back to that row
+#[test]
+fn the_ref_key_in_the_list_puts_the_picked_reference_into_the_highlighted_session() {
+    let Some(sb) = Sandbox::new("ref-list") else { return };
+    let new = |t: &str| {
+        let id = sb.aca(&["new", "fake", &sb.proj(), "-t", t]);
+        let pane = sb.pane(&id);
+        sb.wait_screen(&pane, "fake agent up");
+        (id, pane)
+    };
+    let (_, into) = new("写这里");
+    let (there, _) = new("被引用");
+    let script = sb.home.join("ui.sh");
+    let q = |p: &Path| format!("'{}'", p.display());
+    write(
+        &script,
+        &format!(
+            "unset TMUX TMUX_PANE KITTY_WINDOW_ID TERM_PROGRAM SSH_CONNECTION SSH_TTY\n\
+             export HOME={home} ACA_HOME={home} ACA_TMUX_SOCKET={sock} ACA_LANG=zh ACA_IME=0 TERM=xterm-256color\n\
+             exec {aca} ui\n",
+            home = q(&sb.home),
+            sock = sb.socket,
+            aca = q(Path::new(env!("CARGO_BIN_EXE_aca"))),
+        ),
+    );
+    sb.tmux(&["new-session", "-d", "-s", "ui", "-x", "120", "-y", "30", "/bin/sh", script.to_str().unwrap()]);
+    let ui = || sb.tmux(&["capture-pane", "-p", "-t", "ui"]);
+    assert!(sb.until(|| ui().contains("快捷键")), "界面没打开");
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    // send-keys goes straight to the list, past tmux's prefix binding: as a terminal without tmux would
+    let keys = |k: &[&str]| {
+        for key in k {
+            sb.tmux(&["send-keys", "-t", "ui", key]);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+    };
+    keys(&["/", "写这里", "Enter", "Escape"]);
+    keys(&["C-b", "b", "b"]);
+    assert!(sb.until(|| ui().contains("插入到「写这里」")), "{}", ui());
+    keys(&["/", "被引用", "Enter", "Enter"]);
+    let typed = || sb.tmux(&["capture-pane", "-p", "-t", &into]);
+    assert!(sb.until(|| typed().contains(&format!("aca 会话 {there}「被引用」"))), "引用没插进来:\n{}", typed());
+    assert!(sb.until(|| ui().contains("已插入「被引用」的引用")), "{}", ui());
 }
 
 /// Entering a session from the UI passes first through the one just left (so ^` gets back to it once inside): tmux records the

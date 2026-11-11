@@ -48,6 +48,8 @@
 //! [keys]                       # keys aca binds in tmux itself (no prefix, only caught in aca's sessions;
 //!                              # nothing written to your tmux.conf)
 //! next = "C-M-n"               # go to the next session that needs you (`aca next`). This is the default; "" = unbound
+//! ref = "prefix b"             # pick a session and put its reference where you're typing (`aca ui --ref`): the prefix key,
+//!                              # then b. Default; "" = unbound; a key without the prefix like "C-M-b" works too
 //!
 //! [login]                      # logins aca starts (⏎ on the accounts page, aca run … login): no default browser
 //!                              # opened for you, the link pops up to pick from
@@ -90,6 +92,10 @@ pub struct Tool {
     /// Claude: `true` = start it with aca's mod (`--plugin-dir`); limits come from the mod, not the status bar. See agent/claude_mod.rs
     #[serde(rename = "mod")]
     pub mods: bool,
+    /// Whether to start it behind aca's relay (`aca pty`, see [`crate::relay`]), which receives the state it reports itself (OSC
+    /// 7501). Unset = only Claude and Codex (the ones known to report); `true` = this one too; `false` = not this one (screen +
+    /// hooks only). Never shell
+    pub program_status: Option<bool>,
     // The keys below are only for declared tools; the built-in tools each have their own way and ignore them
     pub home_var: String,
     pub resume: Vec<String>,
@@ -322,6 +328,10 @@ fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned + De
 
 /// The key when `[keys] next` is unset: Ctrl+Alt+N
 pub const NEXT_KEY: &str = "C-M-n";
+/// The key when `[keys] ref` is unset: tmux's prefix key, then b (`B` copies the reference in the list). Not Ctrl+Alt+letter
+/// like `next`: window managers take those (Rectangle's default shortcuts are Ctrl+Option ones), and after the prefix key
+/// nothing outside tmux gets in the way
+pub const REF_KEY: &str = "prefix b";
 
 /// `[keys]`: keys aca binds in tmux itself, the same way as Ctrl+Q and plugin hotkeys (see [`crate::tmux::bind_hotkeys`])
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -329,17 +339,29 @@ pub const NEXT_KEY: &str = "C-M-n";
 pub struct Keys {
     /// Go to the next session that needs you (`aca next`): a tmux key name. Unset = [`NEXT_KEY`], `""` = unbound
     pub next: Option<String>,
+    /// Pick a session from the list and put its reference where you're typing (`aca ui --ref`). Unset = [`REF_KEY`], `""` = unbound
+    #[serde(rename = "ref")]
+    pub refer: Option<String>,
 }
 
 impl Keys {
     /// Which key to bind; none = `Ok(None)`. One that can't be a hotkey isn't bound, and Err says why
     pub fn next_key(&self) -> Result<Option<String>, String> {
-        let k = self.next.as_deref().unwrap_or(NEXT_KEY).trim();
-        if k.is_empty() {
-            return Ok(None);
-        }
-        crate::plugin::hotkey_ok(k).map(|_| Some(k.to_string()))
+        own_key(self.next.as_deref(), NEXT_KEY)
     }
+
+    /// The same for `[keys] ref`
+    pub fn ref_key(&self) -> Result<Option<String>, String> {
+        own_key(self.refer.as_deref(), REF_KEY)
+    }
+}
+
+fn own_key(set: Option<&str>, default: &str) -> Result<Option<String>, String> {
+    let k = set.unwrap_or(default).trim();
+    if k.is_empty() {
+        return Ok(None);
+    }
+    crate::plugin::hotkey_ok(k).map(|_| Some(k.to_string()))
 }
 
 /// `[trust]`: the "do you trust …" questions agents ask when they start
@@ -452,12 +474,19 @@ mod tests {
     }
 
     #[test]
-    fn the_next_key_has_a_default_can_be_changed_or_turned_off_and_a_bad_one_is_not_bound() {
+    fn own_keys_have_a_default_can_be_changed_or_turned_off_and_a_bad_one_is_not_bound() {
         assert_eq!(parse("").keys.next_key(), Ok(Some(NEXT_KEY.to_string())));
         assert_eq!(parse("[keys]\nnext = \"M-n\"\n").keys.next_key(), Ok(Some("M-n".to_string())));
         assert_eq!(parse("[keys]\nnext = \"\"\n").keys.next_key(), Ok(None));
         assert!(parse("[keys]\nnext = \"n\"\n").keys.next_key().is_err());
         assert!(parse("[keys]\nnext = \"C-q\"\n").keys.next_key().is_err());
+        assert_eq!(parse("").keys.ref_key(), Ok(Some(REF_KEY.to_string())));
+        assert_eq!(parse("[keys]\nref = \"F6\"\n").keys.ref_key(), Ok(Some("F6".to_string())));
+        assert_eq!(parse("[keys]\nref = \"\"\n").keys.ref_key(), Ok(None));
+        // After the prefix key a plain character is fine; it still has to be one key
+        assert_eq!(parse("[keys]\nnext = \"prefix N\"\n").keys.next_key(), Ok(Some("prefix N".to_string())));
+        assert!(parse("[keys]\nref = \"prefix \"\n").keys.ref_key().is_err());
+        assert!(parse("[keys]\nref = \"prefix b c\"\n").keys.ref_key().is_err());
     }
 
     #[test]

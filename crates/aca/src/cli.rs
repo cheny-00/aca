@@ -965,7 +965,11 @@ fn inbox_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
     let now = paths::now();
     for (m, st) in tail {
         let who = if m.from == "you" { t!("你", "you").to_string() } else { m.who.clone() };
-        let what = if m.kind == "notice" { m.what.clone() } else { t!("说", "said").into() };
+        let what = match (m.kind.as_str(), m.via.as_str()) {
+            ("notice", _) => m.what.clone(),
+            (_, "claude") => t!("说(SendMessage)", "said (SendMessage)").into(),
+            _ => t!("说", "said").into(),
+        };
         let ago = print::age(now.saturating_sub(m.ts));
         let st = match st {
             inbox::Stage::Scheduled => format!("{} {}", st.said(), aca_core::schedule::clock(m.at, now)),
@@ -1037,6 +1041,12 @@ fn run(mut a: Args) -> Res<i32> {
         "retitle" => {
             let (id, tool) = (a.next(ID)?, a.next(Tr::new("工具", "which tool"))?);
             return Ok(hook::retitle_later(&id, &tool, a.next(Tr::new("秒数", "seconds"))?.parse().unwrap_or(3)));
+        }
+        // The relay in front of every agent aca starts (see aca_core::relay): carries its own state reports to aca. Doesn't open the
+        // registry and says nothing of its own
+        "pty" => {
+            let argv = if a.0.first().is_some_and(|w| w == "--") { &a.0[1..] } else { &a.0[..] };
+            return Ok(aca_core::relay::run(argv));
         }
         // The step that starts the agent (see aca_core::agent::launch): append the opening message from the file to the end of the
         // command that follows, and exec that
@@ -1215,6 +1225,12 @@ fn run(mut a: Args) -> Res<i32> {
                 v["run"] = serde_json::to_value(&r).unwrap();
                 v["args"] = json!(s.args);
                 v["work"] = json!(aca_tui::work_dir(&cfg, &s));
+                // Where its conversation record is, its config directory, and (Claude, while running) its inbox for messages
+                // from other Claude sessions: what another agent would otherwise go digging for
+                v["transcript"] = json!(r.transcript);
+                let home = agent::home(&cfg, &s.tool, &s.account).ok().flatten();
+                v["home"] = json!(home.map(|h| h.display().to_string()).unwrap_or_default());
+                v["peer"] = json!(if !r.peer.is_empty() && std::path::Path::new(&r.peer).exists() { r.peer.as_str() } else { "" });
                 println!("{v}");
             } else if !print::show(&cfg, &store, &row, &r) {
                 print_rows(std::slice::from_ref(&row));
@@ -1416,9 +1432,24 @@ fn run(mut a: Args) -> Res<i32> {
         }
         "interrupt" => println!("{}", answer::interrupt(&store, &cfg, &a.id()?)?),
         "output" => {
-            let last = runtime::load(&store.get(&a.id()?)?.id).last;
-            if !print::reply(&last) {
-                print!("{last}");
+            // Flags first: with no id left, id() falls back to the session this window is in
+            let turns = a.opt("--turns")?;
+            let file = a.flag("--file");
+            let s = store.get(&a.id()?)?;
+            if file {
+                println!("{}", aca_tui::conversation_file(&cfg, &s)?);
+            } else if let Some(n) = turns {
+                let n = n
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| tr!("--turns 要一个正整数", "--turns needs a positive whole number"))?;
+                print!("{}", aca_tui::conversation_turns(&cfg, &s, n)?);
+            } else {
+                let last = runtime::load(&s.id).last;
+                if !print::reply(&last) {
+                    print!("{last}");
+                }
             }
         }
         "seen" => session::seen(&store, &a.next(ID)?)?,

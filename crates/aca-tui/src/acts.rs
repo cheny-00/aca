@@ -77,7 +77,7 @@ pub const ACTS: &[Act] = &[
     act("^Z", "撤销", "undo", &[]),
     act("b", "回收站", "trash", &[]),
     act("c", "复制回复", "copy the reply", S),
-    act("B", "信息", "info", S),
+    act("B", "复制引用", "copy a reference", S),
     act("C", "选取文本", "pick text", S),
     act("E", "附带便签打开", "open with a note", S),
     act("i", "下一个待处理", "next to look at", &[]),

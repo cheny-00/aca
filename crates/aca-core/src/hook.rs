@@ -84,14 +84,23 @@ pub fn run(tool: &str) -> i32 {
         false => Default::default(),
     };
     let mut events: Events = vec![];
+    // Claude hands every hook its own inbox socket (each session its own, never a parent's): kept so other sessions can be
+    // told where to send to (`aca show --json`'s `peer`)
+    let peer = std::env::var("CLAUDE_CODE_MESSAGING_SOCKET").ok().filter(|p| !p.is_empty() && agent.name() == "claude");
     runtime::update(&id, |r| {
         events = agent.on_hook(r, &v, now);
+        if let Some(p) = &peer {
+            r.peer.clone_from(p);
+        }
         // Someone is attached to the session the moment it finishes: counts as read
         if ended && attached {
             r.seen = now;
         }
     });
     events.extend(retitle(&id, |r| agent.title(r, &pane_title)));
+    if matches!(v["hook_event_name"].as_str(), Some("Stop" | "StopFailure")) {
+        take_in(&id, agent, now);
+    }
     // The title often arrives a second or two after "finished" (especially on the first turn): if it isn't there yet, leave
     // a detached follow-up that looks again in a few seconds
     if ended && runtime::load(&id).auto_title.is_empty() {
@@ -112,6 +121,27 @@ pub fn run(tool: &str) -> i32 {
     }
     settle(&cfg, &id, agent, &v, events);
     0
+}
+
+/// A turn ended: what the conversation record says about it ([`Agent::turn_record`]). Messages other sessions passed it
+/// through the agent's own channel go into its inbox as delivered; a turn opened by one of them or by a background task's
+/// notice gets what you last said back as `prompt`. The first look starts from the current turn (a little before it, for the
+/// message that opened it)
+fn take_in(id: &str, agent: &dyn Agent, now: u64) {
+    let r = runtime::load(id);
+    let since = match (r.native_seen, r.turn) {
+        (0, 0) => now,
+        (0, turn) => turn.saturating_sub(5),
+        (seen, _) => seen,
+    };
+    let turn = agent.turn_record(&r, since);
+    runtime::update(id, |r| {
+        if let Some(said) = &turn.said {
+            r.prompt = runtime::clip(said, 400);
+        }
+        r.native_seen = now;
+    });
+    inbox::native(id, turn.native);
 }
 
 /// The second half of an event: inbox, event stream, notices

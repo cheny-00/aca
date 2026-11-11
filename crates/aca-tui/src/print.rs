@@ -81,13 +81,24 @@ pub fn age(sec: u64) -> String {
 fn state(s: State) -> (Style, &'static str) {
     let p = theme::pal();
     let strong = |c| Style::new().fg(c).add_modifier(Modifier::BOLD);
+    let style = match s {
+        State::Running => strong(p.green),
+        State::Ask | State::Error => strong(p.red),
+        State::Unread => strong(p.amber),
+        State::Idle | State::Exited | State::Stopped => Style::new().fg(p.muted),
+    };
+    (style, state_name(s))
+}
+
+/// What a state is called
+pub(crate) fn state_name(s: State) -> &'static str {
     match s {
-        State::Running => (strong(p.green), t!("运行中", "running")),
-        State::Ask => (strong(p.red), t!("等待回应", "needs you")),
-        State::Unread => (strong(p.amber), t!("未读", "unread")),
-        State::Idle => (Style::new().fg(p.muted), t!("空闲", "idle")),
-        State::Error => (strong(p.red), t!("出错", "error")),
-        State::Exited | State::Stopped => (Style::new().fg(p.muted), t!("已停止", "stopped")),
+        State::Running => t!("运行中", "running"),
+        State::Ask => t!("等待回应", "needs you"),
+        State::Unread => t!("未读", "unread"),
+        State::Idle => t!("空闲", "idle"),
+        State::Error => t!("出错", "error"),
+        State::Exited | State::Stopped => t!("已停止", "stopped"),
     }
 }
 

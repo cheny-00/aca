@@ -66,7 +66,8 @@ fn secs(c: &regex::Captures) -> u64 {
 
 /// Content of the `--settings` file. Besides the events the state needs, there's the doorbell (passing messages between
 /// sessions, see [`crate::inbox`]):
-/// - SessionStart also runs `aca inbox watch`: it returns `watchPaths`, so Claude itself watches this session's doorbell file
+/// - SessionStart also runs `aca inbox watch`: it returns `watchPaths`, so Claude itself watches this session's doorbell file.
+///   CwdChanged runs it too: a change of working directory swaps the watch list for what CwdChanged hooks return
 /// - When the doorbell changes (FileChanged), `aca inbox take` runs in the background (`asyncRewake`): if there are undelivered
 ///   messages it writes them to stderr and exits 2, and Claude hands that to the model as a system prompt — idle, it starts a
 ///   turn; running, it's slipped into this turn; waiting for you, it's sent after you answer. With none it exits 0 and
@@ -99,6 +100,8 @@ fn settings(aca: &str) -> String {
         "asyncRewake": true, "rewakeMessage": "[aca]", "rewakeSummary": "aca: 收件箱有新消息",
     });
     hooks.insert("FileChanged".into(), json!([{ "hooks": [take] }]));
+    let watch = json!({ "type": "command", "command": format!("{q} inbox watch"), "timeout": 10 });
+    hooks.insert("CwdChanged".into(), json!([{ "hooks": [watch] }]));
     serde_json::to_string_pretty(&json!({ "hooks": hooks })).unwrap()
 }
 
@@ -191,16 +194,31 @@ const MARKS: &str = "✳◐◑";
 /// What it writes before it has a title
 const UNTITLED: &str = "Claude Code";
 
+/// This machine's name, first label only (`my-mac.local` → `my-mac`): what tmux puts in a pane title until something writes one
+static HOST: LazyLock<String> = LazyLock::new(|| {
+    let mut buf = [0u8; 256];
+    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
+    let name = if ok { String::from_utf8_lossy(&buf[..end]).into_owned() } else { String::new() };
+    name.split('.').next().unwrap_or_default().to_string()
+});
+
 /// Pane title `✳ 修登录` → `修登录` ("fix login"): the one you set with /rename, else the one it came up with, the same as
 /// shown in its own interface. Not counted: titles not starting with its mark (terminal title turned off: tmux's default
-/// host name, one a shell wrote), and no title yet
-fn shown_title(pane_title: &str) -> Option<String> {
+/// host name, one a shell wrote), and no title yet.
+/// `bare`: it's reporting its own state (OSC 7501 through aca's relay, see [`crate::relay`]). It then writes the title without
+/// the mark, so a title without one counts too, except tmux's default host name and a path a shell wrote
+fn shown_title(pane_title: &str, bare: bool) -> Option<String> {
     let mut cs = pane_title.chars();
     let mark = cs.next()?;
-    if !(MARKS.contains(mark) || screen::spinning(pane_title)) || cs.next() != Some(' ') {
+    let t = if (MARKS.contains(mark) || screen::spinning(pane_title)) && cs.next() == Some(' ') {
+        cs.as_str()
+    } else if bare && pane_title.split('.').next() != Some(HOST.as_str()) && !pane_title.starts_with(['/', '~']) {
+        pane_title
+    } else {
         return None;
-    }
-    let t = cs.as_str().trim();
+    };
+    let t = t.trim();
     (!t.is_empty() && t != UNTITLED).then(|| t.to_string())
 }
 
@@ -210,15 +228,8 @@ fn shown_title(pane_title: &str) -> Option<String> {
 /// The last reply with text at the end of the conversation record. Not counted: what spawned subagents said, and what Claude
 /// Code filled in itself (model is `<synthetic>`)
 fn transcript_reply(transcript: &Path) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
     // The reply may be followed by several big chunks of tool output: look back further than for the title
-    const TAIL: u64 = 1024 * 1024;
-    let mut f = std::fs::File::open(transcript).ok()?;
-    let len = f.metadata().ok()?.len();
-    f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
+    let text = tail(transcript, 1024 * 1024)?;
     text.lines().rev().filter(|l| l.contains("\"type\":\"assistant\"")).find_map(|l| {
         let v: Value = serde_json::from_str(l).ok()?;
         if v["type"] != "assistant" || v["isSidechain"] == true || v["message"]["model"] == "<synthetic>" {
@@ -232,14 +243,7 @@ fn transcript_reply(transcript: &Path) -> Option<String> {
 }
 
 fn transcript_title(transcript: &Path) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL: u64 = 256 * 1024;
-    let mut f = std::fs::File::open(transcript).ok()?;
-    let len = f.metadata().ok()?.len();
-    f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
+    let text = tail(transcript, 256 * 1024)?;
     let last = |kind: &str, key: &str| {
         let tag = format!("\"type\":\"{kind}\"");
         text.lines().rev().find_map(|l| {
@@ -252,6 +256,73 @@ fn transcript_title(transcript: &Path) -> Option<String> {
         })
     };
     last("custom-title", "customTitle").or_else(|| last("ai-title", "aiTitle"))
+}
+
+/// The last `bytes` of a file as text (the first line may be cut off: it won't parse as JSON and is skipped)
+fn tail(path: &Path, bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(bytes))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// What the end of the record says about the turn that just ended ([`Agent::turn_record`]). Each prompt's entry says where it
+/// came from in `origin.kind` (human / peer: another Claude session's SendMessage / task-notification): on the user message
+/// when it opened a turn, on a `queued_command` attachment when it came in mid-turn. The turn's opening message is the user
+/// message carrying `prompt_id`. Read by fields only; the text Claude wraps around a message isn't parsed
+fn read_turn(text: &str, since: u64, prompt_id: &str) -> super::Turn {
+    let mut turn = super::Turn::default();
+    // What you said last so far, and whether this turn's opener has been passed and wasn't you
+    let (mut yours, mut not_you) = (String::new(), false);
+    for l in text.lines().filter(|l| l.contains("\"origin\"")) {
+        let Ok(v) = serde_json::from_str::<Value>(l) else { continue };
+        if v["isSidechain"] == true {
+            continue;
+        }
+        let queued = v["type"] == "attachment";
+        let (o, said) = if queued {
+            (&v["attachment"]["origin"], v["attachment"]["prompt"].as_str().unwrap_or("").to_string())
+        } else {
+            (&v["origin"], said_in(&v["message"]["content"]))
+        };
+        let kind = o["kind"].as_str().unwrap_or("");
+        if kind == "human" {
+            yours = said;
+            if not_you {
+                turn.said = Some(yours.clone());
+            }
+        } else if !kind.is_empty() && !queued && !prompt_id.is_empty() && v["promptId"] == prompt_id {
+            not_you = true;
+            turn.said = Some(yours.clone());
+        }
+        let ts = v["timestamp"].as_str().and_then(crate::schedule::iso).unwrap_or(0);
+        let id = o["msg_id"].as_str().unwrap_or("");
+        if kind == "peer" && ts >= since && !id.is_empty() {
+            turn.native.push(super::Native {
+                id: id.to_string(),
+                ts,
+                pid: o["verifiedPeerPid"].as_u64().and_then(|p| u32::try_from(p).ok()).unwrap_or(0),
+                addr: o["from"].as_str().unwrap_or("").trim_start_matches("uds:").to_string(),
+                name: o["name"].as_str().unwrap_or("").to_string(),
+                text: o["body"].as_str().unwrap_or("").to_string(),
+            });
+        }
+    }
+    turn
+}
+
+/// The text of a user message: a plain string, or its text parts (a pasted image is a part of its own)
+fn said_in(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => {
+            parts.iter().filter(|c| c["type"] == "text").filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n")
+        }
+        _ => String::new(),
+    }
 }
 
 /// Claude turns the project directory into a folder name under projects: every non-alphanumeric character becomes -
@@ -402,15 +473,15 @@ impl Agent for Claude {
     /// right after /rename. Only when it's not there (terminal title turned off) read the conversation record, and only on
     /// these events
     fn title(&self, r: &Run, pane_title: &str) -> Option<String> {
-        shown_title(pane_title).or_else(|| {
+        shown_title(pane_title, r.ps.is_some()).or_else(|| {
             matches!(r.event.as_str(), "Stop" | "UserPromptSubmit" | "PostCompact")
                 .then(|| transcript_title(Path::new(&r.transcript)))
                 .flatten()
         })
     }
 
-    fn live_title(&self, _r: &Run, pane_title: &str) -> Option<String> {
-        shown_title(pane_title)
+    fn live_title(&self, r: &Run, pane_title: &str) -> Option<String> {
+        shown_title(pane_title, r.ps.is_some())
     }
 
     /// The process name is claude, or just a version number (`2.1.284`: it installs files named by version)
@@ -421,6 +492,14 @@ impl Agent for Claude {
 
     fn last_reply(&self, r: &Run) -> Option<String> {
         transcript_reply(Path::new(&r.transcript))
+    }
+
+    /// Two megabytes from the end: a turn whose tool output is bigger than that loses what came in before it
+    fn turn_record(&self, r: &Run, since: u64) -> super::Turn {
+        match r.transcript.is_empty() {
+            true => super::Turn::default(),
+            false => tail(Path::new(&r.transcript), 2 * 1024 * 1024).map(|t| read_turn(&t, since, &r.prompt_id)).unwrap_or_default(),
+        }
     }
 
     fn live(&self, pid: u32, home: Option<&str>, argv: &[String]) -> Live {
@@ -535,6 +614,44 @@ mod tests {
         s.lines().map(String::from).collect()
     }
 
+    /// The shapes Claude 2.1.316 writes: what you typed, a message from another Claude session (opening a turn when idle, as
+    /// a queued attachment mid-turn), a background task's notice; a tool result carries the turn's promptId but no origin
+    const TURNS: &str = r#"{"type":"user","promptId":"p1","origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"修一下登录"},{"type":"image"}]},"timestamp":"2026-11-02T01:00:00.000Z"}
+{"type":"attachment","attachment":{"type":"queued_command","prompt":"<cross-session-message …>","origin":{"kind":"peer","from":"uds:/tmp/cc-socks/4242.sock","verifiedPeerPid":4242,"msg_id":"aaaa1111-0000-4000-8000-000000000001","name":"api","body":"迁移跑完了"}},"timestamp":"2026-11-02T01:01:00.000Z"}
+{"type":"user","isSidechain":true,"promptId":"p1","origin":{"kind":"peer","msg_id":"cccc3333-0000-4000-8000-000000000003","body":"子代理里的"},"message":{"role":"user","content":"x"},"timestamp":"2026-11-02T01:01:30.000Z"}
+{"type":"user","isMeta":true,"promptId":"p2","origin":{"kind":"peer","from":"uds:/tmp/cc-socks/77.sock","verifiedPeerPid":77,"msg_id":"bbbb2222-0000-4000-8000-000000000002","name":"web","body":"接口改名了"},"message":{"role":"user","content":"Another Claude session sent a message: …"},"timestamp":"2026-11-02T01:02:00.000Z"}
+{"type":"user","promptId":"p2","message":{"role":"user","content":[{"type":"tool_result","content":"\"origin\" in some output"}]},"timestamp":"2026-11-02T01:02:30.000Z"}
+{"type":"user","promptId":"p3","origin":{"kind":"task-notification","producer":"session-task"},"message":{"role":"user","content":"<task-notification>…"},"timestamp":"2026-11-02T01:03:00.000Z"}"#;
+
+    #[test]
+    fn the_record_says_who_opened_the_turn_and_what_other_sessions_sent() {
+        let t = read_turn(TURNS, 0, "p1");
+        // You opened it: the prompt stays
+        assert_eq!(t.said, None);
+        // Both ways a message from another session comes in; not what a subagent got
+        let got: Vec<(&str, u32, &str, &str, &str)> =
+            t.native.iter().map(|n| (n.id.as_str(), n.pid, n.addr.as_str(), n.name.as_str(), n.text.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                ("aaaa1111-0000-4000-8000-000000000001", 4242, "/tmp/cc-socks/4242.sock", "api", "迁移跑完了"),
+                ("bbbb2222-0000-4000-8000-000000000002", 77, "/tmp/cc-socks/77.sock", "web", "接口改名了"),
+            ]
+        );
+        assert_eq!(t.native[1].ts, 1793581320);
+        // Only those since the time asked about
+        assert_eq!(read_turn(TURNS, 1793581320, "").native.len(), 1);
+        // Opened by another session's message, or by a background task's notice: what you last said yourself (the text, not the image)
+        assert_eq!(read_turn(TURNS, 0, "p2").said.as_deref(), Some("修一下登录"));
+        assert_eq!(read_turn(TURNS, 0, "p3").said.as_deref(), Some("修一下登录"));
+        // Something you typed while it ran counts as what you said this turn
+        let typed = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"顺便看下注册","origin":{"kind":"human"}},"timestamp":"2026-11-02T01:03:30.000Z"}"#;
+        assert_eq!(read_turn(&format!("{TURNS}\n{typed}"), 0, "p3").said.as_deref(), Some("顺便看下注册"));
+        // Nothing of yours in the part read: empty rather than another session's words
+        let rest = TURNS.lines().skip(3).collect::<Vec<_>>().join("\n");
+        assert_eq!(read_turn(&rest, 0, "p2").said.as_deref(), Some(""));
+    }
+
     #[test]
     fn the_folder_trust_question_is_answered_by_walking_to_yes() {
         // Copied from 2.1.29x: the cursor starts on No
@@ -612,8 +729,8 @@ mod tests {
             (stop.len(), stop[0]["hooks"][0]["command"].as_str(), stop[1]["hooks"][0]["command"].as_str()),
             (2, Some("say done"), Some("'/bin/aca' hook claude"))
         );
-        // The events the state needs, plus the doorbell
-        assert_eq!(all["hooks"].as_object().unwrap().len(), EVENTS.len() + 1);
+        // The events the state needs, plus the doorbell's two (FileChanged, CwdChanged)
+        assert_eq!(all["hooks"].as_object().unwrap().len(), EVENTS.len() + 2);
 
         // Given as a file: relative paths resolve against the session's directory
         let dir = std::env::temp_dir().join(format!("aca-settings-{}", std::process::id()));
@@ -632,7 +749,7 @@ mod tests {
     fn the_settings_file_only_hooks_what_status_and_the_doorbell_need() {
         let v: Value = serde_json::from_str(&settings("/a b/it's/aca")).unwrap();
         let h = v["hooks"].as_object().unwrap();
-        assert_eq!(h.len(), EVENTS.len() + 1);
+        assert_eq!(h.len(), EVENTS.len() + 2);
         assert_eq!(h["Stop"][0]["hooks"][0]["command"], r#"'/a b/it'\''s/aca' hook claude"#);
         assert_eq!(h["PreToolUse"][0]["matcher"], "AskUserQuestion");
         assert!(h["Stop"][0].get("matcher").is_none());
@@ -645,6 +762,8 @@ mod tests {
         let take = &h["FileChanged"][0]["hooks"][0];
         assert_eq!((take["command"].as_str(), take["asyncRewake"].as_bool()), (Some(r#"'/a b/it'\''s/aca' inbox take"#), Some(true)));
         assert!(h["FileChanged"][0].get("matcher").is_none());
+        // A change of working directory drops the watch unless CwdChanged reports the file again
+        assert_eq!(h["CwdChanged"][0]["hooks"][0]["command"], r#"'/a b/it'\''s/aca' inbox watch"#);
     }
 
     #[test]
@@ -666,22 +785,33 @@ mod tests {
 
     #[test]
     fn the_title_is_the_one_on_the_pane_and_only_its_own() {
-        assert_eq!(shown_title("✳ 修登录 bug").as_deref(), Some("修登录 bug"));
+        assert_eq!(shown_title("✳ 修登录 bug", false).as_deref(), Some("修登录 bug"));
         // The spinner characters while working: current and older versions
-        assert_eq!(shown_title("◐ 修登录").as_deref(), Some("修登录"));
-        assert_eq!(shown_title("⠂ 修登录").as_deref(), Some("修登录"));
+        assert_eq!(shown_title("◐ 修登录", false).as_deref(), Some("修登录"));
+        assert_eq!(shown_title("⠂ 修登录", false).as_deref(), Some("修登录"));
         // No title yet
-        assert_eq!(shown_title("✳ Claude Code"), None);
-        assert_eq!(shown_title("✳ "), None);
+        assert_eq!(shown_title("✳ Claude Code", false), None);
+        assert_eq!(shown_title("✳ ", false), None);
         // Not written by it: tmux's default host name, one a shell wrote, empty
-        assert_eq!(shown_title("my-mac.local"), None);
-        assert_eq!(shown_title("~/workspace/app"), None);
-        assert_eq!(shown_title("✳修登录"), None);
-        assert_eq!(shown_title(""), None);
+        assert_eq!(shown_title("my-mac.local", false), None);
+        assert_eq!(shown_title("~/workspace/app", false), None);
+        assert_eq!(shown_title("✳修登录", false), None);
+        assert_eq!(shown_title("", false), None);
+        // Reporting its own state (behind aca's relay), it writes the title without the mark: taken as is, but still not the
+        // host name tmux starts with, a path, or no title yet
+        assert_eq!(shown_title("修登录 bug", true).as_deref(), Some("修登录 bug"));
+        assert_eq!(shown_title("✳ 修登录", true).as_deref(), Some("修登录"));
+        assert_eq!(shown_title(&format!("{}.local", *HOST), true), None);
+        assert_eq!(shown_title(&HOST, true), None);
+        assert_eq!(shown_title("~/workspace/app", true), None);
+        assert_eq!(shown_title("Claude Code", true), None);
+        assert_eq!(shown_title("修登录 bug", false), None);
         // On list refresh only the pane title is checked, the record isn't read
         let stopped = Run { event: "Stop".into(), transcript: "/nonexistent".into(), ..Default::default() };
         assert_eq!(Claude.live_title(&stopped, "✳ 修登录").as_deref(), Some("修登录"));
         assert_eq!(Claude.live_title(&stopped, "my-mac.local"), None);
+        let reporting = Run { ps: Some(crate::runtime::Program { state: "idle".into(), ..Default::default() }), ..stopped };
+        assert_eq!(Claude.live_title(&reporting, "修登录").as_deref(), Some("修登录"));
     }
 
     #[test]

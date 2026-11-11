@@ -144,6 +144,7 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
             r.status = "running".into();
             r.turn = now;
             r.prompt = clip(s("prompt"), 400);
+            r.prompt_id = s("prompt_id").to_string();
             r.clear_ask();
             r.clear_error();
             out.push(("turn.started", json!({ "prompt": r.prompt })));

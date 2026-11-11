@@ -234,11 +234,22 @@ pub struct Hotkey {
     pub run: String,
 }
 
-/// Keys that can be hotkeys (tmux key names). A bare character isn't allowed: it would swallow what you type in the
-/// session. The final character can only be a lowercase letter, a digit or one of `, . / = -` (plus `]` `^` with Ctrl
+/// Keys that can be hotkeys (tmux key names), or one after tmux's prefix key (`prefix b`). A bare character isn't allowed
+/// without the prefix: it would swallow what you type in the session. The final character can only be a lowercase letter, a digit or one of `, . / = -` (plus `]` `^` with Ctrl
 /// alone): others need escaping in tmux's key table, and Alt with an uppercase letter, `[` or `]` sends what's the start
 /// of another terminal sequence (ESC O, ESC [, ESC ])
 pub fn hotkey_ok(k: &str) -> Res<()> {
+    // After tmux's prefix key (`prefix b`): nothing typed is swallowed, so a plain character is fine too
+    if let Some(after) = k.strip_prefix(crate::tmux::PREFIX_KEY) {
+        let after = after.trim();
+        if after.is_empty() || after.contains(char::is_whitespace) || after.contains(['"', '\'', '\\', ';', '#']) {
+            return Err(tr!(
+                "前缀键之后应写一个 tmux 键名(prefix b、prefix C-y):「{k}」",
+                "after prefix comes one tmux key name (prefix b, prefix C-y): “{k}”"
+            ));
+        }
+        return Ok(());
+    }
     let f = k
         .strip_prefix('F')
         .is_some_and(|n| !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit()) && matches!(n.parse(), Ok(1..=12u8)));

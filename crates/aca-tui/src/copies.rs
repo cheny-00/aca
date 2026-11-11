@@ -2,7 +2,8 @@
 //! for `claude --resume`), path (the session's directory). Press the key at the start of a row to copy it, or pick with ↑↓ and ⏎.
 //! One that's missing (a plain tmux session has no aca id; one that hasn't talked yet has no conversation id) is still listed,
 //! saying why it's missing.
-//! `B` as before: path and conversation id, two lines together.
+//! `a` all: those lines together as `B` used to copy them (Path / Started in / Session / Home), for pasting outside aca; `B`
+//! itself now copies a reference to the session (see `data::reference`).
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::{Line, Span};
@@ -35,6 +36,7 @@ impl Menu {
             Row { key: 'i', name: "aca id", value: id.to_string(), none: t!("A 接管后可用", "only after adopting with A") },
             Row { key: 's', name: "session id", value: line("Session: "), none: t!("暂无对话", "no conversation yet") },
             Row { key: 'p', name: "path", value: line("Path: "), none: t!("目录未知", "directory unknown") },
+            Row { key: 'a', name: "all", value: info.trim().to_string(), none: t!("没有信息", "nothing known") },
         ];
         let sel = rows.iter().position(|r| !r.value.is_empty()).unwrap_or(0);
         Menu { title: title.to_string(), rows, sel }
@@ -75,7 +77,9 @@ impl Overlay for Menu {
         // "i  " + name + "  "
         let room = w.saturating_sub(3 + name_w + 2);
         for (i, r) in self.rows.iter().enumerate() {
-            let (text, st) = if r.value.is_empty() { (r.none, kit::dim()) } else { (r.value.as_str(), ratatui::style::Style::new()) };
+            // Several lines (all) are shown on one
+            let shown = r.value.replace('\n', "  ");
+            let (text, st) = if r.value.is_empty() { (r.none, kit::dim()) } else { (shown.as_str(), ratatui::style::Style::new()) };
             let line = Line::from(vec![
                 Span::styled(r.key.to_string(), if r.value.is_empty() { kit::dim() } else { kit::key_style() }),
                 Span::raw(format!("  {}{}  ", r.name, " ".repeat(name_w - r.name.width()))),
@@ -127,7 +131,14 @@ mod tests {
     fn each_row_copies_its_own_value_by_key_or_enter() {
         let mut m = Menu::new("修登录", "3f2a9c1e", "Path: /w/app\nSession: 5f0c-uuid");
         let rows = text(&m, 66);
-        for want in ["复制 · 修登录", "i  aca id      3f2a9c1e", "s  session id  5f0c-uuid", "p  path        /w/app", "⏎ 复制"] {
+        for want in [
+            "复制 · 修登录",
+            "i  aca id      3f2a9c1e",
+            "s  session id  5f0c-uuid",
+            "p  path        /w/app",
+            "a  all         Path: /w/app  Session: 5f0c-uuid",
+            "⏎ 复制",
+        ] {
             assert!(rows.iter().any(|r| r.contains(want)), "缺「{want}」:{rows:#?}");
         }
         let (f, fx) = press(&mut m, KeyCode::Char('s'));
@@ -137,6 +148,9 @@ mod tests {
         press(&mut m, KeyCode::Down);
         let (f, fx) = press(&mut m, KeyCode::Enter);
         assert_eq!((f, fx.copy.as_deref()), (Flow::Close, Some("/w/app")));
+        // all: the lines together, as they are
+        let (f, fx) = press(&mut m, KeyCode::Char('a'));
+        assert_eq!((f, fx.copy.as_deref()), (Flow::Close, Some("Path: /w/app\nSession: 5f0c-uuid")));
         assert_eq!(press(&mut m, KeyCode::Esc).0, Flow::Close);
     }
 
@@ -149,8 +163,9 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("A 接管后可用")) && rows.iter().any(|r| r.contains("暂无对话")), "{rows:#?}");
         let (f, fx) = press(&mut m, KeyCode::Char('i'));
         assert_eq!((f, fx.copy, fx.flash.as_deref()), (Flow::Stay, None, Some("没有 aca id:A 接管后可用")));
+        // Up from path skips the two missing ones and wraps round to all
         press(&mut m, KeyCode::Up);
-        assert_eq!(m.sel, 2);
+        assert_eq!(m.sel, 3);
         // Phone width: no line too wide
         assert!(text(&Menu::new(&"长".repeat(40), "id", &format!("Path: /{}", "a".repeat(90))), 40).iter().all(|r| r.width() <= 40));
     }

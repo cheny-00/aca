@@ -13,6 +13,11 @@
 //! counts as needs you, and the note is sent only if you go in and answer it within the minute.
 //!
 //! If it can't be sent, the handoff note is left in the new session's note; `s` sends it.
+//!
+//! The same text version is what another session reads with `aca output <id> --turns N` (the last N turns, printed) and
+//! `aca output <id> --file` (all of it written to that file): the reference `B` copies points there. Both start with one
+//! line on where the session is now (state, agent, directory, branch), so the reference itself carries nothing that goes
+//! stale.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -22,6 +27,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
+use aca_core::config::Config;
+use aca_core::store;
 use aca_core::{t, tr};
 
 use crate::create::{NewReq, tilde};
@@ -88,8 +95,7 @@ pub fn run(from: &Source, req: &NewReq, _to: Agent) -> Outcome {
         Ok(d) => d,
         Err(e) => return Outcome::Failed(tr!("交接失败:{e}", "not handed off: {e}")),
     };
-    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let text = render(from, &d, now, crate::usage::local_offset());
+    let text = render(&from.title, &from.log, from.agent, &d, unix_now(), crate::usage::local_offset());
     let digest = match save(&from.sid, &text) {
         Ok(p) => p,
         Err(e) => return Outcome::Failed(tr!("交接失败:{e}", "not handed off: {e}")),
@@ -208,6 +214,8 @@ enum Who {
     Summary,
     /// A report handed back by a subagent; the field is the description written when sending it out
     Sub(String),
+    /// A message another Claude session sent it natively (`SendMessage`); the field is the sender's name
+    Peer(String),
 }
 
 /// One passage: who said it, when (seconds, 0 = unknown), what was said
@@ -330,7 +338,17 @@ fn claude_edits(v: &Value, d: &mut Dialog) {
 /// agents: id of the call that sent out a subagent → its description, used when its report comes back
 fn claude_line(v: &Value, d: &mut Dialog, agents: &mut HashMap<String, String>) {
     claude_edits(v, d);
-    if v["isSidechain"] == true || v["isMeta"] == true {
+    if v["isSidechain"] == true {
+        return;
+    }
+    // A message from another Claude session is injected (isMeta) with a structured origin: on the user message that starts a
+    // turn when it arrives idle, on an attachment when it's taken in mid-turn (seen on 2.1.316)
+    let origin = if v["type"] == "attachment" { &v["attachment"]["origin"] } else { &v["origin"] };
+    if origin["kind"] == "peer" {
+        let name = origin["name"].as_str().unwrap_or("");
+        return d.say(said(Who::Peer(name.to_string()), v, origin["body"].as_str().unwrap_or("")));
+    }
+    if v["isMeta"] == true {
         return;
     }
     let content = &v["message"]["content"];
@@ -462,22 +480,15 @@ fn codex_changes(c: &Value, at: i64, d: &mut Dialog) {
 
 /// The text version: first where the raw record is and what was left out, then passage by passage
 /// "=== who · MM-DD HH:MM ===", finally the changed files
-fn render(from: &Source, d: &Dialog, now: i64, off: i64) -> String {
-    let codex = from.agent == Agent::Codex;
-    let mut o = tr!("# 「{}」的对话(文字版)\n\n", "# Conversation of “{}” (text version)\n\n", from.title);
-    let _ = writeln!(o, "{}", tr!("- 原始记录:{}", "- Raw record: {}", from.log.display()));
+fn render(title: &str, log: &Path, agent: Agent, d: &Dialog, now: i64, off: i64) -> String {
+    let codex = agent == Agent::Codex;
+    let mut o = tr!("# 「{}」的对话(文字版)\n\n", "# Conversation of “{}” (text version)\n\n", title);
+    let _ = writeln!(o, "{}", tr!("- 原始记录:{}", "- Raw record: {}", log.display()));
     let _ = writeln!(o, "{}", tr!("- 抽出时间:{}", "- Extracted: {}", stamp(now, off)));
     o.push_str(t!("- 只留了双方说的话和子代理交回来的报告:工具调用、命令输出、思考过程都省了,要细节按时间去原始记录里找\n", "- Only what both sides said and the reports subagents handed back: tool calls, command output and thinking are left out; for details, look in the raw record by time\n"));
     o.push_str(t!("- 最后一节是它改过的文件\n", "- The last section lists the files it changed\n"));
     for s in &d.said {
-        let who = match &s.who {
-            Who::User => t!("用户", "User").to_string(),
-            Who::Agent => (if codex { "Codex" } else { "Claude" }).to_string(),
-            Who::Summary => t!("压缩摘要", "Compaction summary").to_string(),
-            Who::Sub(desc) if desc.is_empty() => t!("子代理报告", "Subagent report").to_string(),
-            Who::Sub(desc) => tr!("子代理报告 · {desc}", "Subagent report · {desc}"),
-        };
-        let _ = write!(o, "\n=== {who} · {} ===\n\n{}\n", stamp(s.at, off), s.text);
+        passage(&mut o, s, codex, off);
     }
     o.push_str(t!("\n=== 它改过的文件 ===\n\n", "\n=== Files it changed ===\n\n"));
     o.push_str(t!(
@@ -496,6 +507,128 @@ fn render(from: &Source, d: &Dialog, now: i64, off: i64) -> String {
         let _ = writeln!(o, "- {} {}{}", stamp(f.at, off), f.path, if f.gone { t!("(删了)", " (deleted)") } else { "" });
     }
     o
+}
+
+/// One passage of the text version: "=== who · MM-DD HH:MM ===", a blank line, what was said
+fn passage(o: &mut String, s: &Said, codex: bool, off: i64) {
+    let who = match &s.who {
+        Who::User => t!("用户", "User").to_string(),
+        Who::Agent => (if codex { "Codex" } else { "Claude" }).to_string(),
+        Who::Summary => t!("压缩摘要", "Compaction summary").to_string(),
+        Who::Sub(desc) if desc.is_empty() => t!("子代理报告", "Subagent report").to_string(),
+        Who::Sub(desc) => tr!("子代理报告 · {desc}", "Subagent report · {desc}"),
+        Who::Peer(name) if name.is_empty() => t!("别的会话发来", "From another session").to_string(),
+        Who::Peer(name) => tr!("别的会话发来 · {name}", "From another session · {name}"),
+    };
+    let _ = write!(o, "\n=== {who} · {} ===\n\n{}\n", stamp(s.at, off), s.text);
+}
+
+/// Where the last n turns start in `said`, and how many turns there are. A turn starts with something said to it (by the
+/// user or by another session); a compaction summary or a subagent report belongs to the turn it falls in; anything before
+/// the first turn goes with it
+fn last_turns(d: &Dialog, n: usize) -> (usize, usize) {
+    let starts: Vec<usize> = d.said.iter().enumerate().filter(|(_, s)| matches!(s.who, Who::User | Who::Peer(_))).map(|(i, _)| i).collect();
+    let total = starts.len();
+    (if n >= total { 0 } else { starts[total - n] }, total)
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// A registered session's current conversation record and which vendor wrote it: what the hook last reported
+/// (`run.transcript`, follows /clear and account switches), else looked up from the conversation id the way `H` does.
+/// Only Claude's and Codex's records can be read
+fn record(cfg: &Config, s: &store::Session) -> Result<(Agent, PathBuf, String), String> {
+    let agent = crate::data::agent_of_tool(cfg, &s.tool);
+    if !matches!(agent, Agent::Claude | Agent::Codex) {
+        return Err(tr!(
+            "{} 的对话记录读不了,只能看最后一条回复:aca output {}",
+            "{}'s conversation record can't be read; only its last reply: aca output {}",
+            s.tool,
+            s.id
+        ));
+    }
+    let r = aca_core::runtime::load(&s.id);
+    let conv = if r.conv.is_empty() { s.conv.clone() } else { r.conv };
+    let log = if !r.transcript.is_empty() && Path::new(&r.transcript).is_file() {
+        PathBuf::from(r.transcript)
+    } else {
+        let conf = aca_core::agent::home(cfg, &s.tool, &s.account).ok().flatten().map(|p| p.display().to_string()).unwrap_or_default();
+        let w = Where { dir: s.dir.clone(), pid: 0, agent, id: conv.clone() };
+        crate::workdir::log_of(&w, &conf).ok_or(t!("找不到对话记录", "can't find its conversation record"))?
+    };
+    // The text version is named by conversation id, as `H` names it: Claude's record is named by it; Codex's is
+    // rollout-<time>-<id>
+    let sid = match agent {
+        Agent::Claude => log.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default(),
+        _ => conv,
+    };
+    Ok((agent, log, sid))
+}
+
+/// The first line of `aca output --turns / --file`: where the session is now, read at this moment.
+/// "179fbabb「研发进度会议」· Claude·sub · 空闲 12 分钟 · ~/code/app · 分支 main"
+fn where_now(cfg: &Config, s: &store::Session, row: &aca_core::status::Row, agent: Agent, now: u64) -> String {
+    let label = crate::data::agent_label(agent, &crate::data::registered(cfg, s).1);
+    let since = match row.state {
+        aca_core::status::State::Running => row.ran,
+        _ => now.saturating_sub(row.active),
+    };
+    let state = crate::print::state_name(row.state);
+    // Under a minute (or never active) the state alone: "未读 刚刚" says nothing more
+    let state =
+        if since < 60 || (row.active == 0 && row.ran == 0) { state.to_string() } else { format!("{state} {}", crate::data::dur(since)) };
+    let work = crate::data::work_dir(cfg, s);
+    let mut line =
+        tr!("{}「{}」· {label} · {state} · {}", "{} “{}” · {label} · {state} · {}", s.id, row.title, crate::create::tilde(&work));
+    if let Some(b) = crate::statusline::branch_at(Path::new(&work)) {
+        line += &tr!(" · 分支 {b}", " · branch {b}");
+    }
+    line
+}
+
+/// `aca output <id> --turns N`: where it is now, then its last N turns from the text version (compaction summaries and
+/// subagent reports inside them included)
+pub fn turns(cfg: &Config, s: &store::Session, n: usize) -> Result<String, String> {
+    let (agent, log, _) = record(cfg, s)?;
+    let d = dialog(&log, agent)?;
+    let (from, total) = last_turns(&d, n);
+    // The title as the list shows it (the agent's own once it has one), not the one it was registered with
+    let row = aca_core::status::one(cfg, s, false);
+    let mut o = where_now(cfg, s, &row, agent, unix_now() as u64);
+    o.push('\n');
+    o += &if from == 0 {
+        tr!("全部 {total} 轮", "all {total} turns")
+    } else {
+        tr!("最近 {n} 轮(共 {total} 轮;整段:aca output {} --file)", "last {n} of {total} turns (all of it: aca output {} --file)", s.id)
+    };
+    o.push('\n');
+    let off = crate::usage::local_offset();
+    for p in &d.said[from..] {
+        passage(&mut o, p, agent == Agent::Codex, off);
+    }
+    Ok(o)
+}
+
+/// `aca output <id> --file`: the whole text version written to a file (the one `H` hands a new session); where it is now,
+/// then the file's path and line count
+pub fn text_file(cfg: &Config, s: &store::Session) -> Result<String, String> {
+    let (agent, log, sid) = record(cfg, s)?;
+    let d = dialog(&log, agent)?;
+    let row = aca_core::status::one(cfg, s, false);
+    let text = render(&row.title, &log, agent, &d, unix_now(), crate::usage::local_offset());
+    let path = save(&sid, &text).map_err(|e| tr!("无法写出文字版({e})", "can't write the text version ({e})"))?;
+    let lines = text.lines().count();
+    Ok(format!(
+        "{}\n{}",
+        where_now(cfg, s, &row, agent, unix_now() as u64),
+        tr!(
+            "文字版:{}(共 {lines} 行,越往后越新;长的话先从后往前读)",
+            "Text version: {} ({lines} lines, newest last; if it's long, read it from the end backwards first)",
+            path.display()
+        )
+    ))
 }
 
 /// Local time "09-30 14:05"
@@ -611,6 +744,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A message from another Claude session (SendMessage) is injected as isMeta; its sender and body are taken from the
+    /// structured origin, both when it arrives idle (on the user message) and mid-turn (on an attachment). Shapes as seen on
+    /// 2.1.316
+    #[test]
+    fn claude_keeps_messages_other_sessions_sent_it() {
+        let root = scratch("claude-peer");
+        let log = root.join("s-1.jsonl");
+        let lines = [
+            r#"{"type":"queue-operation","operation":"enqueue","content":"<cross-session-message from=\"uds:/tmp/cc-socks/1.sock\" from-name=\"peer-a\">\nping\n</cross-session-message>"}"#,
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Another Claude session sent a message:\n<cross-session-message …>"},"origin":{"kind":"peer","from":"uds:/tmp/cc-socks/1.sock","verifiedPeerPid":1,"msg_id":"m1","name":"peer-a","body":"ping"},"timestamp":"2026-11-02T08:29:36Z"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"收到"}]}}"#,
+            r#"{"type":"user","message":{"content":"跑一下测试"},"origin":{"kind":"human"}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"<cross-session-message …>","origin":{"kind":"peer","name":"peer-a","body":"中途插一句"},"isMeta":true},"timestamp":"2026-11-02T08:33:16Z"}"#,
+            r#"{"type":"user","isMeta":true,"message":{"content":"<task-notification>…</task-notification>"},"origin":{"kind":"task-notification"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"测试过了"}]}}"#,
+        ];
+        std::fs::write(&log, lines.join("\n")).unwrap();
+        let d = dialog(&log, Agent::Claude).unwrap();
+        assert_eq!(
+            said_of(&d),
+            vec![
+                (Who::Peer("peer-a".into()), "ping".into()),
+                (Who::Agent, "收到".into()),
+                (Who::User, "跑一下测试".into()),
+                (Who::Peer("peer-a".into()), "中途插一句".into()),
+                (Who::Agent, "测试过了".into()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_last_turns_start_at_what_was_said_to_it() {
+        let mut d = Dialog::default();
+        for (who, text) in [
+            (Who::Summary, "之前的摘要"),
+            (Who::User, "一"),
+            (Who::Agent, "答一"),
+            (Who::Peer("p".into()), "二"),
+            (Who::Sub("查".into()), "报告"),
+            (Who::Agent, "答二"),
+            (Who::User, "三"),
+            (Who::Agent, "答三"),
+        ] {
+            d.say(Some(Said { who, at: 0, text: text.into() }));
+        }
+        // Turns start at 一 (1), 二 (3), 三 (6); the summary before the first turn goes with it
+        assert_eq!(last_turns(&d, 1), (6, 3));
+        assert_eq!(last_turns(&d, 2), (3, 3));
+        assert_eq!((last_turns(&d, 3), last_turns(&d, 9)), ((0, 3), (0, 3)));
+    }
+
     #[test]
     fn claude_lists_the_files_it_and_its_subagents_changed() {
         let root = scratch("claude-files");
@@ -686,13 +871,14 @@ mod tests {
         d.say(Some(Said { who: Who::User, at: 1_790_730_000, text: "修登录".into() }));
         d.say(Some(Said { who: Who::Sub("查登录".into()), at: 1_790_730_060, text: "cookie 过期了".into() }));
         d.say(Some(Said { who: Who::Agent, at: 0, text: "好".into() }));
-        let t = render(&s, &d, 1_790_730_000, 8 * 3600);
+        d.say(Some(Said { who: Who::Peer("api-worker".into()), at: 1_790_730_120, text: "迁移跑完了".into() }));
+        let t = render(&s.title, &s.log, s.agent, &d, 1_790_730_000, 8 * 3600);
         assert!(t.starts_with("# 「修登录」的对话(文字版)\n\n- 原始记录:/c/p/s-1.jsonl\n- 抽出时间:09-30 09:00\n"), "{t}");
-        assert!(t.contains("\n=== 用户 · 09-30 09:00 ===\n\n修登录\n\n=== 子代理报告 · 查登录 · 09-30 09:01 ===\n\ncookie 过期了\n\n=== Claude · ? ===\n\n好\n"), "{t}");
+        assert!(t.contains("\n=== 用户 · 09-30 09:00 ===\n\n修登录\n\n=== 子代理报告 · 查登录 · 09-30 09:01 ===\n\ncookie 过期了\n\n=== Claude · ? ===\n\n好\n\n=== 别的会话发来 · api-worker · 09-30 09:02 ===\n\n迁移跑完了\n"), "{t}");
         assert!(t.ends_with("\n=== 它改过的文件 ===\n\n按最后一次改的时间排,最近的在最后。只有记录里写明了的:编辑工具改的都在(子代理改的也算),用命令行改的(重定向、sed -i 之类)只有新版 Claude Code 才记。\n\n- 没有\n"), "{t}");
         d.touch("/r/a.rs", 1_790_730_120, false);
         d.touch("/r/b.rs", 1_790_730_180, true);
-        let t = render(&src(Agent::Codex, PathBuf::from("/x.jsonl")), &d, 0, 8 * 3600);
+        let t = render("修登录", Path::new("/x.jsonl"), Agent::Codex, &d, 0, 8 * 3600);
         assert!(t.contains("=== Codex · ? ==="), "{t}");
         assert!(
             t.ends_with(

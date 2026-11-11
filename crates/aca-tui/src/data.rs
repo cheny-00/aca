@@ -234,19 +234,7 @@ impl Session {
 
     /// "Claude·team" / "Codex·alt"; when the account is just the tool name (the fallback shown), only the vendor
     pub fn agent_label(&self) -> String {
-        let name = match self.agent {
-            Agent::Claude => "Claude",
-            Agent::Codex => "Codex",
-            Agent::Pi => "Pi",
-            Agent::Opencode => "OpenCode",
-            Agent::None | Agent::Other => "",
-        };
-        match (name, self.who.as_str()) {
-            (n, "") => n.to_string(),
-            ("", w) => w.to_string(),
-            (n, w) if n.eq_ignore_ascii_case(w) => n.to_string(),
-            (n, w) => format!("{n}·{w}"),
-        }
+        agent_label(self.agent, &self.who)
     }
 
     /// Last column of the list: for running ones, how long it has run (latest activity is always 「刚刚」 ("just now"), which
@@ -444,6 +432,17 @@ pub fn focus_pane(pane: &str) {
 /// `--client`: when the UI runs in a tmux popup, which client pressed the key. A bare switch-client in a popup switches the client
 /// with the latest keypress, so with phone and desktop attached to the same session it would switch the other one away
 static CLIENT: OnceLock<String> = OnceLock::new();
+
+/// `--insert`: opened by `aca ui --ref` to pick a session, the pane its reference goes into (⏎ puts it there instead of going in)
+static INSERT: OnceLock<String> = OnceLock::new();
+
+pub fn set_insert(pane: String) {
+    let _ = INSERT.set(pane);
+}
+
+pub fn insert_to() -> Option<&'static str> {
+    INSERT.get().map(String::as_str)
+}
 
 /// The UI runs in a tmux popup: TMUX set, TMUX_PANE not
 pub fn in_popup() -> bool {
@@ -776,6 +775,33 @@ fn copy_info(path: &str, conv: &str) -> String {
     v.join("\n")
 }
 
+/// What `B` copies for a registered agent session: a reference another agent can act on, two lines that don't go stale —
+/// which session, the vendor and the directory it works in, then the command to read it and the one to message it. State,
+/// last reply, record path, conversation id, account are left out: they change, or the reader has no use for them (`aca
+/// output` prints where it is now when run). None for an unregistered or a shell session: `B` copies [`copy_text`] then
+pub fn reference(s: &Session) -> Option<String> {
+    if s.profile != REGISTERED || s.deck_id.is_empty() || s.agent == Agent::None {
+        return None;
+    }
+    let work = crate::workdir::find(&crate::workdir::Where::of(s)).dir;
+    let dir = crate::create::tilde(if work.is_empty() { &s.dir } else { &work });
+    Some(reference_text(&s.deck_id, &s.title, &agent_label(s.agent, ""), &s.who, &dir, matches!(s.agent, Agent::Claude | Agent::Codex)))
+}
+
+/// The two lines of a reference. vendor empty (a declared tool) = named by `who`; `readable` = aca can read its conversation
+/// record (Claude, Codex), so `--turns` / `--file` work
+fn reference_text(id: &str, title: &str, vendor: &str, who: &str, dir: &str, readable: bool) -> String {
+    let vendor = if vendor.is_empty() { who } else { vendor };
+    let head = tr!("aca 会话 {id}「{title}」({vendor},{dir})", "aca session {id} “{title}” ({vendor}, {dir})");
+    let read = if readable {
+        tr!("aca output {id} --turns 5(整段:--file)", "aca output {id} --turns 5 (all of it: --file)")
+    } else {
+        format!("aca output {id}")
+    };
+    let tell = format!("aca msg {id} \"…\"");
+    format!("{head}\n{}", tr!("看它:{read}　给它传话:{tell}", "Read it: {read} · Message it: {tell}"))
+}
+
 /// What `B` copies (and `C` picks from), worked out when pressed: `info` with `Path:` turned into the directory it's really
 /// working in (see `workdir`), the one it started in following as `Started in:` when that's elsewhere (Claude files the
 /// conversation record under it), and `Home:` the agent's config dir
@@ -825,8 +851,26 @@ fn account_name(account: &str) -> String {
     aca_core::agent::account_label(account).trim_start_matches('.').to_string()
 }
 
+/// "Claude·work": the vendor and who (the account, or the tool name); just one of them when the other is empty or they're
+/// the same
+pub fn agent_label(agent: Agent, who: &str) -> String {
+    let name = match agent {
+        Agent::Claude => "Claude",
+        Agent::Codex => "Codex",
+        Agent::Pi => "Pi",
+        Agent::Opencode => "OpenCode",
+        Agent::None | Agent::Other => "",
+    };
+    match (name, who) {
+        (n, "") => n.to_string(),
+        ("", w) => w.to_string(),
+        (n, w) if n.eq_ignore_ascii_case(w) => n.to_string(),
+        (n, w) => format!("{n}·{w}"),
+    }
+}
+
 /// A registered session: which vendor, which account (the tool name if no account)
-fn registered(cfg: &Config, s: &store::Session) -> (Agent, String) {
+pub(crate) fn registered(cfg: &Config, s: &store::Session) -> (Agent, String) {
     let agent = agent_of_tool(cfg, &s.tool);
     if agent == Agent::None {
         return (Agent::None, String::new());
@@ -1916,6 +1960,19 @@ account = \"alt\"
         // cd'd into /w/app: that's the path; where it started stays (its record is filed under it)
         assert_eq!(with_work_home(info, "/w/app", None), "Path: /w/app\nStarted in: /w\nSession: abc");
         assert_eq!(with_work_home("", "", None), "");
+    }
+
+    /// B's reference: who and where, then how to read it and how to message it; only Claude and Codex get --turns / --file
+    #[test]
+    fn a_reference_names_the_session_and_the_two_commands() {
+        assert_eq!(
+            reference_text("3f2a9c1e", "修登录", "Codex", "work", "~/code/app", true),
+            "aca 会话 3f2a9c1e「修登录」(Codex,~/code/app)\n看它:aca output 3f2a9c1e --turns 5(整段:--file)　给它传话:aca msg 3f2a9c1e \"…\""
+        );
+        // A tool declared in config is named by its name; pi's record isn't read, so only its last reply
+        assert!(reference_text("1", "t", "", "aider", "/w", false).starts_with("aca 会话 1「t」(aider,/w)\n看它:aca output 1　给它传话:"));
+        let en = aca_core::i18n::with(aca_core::i18n::Lang::En, || reference_text("1", "t", "Pi", "pi", "/w", false));
+        assert_eq!(en, "aca session 1 “t” (Pi, /w)\nRead it: aca output 1 · Message it: aca msg 1 \"…\"");
     }
 
     #[test]

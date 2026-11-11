@@ -1,5 +1,5 @@
-//! The list: merges the registry, the panes actually in tmux, the state hooks write and what's on the screen into one row
-//! per session.
+//! The list: merges the registry, the panes actually in tmux, the state hooks write, what the agent reports itself (OSC 7501,
+//! see [`crate::relay`]) and what's on the screen into one row per session.
 //!
 //! One refresh = one `tmux list-panes -a` + one database read + one small file per session + (when reading screens) one
 //! tmux command that captures the screens of all running sessions together (`tmux::capture_many`). Without screens
@@ -14,11 +14,11 @@ use crate::agent::{self, Agent, Handle};
 use crate::config::Config;
 use crate::import;
 use crate::paths::{self, Res};
-use crate::runtime::{self, Run};
+use crate::runtime::{self, Program, Run};
 use crate::screen::{self, Seen};
 use crate::store::{Session, Store};
 use crate::tmux::{self, Pane};
-use crate::{event, hook};
+use crate::{event, hook, relay};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -154,13 +154,49 @@ fn borrow(r: &mut Run, event: &str, ts: u64) {
     (r.status, r.event, r.ts) = (status.into(), event.into(), ts);
 }
 
-/// The screen decides the state (when it was read); hooks fill in what the screen can't show
+/// What the agent in this pane reported itself ([`crate::relay`]): only from the process running there now, and only a known
+/// state
+fn reported<'a>(p: &Pane, r: &'a Run) -> Option<&'a Program> {
+    r.ps.as_ref().filter(|ps| p.pid != 0 && ps.pid == p.pid && relay::STATES.contains(&ps.state.as_str()))
+}
+
+/// Finished and not read yet: nobody attached, and it finished after it was last looked at (marked by hand / attached), and
+/// no key was pressed inside after it finished. A key press in the same second as finishing doesn't count: the order can't be
+/// told, and tmux also records "someone touched it" when a session is created
+fn unread(p: &Pane, r: &Run, done: u64) -> bool {
+    p.attached == 0 && done > r.seen.max(p.last_attached) && done >= p.activity
+}
+
+/// The state, the question when it needs you, and seconds run. What the agent reports itself decides when there is a report
+/// ([`crate::relay`]); otherwise the screen decides (when it was read), and hooks fill in what the screen can't show
 pub fn merge(pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64) -> (State, String, u64) {
     let Some(p) = pane else { return (State::Stopped, String::new(), 0) };
     if p.dead {
         return (State::Exited, String::new(), 0);
     }
     let since_turn = if r.status == "running" && r.turn > 0 { now.saturating_sub(r.turn) } else { 0 };
+    if let Some(ps) = reported(p, r) {
+        return match ps.state.as_str() {
+            // After approving a prompt the turn the hook started goes on: count from there
+            "working" => (State::Running, String::new(), now.saturating_sub(if r.turn > 0 && r.turn <= ps.at { r.turn } else { ps.at })),
+            // The hook's question names the tool and carries the options; when the hook didn't report this one, the agent's own
+            // line; when it gave none (Codex), what the screen asks
+            "blocked" => {
+                let q = match seen {
+                    _ if r.status == "waiting" && !r.ask.is_empty() => r.ask.clone(),
+                    _ if !ps.msg.is_empty() => ps.msg.clone(),
+                    Some(Seen::Ask(q)) => q.clone(),
+                    _ => String::new(),
+                };
+                (State::Ask, q, 0)
+            }
+            "error" => (State::Error, String::new(), 0),
+            // A failure the hook reported (with its kind, used for retrying) outlasts the agent's done / idle, until the next turn
+            _ if r.status == "error" => (State::Error, String::new(), 0),
+            "done" if unread(p, r, ps.at) => (State::Unread, String::new(), 0),
+            _ => (State::Idle, String::new(), 0),
+        };
+    }
     // Tools whose screen can't tell: treat as if the screen wasn't read, and go by whatever the hook says
     let seen = seen.filter(|s| **s != Seen::Unsure);
     match seen {
@@ -187,10 +223,8 @@ pub fn merge(pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64) -> (St
         "running" if seen.is_none() || now.saturating_sub(r.turn) < 3 || seen == Some(&Seen::Moving) => State::Running,
         "error" => State::Error,
         // Read: marked by hand / someone attached the moment it finished (recorded by the hook), attached after it finished, or
-        // pressed a key inside after it finished (stayed attached watching it finish, then switched away). A key press in the
-        // same second as finishing doesn't count: the order can't be told, and tmux also records "someone touched it" when a
-        // session is created
-        "done" if p.attached == 0 && r.done > r.seen.max(p.last_attached) && r.done >= p.activity => State::Unread,
+        // pressed a key inside after it finished (stayed attached watching it finish, then switched away)
+        "done" if unread(p, r, r.done) => State::Unread,
         _ => State::Idle,
     };
     match state {
@@ -519,6 +553,39 @@ mod tests {
         // Unrecognized events (SessionEnd, ones added later) change nothing: still go by the screen only; the recorded
         // conversation id and the like aren't lost
         assert_eq!((at("SessionEnd").status.as_str(), at("Stop").conv.as_str(), at("Stop").seen), ("", "c-1", 7));
+    }
+
+    #[test]
+    fn what_the_agent_reports_itself_decides_over_screen_and_hooks() {
+        let p = Pane { pid: 42, ..pane() };
+        let said = |state: &str, at: u64| Some(Program { pid: 42, state: state.into(), at, ..Default::default() });
+        let m = |r: &Run, seen: Option<Seen>| merge(Some(&p), r, seen.as_ref(), 100);
+        // Esc interrupted the turn: the hook still says running and the screen still spins, the agent says idle
+        let interrupted = Run { turn: 90, ps: said("idle", 95), ..run("running") };
+        assert_eq!(m(&interrupted, Some(Seen::Running(5))).0, State::Idle);
+        // Approved a permission prompt: the hook still says waiting, the agent says working; the turn the hook started goes on
+        let approved = Run { turn: 80, ask: "Bash: ls".into(), ps: said("working", 95), ..run("waiting") };
+        assert_eq!(m(&approved, Some(Seen::Ask("Do you want to proceed?".into()))), (State::Running, String::new(), 20));
+        assert_eq!(m(&Run { ps: said("working", 95), ..run("idle") }, None), (State::Running, String::new(), 5));
+        // Needs you: the hook's question when it reported this one, else the agent's own line
+        let blocked = Program { msg: "approve Bash: touch a".into(), ..said("blocked", 95).unwrap() };
+        assert_eq!(m(&Run { ps: Some(blocked.clone()), ..run("running") }, None), (State::Ask, "approve Bash: touch a".into(), 0));
+        assert_eq!(m(&Run { ask: "Bash: touch a".into(), ps: Some(blocked), ..run("waiting") }, None).1, "Bash: touch a");
+        // No line of its own and no hook (Codex with untrusted hooks): what the screen asks
+        assert_eq!(m(&Run { ps: said("blocked", 95), ..run("") }, Some(Seen::Ask("Run touch?".into()))).1, "Run touch?");
+        // Done: unread until looked at, the same way as the hook's done
+        assert_eq!(m(&Run { ps: said("done", 95), ..run("running") }, None).0, State::Unread);
+        assert_eq!(merge(Some(&Pane { attached: 1, ..p.clone() }), &Run { ps: said("done", 95), ..run("done") }, None, 100).0, State::Idle);
+        // A failure the hook reported stays until the next turn
+        assert_eq!(m(&Run { ps: said("done", 95), ..run("error") }, None).0, State::Error);
+        assert_eq!(m(&Run { ps: said("working", 99), ..run("error") }, None).0, State::Running);
+        // From an earlier start (another process in the pane now), or cleared: screen + hooks as before
+        let old = Run { ps: Some(Program { pid: 7, ..said("idle", 95).unwrap() }), ..run("running") };
+        assert_eq!(m(&old, Some(Seen::Running(5))).0, State::Running);
+        assert_eq!(m(&Run { ps: said("", 95), ..run("waiting") }, Some(Seen::Ask("q".into()))).0, State::Ask);
+        // An unknown pane process (0) never matches
+        let unknown = Run { ps: Some(Program { pid: 0, ..said("idle", 95).unwrap() }), ..run("running") };
+        assert_eq!(merge(Some(&pane()), &unknown, None, 100).0, State::Running);
     }
 
     #[test]

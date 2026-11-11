@@ -39,6 +39,7 @@ mod plugins;
 mod plugtune;
 pub mod print;
 mod reads;
+mod refer;
 mod rehome;
 mod setup;
 mod slots;
@@ -76,6 +77,9 @@ pub use groups::rename_all as rename_group;
 
 /// `aca show --json`'s `work`: the directory the session is really working in (the same one the interface's diff page uses)
 pub use data::work_dir;
+
+/// `aca output --turns N` / `--file`: the conversation as text, the same extraction `H` hands a new session
+pub use handoff::{text_file as conversation_file, turns as conversation_turns};
 
 /// Go into this tmux session (`tmux` is the session id): if already inside tmux, switch this client to it
 fn attach_now(tmux: &str) -> bool {
@@ -283,6 +287,14 @@ pub fn command(name: &str, args: &[String]) -> Option<i32> {
 pub fn main(mut args: Vec<String>) -> anyhow::Result<()> {
     if let Some(c) = take_opt(&mut args, "--client") {
         data::set_client(c);
+    }
+    // `--ref` (the `[keys] ref` hotkey): pop the list up to pick a session whose reference goes where you're typing; that list
+    // is this interface again, opened with `--insert <pane>` (see refer.rs)
+    if args.iter().any(|a| a == "--ref") {
+        return refer::run(&mut args);
+    }
+    if let Some(p) = take_opt(&mut args, "--insert") {
+        data::set_insert(p);
     }
     // When the popup takes only one side of the screen: wherever the highlight moves, this client switches there (see follow.rs)
     if args.iter().any(|a| a == "--follow") {

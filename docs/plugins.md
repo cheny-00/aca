@@ -394,15 +394,16 @@ One JSON object per line. Common fields: `ts` (milliseconds), `event`, `session`
 | `session.moved` | `group` | moved to another group |
 | `session.rehomed` | `tool` `account` `from` (the previous `tool:account`) | carried on under another account (`aca restart --as`, or `X` in the interface): the conversation is copied to the new account and the session restarts in place |
 | `session.archived` / `session.removed` | a removal carries `title`; a session let go with `aca release` adds `released` (its tmux session is still there) | |
-| `turn.started` | `prompt` | you sent a message |
+| `turn.started` | `prompt` | you sent a message. Claude also starts a turn for another Claude session's message and for a background task's notice; this goes out then too, with that text, as who opened the turn is only in the conversation record once the turn ends (the session's `prompt` then goes back to what you last said) |
 | `turn.done` | `last` (the last reply) `bg` (background tasks still running) `secs` | a turn finished |
 | `turn.failed` | `error` `kind` (transient = rate limit, overload, dropped stream: continuing a bit later usually works; account = quota, login, billing; fatal = retrying won't help) | a turn failed (Codex doesn't report this hook: aca fills it in from Codex's transcript when it checks the state) |
 | `turn.interrupted` | `by` (when `aca interrupt` stops Claude: who did it) | you pressed Esc (Codex reports this itself), or `aca interrupt` stopped it |
 | `agent.waiting` | `ask` `kind` (choice / permission / empty = can't tell) `options` (the choices of a multiple-choice question) | waiting for you to confirm or answer |
+| `agent.status` | `state` (idle / working / done / blocked / error / empty = it cleared its status) `kind` (with blocked: permission / question / auth / empty) `msg` (its own one line) | the agent reported its own state (OSC 7501; only agents that speak it, behind aca's relay); sent when it changes |
 | `agent.exited` | `reason` | the agent process exited |
 | `conversation.changed` | `conv` `from` | the conversation id changed (/clear) |
-| `message.sent` | `id` (of this message) `from` `kind` (msg / notice) `what` (what a notice is about; null for other messages) `wake` `text` `at` (when a scheduled one is due, in seconds; null otherwise) | a message was put in this session's inbox (`aca msg`, or a notice sent automatically by a worker it dispatched). A scheduled one (`aca msg --in`) sends this when it's put in; the delivered one waits until it's due |
-| `message.delivered` | `id` `how` (bell / queue / type / wait) | that message reached it |
+| `message.sent` | `id` (of this message) `from` `kind` (msg / notice) `what` (what a notice is about; null for other messages) `wake` `text` `at` (when a scheduled one is due, in seconds; null otherwise) `via` (`claude` = sent with Claude's own SendMessage; null otherwise) | a message was put in this session's inbox (`aca msg`, or a notice sent automatically by a worker it dispatched). What another Claude session sent it with SendMessage is put in when its turn ends, read from its conversation record, and is delivered at once (`how` = native). A scheduled one (`aca msg --in`) sends this when it's put in; the delivered one waits until it's due |
+| `message.delivered` | `id` `how` (bell / queue / type / wait / native: Claude passed it itself) | that message reached it |
 | `message.throttled` | `from` `count` `secs` | one session sent messages too often; later ones are stored without waking it |
 | `ask.answered` | `by` (who answered for it; `you` = from outside) `answer` `ask` `kind` (choice / permission; a confirmation shown at startup is `gate`) | `aca answer` answered a confirmation for it |
 | `limits.changed` | `tool` (claude / codex) `name` (the registered account name, else the directory's name without its dot) `dir` (the account's directory) `wins` (every window of that account: `label` 5h / 7d / Fable …, `used` percent, `resets` and `at` (when the number is from) in seconds) | an account's subscription quota moved: never on a refresh that brings the same numbers. Claude's come through the status line, Codex's when one of its turns ends. `session` is the session that reported it, empty when it wasn't started by aca; `aca limits --json` gives all accounts at once |
@@ -519,7 +520,9 @@ load, and linking says to upgrade aca first). Within one version aca only adds t
   run) `active` (the last time something happened) `bg` (background tasks) `locked` `created` `order` `tokens` (text set
   with `meta set`) `idle_stopped` (when aca stopped it for idling, drawn ☾ in the list; 0 otherwise). `aca show --json`
   also has `work`: the directory it's really working in (where the agent cd'd to, or the repository of the file it last
-  changed; `dir` when neither is known).
+  changed; `dir` when neither is known), `transcript` (its current conversation record, as the hook last reported it),
+  `home` (its config directory) and `peer` (Claude, while it's running: the socket other Claude sessions deliver messages
+  to; empty otherwise).
 - `run` in `aca show --json` is aca's own bookkeeping, **not part of the interface**; its fields can change at any time.
 - `aca plugin actions --json`: one command per line, `{"id", "title", "contexts", "args", "expose"}`.
 - Times: an event's `ts` is in milliseconds, everything else in seconds. JSON is printed compactly on one line; read it

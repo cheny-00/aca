@@ -262,7 +262,7 @@ fn read(path: &Path, from: u64, now: u64, seen: &mut Seen) -> u64 {
 }
 
 /// `2026-10-15T08:00:36.843Z` → seconds. Only UTC is recognized (it's what Claude writes)
-fn iso(s: &str) -> Option<u64> {
+pub(crate) fn iso(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[10] != b'T' || !s.ends_with('Z') {
         return None;

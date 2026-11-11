@@ -59,10 +59,14 @@ Going in, or just looking
   y         open yazi in the directory it's really working in (a stopped session uses the directory it recorded);
             q inside quits back to aca; in a tmux popup it runs in a split next to that pane, zoomed, and switches
             there; q closes that split
-  c / B     copy the last reply / copy the dir it really works in, the conversation id and the config dir (on a
-            phone via OSC 52 into the phone's clipboard)
+  c / B     copy the last reply / copy a reference to the session: two lines saying which session it is, the dir it
+            works in, and the commands to read it (aca output) and message it (aca msg), for pasting to another
+            agent (on a phone via OSC 52 into the phone's clipboard)
+  prefix b  insert a reference (the same key as inside a session): pick a session, its reference goes into the
+            highlighted session's input box, no Enter; then back on that row. Esc cancels
   C         pick one to copy: i aca id (for commands like aca move <id>) · s session id (Claude / Codex's conversation
-            id, for claude --resume) · p path; ↑↓ to pick then Enter works too; missing ones say why
+            id, for claude --resume) · p path · a all (the dir it really works in, the conversation id and the config
+            dir, for pasting outside aca); ↑↓ to pick then Enter works too; missing ones say why
 
   The directory it's really working in: the current directory Claude / Codex track themselves (following cd and
   worktrees); if that's not a repository, the repository its recently changed files are in; when it differs from
@@ -332,6 +336,9 @@ As a switcher (a tmux popup)
   uninstall removes it. To bind it yourself, copy from that file
   Ctrl+Alt+N  pressed inside a session (no list): goes to the next one to look at, ◆ before ◐; again for the one
             after (aca help next). aca binds it, the way Ctrl+Q is; another key: aca tmux key next <key>
+  prefix b  tmux's prefix key (Ctrl+B by default), then b, inside a session: pops up the list on the right; ⏎ puts
+            the picked session's reference (the two lines B copies) into the input box, no Enter (aca ui --ref). aca
+            binds it too; another key: aca tmux key ref <key> (prefix b means b after the prefix key)
   --client  Enter switches only the client that pressed the key (phone and desktop each their own), and it opens with
             that client's current session highlighted
   --follow  follow: wherever the highlight goes, the side switches to that session and the popup stays open (it's

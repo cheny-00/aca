@@ -255,6 +255,37 @@ pub trait Agent: Sync {
     fn live(&self, _pid: u32, _home: Option<&str>, _argv: &[String]) -> Live {
         Live::default()
     }
+
+    /// Read from the conversation record when a turn ends: messages other sessions passed it through the agent's own channel
+    /// since `since` (seconds), and whether this turn was opened by you. Nothing by default
+    fn turn_record(&self, _r: &Run, _since: u64) -> Turn {
+        Turn::default()
+    }
+}
+
+/// What the conversation record says about the turn that just ended ([`Agent::turn_record`])
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Turn {
+    /// Messages from other sessions that came in through the agent's own channel, not aca's inbox
+    pub native: Vec<Native>,
+    /// Another session's message or a background task's notice opened this turn, not you: what you last said yourself (empty
+    /// if it's not in the part read), to keep as [`Run::prompt`]. None = you opened it, or it can't be told
+    pub said: Option<String>,
+}
+
+/// One message another session passed straight to this one (Claude's SendMessage), as the receiver's record has it
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Native {
+    /// The agent's own id for it (Claude: `msg_id`)
+    pub id: String,
+    pub ts: u64,
+    /// The sending process as the agent checked it (Claude: `verifiedPeerPid`); 0 = not given
+    pub pid: u32,
+    /// The sender's address as it says it (Claude: its socket path, without `uds:`)
+    pub addr: String,
+    /// The sender's name as the agent knows it
+    pub name: String,
+    pub text: String,
 }
 
 /// A running process, recognized from what it leaves behind itself ([`Agent::live`])
@@ -393,8 +424,8 @@ fn without(vars: &[&[&str]], set: &[(String, String)], mut cmd: Vec<String>) -> 
     argv
 }
 
-/// Hook commands run through a shell: spaces and quotes in the program path are fine
-pub(crate) fn sh_quote(s: &str) -> String {
+/// Hook commands (and the popup `aca ui --ref` opens) run through a shell: spaces and quotes in the program path are fine
+pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -632,14 +663,35 @@ pub fn launch(cfg: &Config, s: &Session, how: &How, say: Option<&str>) -> Res<La
     }
     let more = agent.env(&tool, &aca, &env)?;
     env.extend(more);
-    env.extend([("ACA_SESSION_ID".to_string(), s.id.clone()), ("ACA_TOOL".to_string(), s.tool.clone()), ("ACA_BIN".to_string(), aca)]);
+    env.extend([
+        ("ACA_SESSION_ID".to_string(), s.id.clone()),
+        ("ACA_TOOL".to_string(), s.tool.clone()),
+        ("ACA_BIN".to_string(), aca.clone()),
+    ]);
     // With another directory / another tmux server (tests), the session's hooks must write to the same place too
     for k in ["ACA_HOME", "ACA_TMUX_SOCKET"] {
         if let Some(v) = std::env::var(k).ok().filter(|v| !v.is_empty()) {
             env.push((k.to_string(), v));
         }
     }
-    Ok(Launch { argv: without(&[FOREIGN], &env, cmd), env, said })
+    let argv = without(&[FOREIGN], &env, cmd);
+    Ok(Launch { argv: relayed(agent.name(), &tool, &aca, argv), env, said })
+}
+
+/// The agents known to report their own state (OSC 7501): Claude Code (2.1.322 on, after the terminal answers its query) and
+/// Codex (0.167 on, without asking). Only these get the relay by default; for the others it would be one more layer for nothing
+const REPORTING: &[&str] = &["claude", "codex"];
+
+/// The agent behind aca's relay (`aca pty -- …`, see [`crate::relay`]), so the state it reports itself reaches aca. By default
+/// only the agents known to report ([`REPORTING`]); `program_status = true` puts any other one behind it too (one that learned
+/// it later), `false` none. Never shell: the list follows a shell's working directory through tmux, which would then only see
+/// the relay's
+fn relayed(name: &str, tool: &Tool, aca: &str, argv: Vec<String>) -> Vec<String> {
+    let on = name != "shell" && tool.program_status.unwrap_or(REPORTING.contains(&name));
+    if !on {
+        return argv;
+    }
+    [aca.to_string(), "pty".into(), "--".into()].into_iter().chain(argv).collect()
 }
 
 /// Maximum bytes for the opening message: it ends up as one command-line argument, and the system allows 1 MB for a
@@ -819,6 +871,20 @@ pub(crate) fn extra(tool: &Tool, s: &Session) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_agents_known_to_report_their_state_go_behind_the_relay() {
+        let argv = || vec!["/usr/bin/env".to_string(), "/bin/x".to_string()];
+        let behind =
+            |name: &str, on: Option<bool>| relayed(name, &Tool { program_status: on, ..Default::default() }, "/aca", argv())[0] == "/aca";
+        assert!(behind("claude", None) && behind("codex", None));
+        assert_eq!(relayed("claude", &Tool::default(), "/aca", argv())[..3], ["/aca", "pty", "--"]);
+        assert!(!behind("pi", None) && !behind("opencode", None) && !behind("aider", None));
+        // Turned on for one that learned it later, off for one that does report
+        assert!(behind("pi", Some(true)) && !behind("claude", Some(false)));
+        // Never shell
+        assert!(!behind("shell", Some(true)));
+    }
 
     fn picked(cfg: &Config, spec: &str) -> Res<(String, String, String)> {
         pick(cfg, spec).map(|p| (p.tool, p.account, p.agent.name().to_string()))

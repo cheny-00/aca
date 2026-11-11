@@ -65,6 +65,10 @@ pub struct Msg {
     pub text: String,
     /// Scheduled (`aca msg --in`): delivered only at this moment; 0 = right away
     pub at: u64,
+    /// How it came: empty = through aca; `claude` = Claude passed it straight from another Claude session (SendMessage), taken
+    /// in from the receiver's conversation record afterwards ([`native`])
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub via: String,
 }
 
 /// Which ones were delivered: `got` reached the other side; `queued` went into Codex's queue, but it hasn't been seen
@@ -220,33 +224,108 @@ pub fn post(mut m: Msg) -> Msg {
     m.ts = paths::now();
     let braked = {
         let _l = lock(&m.to);
-        let mut msgs = all(&m.to);
+        let msgs = all(&m.to);
         let recent = msgs.iter().filter(|x| x.from == m.from && m.ts.saturating_sub(x.ts) < BRAKE_SECS).count();
         let braked = m.wake && recent >= BRAKE;
         m.wake &= !braked;
-        msgs.push(m.clone());
-        if msgs.len() >= TIDY_AT {
-            tidy(&m.to, msgs);
-        } else {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file(&m.to)) {
-                let _ = f.write_all(format!("{}\n", serde_json::to_string(&m).unwrap_or_default()).as_bytes());
-            }
-        }
+        append_locked(&m.to, msgs, std::slice::from_ref(&m));
         braked && recent == BRAKE
     };
-    let what = if m.what.is_empty() { Value::Null } else { json!(m.what) };
-    let at = if m.at == 0 { Value::Null } else { json!(m.at) };
-    event::emit(
-        "message.sent",
-        &m.to,
-        json!({ "id": m.id, "from": m.from, "kind": m.kind, "what": what, "wake": m.wake, "text": clip(&m.text, 200), "at": at }),
-    );
+    sent(&m);
     // The message that just hit the brake: tell you once (not again for the ones after)
     if braked {
         event::emit("message.throttled", &m.to, json!({ "from": m.from, "count": BRAKE, "secs": BRAKE_SECS }));
     }
     m
+}
+
+/// Adds `new` to the end of `to`'s inbox, tidying it once it's grown big (call under the lock; `msgs` is what's in it now)
+fn append_locked(to: &str, mut msgs: Vec<Msg>, new: &[Msg]) {
+    msgs.extend_from_slice(new);
+    if msgs.len() >= TIDY_AT {
+        return tidy(to, msgs);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file(to)) {
+        let text: String = new.iter().map(|m| format!("{}\n", serde_json::to_string(m).unwrap_or_default())).collect();
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
+/// The `message.sent` line in the event stream
+fn sent(m: &Msg) {
+    let or_null = |s: &str| if s.is_empty() { Value::Null } else { json!(s) };
+    let at = if m.at == 0 { Value::Null } else { json!(m.at) };
+    let data = json!({
+        "id": m.id, "from": m.from, "kind": m.kind, "what": or_null(&m.what), "wake": m.wake, "text": clip(&m.text, 200), "at": at,
+        "via": or_null(&m.via),
+    });
+    event::emit("message.sent", &m.to, data);
+}
+
+/// What Claude passed `to` straight from other Claude sessions (SendMessage), read from its record when a turn ends
+/// ([`Agent::turn_record`]): put in its inbox as already delivered, so `aca inbox` and plugins see them alongside aca's own
+/// (`message.sent` with `via`, then `message.delivered` with `how` = native). Taken once each, by Claude's own id for it.
+/// The sender is the session whose Claude inbox socket ([`Run::peer`]) belongs to the process Claude checked; when aca
+/// doesn't know it (started outside aca, or before aca recorded sockets), `who` keeps the name Claude has for it
+pub fn native(to: &str, got: Vec<agent::Native>) {
+    if got.is_empty() {
+        return;
+    }
+    let senders = with_socket();
+    let _l = lock(to);
+    let msgs = all(to);
+    let mut new: Vec<Msg> = vec![];
+    for n in got {
+        let id = format!("c{}", n.id.chars().filter(char::is_ascii_hexdigit).take(8).collect::<String>());
+        if msgs.iter().chain(&new).any(|m| m.id == id) {
+            continue;
+        }
+        let from = senders.iter().find(|(_, r)| sent_by(r, &n));
+        new.push(Msg {
+            id,
+            ts: n.ts,
+            from: from.map(|(s, _)| s.id.clone()).unwrap_or_default(),
+            who: from.map_or_else(|| format!("「{}」claude", n.name), |(s, r)| who(s, r)),
+            to: to.to_string(),
+            kind: "msg".into(),
+            via: "claude".into(),
+            text: n.text,
+            ..Default::default()
+        });
+    }
+    if new.is_empty() {
+        return;
+    }
+    append_locked(to, msgs, &new);
+    new.iter().for_each(sent);
+    mark_locked(to, &new.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), "native");
+}
+
+/// The sessions whose Claude has told aca its inbox socket, the most recently active first (a socket's name is a process id,
+/// and one can be reused by a later process)
+fn with_socket() -> Vec<(Session, Run)> {
+    let Ok(store) = Store::open() else { return vec![] };
+    let mut v: Vec<(Session, Run)> = store
+        .sessions(false)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let r = runtime::load(&s.id);
+            (s, r)
+        })
+        .filter(|(_, r)| !r.peer.is_empty())
+        .collect();
+    v.sort_by_key(|(_, r)| std::cmp::Reverse(r.ts));
+    v
+}
+
+/// Whether `n` came from the Claude whose socket this is: by the process Claude checked, else by the address it gives
+fn sent_by(r: &Run, n: &agent::Native) -> bool {
+    match n.pid {
+        0 => !n.addr.is_empty() && r.peer == n.addr,
+        pid => std::path::Path::new(&r.peer).file_stem().is_some_and(|f| *f == *pid.to_string()),
+    }
 }
 
 /// Tidy: keep every undelivered one and only the latest few delivered; the delivered ids on record are trimmed to the
@@ -796,8 +875,12 @@ pub fn take_cmd() -> i32 {
     2
 }
 
-/// `aca inbox watch`: the extra one run on Claude's SessionStart. Replies with `watchPaths` so it watches the doorbell; if
-/// anything is undelivered, rings once two seconds later (after it starts watching)
+/// `aca inbox watch`: the extra one run on Claude's SessionStart and CwdChanged. Replies with `watchPaths` so it watches
+/// the doorbell; if anything is undelivered, rings once two seconds later (after it starts watching).
+///
+/// CwdChanged too because Claude replaces its watch list with what the CwdChanged hooks return whenever its working
+/// directory changes, even a `cd` it resets right away (read in 2.1.318's code, reproduced: after `cd /tmp && pwd` the
+/// doorbell went unanswered and the message fell back to typing)
 pub fn watch_cmd() -> i32 {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
@@ -805,12 +888,18 @@ pub fn watch_cmd() -> i32 {
     if std::env::var_os("CLAUDE_JOB_DIR").is_some() {
         return 0;
     }
+    // The reply has to name the event it answers
+    let event = serde_json::from_str::<Value>(&input)
+        .ok()
+        .and_then(|v| v["hook_event_name"].as_str().map(str::to_string))
+        .filter(|e| e == "CwdChanged")
+        .unwrap_or_else(|| "SessionStart".into());
     let b = bell(&id);
     if !b.exists() {
         ring(&id);
     }
     runtime::update(&id, |r| r.bell = true);
-    println!("{}", json!({ "hookSpecificOutput": { "hookEventName": "SessionStart", "watchPaths": [b] } }));
+    println!("{}", json!({ "hookSpecificOutput": { "hookEventName": event, "watchPaths": [b] } }));
     if wants_wake(&id) {
         later(&id, 2, &[]);
     }
@@ -954,6 +1043,7 @@ mod tests {
             wake: true,
             text: text.into(),
             at: 0,
+            via: String::new(),
         }
     }
 

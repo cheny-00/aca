@@ -85,6 +85,8 @@ yazi 是可选的,需要自己安装。
 ```sh
 aca show 3f2a          # 状态、目录、对话 id 和它最后的回复
 aca output 3f2a        # 只要它最后的回复
+aca output 3f2a --turns 3   # 最近 3 轮双方说的话,第一行是它现在的状态、目录和分支
+aca output 3f2a --file      # 整段对话的文字版写成文件(和 H 交接时给新会话的是同一份)
 aca show 3f2a --json   # 同样的内容,给脚本用
 ```
 

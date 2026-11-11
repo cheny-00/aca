@@ -367,14 +367,26 @@ fn detach_changes(keys: &str) -> Vec<Vec<String>> {
 pub const HOTKEY_MARK: &str = "--hotkey";
 /// Hotkeys are only intercepted in aca's sessions
 const HOTKEY_IN: &str = "#{?@aca_id,1,0}";
-/// Bound in these key tables: normally (root), and while scrolling back (copy-mode; with vi keys, copy-mode-vi)
-const HOTKEY_TABLES: [&str; 3] = ["root", "copy-mode", "copy-mode-vi"];
+/// Bound in these key tables: normally (root), and while scrolling back (copy-mode; with vi keys, copy-mode-vi). A key
+/// written `prefix <key>` goes in the prefix table alone (tmux uses it while scrolling back too)
+const HOTKEY_TABLES: [&str; 4] = ["root", "copy-mode", "copy-mode-vi", "prefix"];
+/// How a hotkey after tmux's prefix key is written: `prefix b`
+pub const PREFIX_KEY: &str = "prefix ";
+
+/// Which key tables a wanted hotkey goes in, and its name in them: `prefix b` → the prefix table, `b`
+fn hotkey_in<'a>(want: &'a str, table: &str) -> Option<&'a str> {
+    match want.strip_prefix(PREFIX_KEY) {
+        Some(k) => (table == "prefix").then_some(k.trim()),
+        None => (table != "prefix").then_some(want),
+    }
+}
 
 /// Plugin hotkeys (the manifest's `[[hotkeys]]`), done the same way as Ctrl+Q: bound on the tmux server, no prefix; in
-/// aca's sessions the command runs, in other sessions the key goes through to the program inside. `want`: (key, shell
+/// aca's sessions the command runs, in other sessions the key goes through to the program inside (one after the prefix
+/// key, `prefix b`, does nothing there). `want`: (key, shell
 /// command to run on press — carrying [`HOTKEY_MARK`], with `#{…}` inside expanded by tmux). Keys aca bound before that
 /// nobody wants now are unbound; keys someone else bound (your tmux.conf, tmux's defaults) are left alone. Returns the
-/// keys that couldn't be bound in the normal key table. tmux not running: does nothing
+/// keys that couldn't be bound in the normal key table (the prefix table, for a `prefix` one). tmux not running: does nothing
 pub fn bind_hotkeys(want: &[(String, String)]) -> Vec<String> {
     let Ok(keys) = run(&["list-keys"]) else { return vec![] };
     let (cmds, held) = hotkey_changes(&keys, want);
@@ -392,21 +404,23 @@ fn hotkey_changes(keys: &str, want: &[(String, String)]) -> (Vec<Vec<String>>, V
     let (mut cmds, mut held) = (vec![], vec![]);
     for table in HOTKEY_TABLES {
         let now: Vec<(&str, &str)> = bindings(keys, table).collect();
-        for (k, _) in now.iter().filter(|(k, c)| c.contains(HOTKEY_MARK) && !want.iter().any(|(w, _)| same_key(w, k))) {
+        let here: Vec<(&String, &str, &String)> = want.iter().filter_map(|(w, sh)| Some((w, hotkey_in(w, table)?, sh))).collect();
+        for (k, _) in now.iter().filter(|(k, c)| c.contains(HOTKEY_MARK) && !here.iter().any(|(_, w, _)| same_key(w, k))) {
             cmds.push(vec![s("unbind-key"), s("-T"), s(table), s(k)]);
         }
-        for (k, sh) in want {
+        for (want, k, sh) in here {
             match now.iter().find(|(b, _)| same_key(b, k)) {
                 Some((_, c)) if !c.contains(HOTKEY_MARK) => {
-                    if table == "root" {
-                        held.push(k.clone());
+                    if table == "root" || table == "prefix" {
+                        held.push(want.clone());
                     }
                 }
                 Some((_, c)) if plain(c).contains(&plain(sh)) => {}
                 _ => {
                     let go = format!("run-shell -b {}", quote(sh));
-                    let mut c = vec![s("bind-key"), s("-T"), s(table), k.clone(), s("if-shell"), s("-F"), s(HOTKEY_IN), go];
-                    // Normally: not an aca session, so the key goes through as is. While scrolling back there's no "going through"
+                    let mut c = vec![s("bind-key"), s("-T"), s(table), s(k), s("if-shell"), s("-F"), s(HOTKEY_IN), go];
+                    // Normally: not an aca session, so the key goes through as is. While scrolling back, or after the prefix key,
+                    // there's no "going through"
                     if table == "root" {
                         c.push(format!("send-keys {k}"));
                     }
@@ -520,7 +534,7 @@ mod tests {
                 "bind-key    -T {table} {key}  if-shell -F \"#{{?@aca_id,1,0}}\" \"run-shell -b \\\"'/bin/aca' plugin pane aca.copy {pane} --hotkey {key} --session '#{{@aca_id}}' --client '#{{client_name}}'\\\"\" \"send-keys {key}\"\n"
             )
         };
-        let all = |key: &str, pane: &str| HOTKEY_TABLES.map(|t| line(t, key, pane)).concat();
+        let all = |key: &str, pane: &str| HOTKEY_TABLES[..3].iter().map(|t| line(t, key, pane)).collect::<String>();
         assert_eq!(hotkey_changes(&all("C-]", "pick"), &want), (vec![], vec![]));
         // Pane to open changed: rebind. Key changed: unbind the old, bind the new. Nobody wants it any more: unbind all
         assert_eq!(hotkey_changes(&all("C-]", "old"), &want).0.len(), 3);
@@ -528,7 +542,10 @@ mod tests {
         assert_eq!(cmds.iter().filter(|c| c[0] == "unbind-key" && c[3] == "M-y").count(), 3);
         assert_eq!(cmds.iter().filter(|c| c[0] == "bind-key" && c[3] == "C-]").count(), 3);
         let (cmds, _) = hotkey_changes(&all("C-]", "pick"), &[]);
-        assert_eq!(cmds, HOTKEY_TABLES.map(|t| vec!["unbind-key".to_string(), "-T".into(), t.into(), "C-]".into()]));
+        assert_eq!(
+            cmds,
+            HOTKEY_TABLES[..3].iter().map(|t| vec!["unbind-key".to_string(), "-T".into(), t.to_string(), "C-]".into()]).collect::<Vec<_>>()
+        );
         // Your own binding (even one opening an aca pane): left alone, and the one in the normal key table is reported
         let yours =
             "bind-key -T root C-] run-shell -b \"aca plugin pane aca.note pad\"\nbind-key -T copy-mode-vi C-] send-keys -X cancel\n";
@@ -541,15 +558,49 @@ mod tests {
     }
 
     #[test]
+    fn a_hotkey_after_the_prefix_key_goes_in_the_prefix_table_alone() {
+        let sh = format!("'/bin/aca' ui --ref {HOTKEY_MARK} 'prefix b' --client '#{{client_name}}' --pane '#{{pane_id}}'");
+        let want = vec![("prefix b".to_string(), sh.clone())];
+        // Nothing passed through outside aca's sessions: after the prefix key there's nothing to pass on
+        let (cmds, held) = hotkey_changes("bind-key -T prefix d detach-client\n", &want);
+        assert!(held.is_empty());
+        assert_eq!(
+            cmds,
+            [vec![
+                "bind-key".to_string(),
+                "-T".into(),
+                "prefix".into(),
+                "b".into(),
+                "if-shell".into(),
+                "-F".into(),
+                HOTKEY_IN.into(),
+                format!("run-shell -b {}", quote(&sh))
+            ]]
+        );
+        // Already bound; a plain b in the normal key table is someone else's and not touched
+        let ours = format!(
+            "bind-key -T prefix b if-shell -F \"#{{?@aca_id,1,0}}\" \"run-shell -b \\\"{sh}\\\"\"\nbind-key -T root b send-keys x\n"
+        );
+        assert_eq!(hotkey_changes(&ours, &want), (vec![], vec![]));
+        // Changed back to a key without the prefix: the prefix one is unbound
+        let (cmds, _) = hotkey_changes(&ours, &[("C-M-b".to_string(), sh.clone())]);
+        assert!(cmds.iter().any(|c| c[..4] == ["unbind-key", "-T", "prefix", "b"]));
+        assert_eq!(cmds.iter().filter(|c| c[0] == "bind-key").count(), 3);
+        // You already use prefix b: left alone and reported under its full name
+        assert_eq!(hotkey_changes("bind-key -T prefix b source-file x\n", &want), (vec![], vec!["prefix b".to_string()]));
+    }
+
+    #[test]
     fn an_older_tmux_listing_the_modifiers_the_other_way_round_still_names_the_same_key() {
         assert!(same_key("C-M-y", "M-C-y") && same_key("C-q", "C-q") && same_key("M--", "M--"));
         assert!(!same_key("C-y", "M-y") && !same_key("C-M-y", "C-y") && !same_key("M--", "M-"));
         let sh = format!("'/bin/aca' next {HOTKEY_MARK} C-M-n --session '#{{@aca_id}}' --client '#{{client_name}}'");
         let want = vec![("C-M-n".to_string(), sh.clone())];
         // tmux 3.4 prints aca's C-M-n as M-C-n: recognized as aca's, neither unbound nor rebound
-        let ours = HOTKEY_TABLES
+        let ours = HOTKEY_TABLES[..3]
+            .iter()
             .map(|t| format!("bind-key -T {t} M-C-n if-shell -F \"#{{?@aca_id,1,0}}\" \"run-shell -b \\\"{sh}\\\"\" \"send-keys C-M-n\"\n"))
-            .concat();
+            .collect::<String>();
         assert_eq!(hotkey_changes(&ours, &want), (vec![], vec![]));
         // Yours on C-M-n is also printed as M-C-n: left alone and reported; the two scroll-back tables are free, so bind there
         let (cmds, held) = hotkey_changes("bind-key -T root M-C-n display-message mine\n", &want);

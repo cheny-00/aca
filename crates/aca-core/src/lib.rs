@@ -4,7 +4,7 @@
 //! Layers (lower ones don't know about the ones above):
 //! - `paths` `tmux` `store` `config` `runtime`: storage and calls into tmux
 //! - `agent/`: adapters for each agent (how to start it, hooks, screen, title), one file per tool
-//! - `screen` `hook` `status`: where the state comes from
+//! - `screen` `hook` `relay` `status`: where the state comes from (`relay`: what the agent reports itself, OSC 7501)
 //! - `session`: operations on sessions, shared by the interface and the CLI; `adopt`: adopting sessions aca didn't start;
 //!   `proc`: reading processes (recognizing the agent and the account), and background child processes nobody waits for
 //! - `event` `plugin`: the event stream and the plugin host
@@ -28,6 +28,7 @@ pub mod inbox;
 pub mod paths;
 pub mod plugin;
 pub mod proc;
+pub mod relay;
 pub mod runtime;
 pub mod schedule;
 pub mod screen;

@@ -52,8 +52,13 @@ pub struct Run {
     /// multi-select: can't be answered with one number
     pub ask_opts: Vec<String>,
     pub ask_multi: bool,
-    /// What you said this turn (truncated)
+    /// What you said this turn (truncated). A Claude turn opened by another session's message or a background task's notice
+    /// gets what you last said yourself back when the turn ends ([`crate::agent::Agent::turn_record`])
     pub prompt: String,
+    /// The id Claude gave the prompt that opened this turn (UserPromptSubmit's `prompt_id`; its entries in the conversation
+    /// record carry it as `promptId`): when the turn ends, that entry tells who opened it
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prompt_id: String,
     /// The last reply (truncated): `c` copy, notices and plugins all take it from here, without digging through the conversation
     /// record again
     pub last: String,
@@ -73,6 +78,14 @@ pub struct Run {
     /// The name last handed to Claude as its own name (`aca hook-name`): if it's still called that and you renamed it in aca again,
     /// follow along
     pub named: String,
+    /// Claude's inbox address for messages from other Claude sessions (`uds:` + this socket), as Claude exports it to hooks
+    /// (`CLAUDE_CODE_MESSAGING_SOCKET`); a new one each start. Empty for others, and for Claude before 2.1.224
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub peer: String,
+    /// Up to when the messages other sessions passed it through the agent's own channel have been taken into its inbox (see
+    /// [`crate::inbox::native`]); 0 = not looked yet, start from the current turn
+    #[serde(skip_serializing_if = "is_zero")]
+    pub native_seen: u64,
     pub error: String,
     /// What kind of failure this turn was: transient (just carry on in a while) / account (limits, login: needs a person) / fatal
     /// (see [`crate::agent::lifecycle::error_kind`])
@@ -118,6 +131,26 @@ pub struct Run {
     /// directories; billing uses this to assign them back to the original one
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub moves: Vec<Move>,
+    /// What the agent last reported about itself over the program status protocol, relayed by `aca pty` ([`crate::relay`]); None =
+    /// nothing ever reported
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ps: Option<Program>,
+}
+
+/// The agent's own report of its state (OSC 7501's root record)
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct Program {
+    /// The relay that got it (it's the pane's root process): a report counts only while that process is still the one in the pane,
+    /// so one left from an earlier start is never taken for the current one
+    pub pid: u32,
+    /// idle / working / done / blocked / error; empty = it cleared its records (state unknown)
+    pub state: String,
+    /// With blocked: permission / question / auth, or empty
+    pub kind: String,
+    /// One line on what it's doing or waiting for
+    pub msg: String,
+    pub at: u64,
 }
 
 /// One account change: when, which conversation, which configuration directory it was copied from and to

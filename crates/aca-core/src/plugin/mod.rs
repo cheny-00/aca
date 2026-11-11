@@ -1208,21 +1208,43 @@ fn hotkey_command(exe: &str, h: &HotkeyItem) -> String {
         h.plugin,
         h.pane,
         crate::tmux::HOTKEY_MARK,
-        h.key
+        key_word(&h.key)
     )
+}
+
+/// A key as one word of the bound command: one after the prefix key (`prefix b`) has a space in it
+fn key_word(key: &str) -> String {
+    if key.contains(' ') { crate::agent::sh_quote(key) } else { key.to_string() }
 }
 
 /// In the notes about what didn't get bound, aca's own keys (`[keys]`) are listed under this name (plugins' under the
 /// plugin id)
 pub const OWN_KEYS: &str = "aca";
 
-/// The command aca's own key runs: go to the next session that needs you (`aca next`)
-fn next_command(exe: &str, key: &str) -> String {
-    format!("{} next {} {key} --session '#{{@aca_id}}' --client '#{{client_name}}'", crate::agent::sh_quote(exe), crate::tmux::HOTKEY_MARK)
+/// One of aca's own keys: (name under `[keys]`, what it does in a few words, the key or why it isn't bound)
+type OwnKey = (&'static str, &'static str, Result<Option<String>, String>);
+
+/// aca's own keys (`[keys]` in config.toml), in the order they win a key both want
+fn own_keys() -> Vec<OwnKey> {
+    let k = crate::config::load().keys;
+    vec![
+        ("next", t!("下一个待处理", "go to the next one waiting"), k.next_key()),
+        ("ref", t!("插入引用", "insert a reference"), k.ref_key()),
+    ]
+}
+
+/// The command one of aca's own keys runs: `next` goes to the next session that needs you (`aca next`); `ref` pops up the
+/// list and puts the picked session's reference into the pane the key was pressed in (`aca ui --ref`)
+fn own_command(exe: &str, name: &str, key: &str) -> String {
+    let (exe, mark, key) = (crate::agent::sh_quote(exe), crate::tmux::HOTKEY_MARK, key_word(key));
+    if name == "ref" {
+        return format!("{exe} ui --ref {mark} {key} --client '#{{client_name}}' --pane '#{{pane_id}}'");
+    }
+    format!("{exe} {name} {mark} {key} --session '#{{@aca_id}}' --client '#{{client_name}}'")
 }
 
 /// Makes the hotkeys bound in tmux match what's wanted now: binds the wanted ones; unbinds ones aca bound before that
-/// nobody wants now (plugin disabled, removed, key changed). Wanted = aca's own key (`[keys] next` in config.toml) and the
+/// nobody wants now (plugin disabled, removed, key changed). Wanted = aca's own keys (`[keys]` in config.toml) and the
 /// hotkeys of enabled plugins; when both want the same key, aca gets it. Returns what didn't get bound: (plugin id or
 /// [`OWN_KEYS`], one sentence) — you bound that key to something else in tmux yourself, and it's left alone. Does nothing
 /// when tmux isn't running: bindings go along with Ctrl+Q and are redone after creating a session and before entering one
@@ -1235,52 +1257,57 @@ pub fn bind_hotkeys() -> Vec<(String, String)> {
     // Go by the registry as it is, without checking whether your own manifest changed ([`registry`] would: a change makes it
     // re-register and save the registry, which loops back here)
     let (items, _) = hotkeys_in(read_registry());
-    let (next, mut notes) = match crate::config::load().keys.next_key() {
-        Ok(k) => (k, vec![]),
-        Err(e) => (None, vec![(OWN_KEYS.to_string(), tr!("config.toml [keys] next:{e}", "config.toml [keys] next: {e}"))]),
-    };
-    let held = crate::tmux::bind_hotkeys(&want_keys(&items, next.as_ref()));
-    if let Some(k) = next.as_ref().filter(|k| held.contains(k)) {
+    let mut notes = vec![];
+    let mut own: Vec<(&str, &str, String)> = vec![];
+    for (name, what, key) in own_keys() {
+        match key {
+            Ok(Some(k)) if own.iter().any(|(_, _, o)| o == &k) => notes.push((
+                OWN_KEYS.to_string(),
+                tr!(
+                    "config.toml [keys] {name}:{k} 与另一项相同,「{what}」未绑定",
+                    "config.toml [keys] {name}: {k} is taken by another one there; “{what}” isn't bound"
+                ),
+            )),
+            Ok(Some(k)) => own.push((name, what, k)),
+            Ok(None) => {}
+            Err(e) => notes.push((OWN_KEYS.to_string(), tr!("config.toml [keys] {name}:{e}", "config.toml [keys] {name}: {e}"))),
+        }
+    }
+    let held = crate::tmux::bind_hotkeys(&want_keys(&items, &own));
+    for (name, what, k) in own.iter().filter(|(_, _, k)| held.contains(k)) {
         notes.push((
             OWN_KEYS.to_string(),
             tr!(
-                "键 {k} 已在 tmux 中绑定了其他操作,未修改:「下一个待处理」未绑定(换一个键:aca tmux key next <键>)",
-                "key {k} is bound to something else in your tmux and was left alone: “go to the next one waiting” isn't bound (pick another: aca tmux key next <key>)"
+                "键 {k} 已在 tmux 中绑定了其他操作,未修改:「{what}」未绑定(换一个键:aca tmux key {name} <键>)",
+                "key {k} is bound to something else in your tmux and was left alone: “{what}” isn't bound (pick another: aca tmux key {name} <key>)"
             ),
         ));
     }
-    notes.extend(items.iter().filter(|h| next.as_ref() == Some(&h.key)).map(|h| {
-        (
-            h.plugin.clone(),
-            tr!(
-                "键 {} 已被 aca 占用(下一个待处理):{}「{}」未绑定(换一个键:aca plugin hotkey {} {} <键>)",
-                "key {} is aca's own (go to the next one waiting): {} “{}” isn't bound (pick another: aca plugin hotkey {} {} <key>)",
+    let aca_has = |k: &String| own.iter().find(|(_, _, o)| o == k).map(|(_, what, _)| *what);
+    for h in &items {
+        let said = match aca_has(&h.key) {
+            Some(what) => tr!(
+                "键 {} 已被 aca 占用({what}):{}「{}」未绑定(换一个键:aca plugin hotkey {} {} <键>)",
+                "key {} is aca's own ({what}): {} “{}” isn't bound (pick another: aca plugin hotkey {} {} <key>)",
                 h.key,
                 h.plugin,
                 h.title,
                 h.plugin,
                 h.pane
             ),
-        )
-    }));
-    let plugins = items
-        .iter()
-        .filter(|h| held.contains(&h.key) && next.as_ref() != Some(&h.key))
-        .map(|h| {
-            (
-                h.plugin.clone(),
-                tr!(
-                    "键 {} 已在 tmux 中绑定了其他操作,未修改:{}「{}」未绑定(换一个键:aca plugin hotkey {} {} <键>)",
-                    "key {} is bound to something else in your tmux and was left alone: {} “{}” isn't bound (pick another: aca plugin hotkey {} {} <key>)",
-                    h.key,
-                    h.plugin,
-                    h.title,
-                    h.plugin,
-                    h.pane
-                ),
-            )
-        });
-    notes.extend(plugins);
+            None if held.contains(&h.key) => tr!(
+                "键 {} 已在 tmux 中绑定了其他操作,未修改:{}「{}」未绑定(换一个键:aca plugin hotkey {} {} <键>)",
+                "key {} is bound to something else in your tmux and was left alone: {} “{}” isn't bound (pick another: aca plugin hotkey {} {} <key>)",
+                h.key,
+                h.plugin,
+                h.title,
+                h.plugin,
+                h.pane
+            ),
+            None => continue,
+        };
+        notes.push((h.plugin.clone(), said));
+    }
     notes
 }
 
@@ -1292,15 +1319,22 @@ pub fn hotkey_binds() -> Option<Vec<(String, String)>> {
         return None;
     }
     let (items, _) = hotkeys_in(read_registry());
-    let next = crate::config::load().keys.next_key().ok().flatten();
-    Some(want_keys(&items, next.as_ref()))
+    let mut own: Vec<(&str, &str, String)> = vec![];
+    for (name, what, key) in own_keys() {
+        if let Ok(Some(k)) = key
+            && !own.iter().any(|(_, _, o)| o == &k)
+        {
+            own.push((name, what, k));
+        }
+    }
+    Some(want_keys(&items, &own))
 }
 
-/// aca's own key, and the hotkeys of enabled plugins; when both want the same key, aca gets it
-fn want_keys(items: &[HotkeyItem], next: Option<&String>) -> Vec<(String, String)> {
+/// aca's own keys, and the hotkeys of enabled plugins; when both want the same key, aca gets it
+fn want_keys(items: &[HotkeyItem], own: &[(&str, &str, String)]) -> Vec<(String, String)> {
     let exe = crate::agent::self_exe();
-    let mut want: Vec<(String, String)> = next.iter().map(|k| (k.to_string(), next_command(&exe, k))).collect();
-    want.extend(items.iter().filter(|h| next != Some(&h.key)).map(|h| (h.key.clone(), hotkey_command(&exe, h))));
+    let mut want: Vec<(String, String)> = own.iter().map(|(name, _, k)| (k.clone(), own_command(&exe, name, k))).collect();
+    want.extend(items.iter().filter(|h| !own.iter().any(|(_, _, k)| k == &h.key)).map(|h| (h.key.clone(), hotkey_command(&exe, h))));
     want
 }
 

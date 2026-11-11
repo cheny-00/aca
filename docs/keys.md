@@ -44,8 +44,10 @@ without doing it. `aca help keys` describes every key in detail.
 |---|---|
 | `Ctrl+Q` | Back to the list. The agent keeps working |
 | `Ctrl+Alt+N` | Go straight to the next session waiting for you |
+| prefix, then `b` | Pick a session and put its reference (the two lines `B` copies) into the input box, without Enter. Works in the list too: into the highlighted session |
 
-Both only apply in sessions that aca started; anywhere else they go to the program as usual. In other tmux
+These only apply in sessions that aca started; anywhere else they go to the program as usual (prefix + `b` does
+nothing there). In other tmux
 sessions, come back with the tmux prefix and `d`.
 
 **From any tmux session, after `aca tmux install`** (optional, see [Optional tools](install.md#optional-tools))
@@ -59,6 +61,9 @@ sessions, come back with the tmux prefix and `d`.
 
 - `Ctrl+Alt+N`: `aca tmux key next <key>` with a tmux key name such as `M-n` or `F7`. It is saved as
   `[keys] next` in `config.toml`, and `""` turns it off.
+- prefix + `b`: `aca tmux key ref <key>`, saved as `[keys] ref`; `prefix b` means `b` after the prefix key, and a key
+  without the prefix works too. It isn't Ctrl+Alt+letter by default: window managers (Rectangle, for one) often take
+  Ctrl+Option combinations, and the key never reaches tmux.
 - `Ctrl+\` and prefix + `a` are in `~/.config/aca/tmux.conf`, which aca rewrites when it is upgraded. To use
   other keys, unbind and bind them in your own `tmux.conf` after the line that loads that file.
 - `Ctrl+Q`: if you already bound it in tmux yourself, aca leaves your binding alone; use prefix + `d` instead.

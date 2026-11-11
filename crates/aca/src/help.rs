@@ -38,10 +38,10 @@ pub const GROUPS: &[(Tr, &[Cmd])] = &[
                     "界面(即不带参数的 aca);带关键词且只有一个匹配时直接进入",
                     "the interface (plain aca); KEYWORD with one match enters it",
                 ),
-                usage: &[Tr::new(
-                    "ui [关键词] [-l] [-n] [--client 客户端] [--follow]",
-                    "ui [KEYWORD] [-l] [-n] [--client CLIENT] [--follow]",
-                )],
+                usage: &[
+                    Tr::new("ui [关键词] [-l] [-n] [--client 客户端] [--follow]", "ui [KEYWORD] [-l] [-n] [--client CLIENT] [--follow]"),
+                    Tr::new("ui --ref [--pane 窗格] [--client 客户端]", "ui --ref [--pane PANE] [--client CLIENT]"),
+                ],
                 more: Tr::new(
                     "\
 会话列表 + 高亮会话的实时画面,按回车进入会话;进入后按 Ctrl+Q(或 tmux 前缀键 + d)返回。
@@ -53,6 +53,10 @@ pub const GROUPS: &[(Tr, &[Cmd])] = &[
   --client 客户端    在 tmux 弹窗里使用:回车把这个客户端切换过去,打开时高亮它当前所在的会话
   --follow           弹窗只占屏幕一侧时使用(配合 --client):高亮移到哪,这个客户端就切换到哪,弹窗不关闭;
                      ⏎ 留在这里,Esc 返回打开时所在的会话,Ctrl+\\ 关闭。绑定按键的写法:aca help keys
+  --ref              在 tmux 里弹出列表,⏎ 把选中会话的引用(B 复制的两行)插到窗格的输入框里(粘贴,不回车),
+                     Esc 取消。列表在右侧打开,窗口不足 120 列时全屏。在 aca 的会话里按前缀键再按 b 就是它:
+                     aca 把这个键绑定在 tmux 上(和 Ctrl+Q 一样),记在 config.toml 的 [keys] ref,换键:aca tmux key ref <键>
+  --pane 窗格        --ref 插到哪个窗格(按键时由 tmux 填入);不写时:运行命令的这个
   --snapshot 宽x高 [按键]    不打开终端,按这个尺寸画一帧并打印(测试用)",
                     "\
 The list plus a live view of the highlighted session; Enter goes in. Inside, Ctrl+Q (or tmux prefix + d) comes back.
@@ -66,6 +70,11 @@ Press ? inside for the keys; every key in detail: aca help keys
   --follow           when the popup covers one side of the screen (with --client): the client follows the highlight
                      and the popup stays open; ⏎ stays there, Esc goes back where you started, Ctrl+\\ closes it.
                      How to bind it: aca help keys
+  --ref              inside tmux, pops up the list; ⏎ puts the picked session's reference (the two lines B copies)
+                     into the pane's input box (pasted, no Enter), Esc cancels. It opens on the right, full screen on a
+                     window under 120 columns. The prefix key then b inside aca's sessions does this: aca binds the key in
+                     tmux (the way Ctrl+Q is), kept as [keys] ref in config.toml; another key: aca tmux key ref <key>
+  --pane PANE        where --ref puts it (tmux fills it in for the key); default: the pane you typed it in
   --snapshot WxH [KEYS]    draw one frame at that size and print it, without a terminal (for tests)",
                 ),
             },
@@ -534,8 +543,22 @@ To pass a message to another session (without touching its input box, kept until
                 names: &["output"],
                 short: Tr::same("output [id]"),
                 brief: Tr::new("最后一条回复(由 hook 记录,最长 4000 字)", "the last reply (recorded by hooks, up to 4000 characters)"),
-                usage: &[Tr::same("output [id]")],
-                more: Tr::new("  id        不写时:在某个会话的 tmux 里另开的窗口中运行,就是那个会话", "  id        default: typed in a window you opened inside a session's tmux, that session"),
+                usage: &[Tr::same("output [id]"), Tr::new("output [id] [--turns 轮数]", "output [id] [--turns N]"), Tr::same("output [id] [--file]")],
+                more: Tr::new(
+                    "  id             不写时:在某个会话的 tmux 里另开的窗口中运行,就是那个会话
+  --turns 轮数   最近这么多轮双方说的话,从对话记录里取(工具调用、命令输出、思考过程都省了)
+  --file         整段对话的文字版写成文件,打印路径和行数(就是 H 交接时给新会话读的那份)
+
+--turns 和 --file 的第一行是它现在的状态、工具和账号、目录、分支。只认 Claude 和 Codex 的对话记录。",
+                    "  id          default: typed in a window you opened inside a session's tmux, that session
+  --turns N   what both sides said in the last N turns, from the conversation record (tool calls, command
+              output and thinking left out)
+  --file      the whole conversation as text, written to a file; prints its path and line count (the
+              same one H hands a new session)
+
+The first line of --turns and --file says where it is now: state, tool and account, directory, branch.
+Only Claude's and Codex's conversation records can be read.",
+                ),
             },
             Cmd {
                 names: &["seen"],
@@ -657,13 +680,16 @@ More than 20 from one session to another within 10 minutes: the rest are kept, n
   -n 条数   最近几条(默认 20)
   --json    一行一条 JSON(供脚本读取)
 
-[定时 10:20] 还没到点  [未送达] 还在收件箱里  [排队中] 已放进 Codex 的队列,它还没为这条开始一轮  [已送达] 已交给它",
+[定时 10:20] 还没到点  [未送达] 还在收件箱里  [排队中] 已放进 Codex 的队列,它还没为这条开始一轮  [已送达] 已交给它
+说(SendMessage):别的 Claude 会话用 Claude 自带的 SendMessage 直接发来的,一轮结束时从对话记录里记下",
                     "  id         default: inside a session, its own; outside, which sessions have undelivered messages
   -n COUNT   the latest few (default 20)
   --json     one JSON message per line (for scripts)
 
 [scheduled 10:20] not due yet  [undelivered] still in the inbox  [queued] in Codex's queue, no turn for it yet
-[delivered] in front of it",
+[delivered] in front of it
+said (SendMessage): sent straight from another Claude session with Claude's own SendMessage, recorded from the
+conversation when a turn ends",
                 ),
             },
             Cmd {
@@ -1038,14 +1064,14 @@ directory for 5 seconds. Colors are Catppuccin Latte; the icons need a Nerd Font
                 names: &["tmux", "tmux-status"],
                 short: Tr::same("tmux install | uninstall | key"),
                 brief: Tr::new(
-                    "切换器的按键、状态栏的待处理数:安装 / 卸载;修改「下一个」的键",
-                    "switcher keys + status segment: add / remove; the next key",
+                    "切换器的按键、状态栏的待处理数:安装 / 卸载;修改会话里的热键",
+                    "switcher keys + status segment: add / remove; in-session keys",
                 ),
                 usage: &[
                     Tr::same("tmux [install | uninstall]"),
                     Tr::same("tmux key"),
-                    Tr::new("tmux key next <键>", "tmux key next <KEY>"),
-                    Tr::same("tmux key next --none"),
+                    Tr::new("tmux key next | ref <键>", "tmux key next | ref <KEY>"),
+                    Tr::same("tmux key next | ref --none"),
                     Tr::same("tmux-status [id]"),
                 ],
                 more: Tr::new(
@@ -1055,10 +1081,11 @@ directory for 5 seconds. Colors are Catppuccin Latte; the icons need a Nerd Font
                并在你的 tmux.conf 里加两行:一行注释、一行 source-file -q 它(放在 TPM 那一段之前,没有就放在最后)。已打开的 tmux 立即生效
   uninstall    去掉那两行、删除 aca 的那份配置;已打开的 tmux 里 aca 绑定的键和状态栏那一段也一并撤销
   key          aca 自己绑定在 tmux 上、你可以修改的键:当前是哪个、是否已绑定。它们不在上面那份配置里:和 Ctrl+Q 一样
-               由 aca 直接绑定,没有 install 也存在。目前只有一个:
+               由 aca 直接绑定,没有 install 也存在:
   next         进入下一个待处理的会话(aca help next),默认 Ctrl+Alt+N。后面给一个键就改成它(tmux 的键名:M-n、C-M-n、F7),
                记在 config.toml 的 [keys] next,并立即绑定
-  --none       不绑定这个键(仍然可以输入 aca next)
+  ref          选一个会话、把它的引用插到输入框(aca help ui 的 --ref),默认前缀键 + b;改法同上,记在 [keys] ref
+  --none       不绑定这个键(仍然可以输入 aca next / aca ui --ref)
   tmux-status  状态栏上的那一段,显示为「 ◆ 2  ◐ 3」:只有类别和个数,符号与列表相同。◆ 等待回应(派出去的 worker 也算):
                agent 停下来等你,红底;◐ 未读:已完成但尚未查看(只算你自己开的),次要文字色。不显示名字:是谁、在问什么看列表,
                按 Ctrl+Alt+N(aca next)直接过去。后面的 ⚠ bark 是出错的插件(钩子、定时上次没有成功运行,gateway 的服务停止了;
@@ -1076,10 +1103,12 @@ aca 的那份配置由 aca 管理:每次 install 都会重写,升级后打开界
                source-file -q of it (before the TPM part, or at the end). The running tmux picks it up at once
   uninstall    removes those two lines and aca's file; aca's keys and status segment leave the running tmux too
   key          the keys aca binds in tmux itself that you can change: which they are, bound or not. They aren't in the
-               file above: aca binds them directly, the way Ctrl+Q is, installed or not. One for now:
+               file above: aca binds them directly, the way Ctrl+Q is, installed or not:
   next         go to the next session waiting for you (aca help next), Ctrl+Alt+N by default. Give a key to change it
                (a tmux key name: M-n, C-M-n, F7); kept as [keys] next in config.toml and bound at once
-  --none       no key for it (aca next still works typed)
+  ref          pick a session and put its reference where you type (--ref in aca help ui), prefix + b by default;
+               changed the same way (prefix b = b after the prefix key), kept as [keys] ref
+  --none       no key for it (aca next / aca ui --ref still work typed)
   tmux-status  the status-bar segment, like \" ◆ 2  ◐ 3\": kinds and counts only, same symbols as the list. ◆ needs you
                (dispatched workers count too): an agent is stopped until you answer, so it's a red block;
                ◐ unread: finished and not looked at (only the ones you started), in a minor color. No names: who and what they
@@ -1407,6 +1436,7 @@ const CONFIG: &str = "\
   args = [\"--dangerously-skip-permissions\"]                   # 每次启动都带的参数
   env = { ANTHROPIC_BASE_URL = \"https://…\" }
   mod = true                       # 启动 Claude 时带上 aca 的 mod:不靠状态栏获取订阅额度(不写:不带;也可在界面 ^S 里按 m 开关)
+  program_status = false           # 启动时经不经 aca 中转,收它自己报的状态(OSC 7501);false 只靠屏幕和 hook(不写:只有 claude、codex 经中转;shell 从不)
   [tools.codex]
   cmd = [\"~/bin/codex-wrapper.sh\"] # 自己套了一层脚本时
   hook_trust = \"bypass\"            # 不让 Codex 询问「Hooks need review」(不写:每个账号询问一次)
@@ -1435,9 +1465,10 @@ const CONFIG: &str = "\
                                    # (never 或不写 = 不删除)。置顶的、有便签的、派出去的会话仍未停止的不删除。Claude 自己的对话记录
                                    # 默认保留 30 天,停止超过这么久的,重新启动也无法恢复原来的对话
 
-aca 绑定在 tmux 上的键(不用前缀,只在 aca 的会话里拦截;不写入你的 tmux.conf)
+aca 绑定在 tmux 上的键(只在 aca 的会话里拦截;不写入你的 tmux.conf;写成 prefix b 的是前缀键之后的键)
   [keys]
   next = \"C-M-n\"                   # 进入下一个待处理的会话(aca help next)。不写时就是它;\"\" = 不绑定;aca tmux key next <键> 也是修改这里
+  ref = \"prefix b\"                 # 选一个会话、把引用插到输入框(aca help ui 的 --ref)。不写时就是它;\"\" = 不绑定;aca tmux key ref <键> 也是修改这里
 
 登录(账号页的 ⏎、aca run … login:不替你打开默认浏览器,弹出链接供选择;有误时只忽略这一节)
   [login]
@@ -1480,6 +1511,7 @@ Tools
   args = [\"--dangerously-skip-permissions\"]                   # arguments for every start
   env = { ANTHROPIC_BASE_URL = \"https://…\" }
   mod = true                       # start Claude with aca's mod: quotas without the status bar (unset: none; m in ^S toggles)
+  program_status = false           # start it behind aca's relay to get its own state reports (OSC 7501); false: screen + hooks only (unset: claude, codex only; never shell)
   [tools.codex]
   cmd = [\"~/bin/codex-wrapper.sh\"] # wrapped in a script of your own
   hook_trust = \"bypass\"            # keep Codex from asking \"Hooks need review\" (default: asks once per account)
@@ -1511,10 +1543,12 @@ Idle sessions (aca help stop; a mistake drops only this)
                                    # or ones with dispatched sessions still open. Claude keeps its own records 30 days by
                                    # default, so one stopped longer can't resume its conversation anyway
 
-Keys aca binds in tmux (no prefix, only inside aca's sessions; nothing written to your tmux.conf)
+Keys aca binds in tmux (only inside aca's sessions; nothing written to your tmux.conf; prefix b = b after the prefix key)
   [keys]
   next = \"C-M-n\"                   # go to the next session waiting for you (aca help next). Unset: this; \"\" = not bound;
                                    # aca tmux key next <key> edits this
+  ref = \"prefix b\"                 # pick a session and put its reference where you type (aca ui --ref). Unset: this;
+                                   # \"\" = not bound; aca tmux key ref <key> edits this
 
 Logins (⏎ on the accounts page, aca run … login: no default browser, the link pops up to pick; a mistake drops only this)
   [login]
@@ -1711,7 +1745,12 @@ mod tests {
         assert_eq!(usage("stop").as_deref(), Some("aca stop <id>\n     aca stop --idle <时长>"));
         assert_eq!(usage("rename").as_deref(), Some("aca rename <id> <标题>\n     aca rename <id> --auto"));
         let output = of("output").unwrap();
-        assert!(output.contains("最长 4000 字)") && output.ends_with("就是那个会话"), "{output}");
+        assert!(
+            output.contains("最长 4000 字)")
+                && output.contains("就是那个会话\n  --turns 轮数")
+                && output.ends_with("只认 Claude 和 Codex 的对话记录。"),
+            "{output}"
+        );
         assert!(of("keys").unwrap().contains("回车") && of("config").unwrap().contains("[accounts.claude]"));
         assert_eq!((of("nope"), usage("nope")), (None, None));
         let en = with(Lang::En, || (of("new").unwrap(), usage("rename").unwrap(), of("config").unwrap()));

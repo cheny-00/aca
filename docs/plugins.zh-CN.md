@@ -346,15 +346,16 @@ plugins.toml 里不用写它(sync 不会安装它,也不会删除它);要关闭�
 | `session.moved` | `group` | 移到别的分组 |
 | `session.rehomed` | `tool` `account` `from`(原来的「工具:账号」) | 切换账号继续(`aca restart --as`、界面的 `X`):对话复制到新账号,在原地重启 |
 | `session.archived` / `session.removed` | 删除的带 `title`;`aca release` 移出 aca 的多一个 `released`(tmux 会话保留) | |
-| `turn.started` | `prompt` | 你发送了一句话 |
+| `turn.started` | `prompt` | 你发送了一句话。别的 Claude 会话发来的消息、后台任务的通知也会让 Claude 开始一轮,这时也发这一条,`prompt` 是那段话:谁开的这一轮要等这一轮结束才在对话记录里查得到(到时会话的 `prompt` 改回你上一次说的) |
 | `turn.done` | `last`(最后一条回复)`bg`(仍在运行的后台任务数)`secs` | 一轮结束 |
 | `turn.failed` | `error` `kind`(transient = 限流、过载、连接中断,过一会儿继续多半就好;account = 额度、登录、欠费;fatal = 重试也无效) | 一轮失败(Codex 不报这个 hook:aca 查看状态时从它的对话记录中读出来补上) |
 | `turn.interrupted` | `by`(`aca interrupt` 中止 Claude 时:谁按的) | 你按 Esc 中断了它(Codex 自己报);或者 `aca interrupt` 中止了它 |
 | `agent.waiting` | `ask` `kind`(choice / permission / 空 = 无法识别)`options`(选择题的选项) | 等待你确认或回答 |
+| `agent.status` | `state`(idle / working / done / blocked / error / 空 = 它清掉了自己的状态)`kind`(blocked 时:permission / question / auth / 空)`msg`(它自己写的一行说明) | agent 自己报告了状态(OSC 7501;只有支持这个协议、经 aca 中转启动的 agent 才有),变了才发 |
 | `agent.exited` | `reason` | agent 进程退出 |
 | `conversation.changed` | `conv` `from` | 对话 id 变了(/clear) |
-| `message.sent` | `id`(这条消息的)`from` `kind`(msg / notice)`what`(通知所说的事;不是通知时为 null)`wake` `text` `at`(定时的到点时刻,秒;不是定时的为 null)| 往这个会话的收件箱放了一条消息(`aca msg`,或者它派出去的 worker 自动发的通知)。定时的(`aca msg --in`)放进去时就发这一条,送达的那条要等到点 |
-| `message.delivered` | `id` `how`(bell / queue / type / wait) | 那条消息已送达 |
+| `message.sent` | `id`(这条消息的)`from` `kind`(msg / notice)`what`(通知所说的事;不是通知时为 null)`wake` `text` `at`(定时的到点时刻,秒;不是定时的为 null)`via`(`claude` = 用 Claude 自带的 SendMessage 发来的;其余为 null)| 往这个会话的收件箱放了一条消息(`aca msg`,或者它派出去的 worker 自动发的通知)。别的 Claude 会话用 SendMessage 发来的,在一轮结束时从对话记录里记下,随即算作已送达(`how` = native)。定时的(`aca msg --in`)放进去时就发这一条,送达的那条要等到点 |
+| `message.delivered` | `id` `how`(bell / queue / type / wait / native:Claude 自己送到的) | 那条消息已送达 |
 | `message.throttled` | `from` `count` `secs` | 同一个会话发送过于频繁,之后的只保存、不唤醒 |
 | `ask.answered` | `by`(谁代为回答;`you` = 在外部回答)`answer` `ask` `kind`(choice / permission;启动时的确认框是 `gate`) | `aca answer` 代为回答了确认框 |
 | `limits.changed` | `tool`(claude / codex)`name`(登记的账号名,未登记的是目录名去掉点)`dir`(账号目录)`wins`(这个账号的每个窗口:`label` 5h / 7d / Fable …、已用百分比 `used`、`resets` 和这份数据的时间 `at`,都以秒计) | 一个账号的订阅额度有变化:刷新时数值没变的不发出。Claude 的来自状态栏,Codex 的在它一轮结束时读取。`session` 是报告它的会话,不是 aca 启动的则为空;一次获取全部账号用 `aca limits --json` |
@@ -450,7 +451,8 @@ aca 会指出是哪个插件:
   `tmux`(tmux 会话名)`pane`(agent 所在的窗格)`attached`(连着的终端数)`conv`(对话 id)`ask`(等待回应时的提问)
   `ran`(这一轮已运行的秒数)`active`(最近有动静的时间)`bg`(后台任务数)`locked` `created` `order` `tokens`(`meta set` 设置的文字)
   `idle_stopped`(因空闲被 aca 停止的时间,列表里显示 ☾;其他情况为 0)。`aca show --json` 另有 `work`:它真正在干活的目录
-  (agent cd 进去的目录,或最近改的文件所在的仓库;都查不到时同 `dir`)。
+  (agent cd 进去的目录,或最近改的文件所在的仓库;都查不到时同 `dir`)、`transcript`(当前对话记录的路径,以 hook 最后报告的为准)、
+  `home`(它的配置目录)和 `peer`(Claude 运行时,别的 Claude 会话给它发消息用的 socket;其他情况为空)。
 - `aca show --json` 里的 `run` 是 aca 内部记录的状态,**不是接口**,其中的字段随时可能变。
 - `aca plugin actions --json`:每行一个能力,`{"id", "title", "contexts", "args", "expose"}`。
 - 时间:事件的 `ts` 是毫秒,其他地方是秒。JSON 是紧凑的一行,用 `jq` 读取,不要用 sed 拆分(排版格式不属于接口)。

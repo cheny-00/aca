@@ -43,8 +43,9 @@
 |---|---|
 | `Ctrl+Q` | 回到列表,agent 继续运行 |
 | `Ctrl+Alt+N` | 直接进入下一个待处理的会话 |
+| 前缀键,再按 `b` | 选一个会话,把它的引用(`B` 复制的那两行)插到输入框,不回车。在列表里按也行:插到高亮的那个会话 |
 
-这两个键只在 aca 启动的会话里有效,在其他地方会照常传给里面的程序。在其他 tmux 会话里,用 tmux 前缀键加 `d` 返回。
+这几个键只在 aca 启动的会话里有效,在其他地方会照常传给里面的程序(前缀键 + `b` 在其他地方什么也不做)。在其他 tmux 会话里,用 tmux 前缀键加 `d` 返回。
 
 **在任何 tmux 会话里,运行过 `aca tmux install` 之后**(可选,见[可选的工具](install.zh-CN.md#可选的工具))
 
@@ -57,6 +58,8 @@
 
 - `Ctrl+Alt+N`:`aca tmux key next <键>`,键名用 tmux 的写法,比如 `M-n`、`F7`。它记在 `config.toml` 的
   `[keys] next` 里,设为 `""` 表示不绑定。
+- 前缀键 + `b`:`aca tmux key ref <键>`,记在 `[keys] ref`;写 `prefix b` 表示前缀键之后的 `b`,也可以换成不带前缀的键。
+  默认不用 Ctrl+Alt 加字母:窗口管理工具(比如 Rectangle)常把 Ctrl+Option 组合当快捷键,键到不了 tmux。
 - `Ctrl+\` 和前缀键 + `a` 写在 `~/.config/aca/tmux.conf` 里,升级 aca 时这份文件会被重写。想换成别的键,
   在你自己的 `tmux.conf` 里、加载这份文件的那一行后面 unbind / bind。
 - `Ctrl+Q`:如果你自己在 tmux 里绑定过它,aca 不会修改你的设置;这时用前缀键 + `d` 返回。
