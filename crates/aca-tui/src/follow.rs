@@ -18,7 +18,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::ui::Preview;
+use crate::view::Preview;
 
 /// Started with `--follow` (passed on as is when ^L restarts)
 static ASKED: AtomicBool = AtomicBool::new(false);

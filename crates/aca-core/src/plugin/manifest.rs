@@ -40,6 +40,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::paths::Res;
+use crate::tmux::hotkey_ok;
 use crate::{t, tr};
 
 pub const MANIFEST: &str = "aca-plugin.toml";
@@ -57,10 +58,6 @@ pub const EXPOSE: &[&str] = &["menu", "cli", "agent", "agent?"];
 pub const INPUTS: &[&str] = &["reply", "screen", "scrollback"];
 /// Keys in the `:` menu kept for the interface itself: `/` filters
 pub const MENU_KEYS_TAKEN: &[&str] = &["/"];
-/// Not allowed as hotkeys: Ctrl+Q is aca's own (going back); the rest mean something else in a terminal (interrupt, end
-/// of file, suspend, Enter, Tab, newline, backspace). Not with Alt added either (`C-M-c`): before the binding is back in
-/// place (tmux just restarted), that key reaches the agent as Esc plus Ctrl+C
-pub const HOTKEYS_TAKEN: &[&str] = &["C-q", "C-c", "C-d", "C-z", "C-m", "C-i", "C-j", "C-h"];
 /// The agents `[agent] for` accepts
 pub const AGENTS: &[&str] = &["claude", "codex"];
 /// The agents that can take plugin MCP servers at launch (only the [`AGENTS`] ones accept plugin directories)
@@ -232,46 +229,6 @@ pub struct Hotkey {
     pub key: String,
     /// The id of a pane in the same plugin
     pub run: String,
-}
-
-/// Keys that can be hotkeys (tmux key names), or one after tmux's prefix key (`prefix b`). A bare character isn't allowed
-/// without the prefix: it would swallow what you type in the session. The final character can only be a lowercase letter, a digit or one of `, . / = -` (plus `]` `^` with Ctrl
-/// alone): others need escaping in tmux's key table, and Alt with an uppercase letter, `[` or `]` sends what's the start
-/// of another terminal sequence (ESC O, ESC [, ESC ])
-pub fn hotkey_ok(k: &str) -> Res<()> {
-    // After tmux's prefix key (`prefix b`): nothing typed is swallowed, so a plain character is fine too
-    if let Some(after) = k.strip_prefix(crate::tmux::PREFIX_KEY) {
-        let after = after.trim();
-        if after.is_empty() || after.contains(char::is_whitespace) || after.contains(['"', '\'', '\\', ';', '#']) {
-            return Err(tr!(
-                "前缀键之后应写一个 tmux 键名(prefix b、prefix C-y):「{k}」",
-                "after prefix comes one tmux key name (prefix b, prefix C-y): “{k}”"
-            ));
-        }
-        return Ok(());
-    }
-    let f = k
-        .strip_prefix('F')
-        .is_some_and(|n| !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit()) && matches!(n.parse(), Ok(1..=12u8)));
-    let (last, ctrl_only) = match ["C-M-", "M-"].iter().find_map(|p| k.strip_prefix(p)) {
-        Some(c) => (c, false),
-        None => (k.strip_prefix("C-").unwrap_or_default(), true),
-    };
-    let fits = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || ",./=-".contains(c) || (ctrl_only && "]^".contains(c));
-    let chord = last.len() == 1 && last.chars().all(fits);
-    if !f && !chord {
-        return Err(tr!(
-            "热键应写为带 Ctrl / Alt 的 tmux 键名(C-]、M-y、C-M-y)或 F1–F12:「{k}」",
-            "a hotkey is a tmux key name with Ctrl / Alt (C-], M-y, C-M-y) or F1–F12: “{k}”"
-        ));
-    }
-    if HOTKEYS_TAKEN.contains(&k.replacen("C-M-", "C-", 1).as_str()) {
-        return Err(tr!(
-            "{k} 不能用作热键(已被 aca 占用,或在终端中另有含义)",
-            "{k} can't be a hotkey (aca's own, or it means something to the terminal)"
-        ));
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]

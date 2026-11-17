@@ -11,10 +11,12 @@
 //! - On `aca rm`, if no other session is in it and it's clean (no changes and no untracked files), it's removed too; the branch
 //!   stays, so no commits are lost. One that isn't clean stays, and you're told where it is (no `--force`)
 //!
+//! - A repository mounted into a sandbox (see [`crate::sandbox`]): the worktree goes in the sandbox's workspace instead,
+//!   `worktrees/<repository>/<branch>`, and git runs inside it
+//!
 //! A new worktree only has the tracked files: things like `node_modules`, `.venv` and `.env` you install or copy yourself.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::paths::Res;
 use crate::tr;
@@ -22,7 +24,7 @@ use crate::tr;
 const DIR: &str = ".worktrees";
 
 fn git(dir: &Path, args: &[&str]) -> Res<String> {
-    let o = Command::new("git").arg("-C").arg(dir).args(args).output().map_err(|e| tr!("无法启动 git:{e}", "can't start git: {e}"))?;
+    let o = crate::sandbox::git(dir, args, &[]).output().map_err(|e| tr!("无法启动 git:{e}", "can't start git: {e}"))?;
     if o.status.success() {
         Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
     } else {
@@ -62,8 +64,13 @@ pub fn make(dir: &Path, branch: &str) -> Res<PathBuf> {
     })?;
     git(dir, &["check-ref-format", "--branch", branch])
         .map_err(|_| tr!("{branch} 不是有效的分支名", "{branch} isn't a valid branch name"))?;
-    let path = main.join(DIR).join(branch.replace('/', "-"));
-    exclude(&common);
+    let path = match crate::sandbox::holding(&crate::config::load(), &main) {
+        Some((_, b)) => b.worktrees().join(main.file_name().unwrap_or_default()).join(branch.replace('/', "-")),
+        None => {
+            exclude(&common);
+            main.join(DIR).join(branch.replace('/', "-"))
+        }
+    };
     if path.exists() {
         // Already opened: keep using it, but it has to be on this branch
         if git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).ok().as_deref() != Some(branch) {
@@ -87,8 +94,13 @@ pub fn make(dir: &Path, branch: &str) -> Res<PathBuf> {
 /// Which worktree opened by aca `dir` is in: (the worktree's root, the main repository's root)
 fn owner(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let (main, _, _) = repo(dir)?;
-    let first = dir.strip_prefix(main.join(DIR)).ok()?.components().next()?;
-    Some((main.join(DIR).join(first), main))
+    let under = match crate::sandbox::holding(&crate::config::load(), &main) {
+        Some((_, b)) => b.worktrees().join(main.file_name()?),
+        None => main.join(DIR),
+    };
+    let under = std::fs::canonicalize(&under).unwrap_or(under);
+    let first = dir.strip_prefix(&under).ok()?.components().next()?;
+    Some((under.join(first), main))
 }
 
 /// A line for people: which worktree and which branch this directory is on

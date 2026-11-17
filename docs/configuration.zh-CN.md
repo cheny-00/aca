@@ -56,6 +56,7 @@ busy = ['Working\.\.\.']
 | `[keys]` | aca 绑定在 tmux 上、进入下一个待处理会话的键 | [按键](keys.zh-CN.md) |
 | `[login]` | 登录链接可以用哪些浏览器打开;通过 SSH 连接时改为在其他设备上完成登录 | `aca help config` |
 | `[ui]` | 语言;`n` 菜单的顺序,以及要隐藏的项 | `aca help config` |
+| `[sandbox.<名字>]` | 经 ssh 进入的笼子,Mac 上的目录用同一个路径挂进去;绑定它的账号只在里面启动 | [账号](accounts.zh-CN.md#放在沙箱里的账号) |
 | `[mcps.<名字>]` | 你的 MCP server 目录:用 `M` 挂到某个项目上,或者通过 gateway 插件提供给所有 agent | [docs/plugins.zh-CN.md](plugins.zh-CN.md) |
 | `[theme]` `[ime]` `[new_group]` | 主题、自动切换输入法(只有 macOS)、新分组的默认目录 | 在设置页(`Ctrl+S`)里改 |
 

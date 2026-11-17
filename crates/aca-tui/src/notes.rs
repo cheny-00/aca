@@ -14,9 +14,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use aca_core::tr;
+use aca_records::paths::{state_file, write_atomic};
 
 use crate::data::Session;
-use crate::state::{state_file, write_atomic};
 
 #[derive(Default)]
 pub struct Notes {

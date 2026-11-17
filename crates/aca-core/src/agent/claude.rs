@@ -155,7 +155,7 @@ fn merge(ours: &str, theirs: &str, dir: &str) -> Res<String> {
 
 /// The pure half: no file writes. `settings` is the one to pass (already merged if you passed your own), `mods` is the
 /// directory of aca's mod (not passed = None), `mcp` is the `--mcp-config` file for plugins' MCP servers (none = None)
-fn plan(tool: &Tool, s: &Session, how: &How, settings: &str, mods: Option<&str>, mcp: Option<&str>) -> Vec<String> {
+fn plan(tool: &Tool, s: &Session, how: &How, settings: Option<&str>, mods: Option<&str>, mcp: Option<&str>) -> Vec<String> {
     let mut argv = super::base(tool, "claude");
     let mut a = |xs: &[&str]| argv.extend(xs.iter().map(|x| x.to_string()));
     match how {
@@ -173,7 +173,9 @@ fn plan(tool: &Tool, s: &Session, how: &How, settings: &str, mods: Option<&str>,
     if let Some(f) = mcp {
         a(&["--mcp-config", f]);
     }
-    a(&["--settings", settings]);
+    if let Some(f) = settings {
+        a(&["--settings", f]);
+    }
     if let Some(dir) = mods {
         a(&["--plugin-dir", dir]);
     }
@@ -298,7 +300,7 @@ fn read_turn(text: &str, since: u64, prompt_id: &str) -> super::Turn {
             not_you = true;
             turn.said = Some(yours.clone());
         }
-        let ts = v["timestamp"].as_str().and_then(crate::schedule::iso).unwrap_or(0);
+        let ts = v["timestamp"].as_str().and_then(crate::paths::iso).unwrap_or(0);
         let id = o["msg_id"].as_str().unwrap_or("");
         if kind == "peer" && ts >= since && !id.is_empty() {
             turn.native.push(super::Native {
@@ -331,8 +333,8 @@ fn project_key(dir: &str) -> String {
 }
 
 /// On the command line: the "which conversation to resume" arguments, plus the hooks, mod and aca plugin directories aca
-/// passed itself: not carried over when adopting (rebuilt on start)
-fn not_carried(rest: &[String]) -> usize {
+/// passed itself (`ours`): not carried over when adopting (rebuilt on start)
+fn not_carried(rest: &[String], ours: &dyn Fn(&str) -> bool) -> usize {
     if matches!(rest[0].as_str(), "--continue" | "-c" | "--fork-session") {
         return 1;
     }
@@ -342,7 +344,7 @@ fn not_carried(rest: &[String]) -> usize {
     }
     let n = super::valued(rest, &["--settings", "--plugin-dir", "--mcp-config"]);
     let file = if n == 2 { rest.get(1).map(String::as_str) } else { rest[0].split_once('=').map(|(_, v)| v) };
-    if rest[0].starts_with("--plugin-dir") && file.is_some_and(crate::plugin::is_agent_dir) {
+    if rest[0].starts_with("--plugin-dir") && file.is_some_and(ours) {
         return n;
     }
     if file.is_some_and(|f| Path::new(f).starts_with(paths::state_dir().join("hooks"))) { n } else { 0 }
@@ -351,7 +353,7 @@ fn not_carried(rest: &[String]) -> usize {
 /// Which conversation a running Claude is on now: it records this itself in `sessions/<pid>.json` in the config directory
 /// (the current conversation id — it changes after /clear and compaction — the start directory, the title); older versions
 /// without this file: look at `--session-id` / `--resume` on the command line
-fn live_in(conf: &Path, pid: u32, argv: &[String]) -> Live {
+fn live_in(conf: &Path, pid: u32, argv: &[String], ours: &dyn Fn(&str) -> bool) -> Live {
     let own: Value = std::fs::read_to_string(conf.join("sessions").join(format!("{pid}.json")))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -380,7 +382,7 @@ fn live_in(conf: &Path, pid: u32, argv: &[String]) -> Live {
         title: named.or_else(|| transcript.as_deref().and_then(transcript_title)).unwrap_or_default(),
         transcript: transcript.map(|t| t.to_string_lossy().into_owned()).unwrap_or_default(),
         conv,
-        args: super::carry(argv, not_carried),
+        args: super::carry(argv, |rest| not_carried(rest, ours)),
     }
 }
 
@@ -424,6 +426,10 @@ impl Agent for Claude {
     }
 
     fn argv(&self, tool: &Tool, s: &Session, how: &How, aca: &str) -> Res<Vec<String>> {
+        // Inside a sandbox: none of the files below exist there (see crate::sandbox)
+        if tool.bare {
+            return Ok(plan(&Tool { plugin_dirs: vec![], ..tool.clone() }, s, how, None, None, None));
+        }
         let ours = settings(aca);
         let file = match take_settings(&mut super::extra(tool, s)) {
             None => super::hook_file("claude.json", &ours)?,
@@ -444,13 +450,13 @@ impl Agent for Claude {
         let mcp = match tool.mcp.is_empty() {
             true => None,
             false => {
-                let text = crate::plugin::mount::claude_mcp_config(aca, &tool.mcp);
+                let text = claude_mcp_config(aca, &tool.mcp);
                 let mut h = DefaultHasher::new();
                 text.hash(&mut h);
                 Some(super::hook_file(&format!("mcp-{:016x}.json", h.finish()), &text)?.to_string_lossy().into_owned())
             }
         };
-        Ok(plan(tool, s, how, &file.to_string_lossy(), mods.as_deref(), mcp.as_deref()))
+        Ok(plan(tool, s, how, Some(&file.to_string_lossy()), mods.as_deref(), mcp.as_deref()))
     }
 
     /// Can only resume if the conversation record exists (a session started but never talked to has none); a fork never talked
@@ -502,9 +508,9 @@ impl Agent for Claude {
         }
     }
 
-    fn live(&self, pid: u32, home: Option<&str>, argv: &[String]) -> Live {
+    fn live(&self, pid: u32, home: Option<&str>, argv: &[String], ours: &dyn Fn(&str) -> bool) -> Live {
         let conf = home.map_or_else(|| PathBuf::from(paths::expand("~/.claude")), PathBuf::from);
-        live_in(&conf, pid, argv)
+        live_in(&conf, pid, argv, ours)
     }
 
     fn delivery(&self) -> super::Delivery {
@@ -596,6 +602,13 @@ impl Agent for Claude {
     }
 }
 
+/// The content of Claude's `--mcp-config`
+pub fn claude_mcp_config(aca: &str, mcp: &[(String, Vec<String>)]) -> String {
+    let servers: serde_json::Map<String, serde_json::Value> =
+        mcp.iter().map(|(name, args)| (name.clone(), serde_json::json!({ "type": "stdio", "command": aca, "args": args }))).collect();
+    serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": servers })).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,29 +690,39 @@ mod tests {
     fn it_starts_resumes_and_forks_with_hooks_passed_at_launch() {
         let t = Tool { args: vec!["-Q".into()], ..Default::default() };
         assert_eq!(
-            plan(&t, &s("c-1"), &How::Fresh, "/st/claude.json", None, None).join(" "),
+            plan(&t, &s("c-1"), &How::Fresh, Some("/st/claude.json"), None, None).join(" "),
             "claude --session-id c-1 --settings /st/claude.json -Q --model haiku"
         );
         let plain = Tool::default();
         assert_eq!(
-            plan(&plain, &s("c-1"), &How::Resume("c-9".into()), "/st/c.json", None, None).join(" "),
+            plan(&plain, &s("c-1"), &How::Resume("c-9".into()), Some("/st/c.json"), None, None).join(" "),
             "claude --resume c-9 --settings /st/c.json --model haiku"
         );
         assert_eq!(
-            plan(&plain, &s("c-2"), &How::Fork("c-1".into()), "/st/c.json", None, None).join(" "),
+            plan(&plain, &s("c-2"), &How::Fork("c-1".into()), Some("/st/c.json"), None, None).join(" "),
             "claude --resume c-1 --fork-session --session-id c-2 --settings /st/c.json --model haiku"
         );
         // A tool with its own command (a wrapper script): the arguments still follow
         let wrapped = Tool { cmd: vec!["/w/cc.sh".into(), "-x".into()], ..Default::default() };
-        assert_eq!(plan(&wrapped, &s(""), &How::Fresh, "/st/c.json", None, None)[..4], ["/w/cc.sh", "-x", "--settings", "/st/c.json"]);
+        assert_eq!(
+            plan(&wrapped, &s(""), &How::Fresh, Some("/st/c.json"), None, None)[..4],
+            ["/w/cc.sh", "-x", "--settings", "/st/c.json"]
+        );
+        // Inside a sandbox: only the conversation and your own arguments
+        let bare =
+            Tool { bare: true, plugin_dirs: vec!["/st/p".into()], args: vec!["--model".into(), "opus".into()], ..Default::default() };
+        assert_eq!(
+            Claude.argv(&bare, &s("c-1"), &How::Resume("c-9".into()), "/aca").unwrap().join(" "),
+            "claude --resume c-9 --model opus --model haiku"
+        );
         // aca's mod is passed at startup like the hooks: right after --settings, with your own arguments still last
         assert_eq!(
-            plan(&plain, &s("c-1"), &How::Fresh, "/st/c.json", Some("/st/hooks/claude-mod/aca"), None).join(" "),
+            plan(&plain, &s("c-1"), &How::Fresh, Some("/st/c.json"), Some("/st/hooks/claude-mod/aca"), None).join(" "),
             "claude --session-id c-1 --settings /st/c.json --plugin-dir /st/hooks/claude-mod/aca --model haiku"
         );
         // Plugins' MCP servers: --mcp-config right after --settings, so it doesn't swallow later arguments as its own
         assert_eq!(
-            plan(&plain, &s("c-1"), &How::Fresh, "/st/c.json", None, Some("/st/hooks/mcp-1.json")).join(" "),
+            plan(&plain, &s("c-1"), &How::Fresh, Some("/st/c.json"), None, Some("/st/hooks/mcp-1.json")).join(" "),
             "claude --session-id c-1 --mcp-config /st/hooks/mcp-1.json --settings /st/c.json --model haiku"
         );
     }
@@ -716,7 +739,7 @@ mod tests {
         assert_eq!(extra, ["-Q", "--model", "haiku"]);
         // Only the merged one is left in the command
         assert_eq!(
-            plan(&t, &sess, &How::Fresh, "/st/merged.json", None, None).join(" "),
+            plan(&t, &sess, &How::Fresh, Some("/st/merged.json"), None, None).join(" "),
             "claude --session-id c-1 --settings /st/merged.json -Q --model haiku"
         );
 
@@ -880,6 +903,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn live_in(conf: &Path, pid: u32, argv: &[String]) -> Live {
+        super::live_in(conf, pid, argv, &|_| false)
+    }
+
     #[test]
     fn a_running_claude_says_which_conversation_it_is_on() {
         let conf = std::env::temp_dir().join(format!("aca-live-{}", std::process::id()));
@@ -921,7 +948,10 @@ mod tests {
 
     #[test]
     fn only_switches_and_single_words_are_carried_over() {
-        let carried = |words: &[&str]| crate::agent::carry(&words.iter().map(|w| w.to_string()).collect::<Vec<_>>(), not_carried);
+        let plugin = |d: &str| d == "/aca/claude-plugins/x/local";
+        let carried = |words: &[&str]| {
+            crate::agent::carry(&words.iter().map(|w| w.to_string()).collect::<Vec<_>>(), |rest| not_carried(rest, &plugin))
+        };
         let some = |words: &[&str]| Some(words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
         assert_eq!(carried(&["claude"]), some(&[]));
         assert_eq!(
@@ -937,6 +967,11 @@ mod tests {
         // aca's mod isn't carried either; your own --plugin-dir is
         let mods = paths::state_dir().join("hooks/claude-mod/aca").to_string_lossy().into_owned();
         assert_eq!(carried(&["claude", "--plugin-dir", &mods, "--plugin-dir", "/my/mod"]), some(&["--plugin-dir", "/my/mod"]));
+        // Nor a plugin directory aca brought (the caller says which those are)
+        assert_eq!(
+            carried(&["claude", "--plugin-dir=/aca/claude-plugins/x/local", "--plugin-dir", "/my/mod"]),
+            some(&["--plugin-dir", "/my/mod"])
+        );
         // Started with a message handed to it: can't tell which are arguments, carry nothing
         assert_eq!(carried(&["claude", "--dangerously-skip-permissions", "修一下 登录"]), None);
         assert_eq!(carried(&["claude", "fix"]), None);

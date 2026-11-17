@@ -147,7 +147,7 @@ mod tests {
     use crate::config;
 
     fn tool(toml: &str) -> Tool {
-        config::parse(&format!("[tools.toy]\n{toml}")).tool("toy").unwrap()
+        crate::agent::tool(&config::parse(&format!("[tools.toy]\n{toml}")), "toy").unwrap()
     }
 
     fn toy(toml: &str) -> Declared {

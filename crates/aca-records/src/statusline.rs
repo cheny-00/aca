@@ -119,7 +119,7 @@ pub fn run() -> i32 {
         _ => Counts::default(),
     };
     let quota = limits.and_then(|d| {
-        let srcs = crate::usage::sources(&crate::data::accounts(&aca_core::config::load()), &home);
+        let srcs = crate::usage::sources(&crate::agent::accounts(&aca_core::config::load()), &home);
         crate::limits::quota_for(&d, &srcs, transcript.as_deref(), now)
     });
     let active = std::env::var_os("VIRTUAL_ENV").filter(|x| !x.is_empty()).map(PathBuf::from);
@@ -137,7 +137,7 @@ pub fn run() -> i32 {
     };
     let out = render(&v, &facts);
     if let Some(last) = &last {
-        let _ = crate::state::write_atomic(last, &out);
+        let _ = crate::paths::write_atomic(last, &out);
     }
     // Claude Code closes the pipe when it can't wait: a failed write isn't an error
     let _ = std::io::stdout().write_all(out.as_bytes());
@@ -227,7 +227,7 @@ fn render(v: &Value, f: &Facts) -> String {
 }
 
 /// The sample shown on the settings page: made-up numbers, drawn the same way as the real thing
-pub(crate) fn sample(who: &str) -> String {
+pub fn sample(who: &str) -> String {
     let v = serde_json::json!({
         "context_window": {"used_percentage": 42},
         "model": {"display_name": "Opus"},
@@ -236,7 +236,7 @@ pub(crate) fn sample(who: &str) -> String {
     });
     let wins = [("5h", 23.0, 7200), ("7d", 41.0, 259_200)];
     let quota = Quota {
-        agent: crate::data::Agent::Claude,
+        agent: crate::agent::Agent::Claude,
         who: who.to_string(),
         plan: String::new(),
         wins: wins.into_iter().map(|(label, used, resets)| Win { label: label.into(), used, resets: Some(resets) }).collect(),
@@ -357,7 +357,7 @@ fn stamp(head: &Path) -> String {
 }
 
 /// The branch of the repository (or worktree) this directory is in, read from HEAD without running git
-pub(crate) fn branch_at(dir: &Path) -> Option<String> {
+pub fn branch_at(dir: &Path) -> Option<String> {
     branch(&repo(dir)?.1)
 }
 
@@ -373,9 +373,10 @@ fn branch(head: &Path) -> Option<String> {
 
 /// Two gits run together: status (which files, ahead / behind) and the line counts of unstaged changes
 fn count(dir: &Path) -> Counts {
+    // Inside the sandbox `dir` is mounted into, if any (see aca_core::sandbox)
     let git = |args: &[&str]| {
-        let mut c = Command::new("git");
-        c.arg("--no-optional-locks").arg("-C").arg(dir).args(args);
+        let args: Vec<&str> = std::iter::once("--no-optional-locks").chain(args.iter().copied()).collect();
+        let mut c = aca_core::sandbox::git(dir, &args, &[]);
         c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()
     };
     let (status, numstat) = (git(&["status", "--porcelain=v2", "--branch"]), git(&["diff", "--numstat"]));
@@ -481,7 +482,7 @@ fn cached<T: Serialize + DeserializeOwned>(dir: &Path, kind: &str, key: &str, st
     }
     let e = Entry { key: key.to_string(), stamp: stamp.to_string(), value: compute() };
     if let Ok(text) = serde_json::to_string(&e) {
-        let _ = crate::state::write_atomic(&path, &text);
+        let _ = crate::paths::write_atomic(&path, &text);
     }
     e.value
 }
@@ -489,7 +490,12 @@ fn cached<T: Serialize + DeserializeOwned>(dir: &Path, kind: &str, key: &str, st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::Agent;
+    use crate::agent::Agent;
+
+    /// The text without its colors (the status line writes only SGR sequences)
+    fn strip(s: &str) -> String {
+        regex::Regex::new("\x1b\\[[0-9;]*m").unwrap().replace_all(s, "").into_owned()
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("aca-statusline-test-{}-{name}", std::process::id()));
@@ -522,7 +528,7 @@ mod tests {
         };
         let out = render(&v, &f);
         assert_eq!(
-            out.lines().map(crate::ansi::strip).collect::<Vec<_>>(),
+            out.lines().map(strip).collect::<Vec<_>>(),
             [
                 format!(
                     "━━━━━━╌╌╌╌╌╌╌╌╌ 42% │ {I_MODEL} Opus │ {I_GIT} dev_ye {I_STAGED} 2 {I_MODIFIED} 11 {I_UNTRACKED} 12 +3845-1816 ⇡10 ⇣1 │ {I_DIR} app/src"
@@ -540,13 +546,13 @@ mod tests {
         assert_eq!(render(&Value::Null, &Facts::default()), "");
         // Input unreadable but the account has quota: only the quota line, with no blank line before it
         let only_quota = Facts { quota: Some(quota_of(&[("5h", 9.0, 5000)])), now: 1000, ..Facts::default() };
-        assert_eq!(crate::ansi::strip(&render(&Value::Null, &only_quota)), "sub 5h 9%");
+        assert_eq!(strip(&render(&Value::Null, &only_quota)), "sub 5h 9%");
         // No cost, no quota, no environment: a single line; a clean repo shows only the branch
         let v = serde_json::json!({"workspace": {"current_dir": "/home/me/x"}, "cost": {"total_cost_usd": 0}});
         let f = Facts { branch: Some("main".into()), home: "/home/me".into(), ..Facts::default() };
-        assert_eq!(crate::ansi::strip(&render(&v, &f)), format!("{I_GIT} main │ {I_DIR} ~/x"));
+        assert_eq!(strip(&render(&v, &f)), format!("{I_GIT} main │ {I_DIR} ~/x"));
         // Context over 100 is drawn just full
-        let full = crate::ansi::strip(&render(&serde_json::json!({"context_window": {"used_percentage": 130}}), &Facts::default()));
+        let full = strip(&render(&serde_json::json!({"context_window": {"used_percentage": 130}}), &Facts::default()));
         assert_eq!(full, format!("{} 130%", "━".repeat(15)));
     }
 
@@ -554,7 +560,7 @@ mod tests {
     fn a_long_session_reads_in_days_and_hours_not_thousands_of_minutes() {
         assert_eq!([0, 45, 65, 3600, 3725, 86400, 875655].map(span), ["0s", "45s", "1m5s", "1h0m", "1h2m", "1d0h", "10d3h"]);
         let v = serde_json::json!({"cost": {"total_cost_usd": 106.107, "total_duration_ms": 875655000u64}});
-        assert_eq!(crate::ansi::strip(&render(&v, &Facts::default())), "$106.11 10d3h");
+        assert_eq!(strip(&render(&v, &Facts::default())), "$106.11 10d3h");
     }
 
     #[test]
@@ -569,7 +575,7 @@ mod tests {
 
     #[test]
     fn a_window_past_its_reset_is_dropped_and_a_nearly_full_one_shows_the_time_left() {
-        let q = |wins: &[(&str, f64, i64)]| quota(&quota_of(wins), 1000).map(|s| crate::ansi::strip(&s));
+        let q = |wins: &[(&str, f64, i64)]| quota(&quota_of(wins), 1000).map(|s| strip(&s));
         assert_eq!(q(&[("5h", 9.0, 999), ("7d", 11.4, 5000)]).as_deref(), Some("sub 7d 11%"));
         assert_eq!(
             q(&[("5h", 80.0, 1000 + 45 * 60), ("7d", 99.0, 1000 + 3 * 86400 + 4 * 3600)]).as_deref(),

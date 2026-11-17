@@ -1,0 +1,22 @@
+[package]
+name = "aca-records"
+description = "读各家 agent 自己写下的记录:对话记录、用量和计费、配额、工作目录;不画界面"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aca-core.workspace = true
+memchr = "2.8.3"
+regex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+# Builders of small records for tests, also used by the interface's tests (`aca-tui` turns it on as a dev-dependency)
+fixtures = []
+
+[lints]
+workspace = true

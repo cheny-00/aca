@@ -5,27 +5,11 @@
 //! exit normally. The filter text isn't remembered: it's temporary by nature,
 //! and the commands Moshi auto-types land exactly in the filter box.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::ui::{DAYS, Preview, Scope};
+use aca_records::paths::write_atomic;
 
-/// ~/.local/state/aca/ui/<name> (`ACA_HOME` moves it: tests can't touch the real one)
-pub fn state_file(name: &str) -> Option<PathBuf> {
-    Some(aca_core::paths::state_dir().join("ui").join(name))
-}
-
-/// Write a temporary file, then rename: when the aca on the phone and the one on the desktop write at once, a reader never sees
-/// half a file. The original file's permissions are kept: one tightened to owner-only (it holds secrets) doesn't go back to the
-/// default on a rewrite
-pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    let tmp = path.with_file_name(format!(".{}.tmp", path.file_name().unwrap().to_string_lossy()));
-    std::fs::write(&tmp, text)?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
-    }
-    std::fs::rename(&tmp, path)
-}
+use crate::view::{DAYS, Preview, Scope};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct View {

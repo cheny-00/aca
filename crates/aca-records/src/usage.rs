@@ -33,10 +33,11 @@ use std::sync::{LazyLock, Mutex};
 use memchr::memmem::Finder;
 use serde::{Deserialize, Deserializer, Serialize};
 
+use aca_core::config::Config;
 use aca_core::i18n::Tr;
 use aca_core::{t, tr};
 
-use crate::data::Agent;
+use crate::agent::Agent;
 
 // ---------- Prices ----------
 
@@ -1570,20 +1571,21 @@ impl Acc {
 }
 
 /// Like `build`, but carries on from the saved copy of what was read before (see `Scanner::load`), and saves it back afterwards
-pub fn build_cached(only: &[String]) -> Report {
+pub fn build_cached(only: &[String], palette: usize, quota_note: fn(&Config) -> String) -> Report {
     let path = cache_file();
     let mut sc = path.as_deref().and_then(Scanner::load).unwrap_or_default();
-    let r = build(&mut sc, only);
+    let r = build(&mut sc, only, palette, quota_note);
     if let Some(p) = &path {
         sc.save(p);
     }
     r
 }
 
-/// The whole flow: read the config → read newly written records → total up
-pub fn build(sc: &mut Scanner, only: &[String]) -> Report {
+/// The whole flow: read the config → read newly written records → total up. `palette`: how many colors the billing page has
+/// for accounts (see `slots`); `quota_note`: the line atop the quotas, written by the interface
+pub fn build(sc: &mut Scanner, only: &[String], palette: usize, quota_note: fn(&Config) -> String) -> Report {
     let home = std::env::var("HOME").unwrap_or_default();
-    let accounts = crate::data::accounts(&aca_core::config::load());
+    let accounts = crate::agent::accounts(&aca_core::config::load());
     let srcs = sources(&accounts, &home);
     sc.scan(srcs.clone());
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
@@ -1591,7 +1593,7 @@ pub fn build(sc: &mut Scanner, only: &[String]) -> Report {
     let quotas = crate::limits::dir().map(|d| crate::limits::quotas(&d, &srcs, now)).unwrap_or_default();
     let mut r = sc.report(now, local_offset(), &deck(), quotas, only);
     r.quotas = subscribed(std::mem::take(&mut r.quotas), &accounts, &home);
-    r.quota_note = crate::limits::mod_note(&aca_core::config::load());
+    r.quota_note = quota_note(&aca_core::config::load());
     // Order for handing out slots the first time: biggest spenders over the last 30 days first (the first few, adjacent palette colors
     // are the easiest to tell apart), then those used earlier, then quota-only ones. Accounts that already have a slot aren't affected
     let mut names: Vec<String> = vec![];
@@ -1602,7 +1604,7 @@ pub fn build(sc: &mut Scanner, only: &[String]) -> Report {
             names.push(n);
         }
     }
-    r.colors = crate::slots::assign(crate::state::state_file("colors").as_deref(), &names, crate::theme::pal().series.len());
+    r.colors = crate::slots::assign(crate::paths::state_file("colors").as_deref(), &names, palette);
     r
 }
 
@@ -1684,25 +1686,30 @@ fn md(ts: i64, off: i64) -> String {
     format!("{m}/{d}")
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures {
     use super::*;
 
     /// Every call (model, tokens) that `$` reads from one Claude record: the session record (trace_claude) tests check costs against it
-    pub(crate) fn claude_seen(path: &Path) -> Vec<(String, [u64; 5])> {
+    pub fn claude_seen(path: &Path) -> Vec<(String, [u64; 5])> {
         let mut s = Seen::new(0, Agent::Claude, path);
         read_file(path, &mut s, std::fs::metadata(path).unwrap().len());
         s.recs.iter().map(|r| (s.models[r.model as usize].clone(), r.tok.map(u64::from))).collect()
     }
 
     /// Every call (model, tokens) that `$` reads from one Codex record: the session record (trace_codex) tests check costs against it
-    pub(crate) fn codex_seen(path: &Path) -> Vec<(String, [u64; 5])> {
+    pub fn codex_seen(path: &Path) -> Vec<(String, [u64; 5])> {
         let mut s = Seen::new(0, Agent::Codex, path);
         for l in std::fs::read_to_string(path).unwrap().lines() {
             codex_line(&mut s, l.as_bytes());
         }
         s.recs.iter().map(|r| (s.models[r.model as usize].clone(), r.tok.map(u64::from))).collect()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     fn claude(id: &str, req: &str, ts: &str, model: &str, usage: &str) -> String {
         format!(
@@ -1718,6 +1725,27 @@ pub(crate) mod tests {
                 claude_line(s, l.as_bytes(), i as u64);
             }
         }
+    }
+
+    fn tc(ts: &str, total: u64, last_in: u64, cached: u64, out: u64, rate: &str) -> String {
+        let last = last_in + out;
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":{total}}},"last_token_usage":{{"input_tokens":{last_in},"cached_input_tokens":{cached},"cache_write_input_tokens":0,"output_tokens":{out},"reasoning_output_tokens":1,"total_tokens":{last}}}}},"rate_limits":{rate}}}}}"#
+        )
+    }
+
+    const META: &str = r#"{"timestamp":"2026-09-28T00:00:00Z","type":"session_meta","payload":{"id":"t","cwd":"/w/cx","base_instructions":{"text":"long \"token_count\" text"}}}"#;
+
+    const TURN: &str = r#"{"timestamp":"2026-09-28T00:00:01Z","type":"turn_context","payload":{"model":"gpt-6-astra","cwd":"/w/cx"}}"#;
+
+    const RATE: &str = r#"{"limit_id":"codex","primary":{"used_percent":24.0,"window_minutes":10080,"resets_at":1790000000},"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"plan_type":"plus"}"#;
+
+    fn scanner_with(files: Vec<(&str, Seen)>) -> Scanner {
+        let srcs = vec![
+            Source { agent: Agent::Claude, who: "work".into(), dir: PathBuf::from("/c") },
+            Source { agent: Agent::Codex, who: "cx".into(), dir: PathBuf::from("/x") },
+        ];
+        Scanner { srcs, files: files.into_iter().map(|(p, s)| (PathBuf::from(p), s)).collect(), ..Default::default() }
     }
 
     #[test]
@@ -1773,17 +1801,6 @@ pub(crate) mod tests {
         // Old records without the 5-minute / 1-hour split count as 5 minutes
         assert_eq!(s.recs[0].tok, [1, 50, 0, 0, 1]);
     }
-
-    fn tc(ts: &str, total: u64, last_in: u64, cached: u64, out: u64, rate: &str) -> String {
-        let last = last_in + out;
-        format!(
-            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":{total}}},"last_token_usage":{{"input_tokens":{last_in},"cached_input_tokens":{cached},"cache_write_input_tokens":0,"output_tokens":{out},"reasoning_output_tokens":1,"total_tokens":{last}}}}},"rate_limits":{rate}}}}}"#
-        )
-    }
-
-    const META: &str = r#"{"timestamp":"2026-09-28T00:00:00Z","type":"session_meta","payload":{"id":"t","cwd":"/w/cx","base_instructions":{"text":"long \"token_count\" text"}}}"#;
-    const TURN: &str = r#"{"timestamp":"2026-09-28T00:00:01Z","type":"turn_context","payload":{"model":"gpt-6-astra","cwd":"/w/cx"}}"#;
-    const RATE: &str = r#"{"limit_id":"codex","primary":{"used_percent":24.0,"window_minutes":10080,"resets_at":1790000000},"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"plan_type":"plus"}"#;
 
     #[test]
     fn codex_counts_each_turn_once_and_keeps_the_latest_quota() {
@@ -1872,14 +1889,6 @@ pub(crate) mod tests {
         let mut s = Seen::new(0, Agent::Codex, Path::new("/h/sessions/rollout-f.jsonl"));
         feed(&mut s, &[meta.to_string(), turn, tc("2026-09-28T00:00:00.500Z", 110, 10)]);
         assert_eq!((s.conv.as_str(), s.recs.len()), ("rollout-f", 1));
-    }
-
-    fn scanner_with(files: Vec<(&str, Seen)>) -> Scanner {
-        let srcs = vec![
-            Source { agent: Agent::Claude, who: "work".into(), dir: PathBuf::from("/c") },
-            Source { agent: Agent::Codex, who: "cx".into(), dir: PathBuf::from("/x") },
-        ];
-        Scanner { srcs, files: files.into_iter().map(|(p, s)| (PathBuf::from(p), s)).collect(), ..Default::default() }
     }
 
     #[test]

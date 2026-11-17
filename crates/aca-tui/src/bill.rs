@@ -18,11 +18,11 @@ use unicode_width::UnicodeWidthStr;
 
 use aca_core::i18n::{Lang, Tr, lang};
 use aca_core::{t, tr};
+use aca_records::agent::Agent;
+use aca_records::usage::{Quota, RANGES, Range, Report, Row, WEEK, civil_from_days, weekday};
 
-use crate::data::Agent;
+use crate::kit::{clip, dim};
 use crate::theme;
-use crate::ui::{clip, dim};
-use crate::usage::{Quota, RANGES, Range, Report, Row, WEEK, civil_from_days, weekday};
 
 /// Widest a column gets
 const MAX_W: usize = 96;
@@ -295,7 +295,7 @@ const STALE: i64 = 3600;
 pub(crate) fn ago(ts: i64, now: i64) -> String {
     match (now - ts).max(0) as u64 {
         0..=59 => t!("刚刚", "just now").into(),
-        s => tr!("{}前", "{} ago", crate::data::dur(s)),
+        s => tr!("{}前", "{} ago", aca_records::words::dur(s)),
     }
 }
 
@@ -325,7 +325,7 @@ fn runs_out(used: f64, resets: i64, len: i64, at: i64) -> Option<i64> {
 fn family_spans(name: &str, agent: Option<Agent>, rest: Style) -> Vec<Span<'static>> {
     let (fam, tail) = name.split_once(' ').map_or((name, ""), |(f, t)| (f, t));
     let agent = agent.unwrap_or(if fam == "Codex" { Agent::Codex } else { Agent::Claude });
-    let mut v = vec![Span::styled(fam.to_string(), crate::ui::agent_style(agent).patch(rest))];
+    let mut v = vec![Span::styled(fam.to_string(), crate::kit::agent_style(agent).patch(rest))];
     if !tail.is_empty() {
         v.push(Span::styled(format!(" {tail}"), rest));
     }
@@ -335,7 +335,7 @@ fn family_spans(name: &str, agent: Option<Agent>, rest: Style) -> Vec<Span<'stat
 /// The account's full name in the quota block (the one colors are looked up by)
 fn quota_name(q: &Quota) -> String {
     match q.agent {
-        Agent::Claude | Agent::Codex => crate::usage::account_name(q.agent, &q.who),
+        Agent::Claude | Agent::Codex => aca_records::usage::account_name(q.agent, &q.who),
         _ => q.who.clone(),
     }
 }
@@ -344,7 +344,7 @@ fn quota_name(q: &Quota) -> String {
 /// the name itself is in the body text color.
 /// label_w: cells to align window names to (the longest in the whole block, see `label_width`)
 fn quota_lines(out: &mut Vec<Line<'static>>, q: &Quota, swatch: Color, (now, off): (i64, i64), w: usize, label_w: usize) {
-    let name = crate::usage::account_shown(&quota_name(q)).to_string();
+    let name = aca_records::usage::account_shown(&quota_name(q)).to_string();
     let mut left = vec![Span::raw(" "), Span::styled("■ ", Style::new().fg(swatch))];
     left.extend(family_spans(&name, Some(q.agent), Style::new().add_modifier(Modifier::BOLD)));
     let mut used_w = 3 + name.width();
@@ -815,7 +815,7 @@ fn trend_block(g: &Range, sel: usize, pal: &[(String, Color)], w: usize) -> Vec<
             .iter()
             .map(|(name, c)| {
                 let mut v = vec![Span::styled("■ ", Style::new().fg(*c))];
-                v.extend(family_spans(crate::usage::account_shown(name), None, dim()));
+                v.extend(family_spans(aca_records::usage::account_shown(name), None, dim()));
                 v
             })
             .collect();
@@ -905,7 +905,7 @@ fn rows_block(title: &str, rows: &[Row], total: f64, top: usize, kind: Kind, pal
         let name = match kind {
             Kind::Dir => clip_left(&r.name, name_col),
             Kind::Session => clip_name(&r.name, name_col),
-            Kind::Src => clip(crate::usage::account_shown(&r.name), name_col),
+            Kind::Src => clip(aca_records::usage::account_shown(&r.name), name_col),
             Kind::Model => clip(&r.name, name_col),
         };
         let mut spans = vec![Span::raw("  ")];
@@ -1051,7 +1051,7 @@ pub fn lines(r: &Report, sel: usize, more: bool, w: usize) -> Vec<Line<'static>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usage::Win;
+    use aca_records::usage::Win;
 
     fn text(ls: &[Line]) -> Vec<String> {
         ls.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     fn report() -> Report {
-        let now = crate::usage::parse_ts("2026-09-30T02:00:00Z");
+        let now = aca_records::usage::parse_ts("2026-09-30T02:00:00Z");
         let row = |name: &str, note: &str, agent, cost| Row { name: name.into(), note: note.into(), agent, cost, tokens: 1, calls: 1 };
         let mut sessions: Vec<Row> = (0..20).map(|i| row(&format!("会话{i}"), "work", Agent::Claude, 20.0 - i as f64)).collect();
         sessions[0].name = "一个特别特别特别特别特别特别长的会话标题".into();
@@ -1218,7 +1218,7 @@ mod tests {
                 },
             ],
             ranges: vec![today, week, month, all],
-            first: Some(crate::usage::parse_ts("2026-03-06T01:00:00Z")),
+            first: Some(aca_records::usage::parse_ts("2026-03-06T01:00:00Z")),
             colors: vec![("Claude work".into(), 0), ("Codex cx".into(), 1)],
             ..Default::default()
         }
@@ -1295,8 +1295,8 @@ mod tests {
         let t = text(&lines(&r, 0, false, 60));
         assert!(!t.iter().any(|l| l.contains("按账号") || l.contains("按模型")), "{t:#?}");
         assert_eq!(find(&t, "■ Claude").1, " ■ Claude");
-        assert_eq!(crate::usage::account_shown("Codex codex"), "Codex");
-        assert_eq!(crate::usage::account_shown("Codex cx"), "Codex cx");
+        assert_eq!(aca_records::usage::account_shown("Codex codex"), "Codex");
+        assert_eq!(aca_records::usage::account_shown("Codex cx"), "Codex cx");
     }
 
     #[test]

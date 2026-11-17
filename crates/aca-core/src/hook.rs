@@ -168,6 +168,53 @@ pub fn feed(cfg: &config::Config, id: &str, agent: &dyn Agent, v: &Value) {
     settle(cfg, id, agent, v, events);
 }
 
+/// A session inside a sandbox, where aca's hooks don't go: what the agent reports itself over OSC 7501 (see
+/// [`crate::relay`]; `exited` when the program ended) stands in for the hook events it can't send — a turn starting,
+/// ending, being interrupted, asking, failing, the program exiting — fed the way [`feed`] does, so `aca wait`, the notice
+/// to the session that delegated it and the event stream work as with hooks. Other sessions: nothing (their hooks say it)
+pub fn reported(id: &str, state: &str, kind: &str, msg: &str) {
+    let cfg = config::load();
+    let Ok(s) = Store::open().and_then(|st| st.get(id)) else { return };
+    if crate::sandbox::cage_of_session(&cfg, &s).is_none() {
+        return;
+    }
+    let Ok((agent, _)) = agent::of(&cfg, &s) else { return };
+    let r = runtime::load(id);
+    let Some(v) = stands_for(&r, state, kind, msg) else { return };
+    let v = match v["hook_event_name"].as_str() {
+        // The reply is in the conversation record, which only it writes: found in the sandbox's config directory
+        Some("Stop") => {
+            let r = crate::session::inside(&cfg, &s, &r);
+            json!({ "hook_event_name": "Stop", "last_assistant_message": agent.last_reply(&r).unwrap_or_default() })
+        }
+        _ => v,
+    };
+    feed(&cfg, id, &*agent, &v);
+}
+
+/// The hook event a report stands for, given the state the hook side has recorded so far ([`reported`]). Going by that state
+/// rather than the previous report, a turn is opened and closed once even when the screen filled the end in first
+fn stands_for(r: &Run, state: &str, kind: &str, msg: &str) -> Option<Value> {
+    let open = matches!(r.status.as_str(), "running" | "waiting");
+    Some(match state {
+        // Approved: on with the same turn
+        "working" if r.status == "waiting" => json!({ "hook_event_name": "PostToolUse" }),
+        "working" if r.status != "running" => json!({ "hook_event_name": "UserPromptSubmit", "prompt": r.prompt }),
+        "done" if open => json!({ "hook_event_name": "Stop" }),
+        // Esc, or a permission refused (Codex's "idle" after a finished turn is only you typing)
+        "idle" if open => json!({ "hook_event_name": "Interrupt" }),
+        "blocked" if r.status != "waiting" => json!({
+            "hook_event_name": "Notification",
+            "notification_type": if kind == "permission" { "permission_prompt" } else { "elicitation_dialog" },
+            "message": msg,
+        }),
+        "error" if r.status != "error" && msg.is_empty() => json!({ "hook_event_name": "StopFailure" }),
+        "error" if r.status != "error" => json!({ "hook_event_name": "StopFailure", "error": msg }),
+        "exited" if r.status != "ended" => json!({ "hook_event_name": "SessionEnd", "reason": "exit" }),
+        _ => return None,
+    })
+}
+
 /// `aca retitle <session> <tool> <secs>`: the follow-up a hook leaves. Waits a few seconds, then looks at the title again
 pub fn retitle_later(id: &str, tool: &str, secs: u64) -> i32 {
     std::thread::sleep(std::time::Duration::from_secs(secs));
@@ -227,6 +274,36 @@ fn name_for(s: &Session, r: &Run, has: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sandboxed_agents_own_reports_open_and_close_each_turn_once() {
+        let at = |status: &str| Run { status: status.into(), prompt: "修登录".into(), ..Default::default() };
+        let ev = |status: &str, state: &str, kind: &str, msg: &str| {
+            stands_for(&at(status), state, kind, msg).map(|v| v["hook_event_name"].as_str().unwrap_or("").to_string())
+        };
+        let ev = |status: &str, state: &str| ev(status, state, "", "");
+        // Started, idle: nothing; a turn opens once, an approval carries it on
+        assert_eq!((ev("", "idle"), ev("", "done")), (None, None));
+        assert_eq!(ev("idle", "working").as_deref(), Some("UserPromptSubmit"));
+        assert_eq!(ev("done", "working").as_deref(), Some("UserPromptSubmit"));
+        assert_eq!(ev("running", "working"), None);
+        assert_eq!(ev("waiting", "working").as_deref(), Some("PostToolUse"));
+        // It closes once: a turn the screen already closed isn't closed again; Codex's idle after done is you typing
+        assert_eq!(ev("running", "done").as_deref(), Some("Stop"));
+        assert_eq!(ev("waiting", "done").as_deref(), Some("Stop"));
+        assert_eq!((ev("done", "done"), ev("done", "idle")), (None, None));
+        assert_eq!(ev("running", "idle").as_deref(), Some("Interrupt"));
+        assert_eq!((ev("running", "error").as_deref(), ev("error", "error")), (Some("StopFailure"), None));
+        assert_eq!((ev("done", "exited").as_deref(), ev("ended", "exited")), (Some("SessionEnd"), None));
+        // Asking: a permission prompt or a question to you, with its own line
+        let v = stands_for(&at("running"), "blocked", "permission", "approve Bash: make").unwrap();
+        assert_eq!((v["notification_type"].as_str(), v["message"].as_str()), (Some("permission_prompt"), Some("approve Bash: make")));
+        let v = stands_for(&at("running"), "blocked", "question", "").unwrap();
+        assert_eq!(v["notification_type"], "elicitation_dialog");
+        assert_eq!(ev("waiting", "blocked"), None);
+        // The prompt it was given stays the prompt
+        assert_eq!(stands_for(&at("idle"), "working", "", "").unwrap()["prompt"], "修登录");
+    }
 
     #[test]
     fn claude_is_named_after_the_session_once_and_follows_renames_made_in_aca_only() {

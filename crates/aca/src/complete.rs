@@ -494,7 +494,7 @@ fn values(k: Kind, cmd: &str) -> Vec<Cand> {
         }
         Kind::Tool => {
             let cfg = config::load();
-            cfg.names().into_iter().map(|n| ("tool", n.clone(), tool_note(&cfg, &n))).collect()
+            aca_core::agent::names(&cfg).into_iter().map(|n| ("tool", n.clone(), tool_note(&cfg, &n))).collect()
         }
         Kind::Tmux => {
             let f = "#{session_name}\t#{@aca_id}\t#{pane_current_command}\t#{pane_current_path}";
@@ -529,7 +529,7 @@ fn tool_note(cfg: &config::Config, name: &str) -> String {
         }
         return v.join(" · ");
     }
-    let Some(t) = cfg.tool(name) else { return String::new() };
+    let Some(t) = aca_core::agent::tool(cfg, name) else { return String::new() };
     let what = match t.kind.as_str() {
         "shell" => return tr!("普通 shell,不启动 agent", "a plain shell, no agent"),
         "" => tr!("声明式工具", "declared tool"),

@@ -58,6 +58,7 @@ Every section, and where to read more:
 | `[keys]` | The key aca binds in tmux to go to the next session waiting for you | [Keys](keys.md) |
 | `[login]` | Which browsers a login link can open in; logging in on another device when you are on SSH | `aca help config` |
 | `[ui]` | Language; order of the `n` menu, and entries hidden from it | `aca help config` |
+| `[sandbox.<name>]` | A cage reached over ssh, with directories of this Mac mounted at the same path; an account bound to it starts only inside | [Accounts](accounts.md#an-account-kept-in-a-sandbox) |
 | `[mcps.<name>]` | Your catalog of MCP servers: attach one to a project with `M`, or serve it to every agent through the gateway plugin | [docs/plugins.md](plugins.md) |
 | `[theme]` `[ime]` `[new_group]` | Theme, input method switching (macOS only), default directory for new groups | Set on the settings page (`Ctrl+S`) |
 

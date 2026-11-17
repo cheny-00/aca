@@ -394,7 +394,7 @@ fn key(args: &[String]) -> Res<String> {
             if !rest.is_empty() {
                 let k = if rest == ["--none"] { String::new() } else { rest.join(" ") };
                 if !k.is_empty() {
-                    aca_core::plugin::hotkey_ok(&k)?;
+                    aca_core::tmux::hotkey_ok(&k)?;
                 }
                 crate::config::set("keys", which, toml::Value::String(k))?;
             }

@@ -62,7 +62,7 @@ fn dir() -> PathBuf {
 /// Called when the interface opens, after ratatui::init. prev = the panic hook from before init (std's default: print the
 /// panic message to stderr, never mind if that fails); release = hand the terminal back, called on a main-thread panic
 pub fn install(prev: Hook, release: fn() -> std::io::Result<()>) {
-    TZ.store(crate::usage::local_offset(), Ordering::Relaxed);
+    TZ.store(aca_records::usage::local_offset(), Ordering::Relaxed);
     let _ = STARTED.set(Instant::now());
     let flag = HUP.get_or_init(|| Arc::new(AtomicBool::new(false)));
     // With it caught, a hangup doesn't just kill us: the main loop sees it, finishes up and writes an entry
@@ -188,7 +188,7 @@ fn on_panic(info: &PanicHookInfo<'_>, main: bool) {
 
 /// The last interface quit on a panic: the bottom bar says so. Deleted once said, said only once
 pub fn take_notice() -> Option<String> {
-    take_notice_in(&dir(), now_secs(), crate::usage::local_offset())
+    take_notice_in(&dir(), now_secs(), aca_records::usage::local_offset())
 }
 
 fn take_notice_in(dir: &Path, now: i64, tz: i64) -> Option<String> {
@@ -278,7 +278,7 @@ fn uptime() -> Option<Duration> {
 /// 2026-10-14 22:59:33 (local time)
 fn stamp(at: i64, tz: i64) -> String {
     let t = at + tz;
-    let (y, m, d) = crate::usage::civil_from_days(t.div_euclid(86400));
+    let (y, m, d) = aca_records::usage::civil_from_days(t.div_euclid(86400));
     let s = t.rem_euclid(86400);
     format!("{y}-{m:02}-{d:02} {:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
@@ -291,7 +291,7 @@ fn when(at: i64, now: i64, tz: i64) -> String {
     if t.div_euclid(86400) == today {
         return clock;
     }
-    let (_, m, d) = crate::usage::civil_from_days(t.div_euclid(86400));
+    let (_, m, d) = aca_records::usage::civil_from_days(t.div_euclid(86400));
     format!("{m}/{d} {clock}")
 }
 

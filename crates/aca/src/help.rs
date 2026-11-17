@@ -1430,6 +1430,29 @@ const CONFIG: &str = "\
   api = { env_file = \"~/.secrets/openai.env\" }                # key 放在文件里,每次启动时读取(aca 不保存)
   未登记的目录不必写在这里:aca new codex:~/.codex-try
 
+沙箱(经 ssh 进入的笼子,Mac 上的目录用同一个路径挂进去;绑定它的账号只在里面启动)
+  [sandbox.work]
+  ssh = \"work\"                     # ~/.ssh/config 里的 Host
+  up = \"~/cage/up\"                 # ssh 连不上时先运行它(只在终端里启动时)
+  dirs = [\"~/work/app\"]            # 挂进去的项目目录:会话只能在这里启动,aca 对它们运行的 git 都在笼子里运行
+  workspace = \"~/cages/work\"       # 也挂进去:claude/、codex/ 是里面的配置目录(登录、对话记录),worktrees/ 放 -w 新建的 worktree
+  space = \"3\"                      # 它的会话默认放进界面的哪个工作区(用 Q 移走的除外)
+  delegate = true                  # 让别的会话往里派活、传话,干完的结果回到派活的会话;不写就是封闭的
+  [accounts.claude]
+  team = { sandbox = \"work\" }      # 只在 work 里启动(不写 home),aca run claude:team 也在里面运行;不换账号,
+                                   # aca.remote 的 run 也不往里派任务
+  [accounts.codex]
+  team = { sandbox = \"work\" }      # Codex 也一样;aca run codex:team login 在里面登录,用这台 Mac 的浏览器
+  不用写:aca new shell:work 在笼子里开一个终端(目录不在 dirs 里时落在笼子登录时的默认目录)
+
+  不写 ssh:在本机跑,只带上它的 env(换时区、换出口);不隔开,只有认这些变量的程序跟着走
+  [sandbox.unis]
+  env = { TZ = \"America/Los_Angeles\", HTTPS_PROXY = \"http://127.0.0.1:28888\" }   # 笼子也能写,随命令带进去
+  workspace = \"~/cages/unis\"       # 绑定它的账号的配置目录:codex/、claude/(登录、对话记录)
+  [accounts.codex]
+  team-unis = { sandbox = \"unis\" } # 在本机启动,带上 unis 的 env;派活、传话、换账号都和普通账号一样
+  两种都是界面里的特殊环境:^E 单独列出(n 里没有),列表里显示成 team@work、team-unis@unis
+
 工具
   [tools.claude]                   # 内置工具(claude / codex / pi / opencode / shell)的默认值
   account = \"work\"                 # 不指定账号时用哪个
@@ -1504,6 +1527,30 @@ Accounts = what to bring along when starting an agent, written once in its own t
   team = { home = \"~/.codex2\", args = [\"--profile\", \"team\"] }  # a directory plus arguments
   api = { env_file = \"~/.secrets/openai.env\" }                # the key lives in a file, read at each start (aca keeps none)
   Unregistered directories don't need to be here: aca new codex:~/.codex-try
+
+Sandboxes (a cage reached over ssh, directories of this Mac mounted at the same path; an account bound to one starts only inside)
+  [sandbox.work]
+  ssh = \"work\"                     # a Host in ~/.ssh/config
+  up = \"~/cage/up\"                 # run first when ssh can't connect (only when started from a terminal)
+  dirs = [\"~/work/app\"]            # project directories mounted into it: its sessions start only here, and git aca runs on them runs inside
+  workspace = \"~/cages/work\"       # mounted too: claude/, codex/ are the config dirs inside (logins, conversations), worktrees/ for -w's
+  space = \"3\"                      # the interface's workspace its sessions go to (unless sent elsewhere with Q)
+  delegate = true                  # other sessions may delegate to it and message it, results go back to them; unset = closed
+  [accounts.claude]
+  team = { sandbox = \"work\" }      # started only inside work (no home), aca run claude:team runs inside too; no switching
+                                   # accounts, no aca.remote run into it
+  [accounts.codex]
+  team = { sandbox = \"work\" }      # Codex the same; aca run codex:team login logs in inside, with the browser on this Mac
+  Nothing to write: aca new shell:work opens a terminal inside (where a login to the cage lands when the directory isn't in dirs)
+
+  Without ssh: it runs on this Mac with its env (another time zone, another way out); nothing kept apart, only programs that
+  read those variables follow them
+  [sandbox.unis]
+  env = { TZ = \"America/Los_Angeles\", HTTPS_PROXY = \"http://127.0.0.1:28888\" }   # a cage takes one too, sent in with each command
+  workspace = \"~/cages/unis\"       # the config dirs of the accounts bound to it: codex/, claude/ (logins, conversations)
+  [accounts.codex]
+  team-unis = { sandbox = \"unis\" } # starts here with unis's env; delegating, messages, switching as with any account
+  Both are the interface's special environments: listed apart under ^E (not in n), shown as team@work, team-unis@unis
 
 Tools
   [tools.claude]                   # defaults for the built-ins (claude / codex / pi / opencode / shell)

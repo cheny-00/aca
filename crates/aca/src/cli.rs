@@ -1048,11 +1048,33 @@ fn run(mut a: Args) -> Res<i32> {
             let argv = if a.0.first().is_some_and(|w| w == "--") { &a.0[1..] } else { &a.0[..] };
             return Ok(aca_core::relay::run(argv));
         }
-        // The step that starts the agent (see aca_core::agent::launch): append the opening message from the file to the end of the
+        // The step that starts the agent (see aca_core::launch::launch): append the opening message from the file to the end of the
         // command that follows, and exec that
         "exec-saying" => {
             let file = a.next(Tr::new("文件", "a file"))?;
             return Err(tr!("无法启动:{}", "couldn't start it: {}", agent::exec_saying(&file, &a.0)));
+        }
+        // The step that starts an agent inside a sandbox (see aca_core::sandbox): run its `up` if ssh can't connect, then exec ssh
+        // with the command
+        "exec-sandbox" => {
+            let forward = match a.opt("--forward")? {
+                Some(p) => Some(p.parse::<u16>().map_err(|_| tr!("--forward 后面需要端口号", "--forward needs a port after it"))?),
+                None => None,
+            };
+            let (name, command) = (a.next(Tr::new("沙箱", "a sandbox"))?, a.next(Tr::new("命令", "a command"))?);
+            return Err(tr!("无法启动:{}", "couldn't start it: {}", aca_core::sandbox::exec(&name, &command, forward)));
+        }
+        // For plugins that send work over ssh (aca.remote): which sandbox this ssh destination gets into, if any. Prints its name and
+        // exits 0; exits 1 when it's none (see aca_core::sandbox::reached_by)
+        "sandbox-of" => {
+            let dest = a.next(Tr::new("ssh 目标", "an ssh destination"))?;
+            return Ok(match aca_core::sandbox::reached_by(&config::load(), &dest) {
+                Some(name) => {
+                    println!("{name}");
+                    0
+                }
+                None => 1,
+            });
         }
         // A fallback left when starting a session (see aca_core::trust): when "do you trust this directory" comes up, choose trust for you
         "trust-watch" => {
@@ -1131,6 +1153,13 @@ fn run(mut a: Args) -> Res<i32> {
     if cmd == "ui" {
         return ui(a.0);
     }
+    match cmd.as_str() {
+        // statusLine runs it on every refresh: touches nothing else; after recording the quota it hands the input to the next command
+        "limits" => return Ok(aca_records::limits::run(&a.0)),
+        // Also runs on every refresh: after recording the quota it draws the status bar itself, handing nothing to another command
+        "statusline" => return Ok(aca_records::statusline::run()),
+        _ => {}
+    }
     if let Some(code) = aca_tui::command(&cmd, &a.0) {
         return Ok(code);
     }
@@ -1155,7 +1184,7 @@ fn run(mut a: Args) -> Res<i32> {
     if cmd == "run" {
         let spec = a.next(Tr::new("工具[:账号]", "TOOL[:ACCOUNT]"))?;
         let args = if a.0.first().is_some_and(|x| x == "--") { &a.0[1..] } else { &a.0[..] };
-        let l = agent::direct(&cfg, &spec, args)?;
+        let l = aca_core::launch::direct(&cfg, &spec, args)?;
         return Err(tr!(
             "无法启动:{}",
             "couldn't start it: {}",
@@ -1224,7 +1253,7 @@ fn run(mut a: Args) -> Res<i32> {
                 let mut v = serde_json::to_value(&row).unwrap();
                 v["run"] = serde_json::to_value(&r).unwrap();
                 v["args"] = json!(s.args);
-                v["work"] = json!(aca_tui::work_dir(&cfg, &s));
+                v["work"] = json!(aca_records::workdir::work_dir(&cfg, &s));
                 // Where its conversation record is, its config directory, and (Claude, while running) its inbox for messages
                 // from other Claude sessions: what another agent would otherwise go digging for
                 v["transcript"] = json!(r.transcript);
@@ -1245,7 +1274,7 @@ fn run(mut a: Args) -> Res<i32> {
             let s = store.get(&a.next(ID)?)?;
             let p = tmux::find(&s.id).ok_or_else(|| tr!("会话未运行(aca start)", "the session isn't running (aca start)"))?;
             runtime::update(&s.id, |r| r.seen = paths::now());
-            tmux::bind_detach();
+            tmux::bind_detach(plugin::hotkey_binds);
             // Run from a tmux binding (a clicked notification, a pressed key): there's no terminal, so switch that client, landing on
             // the agent's pane (same as aca next)
             if let Some(c) = client {
@@ -1437,14 +1466,14 @@ fn run(mut a: Args) -> Res<i32> {
             let file = a.flag("--file");
             let s = store.get(&a.id()?)?;
             if file {
-                println!("{}", aca_tui::conversation_file(&cfg, &s)?);
+                println!("{}", aca_records::dialog::text_file(&cfg, &s)?);
             } else if let Some(n) = turns {
                 let n = n
                     .parse::<usize>()
                     .ok()
                     .filter(|n| *n > 0)
                     .ok_or_else(|| tr!("--turns 要一个正整数", "--turns needs a positive whole number"))?;
-                print!("{}", aca_tui::conversation_turns(&cfg, &s, n)?);
+                print!("{}", aca_records::dialog::turns(&cfg, &s, n)?);
             } else {
                 let last = runtime::load(&s.id).last;
                 if !print::reply(&last) {
@@ -1461,7 +1490,7 @@ fn run(mut a: Args) -> Res<i32> {
             other => return Err(tr!("不支持从 {other} 导入", "can't import from {other}")),
         },
         "names" => {
-            let names = cfg.names();
+            let names = agent::names(&cfg);
             if !print::names(&cfg, &names) {
                 names.iter().for_each(|n| println!("{n}"));
             }

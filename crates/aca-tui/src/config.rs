@@ -107,7 +107,7 @@ pub fn set(section: &str, key: &str, value: Value) -> Result<(), String> {
     let path = path();
     let text = read();
     let new = with_value(&text, section, key, &value).ok_or(t!("config.toml 格式有误,未保存", "config.toml is malformed; not saved"))?;
-    crate::state::write_atomic(&path, &new).map_err(|e| tr!("未保存:{e}", "not saved: {e}"))
+    aca_records::paths::write_atomic(&path, &new).map_err(|e| tr!("未保存:{e}", "not saved: {e}"))
 }
 
 /// Set key under `[section]` to value: replace the line if there is one (indent kept); if the section is there but the line

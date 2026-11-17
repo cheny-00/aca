@@ -46,12 +46,12 @@ type Src = (u64, u32);
 
 /// Half-parsed state (carried across reads of the appended part)
 #[derive(Default)]
-pub(crate) struct State {
+pub struct State {
     /// First line read; a first line without an outer type is the old format
     seen: bool,
-    pub(crate) old: bool,
+    pub old: bool,
     /// Version (0, 155)
-    pub(crate) ver: (u32, u32),
+    pub ver: (u32, u32),
     /// Current model, reasoning effort
     model: String,
     effort: String,
@@ -74,20 +74,20 @@ pub(crate) struct State {
     /// web_search_end waiting to pair with the next web_search_call
     search: Option<Src>,
     /// Turns opened in this log (which part a child thread copied at its start is judged by the parent's)
-    pub(crate) turn_ids: HashSet<String>,
+    pub turn_ids: HashSet<String>,
     /// Turns the parent opened: given when opening a child thread; a forked thread opened on its own reads the parent's log itself
-    pub(crate) parent_turns: Option<HashSet<String>>,
+    pub parent_turns: Option<HashSet<String>>,
     /// How to recognize the copied parent history at the start, and whether we're still inside it
     gate: Gate,
-    pub(crate) copying: bool,
+    pub copying: bool,
     /// spawn_agent calls whose child thread isn't recognized yet
     spawns: Vec<usize>,
     /// This is a child thread: its type and name (as session_meta writes them)
-    pub(crate) role: String,
-    pub(crate) nick: String,
+    pub role: String,
+    pub nick: String,
     /// Name of the task given to it: the last segment of `agent_path` (0.144+'s `/root/layout_review`; the task text is encrypted, only
     /// this name is readable)
-    pub(crate) task: String,
+    pub task: String,
 }
 
 /// Where the parent history copied at the start ends
@@ -235,7 +235,7 @@ fn stamp(head: &[u8]) -> i64 {
 }
 
 /// One log line
-pub(crate) fn line(t: &mut Trace, buf: &[u8], off: u64) {
+pub fn line(t: &mut Trace, buf: &[u8], off: u64) {
     let head = &buf[..buf.len().min(120)];
     // The compaction line carries the whole replaced history, possibly several MB: only read its type
     if memmem::find(head, b"\"type\":\"compacted\"").is_some() {
@@ -341,14 +341,14 @@ fn parent_turns(path: &Path, parent: &str) -> Option<HashSet<String>> {
 }
 
 /// The child thread's task name (see `State::task`); empty when not a child thread or an old version without it
-pub(crate) fn task_of(t: &Trace) -> &str {
+pub fn task_of(t: &Trace) -> &str {
     &t.cx.task
 }
 
 /// Logs of started child threads: found by thread id in the same CODEX_HOME, read into a tree attached under the tool that started it.
 /// The log may not be written yet at start: look again on the next read of appended lines, give up after 30 tries (a minute).
 /// Returns true if something new got attached
-pub(crate) fn find_subs(t: &mut Trace) -> bool {
+pub fn find_subs(t: &mut Trace) -> bool {
     if t.want.is_empty() {
         return false;
     }
@@ -356,7 +356,7 @@ pub(crate) fn find_subs(t: &mut Trace) -> bool {
     let mut grew = false;
     for (tool, id, tries) in std::mem::take(&mut t.want) {
         let sub = crate::workdir::codex_log(&home, &id)
-            .and_then(|p| Trace::open_sub(p, crate::data::Agent::Codex, Some(t.cx.turn_ids.clone())).ok());
+            .and_then(|p| Trace::open_sub(p, crate::agent::Agent::Codex, Some(t.cx.turn_ids.clone())).ok());
         match sub {
             Some(sub) => {
                 t.nodes[tool].sub = Some(t.subs.len());
@@ -1076,7 +1076,7 @@ fn strip_head(text: &str) -> (String, Option<i64>, bool) {
 }
 
 /// What one call thought and said
-pub(crate) fn said(t: &Trace, n: &Node) -> (Vec<String>, Vec<String>) {
+pub fn said(t: &Trace, n: &Node) -> (Vec<String>, Vec<String>) {
     let (mut thought, mut text) = (vec![], vec![]);
     for v in lines_of(t, n) {
         let p = &v["payload"];
@@ -1094,7 +1094,7 @@ pub(crate) fn said(t: &Trace, n: &Node) -> (Vec<String>, Vec<String>) {
 }
 
 /// What you asked (words put in appended); a log starting mid-turn with no prompt is from nobody
-pub(crate) fn asked(t: &Trace, n: &Node) -> (Asker, String) {
+pub fn asked(t: &Trace, n: &Node) -> (Asker, String) {
     let mut parts = vec![];
     for v in lines_of(t, n) {
         let p = &v["payload"];
@@ -1135,7 +1135,7 @@ fn error_text(v: &Value) -> String {
     }
 }
 
-pub(crate) fn fail_text(t: &Trace, n: &Node) -> String {
+pub fn fail_text(t: &Trace, n: &Node) -> String {
     let Some(v) = n.src.first().and_then(|&x| t.read_at(x)) else { return String::new() };
     let p = &v["payload"];
     match p.get("type").and_then(Value::as_str) {
@@ -1238,7 +1238,7 @@ fn plan_text(args: &Value) -> String {
 
 /// One tool's content. An exec's commands and changes come from what the log says really ran, recognized from the JS only if absent;
 /// if nothing is recognized, show the JS itself
-pub(crate) fn io(t: &Trace, n: &Node) -> Io {
+pub fn io(t: &Trace, n: &Node) -> Io {
     let mut io = Io::default();
     let (mut code, mut patch, mut plan) = (None, None, false);
     let (mut ran, mut ran_out, mut edits, mut exits) = (vec![], vec![], vec![], vec![]);
@@ -1339,31 +1339,31 @@ pub(crate) fn io(t: &Trace, n: &Node) -> Io {
     io
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures {
     use super::*;
-    use crate::data::Agent;
+    use crate::agent::Agent;
     use serde_json::json;
     use std::io::Write;
     use std::path::PathBuf;
 
-    pub(crate) fn at(ms: u32) -> String {
+    pub fn at(ms: u32) -> String {
         format!("2026-09-30T01:{:02}:{:02}.{:03}Z", ms / 60_000, ms / 1000 % 60, ms % 1000)
     }
 
-    fn row(ms: u32, kind: &str, payload: Value) -> Value {
+    pub fn row(ms: u32, kind: &str, payload: Value) -> Value {
         json!({"timestamp": at(ms), "type": kind, "payload": payload})
     }
 
-    fn ev(ms: u32, payload: Value) -> Value {
+    pub fn ev(ms: u32, payload: Value) -> Value {
         row(ms, "event_msg", payload)
     }
 
-    fn ri(ms: u32, payload: Value) -> Value {
+    pub fn ri(ms: u32, payload: Value) -> Value {
         row(ms, "response_item", payload)
     }
 
-    fn meta(ver: &str) -> Value {
+    pub fn meta(ver: &str) -> Value {
         row(
             0,
             "session_meta",
@@ -1372,7 +1372,7 @@ pub(crate) mod tests {
     }
 
     /// A new cumulative count: total differs every time
-    fn tokens(ms: u32, total: u64, input: u64, cached: u64, out: u64) -> Value {
+    pub fn tokens(ms: u32, total: u64, input: u64, cached: u64, out: u64) -> Value {
         ev(
             ms,
             json!({"type": "token_count", "info": {
@@ -1382,11 +1382,11 @@ pub(crate) mod tests {
         )
     }
 
-    fn say(ms: u32, text: &str, phase: &str) -> Value {
+    pub fn say(ms: u32, text: &str, phase: &str) -> Value {
         ri(ms, json!({"type": "message", "role": "assistant", "phase": phase, "content": [{"type": "output_text", "text": text}]}))
     }
 
-    pub(crate) fn file(name: &str, lines: &[Value]) -> PathBuf {
+    pub fn file(name: &str, lines: &[Value]) -> PathBuf {
         let d = std::env::temp_dir().join(format!("aca-trace-cx-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -1402,22 +1402,22 @@ pub(crate) mod tests {
         p
     }
 
-    fn open(name: &str, lines: &[Value]) -> Trace {
+    pub fn open(name: &str, lines: &[Value]) -> Trace {
         Trace::open_born(file(name, lines), Agent::Codex, 0).unwrap()
     }
 
-    fn kinds(t: &Trace, i: usize) -> Vec<Kind> {
+    pub fn kinds(t: &Trace, i: usize) -> Vec<Kind> {
         t.nodes[i].kids.iter().map(|&k| t.nodes[k].kind).collect()
     }
 
     /// A 0.155 turn: the exec runs two commands (one goes to the background and finishes after exec returns), the next call changes a
     /// file, then the reply
-    pub(crate) fn fixture(name: &str) -> (Trace, PathBuf) {
+    pub fn fixture(name: &str) -> (Trace, PathBuf) {
         let p = file(name, &fixture_lines());
         (Trace::open_born(p.clone(), Agent::Codex, 0).unwrap(), p)
     }
 
-    fn fixture_lines() -> Vec<Value> {
+    pub fn fixture_lines() -> Vec<Value> {
         vec![
             meta("0.155.0"),
             ev(1000, json!({"type": "task_started", "turn_id": "t1", "started_at": 1})),
@@ -1515,192 +1515,8 @@ pub(crate) mod tests {
         ]
     }
 
-    #[test]
-    fn a_turn_is_its_calls_each_new_token_count_is_one_and_the_money_matches_the_bill() {
-        let (t, p) = fixture("turns");
-        let roots: Vec<Kind> = t.roots.iter().map(|&r| t.nodes[r].kind).collect();
-        assert_eq!(roots, [Kind::Turn, Kind::Mark, Kind::Turn]);
-        let turn = t.roots[0];
-        let n = &t.nodes[turn];
-        assert_eq!((n.label.as_str(), n.exact, t.dur(turn, false, 0), n.state), ("跑一下测试", true, 19_000, St::Ok));
-        // Three calls: re-reported cumulative counts don't count
-        assert_eq!(kinds(&t, turn), [Kind::Call, Kind::Call, Kind::Call]);
-        let c1 = &t.nodes[n.kids[0]];
-        // From the prompt to token_usage_record; cache reads taken out of input
-        assert_eq!((c1.t1 - c1.t0, c1.tok, c1.think, c1.label.as_str()), (8100 - 1030, [100, 0, 0, 800, 50], 3, "先跑测试"));
-        assert_eq!((t.models[c1.model].as_str(), c1.effort.as_str()), ("gpt-5.5", "high"));
-        let c2 = &t.nodes[n.kids[1]];
-        // The second call starts at the previous tool output; when thinking has a summary, write its first sentence
-        assert_eq!((c2.t0, c2.thought.as_str()), (ts_ms(&at(9500)), "**修 b**"));
-        assert_eq!(t.nodes[n.kids[2]].label, "改好了:b 的断言写错了。");
-        assert_eq!(t.nodes[t.roots[1]].label, "压缩");
-        // Money: same as the $ panel computes from the same log
-        let s = t.total(false, 0).2;
-        let mut seen = crate::usage::tests::codex_seen(&p);
-        let bill: f64 = seen.drain(..).map(|(m, tok)| crate::usage::call_cost(&m, tok, false, false, 0).unwrap()).sum();
-        assert_eq!(s.calls, 4);
-        assert!((s.cost - bill).abs() < 1e-12, "{} vs {bill}", s.cost);
-    }
-
-    #[test]
-    fn what_an_exec_ran_hangs_under_it_even_when_it_finishes_later() {
-        let (t, _) = fixture("exec");
-        let c1 = t.nodes[t.roots[0]].kids[0];
-        let e1 = t.nodes[c1].kids[0];
-        let n = &t.nodes[e1];
-        // The first line shows the first command really run; failed tests mean an error, the exit code is the failed one's
-        assert_eq!((n.name.as_str(), n.label.as_str(), n.t1 - n.t0, n.state), ("Shell", "cargo test --release", 1500, St::Err));
-        let io = io(&t, n);
-        assert_eq!(io.cmds, ["cargo test --release", "sleep 60"]);
-        assert_eq!(io.out.as_deref(), Some("running 3 tests\ntest a ... ok\ntest b ... FAILED"));
-        assert_eq!(io.exit, Some(101));
-        // The second exec: changes a file, with line numbers (from the unified diff), e stops at the changed line
-        let e2 = t.nodes[t.nodes[t.roots[0]].kids[1]].kids[0];
-        assert_eq!((t.nodes[e2].name.as_str(), t.nodes[e2].label.as_str()), ("Patch", "src/b.rs"));
-        let io = crate::trace::io(&t, e2);
-        let rows: Vec<(char, Option<u64>)> = io.edits[0].1.iter().map(|c| (c.c, c.no)).collect();
-        assert_eq!(rows, [(' ', Some(7)), ('-', Some(8)), ('+', Some(8)), (' ', Some(9))]);
-        assert_eq!(io.file, Some(("/p/app/src/b.rs".into(), 8)));
-        assert!(io.input.is_none() && io.cmds.is_empty());
-    }
-
-    #[test]
-    fn old_style_tools_their_end_events_and_an_interrupted_turn() {
-        let (t, _) = fixture("old-tools");
-        let turn = t.roots[2];
-        assert_eq!((t.nodes[turn].label.as_str(), t.nodes[turn].state), ("再跑一次", St::Stopped));
-        let call = t.nodes[turn].kids[0];
-        let (build, patch) = (t.nodes[call].kids[0], t.nodes[call].kids[1]);
-        let b = &t.nodes[build];
-        // Duration is what exec_command_end states, output with the head stripped
-        assert_eq!((b.name.as_str(), b.label.as_str(), b.t1 - b.t0, b.exact, b.state), ("Shell", "cargo build", 3500, true, St::Ok));
-        assert_eq!(io(&t, b).out.as_deref(), Some("Finished\n"));
-        // apply_patch verification failed: an error; two files, the new one starts at line 1
-        let p = &t.nodes[patch];
-        assert_eq!((p.name.as_str(), p.label.as_str(), p.state), ("Patch", "docs/n.md 等 2 个文件", St::Err));
-        let io = io(&t, p);
-        assert_eq!(io.edits.len(), 2);
-        assert_eq!(io.edits[0].1.iter().map(|c| (c.c, c.no)).collect::<Vec<_>>(), [('+', Some(1)), ('+', Some(2))]);
-        assert_eq!(io.edits[1].1.iter().map(|c| c.c).collect::<String>(), "-+");
-    }
-
-    #[test]
-    fn the_chat_steps_and_detail_read_back_what_codex_said_and_ran() {
-        let (t, _) = fixture("page");
-        let turn = t.roots[0];
-        let plain = |ps: &[crate::trace::Para], w: usize| {
-            crate::trace::wrap(ps, w).iter().map(|l| crate::ansi::plain(l).trim_end().to_string()).collect::<Vec<_>>()
-        };
-        let c = crate::trace::chat(&t, turn, false, 0);
-        assert_eq!(plain(&c.asked, 60), ["你  跑一下测试", "    顺便修掉", "    [图片]"]);
-        assert_eq!(plain(&c.reply, 60)[0], "Codex  改好了:b 的断言写错了。");
-        // Right side: a folded exec shows the start of its output and the command count at the right; changing files shows
-        // the changed lines
-        let steps: Vec<String> = crate::trace::steps(&t, turn, false, 0, &|_| false).iter().flat_map(|s| plain(&s.paras, 70)).collect();
-        assert!(steps.iter().any(|l| l.starts_with("▸ Shell cargo test --release") && l.ends_with("2 条命令 · 1.5s")), "{steps:#?}");
-        assert!(steps.iter().any(|l| l == "  running 3 tests"), "{steps:#?}");
-        assert!(steps.iter().any(|l| l.starts_with("▸ Patch src/b.rs") && l.ends_with("+1 -1")), "{steps:#?}");
-        assert!(steps.iter().any(|l| l == "  8 +     assert_eq!(x, 2);"), "{steps:#?}");
-        assert!(steps.iter().any(|l| l == "思考 修 b · 改断言"), "{steps:#?}");
-        // Unfolded: both commands written out
-        let open: Vec<String> = crate::trace::steps(&t, turn, false, 0, &|_| true).iter().flat_map(|s| plain(&s.paras, 70)).collect();
-        assert!(open.windows(2).any(|w| w[0] == "  $ cargo test --release" && w[1] == "  $ sleep 60"), "{open:#?}");
-        // Details: commands, exit code; e writes Markdown
-        let e1 = t.nodes[t.nodes[turn].kids[0]].kids[0];
-        let d = plain(&crate::trace::detail(&t, e1, false, 0), 80);
-        assert!(d.iter().any(|l| l == "cargo test --release") && d.iter().any(|l| l == "sleep 60"), "{d:#?}");
-        let Some(crate::trace::View::Text { text, .. }) = crate::trace::view(&t, turn, false, 0) else { panic!() };
-        for want in [
-            "## 你\n\n跑一下测试",
-            "### Shell · cargo test --release",
-            "```sh\ncargo test --release\nsleep 60\n```",
-            "```diff\n@@ 第 7 行 @@",
-        ] {
-            assert!(text.contains(want), "缺「{want}」:{text}");
-        }
-    }
-
-    #[test]
-    fn a_block_whose_signature_stays_the_same_looks_the_same_after_the_record_grows() {
-        // A running session: the log read up to half of the first turn, then read on. Blocks whose signature didn't change are reused (the
-        // UI doesn't re-lay out) and must be identical to re-laid-out ones
-        let all = fixture_lines();
-        let p = file("grow", &all[..13]);
-        let mut t = Trace::open_born(p.clone(), Agent::Codex, 0).unwrap();
-        let turn = t.roots[0];
-        let now = ts_ms(&at(30_000));
-        let snap = |t: &Trace, open: bool| -> Vec<(usize, u64, Vec<String>)> {
-            let list = crate::trace::step_nodes(t, turn);
-            let open = |_| open;
-            (0..list.len())
-                .map(|k| {
-                    let s = crate::trace::step(t, turn, k, true, now, &open).unwrap();
-                    (
-                        list[k],
-                        crate::trace::step_sig(t, turn, &list, k, true, now, &open),
-                        crate::trace::wrap(&s.paras, 70).iter().map(crate::ansi::plain).collect(),
-                    )
-                })
-                .collect()
-        };
-        for open in [false, true] {
-            let mut before = snap(&t, open);
-            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-            for l in &all[13..22] {
-                let (ts, k, pl) = (&l["timestamp"], &l["type"], &l["payload"]);
-                writeln!(f, r#"{{"timestamp":{ts},"type":{k},"payload":{pl}}}"#).unwrap();
-            }
-            assert!(t.tail().unwrap());
-            let after = snap(&t, open);
-            let mut kept = 0;
-            for (node, sig, text) in &after {
-                if let Some(b) = before.iter().find(|b| b.0 == *node).filter(|b| b.1 == *sig) {
-                    assert_eq!(&b.2, text, "签名没变、样子变了:节点 {node}");
-                    kept += 1;
-                }
-            }
-            // The head (whole-turn total), the exec whose background command finished, and the call that's no longer the last
-            // get re-laid out; the first call stays as it was
-            let c1 = t.nodes[turn].kids[0];
-            assert!(before.iter().chain(&after).filter(|b| b.0 == c1).map(|b| b.1).collect::<std::collections::HashSet<_>>().len() == 1);
-            assert!(kept >= 1 && kept < after.len(), "kept={kept} of {}", after.len());
-            // Once more (the next round of open grows from the same starting point)
-            before.clear();
-            let _ = std::fs::write(
-                &p,
-                all[..13]
-                    .iter()
-                    .map(|l| format!("{{\"timestamp\":{},\"type\":{},\"payload\":{}}}\n", l["timestamp"], l["type"], l["payload"]))
-                    .collect::<String>(),
-            );
-            t = Trace::open_born(p.clone(), Agent::Codex, 0).unwrap();
-        }
-    }
-
-    #[test]
-    fn js_literals_and_output_heads() {
-        assert_eq!(
-            lit_cmds(r#"await tools.exec_command({ cmd: "echo \"hi\"\nls", workdir: '/x' }); tools.exec_command({cmd: `git log -1`})"#),
-            ["echo \"hi\"\nls", "git log -1"]
-        );
-        assert_eq!(lit_cmds("tools.exec_command({cmd})"), Vec::<String>::new());
-        assert_eq!(
-            exec_head("await tools.write_stdin({session_id: 3, chars: ''})", ""),
-            ("stdin", "await tools.write_stdin({session_id: 3, chars: ''})".to_string())
-        );
-        assert_eq!(strip_head("Exit code: 1\nWall time: 0.2 seconds\nOutput:\nboom"), ("boom".to_string(), Some(1), false));
-        assert_eq!(strip_head("Script failed\nWall time 0.1 seconds\nOutput:\nTypeError"), ("TypeError".to_string(), None, true));
-        assert_eq!(
-            strip_head(r#"{"output":"Success.\n","metadata":{"exit_code":0,"duration_seconds":0.1}}"#),
-            ("Success.\n".to_string(), Some(0), false)
-        );
-        assert_eq!(strip_head("plain"), ("plain".to_string(), None, false));
-        assert_eq!(cmd_text(&json!(["bash", "-lc", "make"])), "make");
-        assert_eq!(cmd_text(&json!(["git", "status"])), "git status");
-    }
-
     /// A CODEX_HOME: sessions/2026/09/30/rollout-…-<id>.jsonl (lines with an ordinal have it before payload, as Codex writes)
-    fn home_file(home: &std::path::Path, id: &str, lines: &[Value]) -> PathBuf {
+    pub fn home_file(home: &std::path::Path, id: &str, lines: &[Value]) -> PathBuf {
         let d = home.join("sessions/2026/09/30");
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join(format!("rollout-2026-09-30T01-00-00-{id}.jsonl"));
@@ -1715,13 +1531,13 @@ pub(crate) mod tests {
         p
     }
 
-    fn home(name: &str) -> PathBuf {
+    pub fn home(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("aca-trace-cxh-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
 
-    fn child_meta(id: &str, extra: Value) -> Value {
+    pub fn child_meta(id: &str, extra: Value) -> Value {
         let mut p = json!({"id": id, "cwd": "/p/app", "cli_version": "0.155.0", "agent_nickname": "Euclid", "agent_role": "explorer",
                            "source": {"subagent": {"thread_spawn": {"parent_thread_id": "th", "depth": 1, "agent_nickname": "Euclid", "agent_role": "explorer"}}}});
         p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
@@ -1730,7 +1546,7 @@ pub(crate) mod tests {
 
     /// The parent starts two child threads in one turn: one new version (sub_agent_activity arrives when it starts), one old (id in
     /// spawn_agent's output)
-    pub(crate) fn family(name: &str, kid1_done: bool) -> (PathBuf, PathBuf) {
+    pub fn family(name: &str, kid1_done: bool) -> (PathBuf, PathBuf) {
         let h = home(name);
         let spawn = |ms, id: &str, args: Value| {
             ri(ms, json!({"type": "function_call", "name": "spawn_agent", "call_id": id, "arguments": args.to_string()}))
@@ -1819,42 +1635,104 @@ pub(crate) mod tests {
         );
         (h, parent)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{at, ev, family, fixture, kinds, open, row, tokens};
+    use super::*;
+    use crate::agent::Agent;
+    use serde_json::json;
 
     #[test]
-    fn child_threads_hang_under_spawn_agent_and_the_parent_history_they_copied_is_not_counted() {
-        let (_h, parent) = family("kids", true);
-        let t = Trace::open_born(parent, Agent::Codex, 0).unwrap();
-        let call = t.nodes[t.roots[0]].kids[0];
-        let (sp1, sp2) = (t.nodes[call].kids[0], t.nodes[call].kids[1]);
-        assert_eq!((t.nodes[sp1].name.as_str(), t.nodes[sp1].label.as_str()), ("Agent", "explorer · 看看 b.rs 里的断言"));
-        let k1 = t.sub_of(sp1).expect("kid1 按 sub_agent_activity 挂上");
-        let k2 = t.sub_of(sp2).expect("kid2 按输出里的 agent_id 挂上");
-        assert_eq!((k1.kind.as_str(), k1.desc.as_str(), k2.desc.as_str()), ("explorer", "Euclid", "Noether"));
-        // The parent turn copied at the start is folded into one block, not counted; its own turn is turn 1, receiving the task
-        for k in [k1, k2] {
-            let roots: Vec<Kind> = k.t.roots.iter().map(|&r| k.t.nodes[r].kind).collect();
-            assert_eq!(roots, [Kind::Copied, Kind::Turn], "{}", k.id);
-            assert_eq!(k.t.turn_no(k.t.roots[1]), Some(1));
-        }
-        assert_eq!(crate::trace::asked(&k1.t, k1.t.roots[1]), ("任务", "看看 b.rs 里的断言".to_string()));
-        // Money: a child thread counts only its own usage (not the copied call), added to the turn that started it
-        let cost = |m: &str, tok: [u64; 5]| crate::usage::call_cost(m, tok, false, false, 0).unwrap();
-        let own = cost("gpt-5.5", [100, 0, 0, 300, 70]) + cost("gpt-5.5", [100, 0, 0, 200, 60]);
-        assert!((k1.t.total(false, 0).2.cost - own).abs() < 1e-12);
-        let kid2 = cost("gpt-5.5", [300, 0, 0, 0, 40]);
-        assert!((k2.t.total(false, 0).2.cost - kid2).abs() < 1e-12, "{}", k2.t.total(false, 0).2.cost);
-        let s = t.sum(t.roots[0]);
-        assert_eq!((s.calls, s.subs), (2, 2));
-        assert!((s.sub_cost - own - kid2).abs() < 1e-12);
-        // All done; the right side shows the child thread's numbers and what it said last
-        assert!(!t.sub_live(sp1, true, ts_ms(&at(9000))));
-        let plain = |ps: &[crate::trace::Para]| {
-            crate::trace::wrap(ps, 80).iter().map(|l| crate::ansi::plain(l).trim_end().to_string()).collect::<Vec<_>>()
-        };
-        let (ps, _) = crate::trace_page::tool_item(&t, sp1, false, 0, false);
-        let text = plain(&ps);
-        assert!(text[0].starts_with("· Agent explorer · 看看 b.rs 里的断言") && text[0].contains("2 调用"), "{text:#?}");
-        assert_eq!(&text[1..], ["  b.rs 第 8 行:断言写反了。", "  改成 2 就对了"]);
+    fn a_turn_is_its_calls_each_new_token_count_is_one_and_the_money_matches_the_bill() {
+        let (t, p) = fixture("turns");
+        let roots: Vec<Kind> = t.roots.iter().map(|&r| t.nodes[r].kind).collect();
+        assert_eq!(roots, [Kind::Turn, Kind::Mark, Kind::Turn]);
+        let turn = t.roots[0];
+        let n = &t.nodes[turn];
+        assert_eq!((n.label.as_str(), n.exact, t.dur(turn, false, 0), n.state), ("跑一下测试", true, 19_000, St::Ok));
+        // Three calls: re-reported cumulative counts don't count
+        assert_eq!(kinds(&t, turn), [Kind::Call, Kind::Call, Kind::Call]);
+        let c1 = &t.nodes[n.kids[0]];
+        // From the prompt to token_usage_record; cache reads taken out of input
+        assert_eq!((c1.t1 - c1.t0, c1.tok, c1.think, c1.label.as_str()), (8100 - 1030, [100, 0, 0, 800, 50], 3, "先跑测试"));
+        assert_eq!((t.models[c1.model].as_str(), c1.effort.as_str()), ("gpt-5.5", "high"));
+        let c2 = &t.nodes[n.kids[1]];
+        // The second call starts at the previous tool output; when thinking has a summary, write its first sentence
+        assert_eq!((c2.t0, c2.thought.as_str()), (ts_ms(&at(9500)), "**修 b**"));
+        assert_eq!(t.nodes[n.kids[2]].label, "改好了:b 的断言写错了。");
+        assert_eq!(t.nodes[t.roots[1]].label, "压缩");
+        // Money: same as the $ panel computes from the same log
+        let s = t.total(false, 0).2;
+        let mut seen = crate::usage::fixtures::codex_seen(&p);
+        let bill: f64 = seen.drain(..).map(|(m, tok)| crate::usage::call_cost(&m, tok, false, false, 0).unwrap()).sum();
+        assert_eq!(s.calls, 4);
+        assert!((s.cost - bill).abs() < 1e-12, "{} vs {bill}", s.cost);
+    }
+
+    #[test]
+    fn what_an_exec_ran_hangs_under_it_even_when_it_finishes_later() {
+        let (t, _) = fixture("exec");
+        let c1 = t.nodes[t.roots[0]].kids[0];
+        let e1 = t.nodes[c1].kids[0];
+        let n = &t.nodes[e1];
+        // The first line shows the first command really run; failed tests mean an error, the exit code is the failed one's
+        assert_eq!((n.name.as_str(), n.label.as_str(), n.t1 - n.t0, n.state), ("Shell", "cargo test --release", 1500, St::Err));
+        let io = io(&t, n);
+        assert_eq!(io.cmds, ["cargo test --release", "sleep 60"]);
+        assert_eq!(io.out.as_deref(), Some("running 3 tests\ntest a ... ok\ntest b ... FAILED"));
+        assert_eq!(io.exit, Some(101));
+        // The second exec: changes a file, with line numbers (from the unified diff), e stops at the changed line
+        let e2 = t.nodes[t.nodes[t.roots[0]].kids[1]].kids[0];
+        assert_eq!((t.nodes[e2].name.as_str(), t.nodes[e2].label.as_str()), ("Patch", "src/b.rs"));
+        let io = crate::trace::io(&t, e2);
+        let rows: Vec<(char, Option<u64>)> = io.edits[0].1.iter().map(|c| (c.c, c.no)).collect();
+        assert_eq!(rows, [(' ', Some(7)), ('-', Some(8)), ('+', Some(8)), (' ', Some(9))]);
+        assert_eq!(io.file, Some(("/p/app/src/b.rs".into(), 8)));
+        assert!(io.input.is_none() && io.cmds.is_empty());
+    }
+
+    #[test]
+    fn old_style_tools_their_end_events_and_an_interrupted_turn() {
+        let (t, _) = fixture("old-tools");
+        let turn = t.roots[2];
+        assert_eq!((t.nodes[turn].label.as_str(), t.nodes[turn].state), ("再跑一次", St::Stopped));
+        let call = t.nodes[turn].kids[0];
+        let (build, patch) = (t.nodes[call].kids[0], t.nodes[call].kids[1]);
+        let b = &t.nodes[build];
+        // Duration is what exec_command_end states, output with the head stripped
+        assert_eq!((b.name.as_str(), b.label.as_str(), b.t1 - b.t0, b.exact, b.state), ("Shell", "cargo build", 3500, true, St::Ok));
+        assert_eq!(io(&t, b).out.as_deref(), Some("Finished\n"));
+        // apply_patch verification failed: an error; two files, the new one starts at line 1
+        let p = &t.nodes[patch];
+        assert_eq!((p.name.as_str(), p.label.as_str(), p.state), ("Patch", "docs/n.md 等 2 个文件", St::Err));
+        let io = io(&t, p);
+        assert_eq!(io.edits.len(), 2);
+        assert_eq!(io.edits[0].1.iter().map(|c| (c.c, c.no)).collect::<Vec<_>>(), [('+', Some(1)), ('+', Some(2))]);
+        assert_eq!(io.edits[1].1.iter().map(|c| c.c).collect::<String>(), "-+");
+    }
+
+    #[test]
+    fn js_literals_and_output_heads() {
+        assert_eq!(
+            lit_cmds(r#"await tools.exec_command({ cmd: "echo \"hi\"\nls", workdir: '/x' }); tools.exec_command({cmd: `git log -1`})"#),
+            ["echo \"hi\"\nls", "git log -1"]
+        );
+        assert_eq!(lit_cmds("tools.exec_command({cmd})"), Vec::<String>::new());
+        assert_eq!(
+            exec_head("await tools.write_stdin({session_id: 3, chars: ''})", ""),
+            ("stdin", "await tools.write_stdin({session_id: 3, chars: ''})".to_string())
+        );
+        assert_eq!(strip_head("Exit code: 1\nWall time: 0.2 seconds\nOutput:\nboom"), ("boom".to_string(), Some(1), false));
+        assert_eq!(strip_head("Script failed\nWall time 0.1 seconds\nOutput:\nTypeError"), ("TypeError".to_string(), None, true));
+        assert_eq!(
+            strip_head(r#"{"output":"Success.\n","metadata":{"exit_code":0,"duration_seconds":0.1}}"#),
+            ("Success.\n".to_string(), Some(0), false)
+        );
+        assert_eq!(strip_head("plain"), ("plain".to_string(), None, false));
+        assert_eq!(cmd_text(&json!(["bash", "-lc", "make"])), "make");
+        assert_eq!(cmd_text(&json!(["git", "status"])), "git status");
     }
 
     #[test]
@@ -1915,41 +1793,6 @@ pub(crate) mod tests {
             ],
         );
         assert_eq!(t.nodes[t.roots[0]].kind, Kind::Turn);
-    }
-
-    #[test]
-    fn rolled_back_turns_are_greyed_and_unnumbered_but_their_money_stays() {
-        let turn = |ms: u32, id: &str, ask: &str, total: u64| {
-            vec![
-                ev(ms, json!({"type": "task_started", "turn_id": id})),
-                ev(ms + 10, json!({"type": "user_message", "message": ask, "images": [], "local_images": []})),
-                say(ms + 500, "好", "final_answer"),
-                tokens(ms + 600, total, 100, 0, 10),
-                ev(ms + 700, json!({"type": "task_complete", "turn_id": id})),
-            ]
-        };
-        let mut lines = vec![meta("0.150.0"), row(500, "turn_context", json!({"cwd": "/p/app", "model": "gpt-5.5"}))];
-        lines.extend(turn(1000, "1", "一", 110));
-        lines.extend(turn(2000, "2", "二", 220));
-        lines.extend(turn(3000, "3", "三", 330));
-        lines.push(ev(3900, json!({"type": "thread_rolled_back", "num_turns": 2})));
-        lines.extend(turn(4000, "4", "改过的二", 440));
-        let p = file("rollback", &lines);
-        let t = Trace::open_born(p.clone(), Agent::Codex, 0).unwrap();
-        let turns: Vec<usize> = t.roots.iter().copied().filter(|&r| t.nodes[r].kind == Kind::Turn).collect();
-        let rolled: Vec<bool> = turns.iter().map(|&r| t.nodes[r].rolled).collect();
-        assert_eq!(rolled, [false, true, true, false]);
-        assert_eq!(turns.iter().map(|&r| t.turn_no(r)).collect::<Vec<_>>(), [Some(1), None, None, Some(2)]);
-        assert_eq!(crate::trace::where_of(&t, turns[1]), "已回退");
-        let (n, _, s) = t.total(false, 0);
-        let bill: f64 = crate::usage::tests::codex_seen(&p)
-            .into_iter()
-            .map(|(m, tok)| crate::usage::call_cost(&m, tok, false, false, 0).unwrap())
-            .sum();
-        assert_eq!((n, s.calls), (2, 4));
-        assert!((s.cost - bill).abs() < 1e-12);
-        let c = crate::trace::chat(&t, turns[1], false, 0);
-        assert!(crate::ansi::plain(&c.foot.body).starts_with("↶ 已回退 · "));
     }
 
     #[test]

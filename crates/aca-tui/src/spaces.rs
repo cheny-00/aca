@@ -4,7 +4,7 @@
 //! `` ` `` returns to the previous one, `S` lists them (`^R` renames).
 //! `h` is hidden: not listed in `S`, skipped by `[` `]`; you enter it with `q h` (after leaving, `` ` `` gets back too).
 //! Where a session is: its own assignment → a subsession follows its parent session → its group's (recorded by `Q` on a fold
-//! row) → `1` (see `ui::space_of`).
+//! row) → `1` (see `ui::list::space_of`).
 //! Groups are recorded too so that sessions opened later in that group (including ones opened by `aca new` in a terminal) land
 //! there directly, and a group hidden in h doesn't leak out.
 //! Keyed by `notes::key` (registered sessions by id, so renames and restarts follow along).
@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::state::{state_file, write_atomic};
+use aca_records::paths::{state_file, write_atomic};
 
 /// Sessions never assigned go here
 pub const HOME: char = '1';

@@ -26,7 +26,7 @@ use aca_core::{t, tr};
 use unicode_width::UnicodeWidthChar;
 
 use crate::reads::Reads;
-use crate::ui::SEEN_SLACK;
+use crate::view::SEEN_SLACK;
 
 /// How many names of failing plugins to list; the rest as +N
 const NAMES: usize = 2;
@@ -156,7 +156,7 @@ pub fn next(args: &[String]) -> i32 {
         return 0;
     };
     // The Ctrl+Q and hotkey bindings are gone after a server restart: redo them before going into a session (as `aca attach` does)
-    aca_core::tmux::bind_detach();
+    aca_core::tmux::bind_detach(aca_core::plugin::hotkey_binds);
     let went = if in_tmux {
         let mut a = vec!["switch-client"];
         if let Some(c) = &client {

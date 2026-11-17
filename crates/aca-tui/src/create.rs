@@ -15,6 +15,7 @@ use aca_core::i18n::Tr;
 use aca_core::session;
 use aca_core::store::Store;
 use aca_core::{t, tr};
+use aca_records::words::tilde;
 use unicode_width::UnicodeWidthStr;
 
 use crate::data::{GroupHints, Session, tmux_cmd};
@@ -26,15 +27,6 @@ fn env(k: &str) -> Option<String> {
 
 fn home() -> String {
     env("HOME").unwrap_or_default()
-}
-
-/// /Users/me/proj → ~/proj
-pub fn tilde(dir: &str) -> String {
-    let h = home();
-    match dir.strip_prefix(&h) {
-        Some(rest) if !h.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
-        _ => dir.to_string(),
-    }
 }
 
 /// Typed path → absolute path: expand ~, relative paths count from the home directory, drop the trailing /

@@ -8,6 +8,9 @@
 //! personal = "~/.claude-personal"
 //! bedrock = { env = { CLAUDE_CODE_USE_BEDROCK = "1", AWS_PROFILE = "work" } }
 //!
+//! team = { sandbox = "work" } # only ever started inside the sandbox `work` (see [`crate::sandbox`]); its config directory
+//!                              # is that sandbox's, no home here
+//!
 //! [accounts.codex]
 //! work = "~/.codex-work"
 //! team = { home = "~/.codex2", args = ["--profile", "team"] } # arguments on top of the directory
@@ -60,6 +63,13 @@
 //! remote = "auto"              # whether to act as remote (no browsers listed, a login finishable on another device):
 //!                              # auto looks at SSH and whether Linux has a GUI; yes / no fixes it
 //!
+//! [sandbox.work]               # a cage reached over ssh (see crate::sandbox)
+//! ssh = "work"                 # the Host in ~/.ssh/config
+//! up = "~/cage/up"             # run first when ssh can't connect
+//! dirs = ["~/work/app"]        # the directories mounted into it, at the same path; its sessions start in one of them
+//! workspace = "~/cages/work"   # also mounted at the same path: claude/ is its Claude's config dir, worktrees/ its worktrees
+//! space = "3"                  # the interface's workspace its sessions go to unless you send them elsewhere
+//!
 //! [tools.aider]                # no kind and not a built-in name: a declared tool; the keys below tell aca
 //!                              # how to treat it (see agent/declared.rs)
 //! cmd = ["aider"]              # unset = the tool name
@@ -76,7 +86,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::{agent, paths};
+use crate::paths;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
@@ -113,6 +123,10 @@ pub struct Tool {
     /// Codex: aca plugins to enable this time (`-c plugins.<name>@aca.enabled=true`). Filled at start
     #[serde(skip)]
     pub codex_plugins: Vec<String>,
+    /// Started inside a sandbox: only the tool's own arguments, no hooks, aca's mod, plugin directories or MCP servers (all
+    /// files on this Mac). Set at start
+    #[serde(skip)]
+    pub bare: bool,
 }
 
 /// Account: one more layer on top of the tool when starting an agent. Authentication is the harness's own business (its config
@@ -129,6 +143,11 @@ pub struct Account {
     pub env_file: String,
     /// Arguments added every time, such as Codex's `--profile team`
     pub args: Vec<String>,
+    /// Bound to this sandbox (`[sandbox.<it>]`): started only in it, see [`crate::sandbox`]; empty = on this Mac as it is
+    pub sandbox: String,
+    /// The bound sandbox's `env`, under the account's own (env_file, env). Never written in config.toml: filled when the account
+    /// is resolved ([`crate::agent::account`])
+    pub sandbox_env: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -146,13 +165,21 @@ struct Layer {
     env: BTreeMap<String, String>,
     env_file: String,
     args: Vec<String>,
+    sandbox: String,
 }
 
 impl From<AccountDef> for Account {
     fn from(d: AccountDef) -> Account {
         match d {
             AccountDef::Dir(home) => Account { home: dir(&home), ..Default::default() },
-            AccountDef::Layer(l) => Account { home: dir(&l.home), env: l.env, env_file: paths::expand(l.env_file.trim()), args: l.args },
+            AccountDef::Layer(l) => Account {
+                home: dir(&l.home),
+                env: l.env,
+                env_file: paths::expand(l.env_file.trim()),
+                args: l.args,
+                sandbox: l.sandbox.trim().to_string(),
+                sandbox_env: BTreeMap::new(),
+            },
         }
     }
 }
@@ -169,6 +196,8 @@ pub struct Config {
     /// tool → account name → that layer
     pub accounts: BTreeMap<String, BTreeMap<String, Account>>,
     pub tools: BTreeMap<String, Tool>,
+    /// `[sandbox.<name>]`
+    pub sandbox: BTreeMap<String, Sandbox>,
     pub inbox: Inbox,
     pub trust: Trust,
     pub keys: Keys,
@@ -176,6 +205,29 @@ pub struct Config {
     pub login: Login,
     #[serde(deserialize_with = "lenient")]
     pub idle: Idle,
+}
+
+/// `[sandbox.<name>]`, a special environment (see [`crate::sandbox`]): with `ssh`, a cage reached over ssh, with directories of
+/// this Mac mounted into it at the same path; without, this Mac with its `env` set. Paths as written, `~` expanded when used
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Sandbox {
+    /// The name ssh connects to (a Host in ~/.ssh/config); empty = it runs on this Mac
+    pub ssh: String,
+    /// Variables every session in it gets (a time zone, a proxy), under the account's own
+    pub env: BTreeMap<String, String>,
+    /// The command that starts it, run when ssh can't connect; empty = none
+    pub up: String,
+    /// The project directories mounted into it
+    pub dirs: Vec<String>,
+    /// Its own directory (mounted too, in a cage): `claude/` / `codex/` are its accounts' config directories, `worktrees/`
+    /// holds a cage's sessions' worktrees
+    pub workspace: String,
+    /// The interface's workspace (one key, `3`) its sessions go to unless sent elsewhere; empty = like any other session
+    pub space: String,
+    /// Other sessions may start its sessions (delegating) and send them messages; their workers' notices come back out
+    /// as usual. Off = closed (see [`crate::sandbox`])
+    pub delegate: bool,
 }
 
 /// `[idle]`: idle sessions (see [`crate::session::stop_idle`])
@@ -361,7 +413,7 @@ fn own_key(set: Option<&str>, default: &str) -> Result<Option<String>, String> {
     if k.is_empty() {
         return Ok(None);
     }
-    crate::plugin::hotkey_ok(k).map(|_| Some(k.to_string()))
+    crate::tmux::hotkey_ok(k).map(|_| Some(k.to_string()))
 }
 
 /// `[trust]`: the "do you trust …" questions agents ask when they start
@@ -421,54 +473,34 @@ pub fn parse(text: &str) -> Config {
 }
 
 impl Config {
-    /// The definition for a tool name; the built-in tools have one even when unset. A built-in name with no kind gets itself as kind;
-    /// other names with no kind are declared tools, and kind stays empty
-    pub fn tool(&self, name: &str) -> Option<Tool> {
-        let builtin = agent::builtin(name).is_some();
-        let mut t = self.tools.get(name).cloned().or_else(|| builtin.then(Tool::default))?;
-        if t.kind.is_empty() && builtin {
-            t.kind = name.to_string();
-        }
-        Some(t)
-    }
-
     /// A registered account; none = None
     pub fn account(&self, kind: &str, name: &str) -> Option<&Account> {
         self.accounts.get(kind)?.get(name)
-    }
-
-    /// The names the `n` menu / `aca new` accept: tools, and "tool:account"
-    pub fn names(&self) -> Vec<String> {
-        let mut v: Vec<String> = agent::kinds().map(String::from).collect();
-        v.extend(self.tools.keys().filter(|k| agent::builtin(k).is_none()).cloned());
-        for (kind, accounts) in &self.accounts {
-            v.extend(accounts.keys().map(|a| format!("{kind}:{a}")));
-        }
-        v
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{names, tool};
 
     #[test]
     fn builtin_tools_exist_without_any_config_and_custom_ones_name_their_kind() {
         let c = parse("");
-        assert_eq!(c.tool("claude").unwrap().kind, "claude");
-        assert!(c.tool("ccx").is_none());
+        assert_eq!(tool(&c, "claude").unwrap().kind, "claude");
+        assert!(tool(&c, "ccx").is_none());
         let c = parse(
             "[accounts.claude]\nsub = \"~/.claude-subscription/\"\n[tools.claude]\naccount = \"sub\"\n\
              [tools.ccx]\nkind = \"claude\"\nargs = [\"--model\", \"opus\"]\n",
         );
-        assert_eq!(c.tool("claude").unwrap().account, "sub");
+        assert_eq!(tool(&c, "claude").unwrap().account, "sub");
         assert_eq!(
-            c.tool("ccx").unwrap(),
+            tool(&c, "ccx").unwrap(),
             Tool { kind: "claude".into(), args: vec!["--model".into(), "opus".into()], ..Default::default() }
         );
         assert!(c.account("claude", "sub").unwrap().home.ends_with("/.claude-subscription"));
         assert!(c.account("claude", "nope").is_none());
-        assert_eq!(c.names(), ["claude", "codex", "pi", "opencode", "shell", "ccx", "claude:sub"]);
+        assert_eq!(names(&c), ["claude", "codex", "pi", "opencode", "shell", "ccx", "claude:sub"]);
         // A broken file doesn't blow up
         assert_eq!(parse("[accounts\nx"), Config::default());
     }
@@ -495,11 +527,11 @@ mod tests {
             "[tools.aider]\nresume = [\"--session\", \"{conv}\"]\nbusy = ['Working\\.\\.\\.']\nenv = { A = \"1\" }\n\
              [tools.claude]\nenv = { B = \"2\" }\n",
         );
-        let t = c.tool("aider").unwrap();
+        let t = tool(&c, "aider").unwrap();
         assert_eq!((t.kind.as_str(), t.resume.len(), t.busy[0].as_str(), t.env["A"].as_str()), ("", 2, r"Working\.\.\.", "1"));
         // A built-in tool with other keys set still has itself as kind
-        assert_eq!((c.tool("claude").unwrap().kind.as_str(), c.tool("claude").unwrap().env["B"].as_str()), ("claude", "2"));
-        assert_eq!(c.names(), ["claude", "codex", "pi", "opencode", "shell", "aider"]);
+        assert_eq!((tool(&c, "claude").unwrap().kind.as_str(), tool(&c, "claude").unwrap().env["B"].as_str()), ("claude", "2"));
+        assert_eq!(names(&c), ["claude", "codex", "pi", "opencode", "shell", "aider"]);
     }
 
     #[test]
@@ -521,7 +553,7 @@ mod tests {
             (api.home.as_str(), api.env_file.as_str(), api.env["OPENAI_BASE_URL"].as_str()),
             ("", format!("{home}/k.env").as_str(), "https://x")
         );
-        assert_eq!(c.names(), ["claude", "codex", "pi", "opencode", "shell", "codex:api", "codex:corp", "codex:labs"]);
+        assert_eq!(names(&c), ["claude", "codex", "pi", "opencode", "shell", "codex:api", "codex:corp", "codex:labs"]);
     }
 
     #[test]

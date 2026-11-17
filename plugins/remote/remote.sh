@@ -359,6 +359,10 @@ cmd_run() {
   need_conf
   host=$(trim "${ACA_ARG_HOST:-}")
   [ -n "$host" ] || die "$(t '未指定机器(host)' 'no host given')"
+  # A sandbox is closed: aca sends no work into it (aca help config), whichever alias reaches it
+  if box=$("${ACA_BIN:-aca}" sandbox-of "$host" 2>/dev/null); then
+    die "$(t "${host} 是沙箱 ${box},沙箱是封闭的:不往里派任务" "${host} is sandbox ${box}, which is closed: no tasks go in")"
+  fi
   cmd=${ACA_ARG_COMMAND:-}
   [ -n "$(trim "$cmd")" ] || die "$(t '未指定要运行的命令' 'no command to run')"
   within=$(within_arg) || exit 1

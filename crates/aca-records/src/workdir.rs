@@ -18,11 +18,12 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use aca_core::t;
+use aca_core::config::Config;
+use aca_core::{proc, status, store, t};
 
-use crate::data::Agent;
+use crate::agent::{Agent, agent_in, kind_of, registered};
 
-/// Where to look: these fields of a session (from `Session`)
+/// Where to look: these fields of a session (from the interface's row, or a registered session: [`work_dir`])
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Where {
     /// The registered directory (for an unregistered one, the pane's current directory)
@@ -32,13 +33,6 @@ pub struct Where {
     pub agent: Agent,
     /// The registered Claude / Codex conversation id (the one `B` copies)
     pub id: String,
-}
-
-impl Where {
-    pub fn of(s: &crate::data::Session) -> Where {
-        let id = s.info.lines().find_map(|l| l.strip_prefix("Session: ")).unwrap_or("").to_string();
-        Where { dir: s.dir.clone(), pid: s.pid, agent: s.agent, id }
-    }
 }
 
 /// The directory found, and how it was found (shown when it differs from the registered one)
@@ -107,7 +101,7 @@ fn claude_log(conf: &Path, pid: u32, id: &str) -> Option<PathBuf> {
 }
 
 /// Codex's rollout: find it by session id, going back from the most recent date
-pub(crate) fn codex_log(conf: &Path, id: &str) -> Option<PathBuf> {
+pub fn codex_log(conf: &Path, id: &str) -> Option<PathBuf> {
     if id.is_empty() || id.contains('/') {
         return None;
     }
@@ -216,8 +210,28 @@ pub fn find_in(w: &Where, conf: Option<&str>) -> Found {
 
 /// Same as `find_in`, with the config directory read from the agent process's environment
 pub fn find(w: &Where) -> Found {
-    let conf = (w.pid > 0).then(|| crate::data::config_home(w.pid, w.agent)).flatten();
+    let conf = (w.pid > 0).then(|| crate::agent::config_home(w.pid, w.agent)).flatten();
     find_in(w, conf.as_deref())
+}
+
+/// The directory a registered session is really working in without building the whole list: `aca show --json`'s
+/// `work`. kitty's floating window (kfloat, cmd+enter) opened inside a session reads it: tmux only knows where the agent started.
+/// Same fields as the interface's list takes for the row
+pub fn work_dir(cfg: &Config, s: &store::Session) -> String {
+    let Some(p) = aca_core::tmux::find(&s.id).filter(|p| !p.dead) else { return s.dir.clone() };
+    let running = agent_in(&proc::fg_kids(), &p);
+    let shell = crate::agent::agent_of_tool(cfg, &s.tool) == Agent::None;
+    let r = status::load(&s.id);
+    let w = Where {
+        dir: if shell && !p.path.is_empty() { p.path.clone() } else { s.dir.clone() },
+        pid: running.map_or(0, |r| r.1),
+        agent: match running.filter(|_| shell) {
+            Some((tool, _)) => kind_of(tool),
+            None => registered(cfg, s).0,
+        },
+        id: if r.conv.is_empty() { s.conv.clone() } else { r.conv },
+    };
+    find(&w).dir
 }
 
 #[cfg(test)]

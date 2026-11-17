@@ -147,7 +147,7 @@ fn read(db: &Path, cfg: &Config, live: &[String]) -> rusqlite::Result<(Groups, V
         .into_iter()
         .map(|(mut s, tmux)| {
             let alive = !tmux.is_empty() && live.contains(&tmux);
-            let kind = cfg.tool(&s.tool).map(|t| t.kind);
+            let kind = crate::agent::tool(cfg, &s.tool).map(|t| t.kind);
             let located = kind.as_deref().and_then(|k| locate(cfg, k, &s.conv, &s.account));
             let skip = match &kind {
                 None => Some(tr!("config.toml 中没有工具 {}", "no tool {} in config.toml", s.tool)),

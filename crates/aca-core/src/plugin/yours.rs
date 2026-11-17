@@ -16,9 +16,9 @@
 use serde_json::json;
 
 use super::decl::{self, Want};
-use super::manifest::hotkey_ok;
 use super::{Entry, MENU_KEYS_TAKEN, registry};
 use crate::paths::Res;
+use crate::tmux::hotkey_ok;
 use crate::tr;
 
 /// The tools this plugin gives agents now (command ids, in manifest order)

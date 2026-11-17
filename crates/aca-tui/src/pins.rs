@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::state::{state_file, write_atomic};
+use aca_records::paths::{state_file, write_atomic};
 
 #[derive(Default)]
 pub struct Pins {

@@ -23,9 +23,11 @@ use aca_core::tmux::Pane;
 use aca_core::i18n::{self, Lang};
 use aca_core::{paths, status};
 use aca_core::{t, tr};
+use aca_records::agent::{Agent, agent_in, agent_of_tool, builtin, config_home, home_var, kind_of, registered};
+use aca_records::subagent::Subagent;
+use aca_records::words::agent_label;
+use aca_records::workdir::Where;
 use regex::Regex;
-
-use crate::subagent::Subagent;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
@@ -50,20 +52,6 @@ impl State {
     pub fn gone(self) -> bool {
         matches!(self, State::Stopped | State::Crashed)
     }
-}
-
-/// Which vendor's agent runs in the session. The account name in the list is colored by it
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub enum Agent {
-    /// A plain tmux session, or one opened as a shell in the first place
-    #[default]
-    None,
-    Claude,
-    Codex,
-    Pi,
-    Opencode,
-    /// A declared tool (a `[tools.<name>]` in config.toml without a kind)
-    Other,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +98,8 @@ pub struct Session {
     /// Which vendor actually runs and with which account (see `identify`), for display; empty = unknown
     pub agent: Agent,
     pub who: String,
+    /// The sandbox it runs in (`[sandbox.<name>]`), shown after its account (`team@work`); empty = on this Mac
+    pub within: String,
     /// The running claude / codex process, 0 = not running / unknown (used to find the directory it actually works in, see `workdir`)
     pub pid: u32,
     /// Registered session id (every operation on it looks it up by this), empty = plain tmux session or extra window inside a session
@@ -212,6 +202,12 @@ impl Sub {
     }
 }
 
+/// Where to look for the directory this row's session really works in (see `workdir`)
+pub fn where_of(s: &Session) -> Where {
+    let id = s.info.lines().find_map(|l| l.strip_prefix("Session: ")).unwrap_or("").to_string();
+    Where { dir: s.dir.clone(), pid: s.pid, agent: s.agent, id }
+}
+
 impl Session {
     /// Key of the session it belongs to (a sub-pane's is the session it hangs under, a session's is itself):
     /// attach, pins and ordering go by it
@@ -232,9 +228,11 @@ impl Session {
         std::iter::successors(self.under(), move |p| hangs.get(*p).map(String::as_str)).take(DEEP)
     }
 
-    /// "Claude·team" / "Codex·alt"; when the account is just the tool name (the fallback shown), only the vendor
+    /// "Claude·team" / "Codex·alt"; when the account is just the tool name (the fallback shown), only the vendor. One running in a
+    /// sandbox says which after it: "Claude·team@work", and a shell inside just "@work"
     pub fn agent_label(&self) -> String {
-        agent_label(self.agent, &self.who)
+        let label = agent_label(self.agent, &self.who);
+        if self.within.is_empty() { label } else { format!("{label}@{}", self.within) }
     }
 
     /// Last column of the list: for running ones, how long it has run (latest activity is always 「刚刚」 ("just now"), which
@@ -296,7 +294,7 @@ pub struct Entry {
 /// and the shell underneath never shows. The three are each a tmux command, done at the same time
 pub fn prepare(name: &str) -> Entry {
     let (been, live) = thread::scope(|s| {
-        s.spawn(aca_core::tmux::bind_detach);
+        s.spawn(|| aca_core::tmux::bind_detach(aca_core::plugin::hotkey_binds));
         let live = s.spawn(live_sessions);
         (been(), live.join().unwrap_or_default())
     });
@@ -587,23 +585,6 @@ pub fn account_env(s: Option<&Session>, pid: u32, agent: Agent) -> Vec<(String, 
     out
 }
 
-/// The built-in tool this vendor is; None for a shell and declared tools
-fn builtin(agent: Agent) -> Option<&'static dyn aca_core::agent::Agent> {
-    let kind = match agent {
-        Agent::Claude => "claude",
-        Agent::Codex => "codex",
-        Agent::Pi => "pi",
-        Agent::Opencode => "opencode",
-        Agent::None | Agent::Other => return None,
-    };
-    aca_core::agent::builtin(kind)
-}
-
-/// Which environment variable takes this vendor's config dir; None where there's no such thing (shell, declared tools, opencode)
-fn home_var(agent: Agent) -> Option<&'static str> {
-    builtin(agent)?.home_var()
-}
-
 /// The config dir this row's agent uses, where its conversations are kept (`B` copies it): the running process's, else the
 /// registered account's, else the vendor's default (`~/.claude`); None where there's no such thing
 fn agent_home(s: &Session) -> Option<String> {
@@ -621,17 +602,6 @@ fn strip_env(env: &str) -> String {
         .filter(|k| k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
         .map(|k| format!(" -u {k}"))
         .collect()
-}
-
-/// Duration (long form, for the preview and hints): just now / 40 sec / 12 min / 2 hours / 3 days
-pub fn dur(sec: u64) -> String {
-    match sec {
-        0 => t!("刚刚", "just now").into(),
-        1..=59 => tr!("{sec} 秒", "{sec}s"),
-        60..=3599 => tr!("{} 分钟", "{}m", sec / 60),
-        3600..=86399 => tr!("{} 小时", "{}h", sec / 3600),
-        _ => tr!("{} 天", "{}d", sec / 86400),
-    }
 }
 
 /// Duration (short form, the list's last column, at most [`age_w`] cells wide): now / 40s / 12m / 2h / 3d, in Chinese
@@ -652,13 +622,6 @@ pub fn age_w() -> usize {
         Lang::Zh => 4,
         Lang::En => 3,
     }
-}
-
-/// Config dir the agent process uses (CLAUDE_CONFIG_DIR / CODEX_HOME / PI_CODING_AGENT_DIR in its environment);
-/// unset or no such thing = None (use the default)
-pub(crate) fn config_home(pid: u32, agent: Agent) -> Option<String> {
-    let d = aca_core::proc::env_var(pid, home_var(agent)?)?;
-    Some(expand(&d).trim_end_matches('/').to_string())
 }
 
 /// At most this many levels up when counting parents (same as `aca answer` counting parents in aca-core): finishes even if
@@ -783,8 +746,8 @@ pub fn reference(s: &Session) -> Option<String> {
     if s.profile != REGISTERED || s.deck_id.is_empty() || s.agent == Agent::None {
         return None;
     }
-    let work = crate::workdir::find(&crate::workdir::Where::of(s)).dir;
-    let dir = crate::create::tilde(if work.is_empty() { &s.dir } else { &work });
+    let work = aca_records::workdir::find(&where_of(s)).dir;
+    let dir = aca_records::words::tilde(if work.is_empty() { &s.dir } else { &work });
     Some(reference_text(&s.deck_id, &s.title, &agent_label(s.agent, ""), &s.who, &dir, matches!(s.agent, Agent::Claude | Agent::Codex)))
 }
 
@@ -806,7 +769,7 @@ fn reference_text(id: &str, title: &str, vendor: &str, who: &str, dir: &str, rea
 /// working in (see `workdir`), the one it started in following as `Started in:` when that's elsewhere (Claude files the
 /// conversation record under it), and `Home:` the agent's config dir
 pub fn copy_text(s: &Session) -> String {
-    let work = crate::workdir::find(&crate::workdir::Where::of(s)).dir;
+    let work = aca_records::workdir::find(&where_of(s)).dir;
     with_work_home(&s.info, &work, agent_home(s).as_deref())
 }
 
@@ -825,90 +788,12 @@ fn with_work_home(info: &str, work: &str, home: Option<&str>) -> String {
     v.join("\n")
 }
 
-fn kind_of(name: &str) -> Agent {
-    match name {
-        "" | "shell" => Agent::None,
-        "claude" => Agent::Claude,
-        "codex" => Agent::Codex,
-        "pi" => Agent::Pi,
-        "opencode" => Agent::Opencode,
-        _ => Agent::Other,
+/// The sandbox a registered session runs in, empty = on this Mac
+fn sandbox_of(cfg: &Config, s: &store::Session) -> String {
+    if cfg.sandbox.is_empty() {
+        return String::new();
     }
-}
-
-/// Which vendor a tool name is: claude / codex themselves, a custom-named tool by its `kind`, declared tools count as others
-pub fn agent_of_tool(cfg: &Config, tool: &str) -> Agent {
-    match cfg.tool(tool) {
-        Some(t) if !t.kind.is_empty() => kind_of(&t.kind),
-        Some(_) => Agent::Other,
-        None => kind_of(tool),
-    }
-}
-
-/// How the account is written in the list: the registered name; one given as a directory is the directory name
-/// (leading dot removed)
-fn account_name(account: &str) -> String {
-    aca_core::agent::account_label(account).trim_start_matches('.').to_string()
-}
-
-/// "Claude·work": the vendor and who (the account, or the tool name); just one of them when the other is empty or they're
-/// the same
-pub fn agent_label(agent: Agent, who: &str) -> String {
-    let name = match agent {
-        Agent::Claude => "Claude",
-        Agent::Codex => "Codex",
-        Agent::Pi => "Pi",
-        Agent::Opencode => "OpenCode",
-        Agent::None | Agent::Other => "",
-    };
-    match (name, who) {
-        (n, "") => n.to_string(),
-        ("", w) => w.to_string(),
-        (n, w) if n.eq_ignore_ascii_case(w) => n.to_string(),
-        (n, w) => format!("{n}·{w}"),
-    }
-}
-
-/// A registered session: which vendor, which account (the tool name if no account)
-pub(crate) fn registered(cfg: &Config, s: &store::Session) -> (Agent, String) {
-    let agent = agent_of_tool(cfg, &s.tool);
-    if agent == Agent::None {
-        return (Agent::None, String::new());
-    }
-    let who = if s.account.is_empty() { s.tool.clone() } else { account_name(&s.account) };
-    (agent, who)
-}
-
-/// The directory a registered session is really working in (see `workdir`) without building the whole list: `aca show --json`'s
-/// `work`. kitty's floating window (kfloat, cmd+enter) opened inside a session reads it: tmux only knows where the agent started.
-/// Same fields as `build` takes for the row
-pub fn work_dir(cfg: &Config, s: &store::Session) -> String {
-    let Some(p) = aca_core::tmux::find(&s.id).filter(|p| !p.dead) else { return s.dir.clone() };
-    let running = agent_in(&proc::fg_kids(), &p);
-    let shell = agent_of_tool(cfg, &s.tool) == Agent::None;
-    let r = status::load(&s.id);
-    let w = crate::workdir::Where {
-        dir: if shell && !p.path.is_empty() { p.path.clone() } else { s.dir.clone() },
-        pid: running.map_or(0, |r| r.1),
-        agent: match running.filter(|_| shell) {
-            Some((tool, _)) => kind_of(tool),
-            None => registered(cfg, s).0,
-        },
-        id: if r.conv.is_empty() { s.conv.clone() } else { r.conv },
-    };
-    crate::workdir::find(&w).dir
-}
-
-/// Accounts with a registered config dir: (vendor, name, dir). Claude first, then Codex, each by name
-pub fn accounts(cfg: &Config) -> Vec<(Agent, String, String)> {
-    let mut v: Vec<(Agent, String, String)> = cfg
-        .accounts
-        .iter()
-        .flat_map(|(kind, m)| m.iter().filter(|(_, a)| !a.home.is_empty()).map(move |(n, a)| (kind_of(kind), n.clone(), a.home.clone())))
-        .filter(|(a, _, _)| matches!(a, Agent::Claude | Agent::Codex))
-        .collect();
-    v.sort_by_key(|s| s.0 != Agent::Claude);
-    v
+    aca_core::sandbox::of_session(cfg, s).map(|(n, _)| n.to_string()).unwrap_or_default()
 }
 
 /// An agent started by hand (in a shell session or a plain tmux session): `home` is the config dir in its process environment,
@@ -1057,14 +942,6 @@ fn main_panes<'a>(panes: &'a [Pane], known: &dyn Fn(&str) -> bool) -> HashMap<&'
     m
 }
 
-/// The agent running in the pane (started by hand in a shell, or the pane opened straight into it): (claude / codex, pid)
-fn agent_in(kids: &Kids, p: &Pane) -> Option<(&'static str, u32)> {
-    if p.pid == 0 {
-        return None;
-    }
-    proc::agent_under(kids, p.pid).or_else(|| aca_core::agent::by_comm(&p.cmd).map(|a| (a, p.pid)))
-}
-
 /// What collection needs, read from outside
 pub struct Inputs {
     pub now: u64,
@@ -1127,7 +1004,7 @@ fn gather(schedules: bool) -> Vec<Session> {
         let open = |s: &Session| !matches!(s.state, State::Dead | State::Stopped | State::Crashed | State::Exited);
         for s in out.iter_mut().filter(|s| s.sub.is_none() && !s.deck_id.is_empty()) {
             let mut due = if open(s) { aca_core::schedule::due(&status::load(&s.deck_id), now) } else { vec![] };
-            due.extend(aca_core::schedule::inbox(&s.deck_id));
+            due.extend(aca_core::inbox::scheduled_as_due(&s.deck_id));
             due.sort_by_key(|d| d.next.unwrap_or(u64::MAX));
             s.due = due;
         }
@@ -1236,6 +1113,7 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
                 account: String::new(),
                 agent,
                 who,
+                within: String::new(),
                 pid: running.map_or(0, |r| r.1),
                 deck_id: String::new(),
                 info: format!("Path: {}", p.path),
@@ -1310,6 +1188,7 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             account: s.account.clone(),
             agent,
             who,
+            within: sandbox_of(&cfg, s),
             pid: running.map_or(0, |r| r.1),
             deck_id: s.id.clone(),
             worktree: false,
@@ -1379,6 +1258,7 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             worktree: false,
             agent,
             who,
+            within: String::new(),
             pid: running.map_or(0, |r| r.1),
             pane: p.pane.clone(),
             sub: Some(Sub { parent: parent.name.clone(), parent_title: parent.title.clone(), win: p.window, pane: p.index, split }),
@@ -1421,6 +1301,7 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             account: s.account.clone(),
             agent,
             who,
+            within: sandbox_of(&cfg, s),
             pid: 0,
             deck_id: s.id.clone(),
             info: copy_info(&s.dir, &conv),
@@ -1480,6 +1361,7 @@ pub fn blank_row(group: &str, rank: usize) -> Session {
         account: String::new(),
         agent: Agent::None,
         who: String::new(),
+        within: String::new(),
         pid: 0,
         deck_id: String::new(),
         info: String::new(),
@@ -1503,6 +1385,7 @@ pub fn blank_row(group: &str, rank: usize) -> Session {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use aca_records::agent::accounts;
 
     #[test]
     fn the_session_left_last_comes_first_then_the_one_entered() {
@@ -1632,6 +1515,7 @@ pub(crate) mod tests {
             account: String::new(),
             agent: Agent::None,
             who: String::new(),
+            within: String::new(),
             pid: 0,
             deck_id: String::new(),
             info: String::new(),
@@ -1892,9 +1776,17 @@ account = \"alt\"
         assert_eq!(who("mycx", "alt"), (Agent::Codex, "alt".into()));
         assert_eq!(who("odd", ""), (Agent::Other, "odd".into()));
         assert_eq!(who("shell", ""), (Agent::None, String::new()));
-        // Only accounts with a registered config dir, Claude first, then Codex
+        // Only accounts with a config dir of their own, Claude first, then Codex
         let names: Vec<(Agent, String)> = accounts(&cfg).into_iter().map(|a| (a.0, a.1)).collect();
         assert_eq!(names, [(Agent::Claude, "main".into()), (Agent::Claude, "team".into()), (Agent::Codex, "alt".into())]);
+        // One bound to a sandbox: the dir it uses there, in the sandbox's workspace; none without a workspace
+        let boxed = format!(
+            "{CONFIG}[accounts.codex.biz]\nsandbox = \"office\"\n[accounts.codex.lost]\nsandbox = \"bare\"\n\
+             [sandbox.office]\nworkspace = \"/c/office\"\n[sandbox.bare]\nenv = {{ TZ = \"UTC\" }}\n"
+        );
+        let got = accounts(&aca_core::config::parse(&boxed));
+        assert!(got.contains(&(Agent::Codex, "biz".into(), "/c/office/codex".into())), "{got:?}");
+        assert!(!got.iter().any(|a| a.1 == "lost"), "{got:?}");
     }
 
     #[test]
@@ -1921,6 +1813,28 @@ account = \"alt\"
         assert_eq!(s.agent_label(), "Codex");
         (s.agent, s.who) = (Agent::Other, "odd".into());
         assert_eq!(s.agent_label(), "odd");
+        // In a sandbox: which one after it; a shell inside has only that
+        (s.agent, s.who, s.within) = (Agent::Claude, "team".into(), "work".into());
+        assert_eq!(s.agent_label(), "Claude·team@work");
+        (s.agent, s.who) = (Agent::None, String::new());
+        assert_eq!(s.agent_label(), "@work");
+    }
+
+    #[test]
+    fn a_session_knows_the_sandbox_it_runs_in() {
+        let cfg =
+            aca_core::config::parse("[sandbox.work]\nssh = \"work\"\n[accounts.claude]\nteam = { sandbox = \"work\" }\nsub = \"~/.c\"\n");
+        let of = |tool: &str, account: &str| {
+            sandbox_of(&cfg, &store::Session { tool: tool.into(), account: account.into(), ..Default::default() })
+        };
+        assert_eq!(
+            [of("claude", "team"), of("shell", "work"), of("claude", "sub"), of("shell", ""), of("shell", "nope")],
+            ["work", "work", "", "", ""]
+        );
+        assert_eq!(
+            sandbox_of(&Config::default(), &store::Session { tool: "shell".into(), account: "work".into(), ..Default::default() }),
+            ""
+        );
     }
 
     #[test]

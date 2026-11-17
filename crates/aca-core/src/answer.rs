@@ -18,9 +18,6 @@
 //! Who may press: from outside, you can press anything; an agent (calling from inside a session) may only press for the
 //! sessions it delegated (whose parent is it, or further down).
 
-use std::sync::LazyLock;
-
-use regex::Regex;
 use serde_json::json;
 
 use crate::agent::{self, Agent};
@@ -28,58 +25,10 @@ use crate::config::Config;
 use crate::i18n::Tr;
 use crate::paths::Res;
 use crate::runtime::{self, Run};
+use crate::screen::{Gate, gate, gate_keys};
 use crate::status::{self, State};
 use crate::store::{Session, Store};
 use crate::{event, t, tmux, tr};
-
-/// A prompt recognized only from the screen (the gates at startup)
-#[derive(Clone, Debug, PartialEq)]
-pub struct Gate {
-    /// The lines above the options ("Folder access · /p/api · Trust this folder? …")
-    pub title: String,
-    pub opts: Vec<String>,
-    /// Which one is highlighted now (from 0)
-    pub at: usize,
-}
-
-/// "› 1. Trust and continue", "  2. Quit": there may be a highlight mark in front
-static OPT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*([›❯>▶]\s*)?(\d)\.\s+(\S.*?)\s*$").unwrap());
-
-/// The run of consecutive options at the very bottom of the screen, numbered in order from 1 (at least two), and the few
-/// lines above it. None if it can't be recognized
-pub fn gate(lines: &[String]) -> Option<Gate> {
-    let rows: Vec<&str> = lines.iter().map(|l| l.as_str()).filter(|l| !l.trim().is_empty()).collect();
-    let tail = &rows[rows.len().saturating_sub(16)..];
-    let end = tail.iter().rposition(|l| OPT.is_match(l))? + 1;
-    let mut start = end - 1;
-    while start > 0 && OPT.is_match(tail[start - 1]) {
-        start -= 1;
-    }
-    let (mut opts, mut at) = (vec![], 0);
-    for (i, l) in tail[start..end].iter().enumerate() {
-        let c = OPT.captures(l)?;
-        if c[2].parse::<usize>().ok()? != i + 1 {
-            return None;
-        }
-        if c.get(1).is_some() {
-            at = i;
-        }
-        opts.push(c[3].to_string());
-    }
-    if opts.len() < 2 {
-        return None;
-    }
-    let title: Vec<&str> = tail[start.saturating_sub(3)..start].iter().map(|l| l.trim()).collect();
-    Some(Gate { title: title.join(" · "), opts, at })
-}
-
-/// Move to the nth (from 1), then press Enter
-pub(crate) fn gate_keys(g: &Gate, n: usize) -> Vec<&'static str> {
-    let to = n - 1;
-    let mut keys = if to > g.at { vec!["Down"; to - g.at] } else { vec!["Up"; g.at - to] };
-    keys.push("Enter");
-    keys
-}
 
 /// What it's asking (printed by `aca answer <session>` without an answer). `screen` = its current screen (only needed for
 /// prompts recognized from the screen)

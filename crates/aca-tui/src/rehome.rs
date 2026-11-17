@@ -12,19 +12,20 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use aca_core::{t, tr};
+use aca_records::agent::Agent;
+use aca_records::usage::{Quota, Source};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::accounts::Login;
-use crate::data::{Agent, Session, State};
+use crate::data::{Session, State};
+use crate::kit::agent_style;
 use crate::ops::{Job, Target};
 use crate::overlay::{Flow, Fx, Overlay, kit};
 use crate::theme;
 use crate::tools::Tool;
-use crate::ui::agent_style;
-use crate::usage::{Quota, Source};
 
 /// Provided from outside: asking about logins, opening the accounts page. Tests swap in fakes that answer on the spot
 #[derive(Clone, Copy)]
@@ -71,18 +72,18 @@ pub struct Menu {
 pub fn quotas(agent: Agent) -> Vec<Quota> {
     let cfg = aca_core::config::load();
     let home = std::env::var("HOME").unwrap_or_default();
-    let accounts = crate::data::accounts(&cfg);
-    let srcs: Vec<Source> = crate::usage::sources(&accounts, &home);
+    let accounts = aca_records::agent::accounts(&cfg);
+    let srcs: Vec<Source> = aca_records::usage::sources(&accounts, &home);
     match agent {
-        Agent::Claude => crate::limits::dir()
-            .map(|d| crate::limits::quotas(&d, &srcs, crate::limits::now()))
+        Agent::Claude => aca_records::limits::dir()
+            .map(|d| aca_records::limits::quotas(&d, &srcs, aca_records::limits::now()))
             .unwrap_or_default()
             .into_iter()
             .filter(|q| q.agent == Agent::Claude)
             .collect(),
         Agent::Codex => {
-            let now = srcs.iter().filter(|s| s.agent == Agent::Codex).filter_map(crate::usage::codex_now).collect();
-            crate::usage::subscribed(now, &accounts, &home)
+            let now = srcs.iter().filter(|s| s.agent == Agent::Codex).filter_map(aca_records::usage::codex_now).collect();
+            aca_records::usage::subscribed(now, &accounts, &home)
         }
         _ => vec![],
     }

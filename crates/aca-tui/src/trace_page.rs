@@ -10,15 +10,15 @@ use unicode_width::UnicodeWidthStr;
 
 use aca_core::i18n::noun;
 use aca_core::{t, tr};
+use aca_records::agent::Agent;
 
 use crate::ansi::Styled;
-use crate::data::Agent;
+use crate::kit::dim;
 use crate::theme;
 use crate::trace::{
     Change, Chat, Kind, Para, St, Step, Trace, View, asked, blank, body, body_hl, call_note, clean, clock, fail_text, first_line, flat,
     fmt_cost, fmt_dur, fmt_tok, hang, heading, io, md, minor, said, seg, short_model, short_path, thousands, tool_name, unmark,
 };
-use crate::ui::dim;
 
 /// When folded, at most this many lines of changes and of output show
 const PEEK_DIFF: usize = 8;

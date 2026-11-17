@@ -10,9 +10,12 @@ cargo clippy --all-targets               # lints; don't run cargo fmt over the w
 ./install.sh                             # build this checkout and install it
 ```
 
-Three crates: `crates/aca-core` (the session backend, a library), `crates/aca-tui` (the interface, depends
-only on core) and `crates/aca` (the command line, and the entry point of the interface). Bundled plugins
-are in `plugins/` and are compiled into the binary. Each command's usage and help text lives in one table
+Four crates, each depending only on the ones before it: `crates/aca-core` (the session backend, a
+library), `crates/aca-records` (reads what each agent writes down itself: conversation records, usage and
+cost, quotas, the directory a session really works in; draws nothing), `crates/aca-tui` (the interface)
+and `crates/aca` (the command line, and the entry point of the interface). The modules inside `aca-core`
+are layered; the layers are listed at the top of `crates/aca-core/src/lib.rs`, and a module never uses one
+above its own. Bundled plugins are in `plugins/` and are compiled into the binary. Each command's usage and help text lives in one table
 in `crates/aca/src/help.rs`; the interface keys are described in `crates/aca-tui/src/keys.en.txt` and
 `keys.txt`.
 

@@ -15,10 +15,10 @@ use ratatui::style::{Modifier, Style};
 
 use aca_core::i18n::noun;
 use aca_core::{t, tr};
+use aca_records::workdir::{self, Where};
 
 use crate::ansi::{Seg, Styled};
 use crate::theme;
-use crate::workdir::{self, Where};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
@@ -82,18 +82,11 @@ const NEW_FILE_LINES: usize = 300;
 /// The empty tree: a repository with no commits yet uses it as HEAD
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
+/// Inside the sandbox `dir` is mounted into, if any: its `.git/config` may hold commands (see aca_core::sandbox)
 fn git(dir: &str, args: &[&str]) -> Command {
-    let mut c = Command::new("git");
-    c.arg("-C")
-        .arg(dir)
-        .args(["-c", "core.quotepath=off", "--no-pager"])
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
+    let args: Vec<&str> = ["-c", "core.quotepath=off", "--no-pager"].into_iter().chain(args.iter().copied()).collect();
+    let mut c = aca_core::sandbox::git(std::path::Path::new(dir), &args, &[("GIT_OPTIONAL_LOCKS", "0")]);
+    c.env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE").stdin(Stdio::null()).stderr(Stdio::null());
     c
 }
 
@@ -149,7 +142,7 @@ fn untracked(top: &str) -> Vec<String> {
 
 /// When it's not the directory the session was opened in, say so at the top
 fn moved(w: &Where, found: &workdir::Found) -> Option<String> {
-    (!found.how.is_empty() && found.dir != w.dir).then(|| tr!("会话启动目录:{}", "session opened in {}", crate::create::tilde(&w.dir)))
+    (!found.how.is_empty() && found.dir != w.dir).then(|| tr!("会话启动目录:{}", "session opened in {}", aca_records::words::tilde(&w.dir)))
 }
 
 /// For the top of the preview: find the directory, count changes (same as `x` shows by default: uncommitted, new files never
@@ -218,8 +211,9 @@ pub fn load(w: &Where, mode: Mode) -> Diff {
     let found = workdir::find(w);
     let dir = found.dir.as_str();
     let moved = moved(w, &found);
-    let say =
-        |m: &str| notice(&[Some(format!("{} · {m}", crate::create::tilde(dir))), moved.clone()].into_iter().flatten().collect::<Vec<_>>());
+    let say = |m: &str| {
+        notice(&[Some(format!("{} · {m}", aca_records::words::tilde(dir))), moved.clone()].into_iter().flatten().collect::<Vec<_>>())
+    };
     if dir.is_empty() || !std::path::Path::new(dir).is_dir() {
         return say(t!("目录已不存在", "the directory is gone"));
     }
@@ -256,7 +250,7 @@ pub fn load(w: &Where, mode: Mode) -> Diff {
             (p, text)
         })
         .collect();
-    let head = Head { dir: crate::create::tilde(dir), branch, against, commits, note, cut, moved };
+    let head = Head { dir: aca_records::words::tilde(dir), branch, against, commits, note, cut, moved };
     Diff { top, ..render(&head, &patch, &new_files) }
 }
 

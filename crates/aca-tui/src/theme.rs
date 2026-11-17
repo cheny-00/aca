@@ -69,7 +69,7 @@ pub struct Pal {
     pub total: Color,
     pub other: Color,
     pub track: Color,
-    /// Account colors in the billing panel, one slot per account (slots are kept in slots.rs and follow the account, not its
+    /// Account colors in the billing panel, one slot per account (slots are kept in aca-records' slots.rs and follow the account, not its
     /// rank); as many slots as colors.
     /// The defaults are Catppuccin's blue / peach / teal / pink / green hues, avoiding state red and yellow and accent purple
     /// (purple belongs to the bars not split by account).
@@ -754,8 +754,8 @@ fn show(t: &Theme, now: &str, color: bool) {
         }
         println!("{}", row(color, name, *c, t.parent.as_ref().map(|_| (bname, old)), about));
     }
-    // Who each slot belongs to now (as kept by slots.rs)
-    let owners = crate::state::state_file("colors").and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+    // Who each slot belongs to now (as kept by aca-records' slots.rs)
+    let owners = aca_records::paths::state_file("colors").and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
     let owner = |i: usize| owners.lines().filter_map(|l| l.split_once('\t')).find(|x| x.0 == i.to_string()).map(|x| x.1.to_string());
     let changed = t.parent.is_some() && p.series != base.series;
     println!(

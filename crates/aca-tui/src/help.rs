@@ -11,10 +11,11 @@ use unicode_width::UnicodeWidthStr;
 
 use aca_core::i18n::{Lang, lang};
 use aca_core::t;
+use aca_records::agent::Agent;
 
-use crate::data::{Agent, State};
+use crate::data::State;
+use crate::kit::{agent_style, dim, icon, wrap_width};
 use crate::theme;
-use crate::ui::{agent_style, dim, icon, wrap_width};
 
 /// A section: title + (key, what it does). In the key column 「空格」「数字」「前缀」 (Space, 0-9, prefix) are whole words; a
 /// pressed key is matched to its rows by them (see keys_of, hit)

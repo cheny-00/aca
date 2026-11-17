@@ -172,7 +172,7 @@ pub fn stale() -> Vec<(String, String)> {
         if crate::tmux::agent_pane(&panes, &s.id).is_none() {
             continue;
         }
-        let kind = cfg.tool(&s.tool).map(|t| t.kind).unwrap_or_default();
+        let kind = crate::agent::tool(&cfg, &s.tool).map(|t| t.kind).unwrap_or_default();
         if signature(&kind, &s.tool, &s.account) != crate::runtime::load(&s.id).mounts {
             out.push((s.id.clone(), s.title.clone()));
         }
@@ -436,59 +436,9 @@ fn codex_mcp_json(name: &str, aca: &str, args: &[String]) -> String {
     serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": { name: server } })).unwrap()
 }
 
-/// The `-c` value for one MCP server on the Codex side: `mcp_servers.<name>={ command = …, args = […], env = {…} }`.
-/// Used only when the copy can't be made (conversation titles will fail, see [`codex_mcp_copy`])
-pub fn codex_mcp_flag(name: &str, aca: &str, args: &[String], env: &[(String, String)]) -> String {
-    let mut t = toml::Table::new();
-    t.insert("command".into(), aca.into());
-    t.insert("args".into(), toml::Value::Array(args.iter().map(|a| a.clone().into()).collect()));
-    let vars: toml::Table = env.iter().map(|(k, v)| (k.clone(), v.clone().into())).collect();
-    t.insert("env".into(), toml::Value::Table(vars));
-    format!("mcp_servers.{name}={}", toml::Value::Table(t))
-}
-
-/// The pi side: `{ name: { command, args } }`, handed one by one to `pi.registerMcpServer` when aca's extension starts.
-/// pi hides MCP tools behind codemode by default (reachable only by the model writing a script); aca's are only a few, so
-/// they're declared to the model directly, as for Claude and Codex
-pub fn pi_mcp_config(aca: &str, mcp: &[(String, Vec<String>)]) -> String {
-    let servers: serde_json::Map<String, serde_json::Value> = mcp
-        .iter()
-        .map(|(name, args)| (name.clone(), serde_json::json!({ "command": aca, "args": args, "exposure": "direct" })))
-        .collect();
-    serde_json::to_string_pretty(&servers).unwrap()
-}
-
-/// The opencode side: the entries under `mcp` in the layered config (local, command and arguments as one array)
-pub fn opencode_mcp(aca: &str, mcp: &[(String, Vec<String>)]) -> serde_json::Map<String, serde_json::Value> {
-    mcp.iter()
-        .map(|(name, args)| {
-            let cmd: Vec<&str> = std::iter::once(aca).chain(args.iter().map(String::as_str)).collect();
-            (name.clone(), serde_json::json!({ "type": "local", "command": cmd, "enabled": true }))
-        })
-        .collect()
-}
-
-/// The content of Claude's `--mcp-config`
-pub fn claude_mcp_config(aca: &str, mcp: &[(String, Vec<String>)]) -> String {
-    let servers: serde_json::Map<String, serde_json::Value> =
-        mcp.iter().map(|(name, args)| (name.clone(), serde_json::json!({ "type": "stdio", "command": aca, "args": args }))).collect();
-    serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": servers })).unwrap()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pi_and_opencode_get_the_same_servers_in_their_own_shapes() {
-        let mcp = vec![("aca".to_string(), vec!["plugin".to_string(), "tools".to_string()])];
-        let pi: serde_json::Value = serde_json::from_str(&pi_mcp_config("/bin/aca", &mcp)).unwrap();
-        assert_eq!(pi, serde_json::json!({ "aca": { "command": "/bin/aca", "args": ["plugin", "tools"], "exposure": "direct" } }));
-        assert_eq!(
-            serde_json::Value::Object(opencode_mcp("/bin/aca", &mcp)),
-            serde_json::json!({ "aca": { "type": "local", "command": ["/bin/aca", "plugin", "tools"], "enabled": true } })
-        );
-    }
 
     #[test]
     fn ids_become_names_codex_and_mcp_accept() {
@@ -531,23 +481,13 @@ mod tests {
     }
 
     #[test]
-    fn the_flags_for_codex_and_the_file_for_claude_carry_the_session() {
+    fn the_codex_copy_names_the_variables_to_pass_not_the_session() {
         let args = vec!["plugin".to_string(), "mcp".into(), "aca.delegate".into()];
-        let f = codex_mcp_flag("aca-delegate", "/bin/aca", &args, &[("ACA_SESSION_ID".into(), "ab12".into())]);
-        let (k, v) = f.split_once('=').unwrap();
-        assert_eq!(k, "mcp_servers.aca-delegate");
-        let t: toml::Table = toml::from_str(&format!("x = {v}")).unwrap();
-        assert_eq!(t["x"]["command"].as_str(), Some("/bin/aca"));
-        assert_eq!(t["x"]["args"].as_array().unwrap().len(), 3);
-        assert_eq!(t["x"]["env"]["ACA_SESSION_ID"].as_str(), Some("ab12"));
         // The copy doesn't write the session id, only which variables to pass from Codex's environment
         let j: serde_json::Value = serde_json::from_str(&codex_mcp_json("aca-delegate", "/bin/aca", &args)).unwrap();
         let s = &j["mcpServers"]["aca-delegate"];
         assert_eq!((s["command"].as_str(), s["args"][2].as_str()), (Some("/bin/aca"), Some("aca.delegate")));
         assert!(s["env_vars"].as_array().unwrap().iter().any(|v| v == "ACA_SESSION_ID") && s.get("env").is_none());
-        let c: serde_json::Value =
-            serde_json::from_str(&claude_mcp_config("/bin/aca", &[("aca".into(), vec!["plugin".into(), "tools".into()])])).unwrap();
-        assert_eq!(c["mcpServers"]["aca"]["args"][1], "tools");
     }
 
     #[test]

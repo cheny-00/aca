@@ -1,6 +1,6 @@
 id = "aca.remote"
 name = "Remote tasks"
-version = "0.3.1"
+version = "0.3.2"
 api = 1
 description = "把耗时长的任务派到其他机器上后台运行(ssh),结果发回派出它的会话"
 description_en = "Runs long tasks in the background on another machine (ssh); the result comes back to the session that sent it."

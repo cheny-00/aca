@@ -86,6 +86,11 @@ fn plan(tool: &Tool, s: &Session, how: &How, aca: &str) -> Vec<String> {
         How::Resume(conv) => argv.extend(["resume".to_string(), conv.clone()]),
         How::Fork(from) => argv.extend(["fork".to_string(), from.clone()]),
     }
+    // Inside a sandbox: only its own arguments, none of what follows is there (see crate::sandbox)
+    if tool.bare {
+        argv.extend(super::extra(tool, s));
+        return argv;
+    }
     for (ev, matcher) in EVENTS {
         argv.extend(["-c".to_string(), hook_flag(ev, *matcher, aca)]);
     }
@@ -109,7 +114,7 @@ fn plan(tool: &Tool, s: &Session, how: &How, aca: &str) -> Vec<String> {
         argv.extend(["-c".to_string(), format!("shell_environment_policy.set.{k}={}", toml::Value::String(v.clone()))]);
     }
     for (name, args) in &tool.mcp {
-        argv.extend(["-c".to_string(), crate::plugin::mount::codex_mcp_flag(name, aca, args, &env)]);
+        argv.extend(["-c".to_string(), codex_mcp_flag(name, aca, args, &env)]);
     }
     for p in &tool.codex_plugins {
         argv.extend(["-c".to_string(), format!("plugins.{p}@aca.enabled=true")]);
@@ -141,6 +146,54 @@ fn not_carried(rest: &[String], first: bool) -> usize {
 }
 
 const MODEL: &[&str] = &["-m", "--model"];
+
+/// The newest record under `sessions/<year>/<month>/<day>/` whose first line (`session_meta`) says it started in `dir` at or
+/// after `since`, a conversation of its own (not a subagent's): (its id, the file). The day directories go by the local time
+/// where it ran, so the search stops at the first one ending over a day before `since`
+fn started_in(sessions: &Path, dir: &Path, since: u64) -> Option<(String, PathBuf)> {
+    let newest_first = |d: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        v
+    };
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let here = real(dir);
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    for y in newest_first(sessions) {
+        for m in newest_first(&y) {
+            for d in newest_first(&m) {
+                let end = crate::paths::iso(&format!("{}-{}-{}T23:59:59Z", name(&y), name(&m), name(&d)));
+                if end.is_some_and(|e| e + 86400 < since) {
+                    return None;
+                }
+                for f in newest_first(&d) {
+                    let n = name(&f);
+                    if !n.starts_with("rollout-") || !n.ends_with(".jsonl") {
+                        continue;
+                    }
+                    let mut first = String::new();
+                    let Ok(file) = std::fs::File::open(&f) else { continue };
+                    if std::io::BufRead::read_line(&mut std::io::BufReader::new(file), &mut first).is_err() {
+                        continue;
+                    }
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&first) else { continue };
+                    let p = &v["payload"];
+                    let (Some(id), Some(cwd), Some(at)) = (p["id"].as_str(), p["cwd"].as_str(), p["timestamp"].as_str()) else {
+                        continue;
+                    };
+                    if v["type"] == "session_meta"
+                        && !p["source"].is_object()
+                        && crate::paths::iso(at).is_some_and(|t| t >= since)
+                        && real(Path::new(cwd)) == here
+                    {
+                        return Some((id.to_string(), f));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
 /// The file named `rollout-…<tail>` within `depth` levels under `dir`
 fn rollout_in(dir: &Path, tail: &str, depth: u32) -> Option<PathBuf> {
@@ -377,6 +430,10 @@ impl Agent for Codex {
         true
     }
 
+    fn conv_started_in(&self, home: &Path, dir: &Path, since: u64) -> Option<(String, PathBuf)> {
+        started_in(&home.join("sessions"), dir, since)
+    }
+
     fn argv(&self, tool: &Tool, s: &Session, how: &How, aca: &str) -> Res<Vec<String>> {
         Ok(plan(tool, s, how, aca))
     }
@@ -398,7 +455,7 @@ impl Agent for Codex {
     /// A running Codex leaves no "which conversation I'm on now" file: read its log database (see [`live_in`]), which follows
     /// it after `/new` too. When the log database can't tell (older versions, no database), only what the command line says
     /// can be recognized (`codex resume <id>`)
-    fn live(&self, pid: u32, home: Option<&str>, argv: &[String]) -> Live {
+    fn live(&self, pid: u32, home: Option<&str>, argv: &[String], _ours: &dyn Fn(&str) -> bool) -> Live {
         let args = super::carry(argv, |rest| not_carried(rest, rest.len() + 1 == argv.len()));
         let conf = home.map_or_else(|| PathBuf::from(crate::paths::expand("~/.codex")), PathBuf::from);
         if let Some((conv, transcript, title)) = live_in(&conf, pid) {
@@ -455,9 +512,9 @@ impl Agent for Codex {
     /// "Folder access … Trust this folder? … › 1. Trust and continue / 2. Quit". The hook review gate ("2. Trust all and
     /// continue") doesn't count: that's `hook_trust`'s business
     fn trust_keys(&self, lines: &[String]) -> Option<Vec<&'static str>> {
-        let g = crate::answer::gate(lines)?;
+        let g = crate::screen::gate(lines)?;
         let yes = g.opts.iter().position(|o| o == "Trust and continue")?;
-        (g.opts.len() == 2 && g.opts.iter().any(|o| o == "Quit")).then(|| crate::answer::gate_keys(&g, yes + 1))
+        (g.opts.len() == 2 && g.opts.iter().any(|o| o == "Quit")).then(|| crate::screen::gate_keys(&g, yes + 1))
     }
 
     /// Two kinds of ending report no hook, and only leave a `task_complete` in the conversation record:
@@ -500,6 +557,17 @@ impl Agent for Codex {
         }
         Seen::Quiet
     }
+}
+
+/// The `-c` value for one MCP server on the Codex side: `mcp_servers.<name>={ command = …, args = […], env = {…} }`.
+/// Used only when the copy can't be made (conversation titles will fail, see [`crate::plugin::mount::codex_mcp_copy`])
+pub fn codex_mcp_flag(name: &str, aca: &str, args: &[String], env: &[(String, String)]) -> String {
+    let mut t = toml::Table::new();
+    t.insert("command".into(), aca.into());
+    t.insert("args".into(), toml::Value::Array(args.iter().map(|a| a.clone().into()).collect()));
+    let vars: toml::Table = env.iter().map(|(k, v)| (k.clone(), v.clone().into())).collect();
+    t.insert("env".into(), toml::Value::Table(vars));
+    format!("mcp_servers.{name}={}", toml::Value::Table(t))
 }
 
 #[cfg(test)]
@@ -554,6 +622,37 @@ mod tests {
         std::fs::write(f.with_file_name("rollout-2026-10-14T09-00-00-th-10.jsonl"), "").unwrap();
         assert_eq!(Codex.conv_files(&d, "th-1"), vec![PathBuf::from("sessions/2026/10/14/rollout-2026-10-14T09-00-00-th-1.jsonl")]);
         assert!(Codex.conv_files(&d, "th-2").is_empty() && Codex.conv_files(&d, "../x").is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn inside_a_sandbox_the_conversation_is_the_newest_of_its_own_started_in_the_directory() {
+        let d = std::env::temp_dir().join(format!("aca-started-{}", std::process::id()));
+        let app = d.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let meta = |dir: &Path, id: &str, at: &str, source: &str| {
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"timestamp\":\"{at}\",\"cwd\":\"{}\",\"source\":{source}}}}}\n{{}}\n",
+                dir.display()
+            )
+        };
+        let day = d.join("sessions/2026/11/16");
+        std::fs::create_dir_all(&day).unwrap();
+        let put = |name: &str, text: String| std::fs::write(day.join(format!("rollout-2026-11-16T{name}.jsonl")), text).unwrap();
+        put("10-00-00-aa", meta(&app, "aa", "2026-11-16T02:00:00.100Z", "\"cli\""));
+        put("11-00-00-bb", meta(&d, "bb", "2026-11-16T03:00:00.100Z", "\"cli\""));
+        put("12-00-00-cc", meta(&app, "cc", "2026-11-16T04:00:00.100Z", "{\"subagent\":\"review\"}"));
+        let since = |t: &str| crate::paths::iso(t).unwrap();
+        // Newest first: the subagent's and the other directory's don't count
+        let (id, file) = Codex.conv_started_in(&d, &app, since("2026-11-16T01:00:00Z")).unwrap();
+        assert_eq!((id.as_str(), file), ("aa", day.join("rollout-2026-11-16T10-00-00-aa.jsonl")));
+        // Started before the session was: not its own
+        assert_eq!(Codex.conv_started_in(&d, &app, since("2026-11-16T02:30:00Z")), None);
+        // Days ending over a day before are not read at all
+        let old = d.join("sessions/2026/10/01");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("rollout-2026-10-01T10-00-00-zz.jsonl"), meta(&app, "zz", "2026-11-16T05:00:00.000Z", "\"cli\"")).unwrap();
+        assert_eq!(Codex.conv_started_in(&d, &app, since("2026-11-16T04:30:00Z")), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -690,7 +789,9 @@ mod tests {
     #[test]
     fn a_running_codex_only_shows_its_thread_when_it_was_resumed_by_id() {
         // Give it a config directory that doesn't exist: don't touch the real ~/.codex log database
-        let live = |words: &[&str]| Codex.live(1, Some("/nonexistent/aca-test"), &words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
+        let live = |words: &[&str]| {
+            Codex.live(1, Some("/nonexistent/aca-test"), &words.iter().map(|w| w.to_string()).collect::<Vec<_>>(), &|_| false)
+        };
         let some = |words: &[&str]| Some(words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
         // Started fresh by hand: no idea which conversation; arguments carried over
         assert_eq!(
@@ -819,9 +920,9 @@ mod tests {
         // When adopting: what's recognized wins over the command line; when the log database can't tell, the command line is used
         // as before
         let argv: Vec<String> = ["codex", "resume", "th-x", "--search"].map(String::from).to_vec();
-        let l = Codex.live(12, Some(&d.to_string_lossy()), &argv);
+        let l = Codex.live(12, Some(&d.to_string_lossy()), &argv, &|_| false);
         assert_eq!((l.conv.as_str(), l.args), ("th-n", Some(vec!["--search".to_string()])));
-        assert_eq!(Codex.live(3, Some(&d.to_string_lossy()), &argv).conv, "th-x");
+        assert_eq!(Codex.live(3, Some(&d.to_string_lossy()), &argv, &|_| false).conv, "th-x");
         // The database kept elsewhere (config.toml's sqlite_home)
         let moved = d.join("db");
         std::fs::create_dir_all(&moved).unwrap();

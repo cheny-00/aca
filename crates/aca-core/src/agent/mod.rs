@@ -17,7 +17,7 @@
 //! - **Authentication is the harness's own business**. An account is just "the extra things passed when starting it"
 //!   (config directory, environment variables, arguments; see [`Account`]), written in the tool's own terms, in one place;
 //!   with no account aca adds nothing and the tool uses its defaults. Logging in goes through the tool's own command
-//!   (`aca run <tool:account> -- login`, see [`direct`]). aca doesn't store or sync credentials, and writes nothing into
+//!   (`aca run <tool:account> -- login`, see [`crate::launch::direct`]). aca doesn't store or sync credentials, and writes nothing into
 //!   the tool's config directory
 //! - Hooks are **not installed into any config directory**; they're all passed at startup (Claude's `--settings`, Codex's
 //!   `-c hooks.…`; ones that need a file use [`hook_file`], ones that need an environment variable use [`Agent::env`]).
@@ -121,6 +121,13 @@ pub trait Agent: Sync {
     /// wait for the hook to report it
     fn new_conv(&self) -> String {
         String::new()
+    }
+
+    /// Inside a sandbox, where no hook says which conversation it's on and the tool takes no id at start: the newest one it
+    /// started in `dir` at or after `since` (seconds), found in its records under `home`, as (its id, the record). None = can't
+    /// tell
+    fn conv_started_in(&self, _home: &Path, _dir: &Path, _since: u64) -> Option<(String, PathBuf)> {
+        None
     }
 
     fn can_fork(&self) -> bool {
@@ -250,9 +257,10 @@ pub trait Agent: Sync {
 
     /// Asked when adopting ([`crate::adopt`]) a running process aca didn't start: which conversation it's on and which
     /// arguments it carries. `home` is the config directory in its environment (None = its default), `argv` is its command line
-    /// (empty if unreadable). By default nothing is recognized: the conversation id waits for it to restart under aca and the
-    /// hook to report it
-    fn live(&self, _pid: u32, _home: Option<&str>, _argv: &[String]) -> Live {
+    /// (empty if unreadable), `ours` says whether a directory is one aca's plugins bring to agents (those aren't carried: they're
+    /// rebuilt on start). By default nothing is recognized: the conversation id waits for it to restart under aca and the hook to
+    /// report it
+    fn live(&self, _pid: u32, _home: Option<&str>, _argv: &[String], _ours: &dyn Fn(&str) -> bool) -> Live {
         Live::default()
     }
 
@@ -350,6 +358,29 @@ pub fn kinds() -> impl Iterator<Item = &'static str> {
     BUILTIN.iter().map(|a| a.name())
 }
 
+/// The definition for a tool name; the built-in tools have one even when unset. A built-in name with no kind gets itself as kind;
+/// other names with no kind are declared tools, and kind stays empty
+pub fn tool(cfg: &Config, name: &str) -> Option<Tool> {
+    let builtin = builtin(name).is_some();
+    let mut t = cfg.tools.get(name).cloned().or_else(|| builtin.then(Tool::default))?;
+    if t.kind.is_empty() && builtin {
+        t.kind = name.to_string();
+    }
+    Some(t)
+}
+
+/// The names the `n` menu / `aca new` accept: tools, and "tool:account"
+pub fn names(cfg: &Config) -> Vec<String> {
+    let mut v: Vec<String> = kinds().map(String::from).collect();
+    v.extend(cfg.tools.keys().filter(|k| builtin(k).is_none()).cloned());
+    for (kind, accounts) in &cfg.accounts {
+        v.extend(accounts.keys().map(|a| format!("{kind}:{a}")));
+    }
+    // A terminal inside each sandbox
+    v.extend(cfg.sandbox.keys().map(|b| format!("shell:{b}")));
+    v
+}
+
 /// The built-in tool whose process name matches (`claude` / `codex`); desktop apps and other programs = None
 pub fn by_comm(comm: &str) -> Option<&'static str> {
     BUILTIN.iter().copied().find(|a| a.runs_as(comm)).map(|a| a.name())
@@ -380,7 +411,7 @@ impl std::ops::Deref for Handle {
 /// Removed from the environment before starting an agent: variables other sessions (agent-deck's, an outer Claude / Codex)
 /// use to identify themselves. If the tmux server was started from inside one of those sessions, these get into every new
 /// session, and your globally installed hooks would record this session's events under that one
-const FOREIGN: &[&str] = &[
+pub(crate) const FOREIGN: &[&str] = &[
     "AGENTDECK_INSTANCE_ID",
     "AGENTDECK_PROFILE",
     "AGENTDECK_ACCOUNT",
@@ -411,12 +442,13 @@ const FOREIGN: &[&str] = &[
     "CODEX_THREAD_ID",
 ];
 
-/// What [`direct`] removes on top: when run inside an aca session, these two would make its forwarder report to that session
-const OURS: &[&str] = &["ACA_SESSION_ID", "ACA_TOOL"];
+/// What [`crate::launch::direct`] removes on top: when run inside an aca session, these two would make its forwarder report to
+/// that session
+pub(crate) const OURS: &[&str] = &["ACA_SESSION_ID", "ACA_TOOL"];
 
 /// Prefix an env that removes these variables (except ones the tool / account sets itself: you meant those). env execs the
 /// command, same process
-fn without(vars: &[&[&str]], set: &[(String, String)], mut cmd: Vec<String>) -> Vec<String> {
+pub(crate) fn without(vars: &[&[&str]], set: &[(String, String)], mut cmd: Vec<String>) -> Vec<String> {
     let mut argv: Vec<String> = vec!["/usr/bin/env".into()];
     let gone = vars.iter().flat_map(|v| v.iter()).filter(|k| !set.iter().any(|(name, _)| name == *k));
     argv.extend(gone.flat_map(|k| ["-u".to_string(), k.to_string()]));
@@ -430,7 +462,7 @@ pub fn sh_quote(s: &str) -> String {
 }
 
 /// Find the command's full path in PATH: the tmux server's PATH isn't necessarily this terminal's
-fn which(cmd: &str) -> Option<String> {
+pub(crate) fn which(cmd: &str) -> Option<String> {
     if cmd.contains('/') {
         return Some(paths::expand(cmd));
     }
@@ -467,7 +499,7 @@ fn stable_exe(p: &Path) -> PathBuf {
 /// Tool name → (agent, the tool's definition). The hook entry point gets a built-in tool's name (`aca hook claude`) or a
 /// tool name, and goes through here too
 pub fn resolve(cfg: &Config, name: &str) -> Res<(Handle, Tool)> {
-    let tool = cfg.tool(name).ok_or_else(|| tr!("没有工具 {name}(可用:{})", "no tool {name} (there are: {})", cfg.names().join(" ")))?;
+    let tool = tool(cfg, name).ok_or_else(|| tr!("没有工具 {name}(可用:{})", "no tool {name} (there are: {})", names(cfg).join(" ")))?;
     let agent = match tool.kind.as_str() {
         "" => Handle::Declared(declared::Declared::new(name, &tool)?),
         kind => Handle::Builtin(builtin(kind).ok_or_else(|| {
@@ -497,11 +529,16 @@ pub fn account_label(account: &str) -> &str {
     if is_dir(account) { account.rsplit('/').find(|p| !p.is_empty()).unwrap_or(account) } else { account }
 }
 
-/// The session's account layer. No account = an empty layer: aca adds nothing and the harness uses its own defaults
+/// The session's account layer. No account = an empty layer: aca adds nothing and the harness uses its own defaults. Bound to a
+/// sandbox: its `env` comes along (`sandbox_env`); on this Mac, so does the config directory in its workspace
 pub fn account(cfg: &Config, agent: &dyn Agent, account: &str) -> Res<Account> {
-    let layer = match account {
+    let mut layer = match account {
         "" => return Ok(Account::default()),
         dir if is_dir(dir) => Account { home: config::dir(dir), ..Default::default() },
+        // A shell's account can be a sandbox's name: a terminal inside it (`aca new shell:work`)
+        name if agent.name() == "shell" && cfg.account("shell", name).is_none() && cfg.sandbox.contains_key(name) => {
+            Account { sandbox: name.into(), ..Default::default() }
+        }
         name => cfg.account(agent.name(), name).cloned().ok_or_else(|| {
             tr!(
                 "config.toml 的 [accounts.{}] 中没有 {name}(未登记的账号可直接写目录:{}:~/.xxx)",
@@ -511,6 +548,42 @@ pub fn account(cfg: &Config, agent: &dyn Agent, account: &str) -> Res<Account> {
             )
         })?,
     };
+    if !layer.sandbox.is_empty() {
+        let name = layer.sandbox.clone();
+        let Some(b) = cfg.sandbox.get(&name) else {
+            return Err(tr!(
+                "账号 {account} 绑定的沙箱 {name} 不存在:config.toml 中没有 [sandbox.{name}]",
+                "account {account} is bound to sandbox {name}, but there's no [sandbox.{name}] in config.toml"
+            ));
+        };
+        if b.cage() && !matches!(agent.name(), "claude" | "codex" | "shell") {
+            return Err(tr!(
+                "沙箱目前只支持 Claude Code、Codex 和 shell,{} 的账号 {account} 不能绑定沙箱",
+                "sandboxes only take Claude Code, Codex and shell for now; {}'s account {account} can't be bound to one",
+                agent.name()
+            ));
+        }
+        if !layer.home.is_empty() {
+            return Err(tr!(
+                "账号 {account} 绑定了沙箱 {name},不能再写 home:它的配置目录是沙箱 workspace 下的 {}/",
+                "account {account} is bound to sandbox {name}, so it takes no home: its config directory is {}/ in the sandbox's workspace",
+                agent.name()
+            ));
+        }
+        layer.sandbox_env = b.env.clone();
+        // On this Mac: started like any account, its config directory the one a cage's would be. None without a workspace,
+        // or it would quietly use the tool's default directory (another account's login)
+        if !b.cage() && agent.home_var().is_some() {
+            if b.workspace.trim().is_empty() {
+                return Err(tr!(
+                    "[sandbox.{name}] 没写 workspace:账号 {account} 的配置目录要放在它下面({}/)",
+                    "[sandbox.{name}] has no workspace: account {account}'s config directory goes in it ({}/)",
+                    agent.name()
+                ));
+            }
+            layer.home = b.home(agent.name()).to_string_lossy().into_owned();
+        }
+    }
     if !layer.home.is_empty() && agent.home_var().is_none() {
         return Err(tr!(
             "{} 未指定配置目录对应的环境变量(声明式工具写 home_var);未指定时账号中只能使用 env / args",
@@ -569,11 +642,12 @@ fn parse_env(text: &str) -> Result<Vec<(String, String)>, usize> {
     Ok(out)
 }
 
-/// Environment variables of the tool and account layers (later ones override earlier ones): the tool's env, the account's
-/// env_file, the account's env, the config directory
-fn layered_env(agent: &dyn Agent, tool: &Tool, a: &Account) -> Res<Vec<(String, String)>> {
+/// Environment variables of the tool and account layers (later ones override earlier ones): the tool's env, its sandbox's env,
+/// the account's env_file, the account's env, the config directory
+pub(crate) fn layered_env(agent: &dyn Agent, tool: &Tool, a: &Account) -> Res<Vec<(String, String)>> {
     let own = |m: &std::collections::BTreeMap<String, String>| m.iter().map(|(k, v)| (k.clone(), paths::expand(v))).collect::<Vec<_>>();
     let mut env = own(&tool.env);
+    env.extend(own(&a.sandbox_env));
     if !a.env_file.is_empty() {
         let text = std::fs::read_to_string(&a.env_file)
             .map_err(|e| tr!("无法读取账号的 env_file {}:{e}", "can't read the account's env_file {}: {e}", a.env_file))?;
@@ -593,17 +667,14 @@ pub fn home(cfg: &Config, tool: &str, account: &str) -> Res<Option<PathBuf>> {
     let (agent, def) = resolve(cfg, tool)?;
     let Some(var) = agent.home_var() else { return Ok(None) };
     let layer = self::account(cfg, &*agent, account)?;
+    // Bound to a sandbox: the config directory it uses inside, mounted at the same path
+    if let Some(b) = cfg.sandbox.get(&layer.sandbox) {
+        return Ok(Some(b.home(agent.name())));
+    }
     let env = layered_env(&*agent, &def, &layer)?;
     let set = env.into_iter().rev().find(|(k, _)| k == var).map(|(_, v)| v);
     let dir = set.or_else(|| std::env::var(var).ok().filter(|v| !v.is_empty())).or_else(|| agent.default_home().map(String::from));
     Ok(dir.map(|d| PathBuf::from(paths::expand(&d))))
-}
-
-/// Which config directory this Codex uses: the account's `CODEX_HOME`, else the one in the environment, else `~/.codex`
-fn codex_home(env: &[(String, String)]) -> std::path::PathBuf {
-    let from_env = env.iter().rev().find(|(k, _)| k == "CODEX_HOME").map(|(_, v)| v.clone());
-    let home = from_env.or_else(|| std::env::var("CODEX_HOME").ok().filter(|v| !v.is_empty()));
-    home.map(std::path::PathBuf::from).unwrap_or_else(|| paths::home().join(".codex"))
 }
 
 /// This many bytes from the end of the file, starting at the next whole line (for reading the last few entries of a
@@ -629,71 +700,6 @@ pub(crate) fn hook_file(name: &str, content: &str) -> Res<PathBuf> {
     Ok(path)
 }
 
-/// How to start this session this time: the account layer on top of the tool, the command resolved to a full path and
-/// prefixed with an env that removes other sessions' identity, and the session id in the environment
-///
-/// `say` = the opening message: if this tool takes it as a startup argument ([`Agent::opening`]) it goes into a file, and
-/// the command is prefixed with `aca exec-saying <file>`, which reads it and appends it last ([`exec_saying`]); otherwise
-/// `Launch::said` is false
-pub fn launch(cfg: &Config, s: &Session, how: &How, say: Option<&str>) -> Res<Launch> {
-    let (agent, mut tool) = of(cfg, s)?;
-    let layer = account(cfg, &*agent, &s.account)?;
-    // The account's arguments go after the tool's; each tool includes them when building its command ([`extra`])
-    tool.args.extend(layer.args.iter().cloned());
-    // The config's first, aca's own after: on a name clash the later one wins
-    let mut env = layered_env(&*agent, &tool, &layer)?;
-    // What enabled plugins give it (plugin directories, MCP servers; Codex also needs a copy it recognizes prepared)
-    let codex_home = (agent.name() == "codex").then(|| codex_home(&env));
-    let m = crate::plugin::mount::plan(agent.name(), &s.tool, &s.account, codex_home.as_deref());
-    (tool.plugin_dirs, tool.mcp, tool.codex_plugins) = (m.dirs, m.mcp, m.codex_plugins);
-    // Record what was passed this time: when plugins change, the Plugins page uses this to say which running sessions need
-    // a restart
-    let sig = crate::plugin::mount::signature(agent.name(), &s.tool, &s.account);
-    if crate::runtime::load(&s.id).mounts != sig {
-        crate::runtime::update(&s.id, |r| r.mounts = sig);
-    }
-    let aca = self_exe();
-    let mut cmd = agent.argv(&tool, s, how, &aca)?;
-    cmd[0] = which(&cmd[0]).ok_or_else(|| tr!("PATH 中找不到 {}", "{} isn't on PATH", cmd[0]))?;
-    let lead = say.and_then(|text| Some((agent.opening(text)?, text)));
-    let said = lead.is_some();
-    if let Some((lead, text)) = lead {
-        let file = opening_file(&s.id, text)?;
-        cmd = [aca.clone(), "exec-saying".to_string(), file].into_iter().chain(cmd).chain(lead).collect();
-    }
-    let more = agent.env(&tool, &aca, &env)?;
-    env.extend(more);
-    env.extend([
-        ("ACA_SESSION_ID".to_string(), s.id.clone()),
-        ("ACA_TOOL".to_string(), s.tool.clone()),
-        ("ACA_BIN".to_string(), aca.clone()),
-    ]);
-    // With another directory / another tmux server (tests), the session's hooks must write to the same place too
-    for k in ["ACA_HOME", "ACA_TMUX_SOCKET"] {
-        if let Some(v) = std::env::var(k).ok().filter(|v| !v.is_empty()) {
-            env.push((k.to_string(), v));
-        }
-    }
-    let argv = without(&[FOREIGN], &env, cmd);
-    Ok(Launch { argv: relayed(agent.name(), &tool, &aca, argv), env, said })
-}
-
-/// The agents known to report their own state (OSC 7501): Claude Code (2.1.322 on, after the terminal answers its query) and
-/// Codex (0.167 on, without asking). Only these get the relay by default; for the others it would be one more layer for nothing
-const REPORTING: &[&str] = &["claude", "codex"];
-
-/// The agent behind aca's relay (`aca pty -- …`, see [`crate::relay`]), so the state it reports itself reaches aca. By default
-/// only the agents known to report ([`REPORTING`]); `program_status = true` puts any other one behind it too (one that learned
-/// it later), `false` none. Never shell: the list follows a shell's working directory through tmux, which would then only see
-/// the relay's
-fn relayed(name: &str, tool: &Tool, aca: &str, argv: Vec<String>) -> Vec<String> {
-    let on = name != "shell" && tool.program_status.unwrap_or(REPORTING.contains(&name));
-    if !on {
-        return argv;
-    }
-    [aca.to_string(), "pty".into(), "--".into()].into_iter().chain(argv).collect()
-}
-
 /// Maximum bytes for the opening message: it ends up as one command-line argument, and the system allows 1 MB for a
 /// command's arguments plus environment (macOS)
 pub const OPENING_MAX: usize = 200_000;
@@ -706,17 +712,6 @@ pub(crate) fn opening_after_dashes(text: &str) -> Option<Vec<String>> {
     (!word).then(|| vec!["--".to_string()])
 }
 
-/// The opening message is kept in `state/opening/<session id>`, readable only by us, and [`exec_saying`] deletes it after
-/// reading. Not written into the command directly: the command goes through tmux, which caps a command at a dozen-odd KB,
-/// too small for a brief
-fn opening_file(id: &str, text: &str) -> Res<String> {
-    use std::os::unix::fs::PermissionsExt;
-    let path = paths::state_dir().join("opening").join(id);
-    paths::write_atomic(&path, text).map_err(|e| tr!("无法写入 {}:{e}", "can't write {}: {e}", path.display()))?;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    Ok(path.to_string_lossy().into_owned())
-}
-
 /// `aca exec-saying <file> <command…>`: exec that command, with the file's text appended as one last argument. Returning
 /// means the exec failed. If the file is gone (the same command was rerun in the pane), start without the message
 pub fn exec_saying(file: &str, argv: &[String]) -> std::io::Error {
@@ -727,26 +722,9 @@ pub fn exec_saying(file: &str, argv: &[String]) -> std::io::Error {
     std::process::Command::new(program).args(rest).args(text).exec()
 }
 
-/// `aca run`: no session, just run the tool's own command as-is (`login`, `mcp`, `doctor`…), with only the account layer's
-/// **environment** — the same as typing `CODEX_HOME=~/.codex2 codex login` in a terminal, minus typing the directory again.
-/// The arguments are only yours: the tool's and account's `args` are for starting sessions, and management commands may
-/// not accept them (Codex's `login` errors out with `--profile`), so add them yourself after. No hooks either
-pub fn direct(cfg: &Config, spec: &str, args: &[String]) -> Res<Launch> {
-    let p = pick(cfg, spec)?;
-    let mut cmd = base(&p.def, &p.agent.program());
-    cmd[0] = which(&cmd[0]).ok_or_else(|| tr!("PATH 中找不到 {}", "{} isn't on PATH", cmd[0]))?;
-    cmd.extend(args.iter().cloned());
-    let mut env = account_env(cfg, spec)?;
-    let argv = without(&[FOREIGN, OURS], &env, cmd);
-    let asked = std::env::var_os(LOGIN_LINK).is_some();
-    let theirs = std::env::var_os("BROWSER").is_some_and(|b| !b.is_empty());
-    let argv = quiet_login(p.agent.name(), args, Seat { asked, theirs, remote: remote(cfg) }, &mut env, argv);
-    Ok(Launch { argv, env, said: false })
-}
-
 /// Nobody is at this machine: if `[login] remote` says yes / no, follow it; otherwise decide ourselves: connected over SSH
 /// (the same check `aca` uses when copying), or Linux with no graphical session. Then the login link must open on another device:
-/// the kind that calls back to this machine can't finish (see [`quiet_login`])
+/// the kind that calls back to this machine can't finish (see [`crate::launch::quiet_login`])
 pub fn remote(cfg: &Config) -> bool {
     match cfg.login.remote {
         config::Remote::Yes => true,
@@ -758,67 +736,11 @@ pub fn remote(cfg: &Config) -> bool {
     }
 }
 
-/// Circumstances of a login: asked = started by the aca interface (with [`LOGIN_LINK`]); theirs = BROWSER set outside;
-/// remote see [`remote`]
-#[derive(Clone, Copy, Default)]
-struct Seat {
-    asked: bool,
-    theirs: bool,
-    remote: bool,
-}
-
 /// Set when the aca interface starts a login: points at a file where the login link the tool wants to open is written (see
 /// [`login_link`]); the interface sees it and pops up a browser picker
 pub const LOGIN_LINK: &str = "ACA_LOGIN_LINK";
 
-/// On macOS Codex opens links only through the system's open and ignores `$BROWSER`: run it in a sandbox that blocks only
-/// "open another program" (callbacks to this machine still arrive)
-const SANDBOX: &str = "/usr/bin/sandbox-exec";
-const NO_OPEN: &str = "(version 1) (allow default) (deny lsopen)";
-
-/// The tool's own browser login: `claude auth login`, `codex login` (not with a key / token, device code, status check or help)
-fn browser_login(family: &str, args: &[String]) -> bool {
-    let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    let help = |rest: &[&str]| rest.iter().any(|x| matches!(*x, "-h" | "--help" | "help"));
-    match family {
-        "claude" => a.starts_with(&["auth", "login"]) && !help(&a[2..]),
-        "codex" => {
-            a.first() == Some(&"login")
-                && !help(&a[1..])
-                && !a[1..].iter().any(|x| matches!(*x, "status" | "--with-api-key" | "--with-access-token" | "--device-auth"))
-        }
-        _ => false,
-    }
-}
-
-/// Logging in doesn't open your default browser for you (the user, 2026-10-14: this account isn't necessarily logged in from
-/// the default browser, and switching over by hand is a pain). Both tools print the link on screen themselves; Claude opens
-/// links with `$BROWSER`, which points back at aca (see [`login_link`]); Codex ignores it, so it's sandboxed to block that.
-/// Started by the aca interface (asked): done whatever is run (a new account starts the tool itself), overriding a BROWSER
-/// set outside, since the link must go to the interface; typed by you: only login commands, and a BROWSER set outside
-/// (theirs) is yours to use. A BROWSER set in the account always wins.
-/// Remote (the user's pick, 2026-10-14): switch to a login that can finish on another device — Claude gets BROWSER=`true`,
-/// so it opens nothing and shows the link whose code you paste back; Codex gets `--device-auth` (a fixed link + a one-time
-/// code), with no callback to this machine
-fn quiet_login(family: &str, args: &[String], seat: Seat, env: &mut Vec<(String, String)>, mut argv: Vec<String>) -> Vec<String> {
-    let login = browser_login(family, args);
-    if !seat.asked && !login {
-        return argv;
-    }
-    if !env.iter().any(|(k, _)| k == "BROWSER") && (seat.asked || !seat.theirs) {
-        let opener = if seat.remote { "true".to_string() } else { self_exe() };
-        env.push(("BROWSER".into(), opener));
-    }
-    if family == "codex" && seat.remote && login {
-        argv.push("--device-auth".into());
-    }
-    if family == "codex" && cfg!(target_os = "macos") && std::path::Path::new(SANDBOX).exists() {
-        return [SANDBOX.to_string(), "-p".into(), NO_OPEN.into()].into_iter().chain(argv).collect();
-    }
-    argv
-}
-
-/// `aca <link>`: the tool uses aca as its browser when logging in (see [`quiet_login`]). If the aca interface wants the link
+/// `aca <link>`: the tool uses aca as its browser when logging in (see [`crate::launch::quiet_login`]). If the aca interface wants the link
 /// ([`LOGIN_LINK`] points at a file), write it there; otherwise open nothing — the tool already printed the link on screen.
 /// Always exit 0: the tool takes it as opened, and goes on waiting for you to finish logging in in the browser
 pub fn login_link(url: &str) -> i32 {
@@ -846,7 +768,7 @@ pub fn account_env(cfg: &Config, spec: &str) -> Res<Vec<(String, String)>> {
     layered_env(&*p.agent, &p.def, &layer)
 }
 
-/// Run one of the tool's own commands with this session's tool and account (Codex's `queue`): like [`direct`], only the
+/// Run one of the tool's own commands with this session's tool and account (Codex's `queue`): like [`crate::launch::direct`], only the
 /// account layer's environment, only the given arguments, no session identity
 pub fn tool_cmd(cfg: &Config, s: &Session, args: &[String]) -> Res<Launch> {
     let (agent, tool) = of(cfg, s)?;
@@ -873,17 +795,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_agents_known_to_report_their_state_go_behind_the_relay() {
-        let argv = || vec!["/usr/bin/env".to_string(), "/bin/x".to_string()];
-        let behind =
-            |name: &str, on: Option<bool>| relayed(name, &Tool { program_status: on, ..Default::default() }, "/aca", argv())[0] == "/aca";
-        assert!(behind("claude", None) && behind("codex", None));
-        assert_eq!(relayed("claude", &Tool::default(), "/aca", argv())[..3], ["/aca", "pty", "--"]);
-        assert!(!behind("pi", None) && !behind("opencode", None) && !behind("aider", None));
-        // Turned on for one that learned it later, off for one that does report
-        assert!(behind("pi", Some(true)) && !behind("claude", Some(false)));
-        // Never shell
-        assert!(!behind("shell", Some(true)));
+    fn pi_and_opencode_get_the_same_servers_in_their_own_shapes() {
+        let mcp = vec![("aca".to_string(), vec!["plugin".to_string(), "tools".to_string()])];
+        let pi: serde_json::Value = serde_json::from_str(&pi::pi_mcp_config("/bin/aca", &mcp)).unwrap();
+        assert_eq!(pi, serde_json::json!({ "aca": { "command": "/bin/aca", "args": ["plugin", "tools"], "exposure": "direct" } }));
+        assert_eq!(
+            serde_json::Value::Object(opencode::opencode_mcp("/bin/aca", &mcp)),
+            serde_json::json!({ "aca": { "type": "local", "command": ["/bin/aca", "plugin", "tools"], "enabled": true } })
+        );
+    }
+
+    #[test]
+    fn the_flags_for_codex_and_the_file_for_claude_carry_the_session() {
+        let args = vec!["plugin".to_string(), "mcp".into(), "aca.delegate".into()];
+        let f = codex::codex_mcp_flag("aca-delegate", "/bin/aca", &args, &[("ACA_SESSION_ID".into(), "ab12".into())]);
+        let (k, v) = f.split_once('=').unwrap();
+        assert_eq!(k, "mcp_servers.aca-delegate");
+        let t: toml::Table = toml::from_str(&format!("x = {v}")).unwrap();
+        assert_eq!(t["x"]["command"].as_str(), Some("/bin/aca"));
+        assert_eq!(t["x"]["args"].as_array().unwrap().len(), 3);
+        assert_eq!(t["x"]["env"]["ACA_SESSION_ID"].as_str(), Some("ab12"));
+        let c: serde_json::Value =
+            serde_json::from_str(&claude::claude_mcp_config("/bin/aca", &[("aca".into(), vec!["plugin".into(), "tools".into()])])).unwrap();
+        assert_eq!(c["mcpServers"]["aca"]["args"][1], "tools");
     }
 
     fn picked(cfg: &Config, spec: &str) -> Res<(String, String, String)> {
@@ -947,125 +881,6 @@ mod tests {
             assert_eq!(opening_after_dashes(word), None, "{word}");
         }
         assert_eq!(opening_after_dashes("继续"), dashes);
-    }
-
-    #[test]
-    fn the_account_layer_goes_on_top_of_the_tool_at_launch() {
-        let dir = std::env::temp_dir().join(format!("aca-layer-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("k.env");
-        std::fs::write(&file, "# 公司的 key\nexport TOY_KEY=\"from file\"\nTOY_URL=https://x # 走代理\nTOY_MODE='a b'\n").unwrap();
-        let cfg = config::parse(&format!(
-            "[tools.toy]\ncmd = [\"/bin/sh\", \"toy.sh\"]\nhome_var = \"TOY_HOME\"\nargs = [\"--yolo\"]\nenv = {{ TOY_URL = \"tool\", TOY_KEEP = \"1\" }}\n\
-             [accounts.toy]\nwork = {{ home = \"/h/.toy-work\", env_file = \"{}\", env = {{ TOY_MODE = \"inline\" }}, args = [\"--profile\", \"w\"] }}\n",
-            file.display()
-        ));
-        let s =
-            Session { id: "ab12".into(), tool: "toy".into(), account: "work".into(), args: vec!["--mine".into()], ..Default::default() };
-        let l = launch(&cfg, &s, &How::Fresh, None).unwrap();
-        // Arguments: the tool's, the account's, the session's own
-        assert_eq!(l.argv[l.argv.len() - 6..], ["/bin/sh", "toy.sh", "--yolo", "--profile", "w", "--mine"]);
-        // Environment: on a name clash later overrides earlier, the last one counts
-        let last = |k: &str| l.env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-        assert_eq!(
-            (last("TOY_KEEP"), last("TOY_KEY"), last("TOY_URL"), last("TOY_MODE"), last("TOY_HOME")),
-            (Some("1"), Some("from file"), Some("https://x"), Some("inline"), Some("/h/.toy-work"))
-        );
-        assert_eq!((last("ACA_SESSION_ID"), last("ACA_TOOL")), (Some("ab12"), Some("toy")));
-
-        // No account: aca adds nothing
-        let bare = launch(&cfg, &Session { account: String::new(), ..s.clone() }, &How::Fresh, None).unwrap();
-        assert!(bare.env.iter().all(|(k, _)| !matches!(k.as_str(), "TOY_HOME" | "TOY_KEY" | "TOY_MODE")));
-        // Unregistered, written as a directory: just the config directory
-        let adhoc = launch(&cfg, &Session { account: "/h/.toy-new".into(), ..s.clone() }, &How::Fresh, None).unwrap();
-        assert_eq!(adhoc.env.iter().find(|(k, _)| k == "TOY_HOME").map(|(_, v)| v.as_str()), Some("/h/.toy-new"));
-        assert_eq!(adhoc.argv[adhoc.argv.len() - 4..], ["/bin/sh", "toy.sh", "--yolo", "--mine"]);
-
-        // Opening message: a declared tool doesn't take it as a startup argument, so the command is unchanged and whoever starts
-        // it waits for it to come up and types it in
-        let told = launch(&cfg, &s, &How::Fresh, Some("先看一下 README")).unwrap();
-        assert_eq!((told.said, &told.argv), (false, &l.argv));
-
-        // `aca run`: the tool's program + your arguments, the account only adds environment; no session-start arguments, no
-        // session identity
-        let d = direct(&cfg, "toy:work", &["login".to_string()]).unwrap();
-        assert_eq!(d.argv[d.argv.len() - 4..], ["ACA_TOOL", "/bin/sh", "toy.sh", "login"]);
-        assert!(d.argv.windows(2).any(|w| w == ["-u", "ACA_SESSION_ID"]) && d.argv.windows(2).any(|w| w == ["-u", "CLAUDECODE"]));
-        assert!(d.env.iter().any(|(k, v)| k == "TOY_HOME" && v == "/h/.toy-work") && d.env.iter().all(|(k, _)| !k.starts_with("ACA_")));
-
-        // env_file missing / broken: say where, without leaking the content
-        std::fs::write(&file, "TOY_KEY=k\n这行不对 sk-secret\n").unwrap();
-        let err = launch(&cfg, &s, &How::Fresh, None).unwrap_err();
-        assert!(err.contains("第 2 行") && !err.contains("sk-secret"), "{err}");
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(launch(&cfg, &s, &How::Fresh, None).unwrap_err().contains("env_file"));
-    }
-
-    #[test]
-    fn the_outer_sessions_login_is_stripped_unless_the_account_asks_for_it() {
-        let cfg = config::parse(
-            "[tools.claude]\ncmd = [\"/bin/sh\"]\n[accounts.claude]\nfirm = \"/h/.cd\"\n\
-             shared = { home = \"/h/.cd\", env = { CLAUDE_SECURESTORAGE_CONFIG_DIR = \"/h/.c\" } }\n\
-             console = { env = { ANTHROPIC_PROFILE = \"work\" } }\n",
-        );
-        let unset = |spec: &str, var: &str| direct(&cfg, spec, &[]).unwrap().argv.windows(2).any(|w| w == ["-u", var]);
-        // "Where to get credentials" left in the environment by an outer Claude: if not removed, firm's session uses the outer
-        // account's login
-        assert!(unset("claude:firm", "CLAUDE_SECURESTORAGE_CONFIG_DIR") && unset("claude", "CLAUDE_SECURESTORAGE_CONFIG_DIR"));
-        // Set in the account itself: you meant it, so keep it
-        assert!(!unset("claude:shared", "CLAUDE_SECURESTORAGE_CONFIG_DIR") && unset("claude:shared", "CLAUDECODE"));
-        // Same for a profile named outside: if not removed, firm uses that profile's login; one the account names itself is kept
-        assert!(unset("claude:firm", "ANTHROPIC_PROFILE") && unset("claude", "ANTHROPIC_PROFILE"));
-        assert!(!unset("claude:console", "ANTHROPIC_PROFILE") && unset("claude:console", "CLAUDE_SECURESTORAGE_CONFIG_DIR"));
-    }
-
-    #[test]
-    fn logins_aca_runs_dont_open_the_default_browser() {
-        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        // Recognizes both tools' browser logins; not with a key, device code, status check or help
-        assert!(browser_login("claude", &s(&["auth", "login"])) && browser_login("claude", &s(&["auth", "login", "--console"])));
-        assert!(!browser_login("claude", &s(&["auth", "status"])) && !browser_login("claude", &s(&["auth", "login", "-h"])));
-        assert!(!browser_login("claude", &[]) && !browser_login("toy", &s(&["login"])));
-        assert!(browser_login("codex", &s(&["login"])) && !browser_login("codex", &s(&["login", "status"])));
-        assert!(!browser_login("codex", &s(&["login", "--with-api-key"])) && !browser_login("codex", &s(&["login", "--device-auth"])));
-
-        let login = s(&["auth", "login"]);
-        let argv = s(&["/usr/bin/env", "-u", "CLAUDECODE", "/bin/claude", "auth", "login"]);
-        let here = Seat::default();
-        let run = |args: &[String], seat: Seat, env: &[(&str, &str)]| {
-            let mut env: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            let out = quiet_login("claude", args, seat, &mut env, argv.clone());
-            (out, env.into_iter().find(|(k, _)| k == "BROWSER").map(|(_, v)| v))
-        };
-        // A login typed by you: BROWSER points back at aca, the command is unchanged
-        assert_eq!(run(&login, here, &[]), (argv.clone(), Some(self_exe())));
-        // A BROWSER set outside is yours to use; one set in the account wins, also when started by the interface
-        assert_eq!(run(&login, Seat { theirs: true, ..here }, &[]).1, None);
-        assert_eq!(run(&login, Seat { asked: true, ..here }, &[("BROWSER", "/x/ff")]).1.as_deref(), Some("/x/ff"));
-        // Started by the interface: done even when it isn't a login command (a new account starts claude itself), overriding an
-        // outside BROWSER
-        assert_eq!(run(&[], Seat { asked: true, theirs: true, ..here }, &[]).1, Some(self_exe()));
-        // Other commands: unchanged
-        assert_eq!(run(&s(&["-p", "hi"]), here, &[]), (argv.clone(), None));
-        // Remote: Claude opens nothing (BROWSER=true) and shows the link to paste a code from; one set outside is still yours
-        let far = Seat { remote: true, ..here };
-        assert_eq!(run(&login, far, &[]), (argv.clone(), Some("true".into())));
-        assert_eq!(run(&[], Seat { asked: true, ..far }, &[]).1.as_deref(), Some("true"));
-        assert_eq!(run(&login, Seat { theirs: true, ..far }, &[]).1, None);
-
-        // Codex ignores BROWSER: on macOS it's sandboxed, blocking only opening other programs
-        let cx = s(&["/usr/bin/env", "/bin/codex", "login"]);
-        let sandboxed = cfg!(target_os = "macos") && std::path::Path::new(SANDBOX).exists();
-        let strip = |out: Vec<String>| if sandboxed { out[3..].to_vec() } else { out };
-        let out = quiet_login("codex", &s(&["login"]), here, &mut vec![], cx.clone());
-        if sandboxed {
-            assert_eq!(out[..3], s(&[SANDBOX, "-p", NO_OPEN])[..]);
-        }
-        assert_eq!(strip(out), cx);
-        assert_eq!(quiet_login("codex", &s(&["login", "status"]), here, &mut vec![], cx.clone()), cx);
-        // Remote: use the device code, no callback to this machine; nothing added when it isn't a login
-        assert_eq!(strip(quiet_login("codex", &s(&["login"]), far, &mut vec![], cx.clone())), s(&["/usr/bin/env", "/bin/codex", "login", "--device-auth"]));
-        assert_eq!(quiet_login("codex", &s(&["login", "status"]), far, &mut vec![], cx.clone()), cx);
     }
 
     #[test]

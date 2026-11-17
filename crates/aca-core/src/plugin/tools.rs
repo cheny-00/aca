@@ -129,7 +129,7 @@ fn offered_for(ctx: &super::Context) -> Vec<Offered> {
     let s = (!ctx.session.is_empty()).then(|| crate::store::Store::open().ok()?.get(&ctx.session).ok()).flatten();
     let cfg = crate::config::load();
     let (tool, account) = s.as_ref().map(|s| (s.tool.clone(), s.account.clone())).unwrap_or_default();
-    let kind = cfg.tool(&tool).map(|t| t.kind).unwrap_or_default();
+    let kind = crate::agent::tool(&cfg, &tool).map(|t| t.kind).unwrap_or_default();
     let wants = decl::wants().unwrap_or_default();
     let mut out = vec![];
     for e in registry().into_iter().filter(|e| e.enabled) {

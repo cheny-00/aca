@@ -8,6 +8,9 @@
 //! finish on another device (Claude has you paste the code from the web page back into the terminal; Codex uses a device
 //! code: the list shows the one-time code, also copyable). Asks every time, remembers nothing.
 //! Esc: don't open it for now; the link is still in the login terminal and the tool keeps waiting.
+//! A browser login that waits on this machine for the browser to come back (Codex's `http://localhost:1455/auth/callback`)
+//! can be finished on another computer too: 「在别的电脑登录」 (log in on another computer) copies the link, then takes the
+//! address that browser landed on, pasted back, and makes the same request to the login waiting here.
 use std::process::Command;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -52,6 +55,8 @@ pub enum How {
     Copy,
     /// Copy the one-time code of a device-code login
     CopyCode,
+    /// Copy the link, then take the address the browser on the other computer landed on
+    Elsewhere,
     /// Open with this .app (Mac)
     App(String),
     /// Run this command: the link goes last, or replaces `{url}` if an argument has it (from `[login] browsers`, or a Linux .desktop)
@@ -82,6 +87,12 @@ pub struct Pick {
     items: Vec<Item>,
     sel: usize,
     open: fn(&How, &str) -> Result<(), String>,
+    /// Where this login waits for the browser to come back ([`callback_of`]); None = not a login that does
+    back: Option<String>,
+    /// Taking the address pasted back: what's typed so far, and why the last one didn't go
+    paste: Option<(String, String)>,
+    /// Hands the pasted address to the login ([`deliver`]; swapped out in tests)
+    send: fn(&str, &str) -> Result<(), String>,
 }
 
 impl Pick {
@@ -107,15 +118,24 @@ impl Pick {
         if let Some(code) = &link.code {
             items.push(Item { label: tr!("复制验证码 {code}", "copy the one-time code {code}"), how: How::CopyCode });
         }
+        let back = if link.code.is_none() { callback_of(&link.url) } else { None };
+        if back.is_some() {
+            items.push(Item { label: t!("在别的电脑登录", "log in on another computer").into(), how: How::Elsewhere });
+        }
         items.extend(browsers);
-        Pick { title: title.to_string(), link, far, items, sel: 0, open }
+        Pick { title: title.to_string(), link, far, items, sel: 0, open, back, paste: None, send: deliver }
     }
 
-    fn choose(&self, i: usize, fx: &mut Fx) -> Flow {
+    fn choose(&mut self, i: usize, fx: &mut Fx) -> Flow {
         let Some(it) = self.items.get(i) else { return Flow::Stay };
         let copied = match &it.how {
             How::Copy => self.link.url.clone(),
             How::CopyCode => self.link.code.clone().unwrap_or_default(),
+            How::Elsewhere => {
+                fx.copy = Some(self.link.url.clone());
+                self.paste = Some((String::new(), String::new()));
+                return Flow::Stay;
+            }
             how => {
                 return match (self.open)(how, &self.link.url) {
                     Ok(()) => {
@@ -346,7 +366,7 @@ fn launch(how: &How, url: &str) -> Result<(), String> {
         How::System if cfg!(target_os = "macos") => return wait(Command::new("open").arg(url)),
         How::System => vec!["xdg-open".to_string(), url.to_string()],
         How::Cmd(cmd) => fill(cmd, url),
-        How::Copy | How::CopyCode => return Ok(()),
+        How::Copy | How::CopyCode | How::Elsewhere => return Ok(()),
     };
     // A browser command may keep running (the first firefox on Linux does): don't wait, keep its output off the interface; reap it when it
     // exits
@@ -378,12 +398,113 @@ fn short(url: &str) -> String {
     }
 }
 
+/// Where a login link sends the browser back to, when that's this machine (`redirect_uri=http://localhost:1455/auth/callback`):
+/// the login is waiting there. None = it sends it elsewhere, or doesn't say
+fn callback_of(url: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    let raw = query.split('&').find_map(|kv| kv.strip_prefix("redirect_uri="))?;
+    let back = unescape(raw);
+    let rest = back.strip_prefix("http://")?;
+    let host = rest.split('/').next()?;
+    let port = host.strip_prefix("localhost:").or_else(|| host.strip_prefix("127.0.0.1:"))?;
+    port.parse::<u16>().ok().map(|_| back.clone())
+}
+
+/// A URL's `state` (what ties a login's link to the address its browser comes back to)
+fn state_of(url: &str) -> Option<&str> {
+    url.split_once('?')?.1.split('&').find_map(|kv| kv.strip_prefix("state=")).map(str::trim)
+}
+
+/// %XX in a URL's query back to the bytes they stand for (`+` is a space)
+fn unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let pair = (b[i] == b'%' && i + 2 < b.len()).then(|| Some(hex(b[i + 1])? * 16 + hex(b[i + 2])?)).flatten();
+        match (pair, b[i]) {
+            (Some(v), _) => {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+            (None, b'+') => out.push(b' '),
+            (None, c) => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The address the browser on the other computer landed on, pasted back: make the same request it would have made to the login
+/// waiting here at `back` (same path; localhost and 127.0.0.1 count as one). Only for this machine's own address, with a code in it
+fn deliver(back: &str, pasted: &str) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let pasted = pasted.trim();
+    // Copied from an address bar that hides the scheme
+    let pasted = if pasted.starts_with("http") { pasted.to_string() } else { format!("http://{pasted}") };
+    let same = |u: &str| u.replacen("://127.0.0.1:", "://localhost:", 1);
+    let want = || tr!("要粘贴 {back}?… 这样的地址", "paste an address like {back}?…");
+    let query = same(&pasted).strip_prefix(&same(back)).and_then(|r| r.strip_prefix('?')).map(String::from).ok_or_else(want)?;
+    if !query.split('&').any(|kv| kv.starts_with("code=")) {
+        return Err(t!("地址里没有 code:网页上的登录还没完成", "there's no code in it: the login on the web page isn't done").into());
+    }
+    let rest = back.split_once("://").map_or(back, |(_, r)| r);
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let port: u16 = host.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).ok_or_else(want)?;
+    let gone = || {
+        t!("没有登录在等:登录终端里已经结束了,重新登录再试", "no login is waiting: it ended in the login terminal; log in again")
+            .to_string()
+    };
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut c = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)).map_err(|_| gone())?;
+    let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+    c.write_all(format!("GET /{path}?{query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes()).map_err(|_| gone())?;
+    // Only the status line matters
+    let mut got = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !got.windows(2).any(|w| w == b"\r\n") && got.len() < 8192 {
+        match c.read(&mut buf) {
+            Ok(n @ 1..) => got.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&got);
+    let line = text.lines().next().unwrap_or_default().trim().to_string();
+    match line.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()) {
+        Some(200..=399) => Ok(()),
+        Some(_) => Err(tr!("登录没有收下:{line}", "the login didn't take it: {line}")),
+        None => Err(gone()),
+    }
+}
+
 impl Overlay for Pick {
     fn width(&self) -> u16 {
         64
     }
 
     fn lines(&self, w: usize) -> Vec<Line<'static>> {
+        if let Some((text, why)) = &self.paste {
+            let title = t!("在别的电脑登录", "Log in on another computer");
+            let mut out = vec![kit::modal_title(title, theme::accent(), kit::esc_hint(t!("返回", "back")), w), Line::raw("")];
+            out.push(Line::styled(kit::clip(&self.title, w).trim_end().to_string(), kit::dim()));
+            let said = t!(
+                "已复制链接 · 登录后，把浏览器跳到的地址粘贴到这里",
+                "link copied · after logging in, paste the address the browser went to"
+            );
+            out.extend(crate::setup::fold(said, w).into_iter().map(Line::raw));
+            out.push(Line::raw(""));
+            // A long address shows its end, where the typing is
+            let shown = kit::clip_left(text, w.saturating_sub(3));
+            out.push(Line::from(vec![Span::styled("> ", kit::key_style()), Span::raw(shown), Span::styled("▏", kit::key_style())]));
+            if !why.is_empty() {
+                out.extend(crate::setup::fold(why, w).into_iter().map(|l| Line::styled(l, theme::warn())));
+            }
+            out.push(Line::raw(""));
+            out.push(kit::keys_line(&[("⏎", t!("送回登录", "hand it to the login"))], vec![], w));
+            return out;
+        }
         let title = if self.far {
             t!("在手机或其他电脑上登录", "Log in on your phone / another computer")
         } else {
@@ -413,7 +534,41 @@ impl Overlay for Pick {
         out
     }
 
+    fn typing(&self) -> bool {
+        self.paste.is_some()
+    }
+
     fn on_key(&mut self, k: KeyEvent, fx: &mut Fx) -> Flow {
+        if let (Some((text, why)), Some(back)) = (self.paste.as_mut(), self.back.as_deref()) {
+            let ctrl = k.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL);
+            match k.code {
+                // Back to the list: the link is still copied, the login still waiting
+                KeyCode::Esc => self.paste = None,
+                // Another login's address (an older link opened over there): the login here would only answer 400
+                KeyCode::Enter if matches!((state_of(&self.link.url), state_of(text)), (Some(a), Some(b)) if a != b) => {
+                    *why = t!(
+                        "不是这次登录的地址:用这次复制的链接再登录一遍",
+                        "not this login's address: log in again with the link copied this time"
+                    )
+                    .into();
+                }
+                KeyCode::Enter => match (self.send)(back, text) {
+                    Ok(()) => {
+                        fx.say(t!("已送回登录 · 结果看登录终端", "handed to the login · see the login terminal"));
+                        return Flow::Close;
+                    }
+                    Err(e) => *why = e,
+                },
+                KeyCode::Backspace => {
+                    text.pop();
+                }
+                KeyCode::Char('u') if ctrl => text.clear(),
+                // A pasted address arrives as keys; line breaks around it aren't part of it
+                KeyCode::Char(c) if !ctrl && !c.is_control() => text.push(c),
+                _ => {}
+            }
+            return Flow::Stay;
+        }
         let n = self.items.len();
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -591,5 +746,91 @@ mod tests {
         assert_eq!(items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["Firefox(默认)", "Google Chrome"]);
         assert_eq!(items[0].how, How::Cmd(s(&["firefox", "{url}"])));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    const CODEX: &str = "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_x\
+                         &redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid&state=s1";
+
+    /// What the login took: the last address handed over (one per test thread)
+    fn taken(back: &str, pasted: &str) -> Result<(), String> {
+        if pasted.contains("code=") { Ok(()) } else { Err(format!("{back} 没收下 {pasted}")) }
+    }
+
+    #[test]
+    fn a_login_waiting_here_can_be_finished_on_another_computer_by_pasting_where_its_browser_went() {
+        assert_eq!(callback_of(CODEX).as_deref(), Some("http://localhost:1455/auth/callback"));
+        // Sent elsewhere (Claude's paste-a-code page), or not said: nothing to paste back
+        assert_eq!(callback_of("https://claude.com/x?redirect_uri=https%3A%2F%2Fplatform.claude.com%2Fcallback"), None);
+        assert_eq!(callback_of(URL), None);
+        assert_eq!(unescape("a%2Fb+c%zz%4"), "a/b c%zz%4");
+
+        let mut p = Pick::with("登录 Codex · team-unis", link(CODEX, None), false, arrange(found(), None), fake);
+        p.send = taken;
+        shows(&text(&p, 60), &["1  复制链接", "2  在别的电脑登录", "3  Safari"]);
+        // Picked: the link is copied, then the address is taken
+        let (f, fx) = press(&mut p, KeyCode::Char('2'));
+        assert_eq!((f, fx.copy.as_deref()), (Flow::Stay, Some(CODEX)));
+        assert!(p.typing());
+        let rows = text(&p, 60);
+        shows(&rows, &["在别的电脑登录", "Esc 返回", "登录 Codex · team-unis", "已复制链接", "> ▏", "⏎ 送回登录"]);
+        // Pasted as keys; not taken: why, it stays
+        for c in "localhost:1455/auth/callback?state=s1".chars() {
+            press(&mut p, KeyCode::Char(c));
+        }
+        assert_eq!(press(&mut p, KeyCode::Enter).0, Flow::Stay);
+        shows(&text(&p, 60), &["没收下"]);
+        // ^U clears; another login's address (its state differs): said so before anything is sent
+        let ctrl_u = || KeyEvent::new(KeyCode::Char('u'), ratatui::crossterm::event::KeyModifiers::CONTROL);
+        p.on_key(ctrl_u(), &mut Fx::default());
+        for c in "localhost:1455/auth/callback?code=ab&state=old".chars() {
+            press(&mut p, KeyCode::Char(c));
+        }
+        assert_eq!(press(&mut p, KeyCode::Enter).0, Flow::Stay);
+        shows(&text(&p, 60), &["不是这次登录的地址"]);
+        // Taken: closes, saying where to look
+        p.on_key(ctrl_u(), &mut Fx::default());
+        assert_eq!(p.paste.as_ref().map(|(t, _)| t.as_str()), Some(""));
+        for c in "http://localhost:1455/auth/callback?code=ab&state=s1".chars() {
+            press(&mut p, KeyCode::Char(c));
+        }
+        let (f, fx) = press(&mut p, KeyCode::Enter);
+        assert_eq!((f, fx.flash.as_deref()), (Flow::Close, Some("已送回登录 · 结果看登录终端")));
+        // Esc while pasting: back to the list, not closed
+        let mut p = Pick::with("登录 Codex · team-unis", link(CODEX, None), false, vec![], fake);
+        press(&mut p, KeyCode::Char('2'));
+        assert_eq!(press(&mut p, KeyCode::Esc).0, Flow::Stay);
+        assert!(!p.typing() && text(&p, 60).iter().any(|r| r.contains("如何打开登录链接")));
+        // A device code login needs nothing pasted back
+        let p = Pick::with("登录 Codex · x", link(CODEX, Some("AB12-CD3EF")), true, vec![], fake);
+        assert!(!text(&p, 60).iter().any(|r| r.contains("在别的电脑登录")));
+    }
+
+    #[test]
+    fn the_pasted_address_goes_to_the_login_waiting_here_as_the_browser_would_have_sent_it() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 512];
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = c.read(&mut buf).unwrap();
+                got.extend_from_slice(&buf[..n]);
+            }
+            c.write_all(b"HTTP/1.1 302 Found\r\nLocation: /success\r\n\r\n").unwrap();
+            String::from_utf8_lossy(&got).lines().next().unwrap().to_string()
+        });
+        let back = format!("http://localhost:{port}/auth/callback");
+        // 127.0.0.1 or localhost alike, the scheme may be missing
+        deliver(&back, &format!("  127.0.0.1:{port}/auth/callback?code=ab&state=s1\n")).unwrap();
+        assert_eq!(server.join().unwrap(), "GET /auth/callback?code=ab&state=s1 HTTP/1.1");
+        // Not this login's address, no code: said so, nothing sent
+        assert!(deliver(&back, "http://example.com/auth/callback?code=ab").unwrap_err().contains(&back));
+        assert!(deliver(&back, &format!("{back}?error=access_denied")).unwrap_err().contains("code"));
+        // Nobody waiting any more
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let gone = deliver(&format!("http://localhost:{free}/auth/callback"), &format!("localhost:{free}/auth/callback?code=x"));
+        assert!(gone.unwrap_err().contains("没有登录在等"));
     }
 }

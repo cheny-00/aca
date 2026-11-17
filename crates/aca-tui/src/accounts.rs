@@ -27,8 +27,7 @@ use regex::Regex;
 use toml::{Table, Value};
 
 use aca_core::{t, tr};
-
-use crate::data::Agent;
+use aca_records::agent::Agent;
 
 /// Added: the config dir (~ expanded), whether it was just created (a new one needs a login)
 #[derive(Debug, PartialEq)]
@@ -108,12 +107,16 @@ fn read(p: &Path) -> std::io::Result<String> {
     }
 }
 
-/// This family's recorded accounts: (name, dir as written; for a table its home, or empty if none). Unreadable / malformed
-/// counts as none
+/// This family's recorded accounts: (name, dir as written; for a table its home, or empty if none; for one bound to a sandbox
+/// the config dir it uses inside, `<workspace>/<family>`, mounted at the same path). Unreadable / malformed counts as none
 fn list_in(text: &str, fam: &str) -> Vec<(String, String)> {
     let Ok(t) = text.parse::<Table>() else { return vec![] };
     let table = t.get("accounts").and_then(|v| v.get(fam)).and_then(|v| v.as_table());
-    let dir = |v: &Value| v.as_str().or_else(|| v.get("home")?.as_str()).unwrap_or("").trim().to_string();
+    let boxed = |v: &Value| {
+        let w = t.get("sandbox")?.get(v.get("sandbox")?.as_str()?.trim())?.get("workspace")?.as_str()?.trim();
+        Some(format!("{}/{fam}", w.trim_end_matches('/')))
+    };
+    let dir = |v: &Value| boxed(v).unwrap_or_else(|| v.as_str().or_else(|| v.get("home")?.as_str()).unwrap_or("").trim().to_string());
     table.into_iter().flatten().map(|(n, v)| (n.clone(), dir(v))).collect()
 }
 
@@ -170,7 +173,7 @@ pub(crate) fn defaults(text: &str, home: &str, installed: fn(&str) -> bool) -> V
     let mut out = vec![];
     for a in [Agent::Claude, Agent::Codex] {
         let Some(f) = fam(a) else { continue };
-        let Some(tool) = cfg.tool(f) else { continue };
+        let Some(tool) = aca_core::agent::tool(&cfg, f) else { continue };
         let own = format!("{home}/.{f}");
         let taken = !tool.account.is_empty() || listed.iter().any(|(x, abs)| x.agent == a && *abs == own);
         let prog = tool.cmd.first().map_or(f, String::as_str);
@@ -609,7 +612,7 @@ fn with_common_args(text: &str, fam: &str, args: &[String]) -> Result<String, St
 pub(crate) fn set_common_args_in(path: &Path, a: Agent, args: &[String]) -> Result<bool, String> {
     let fam = fam(a).ok_or(t!("仅支持 Claude / Codex 账号", "only Claude / Codex have accounts"))?;
     let text = read(path).map_err(|e| tr!("无法读取 config.toml:{e}", "can't read config.toml: {e}"))?;
-    if aca_core::config::parse(&text).tool(fam).map(|t| t.args).unwrap_or_default() == args {
+    if aca_core::agent::tool(&aca_core::config::parse(&text), fam).map(|t| t.args).unwrap_or_default() == args {
         return Ok(false);
     }
     let new = with_common_args(&text, fam, args)?;
@@ -643,7 +646,7 @@ pub(crate) fn remove_in(path: &Path, home: &str, a: Agent, name: &str) -> Result
 /// Which tools use it when no account is given (`[tools.<name>] account`): removing it leaves those tools unable to start
 pub(crate) fn default_of(cfg: &aca_core::config::Config, a: Agent, name: &str) -> Vec<String> {
     let fam = fam(a).unwrap_or_default();
-    cfg.tools.keys().filter(|t| cfg.tool(t).is_some_and(|d| d.kind == fam && d.account == name)).cloned().collect()
+    cfg.tools.keys().filter(|t| aca_core::agent::tool(cfg, t).is_some_and(|d| d.kind == fam && d.account == name)).cloned().collect()
 }
 
 /// Move this account one step up / down within its family; false if it's already at the top / bottom.
@@ -696,6 +699,16 @@ pub(crate) fn shift_in(path: &Path, home: &str, a: Agent, name: &str, up: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_account_bound_to_a_sandbox_lists_the_config_dir_it_uses_inside() {
+        let text = "[sandbox.work]\nssh = \"work\"\nworkspace = \"~/cages/work/\"\n\
+                    [accounts.claude]\nteam = { sandbox = \"work\" }\nsub = \"~/.claude-sub\"\nlost = { sandbox = \"nope\" }\n";
+        let mut got = list_in(text, "claude");
+        got.sort();
+        let want = [("lost", ""), ("sub", "~/.claude-sub"), ("team", "~/cages/work/claude")];
+        assert_eq!(got, want.map(|(n, d)| (n.to_string(), d.to_string())));
+    }
 
     #[test]
     fn accounts_are_listed_claude_first_then_codex_in_the_menu_order() {

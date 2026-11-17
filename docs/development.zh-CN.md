@@ -10,8 +10,11 @@ cargo clippy --all-targets               # 静态检查;别对整个仓库跑 ca
 ./install.sh                             # 编译当前这份代码并安装
 ```
 
-代码分成三个 crate:`crates/aca-core`(会话后端,是一个库)、`crates/aca-tui`(界面,只依赖 core)、
-`crates/aca`(命令行,也是界面的入口)。自带的插件在 `plugins/` 下,会被编译进程序里。
+代码分成四个 crate,每个只依赖排在它前面的:`crates/aca-core`(会话后端,是一个库)、
+`crates/aca-records`(读各家 agent 自己写下的记录:对话记录、用量和计费、配额、会话实际在哪个目录干活;不画界面)、
+`crates/aca-tui`(界面)、`crates/aca`(命令行,也是界面的入口)。
+`aca-core` 里的模块分了层,各层写在 `crates/aca-core/src/lib.rs` 开头,一个模块不引用比它高的层。
+自带的插件在 `plugins/` 下,会被编译进程序里。
 每条命令的用法和帮助文字都写在 `crates/aca/src/help.rs` 的一张表里;
 界面的按键说明在 `crates/aca-tui/src/keys.txt` 和 `keys.en.txt` 里。
 

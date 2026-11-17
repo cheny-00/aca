@@ -131,7 +131,7 @@ impl Agent for Pi {
         if tool.mcp.is_empty() {
             return Ok(vec![]);
         }
-        let text = crate::plugin::mount::pi_mcp_config(aca, &tool.mcp);
+        let text = pi_mcp_config(aca, &tool.mcp);
         let mut h = DefaultHasher::new();
         text.hash(&mut h);
         let file = super::hook_file(&format!("pi-mcp-{:016x}.json", h.finish()), &text)?;
@@ -154,7 +154,7 @@ impl Agent for Pi {
         (!r.hook_title.is_empty()).then(|| r.hook_title.clone()).or_else(|| pane_title(pane))
     }
 
-    fn live(&self, _pid: u32, _home: Option<&str>, argv: &[String]) -> Live {
+    fn live(&self, _pid: u32, _home: Option<&str>, argv: &[String], _ours: &dyn Fn(&str) -> bool) -> Live {
         let at = argv.iter().position(|a| a == "--session-id");
         let conv = at.and_then(|i| argv.get(i + 1)).cloned().unwrap_or_default();
         Live { conv, args: super::carry(argv, not_carried), ..Default::default() }
@@ -185,6 +185,15 @@ impl Agent for Pi {
         let tail = &nonempty[nonempty.len().saturating_sub(8)..];
         if tail.iter().any(|l| WORKING.is_match(l)) { Seen::Running(0) } else { Seen::Unsure }
     }
+}
+
+/// The pi side: `{ name: { command, args } }`, handed one by one to `pi.registerMcpServer` when aca's extension starts.
+/// pi hides MCP tools behind codemode by default (reachable only by the model writing a script); aca's are only a few, so
+/// they're declared to the model directly, as for Claude and Codex
+pub fn pi_mcp_config(aca: &str, mcp: &[(String, Vec<String>)]) -> String {
+    let servers: serde_json::Map<String, serde_json::Value> =
+        mcp.iter().map(|(name, args)| (name.clone(), serde_json::json!({ "command": aca, "args": args, "exposure": "direct" }))).collect();
+    serde_json::to_string_pretty(&servers).unwrap()
 }
 
 #[cfg(test)]
@@ -275,9 +284,9 @@ mod tests {
     fn adopting_takes_the_conversation_and_carries_the_other_flags() {
         let argv: Vec<String> =
             ["pi", "-e", "/st/hooks/pi.ts", "--session-id", "c-7", "--model", "fake-1", "-e", "./mine.ts"].map(String::from).to_vec();
-        let l = Pi.live(1, None, &argv);
+        let l = Pi.live(1, None, &argv, &|_| false);
         assert_eq!(l.conv, "c-7");
         assert_eq!(l.args.unwrap(), ["--model", "fake-1", "-e", "./mine.ts"]);
-        assert_eq!(Pi.live(1, None, &["pi".to_string(), "-c".to_string()]).args.unwrap(), Vec::<String>::new());
+        assert_eq!(Pi.live(1, None, &["pi".to_string(), "-c".to_string()], &|_| false).args.unwrap(), Vec::<String>::new());
     }
 }

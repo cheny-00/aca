@@ -36,7 +36,7 @@ pub fn assign(path: Option<&Path>, names: &[String], size: usize) -> Vec<(String
     if let Some(p) = path
         && out != text
     {
-        let _ = crate::state::write_atomic(p, &out);
+        let _ = crate::paths::write_atomic(p, &out);
     }
     got
 }

@@ -91,6 +91,20 @@ fn make(store: &Store, cfg: &Config, n: New, say: Option<&str>) -> Res<(Session,
     if !dir.is_dir() {
         return Err(tr!("{} 不是目录", "{} is not a directory", dir.display()));
     }
+    // A cage is closed (see crate::sandbox): no session in it is started by another session, unless it takes work in
+    if let Some((name, _)) = crate::sandbox::cage_of(cfg, agent.name(), &account).filter(|(_, b)| !b.delegate) {
+        let from = match n.parent.as_str() {
+            "" => std::env::var("ACA_SESSION_ID").ok().filter(|p| store.get(p).is_ok()),
+            "-" => None,
+            p => Some(p.to_string()),
+        };
+        if let Some(from) = from {
+            return Err(tr!(
+                "账号 {account} 只在沙箱 {name} 中使用,沙箱是封闭的:不从别的会话({from})往里派活([sandbox.{name}] 写 delegate = true 打开)",
+                "account {account} is only used inside sandbox {name}, which is closed: no work goes in from another session ({from}) (delegate = true in [sandbox.{name}] opens it)"
+            ));
+        }
+    }
     let dir = if n.worktree.is_empty() { dir } else { crate::worktree::make(&dir, n.worktree.trim())? };
     // Created from inside a session: becomes its child and joins the same group
     let parent = match n.parent.as_str() {
@@ -155,8 +169,46 @@ fn make(store: &Store, cfg: &Config, n: New, say: Option<&str>) -> Res<(Session,
 /// conversation's id
 fn how_to_resume(cfg: &Config, s: &Session, r: &Run) -> (How, String) {
     let conv = if r.conv.is_empty() { s.conv.clone() } else { r.conv.clone() };
+    let found = inside_record(cfg, s, &conv, r);
+    let r = &found.unwrap_or_else(|| r.clone());
+    let conv = if conv.is_empty() { r.conv.clone() } else { conv };
     let how = agent::of(cfg, s).map_or(How::Fresh, |(agent, _)| agent.resume(&conv, r));
     (how, conv)
+}
+
+/// The state with where its conversation record is, for a session inside a sandbox ([`inside_record`]); as it was otherwise
+pub(crate) fn inside(cfg: &Config, s: &Session, r: &Run) -> Run {
+    let conv = if r.conv.is_empty() { s.conv.clone() } else { r.conv.clone() };
+    inside_record(cfg, s, &conv, r).unwrap_or_else(|| r.clone())
+}
+
+/// A session inside a sandbox has no hook to say where its conversation record is: look for it in the sandbox's config
+/// directory (mounted at the same path), and remember it. With no conversation id either (Codex takes none at start), the
+/// newest one it started in the session's directory since the session was created. None = not in a sandbox, already known,
+/// or not found
+fn inside_record(cfg: &Config, s: &Session, conv: &str, r: &Run) -> Option<Run> {
+    if !r.transcript.is_empty() && Path::new(&r.transcript).is_file() {
+        return None;
+    }
+    crate::sandbox::cage_of_session(cfg, s)?;
+    let (agent, _) = agent::of(cfg, s).ok()?;
+    let home = agent::home(cfg, &s.tool, &s.account).ok()??;
+    let (conv, file) = match agent.conv_files(&home, conv).first() {
+        Some(f) => (conv.to_string(), home.join(f)),
+        None if conv.is_empty() => agent.conv_started_in(&home, Path::new(&s.dir), s.created)?,
+        None => return None,
+    };
+    let file = file.to_string_lossy().into_owned();
+    runtime::update(&s.id, |x| {
+        x.transcript = file.clone();
+        if x.conv.is_empty() {
+            x.conv = conv.clone();
+        }
+        if !x.convs.contains(&conv) {
+            x.convs.push(conv.clone());
+        }
+    });
+    Some(Run { conv, transcript: file, ..r.clone() })
 }
 
 /// Starts the agent in the target pane. The account's environment goes only to this one process via `respawn-pane -e`, not
@@ -175,9 +227,9 @@ fn launch(cfg: &Config, s: &Session, pane: Option<&Pane>, how: How) -> Res<()> {
     launch_saying(cfg, s, pane, how, None).map(drop)
 }
 
-/// [`launch`], with the opening prompt. Returns whether it was passed as a launch argument (see [`agent::launch`])
+/// [`launch`], with the opening prompt. Returns whether it was passed as a launch argument (see [`crate::launch::launch`])
 fn launch_saying(cfg: &Config, s: &Session, pane: Option<&Pane>, how: How, say: Option<&str>) -> Res<bool> {
-    let l = agent::launch(cfg, s, &how, say)?;
+    let l = crate::launch::launch(cfg, s, &how, say)?;
     let argv: Vec<String> = l.argv.iter().map(|a| tmux::arg(a)).collect();
     match pane {
         Some(p) => {
@@ -211,7 +263,7 @@ fn launch_saying(cfg: &Config, s: &Session, pane: Option<&Pane>, how: How, say: 
             a.push(";".into());
             a.extend(respawn(&target, &s.dir, &l, argv));
             tmux::run(&a)?;
-            tmux::bind_detach();
+            tmux::bind_detach(crate::plugin::hotkey_binds);
         }
     }
     runtime::update(&s.id, |r| {
@@ -513,6 +565,14 @@ pub fn rehome(store: &Store, cfg: &Config, key: &str, to: &str) -> Res<Rehomed> 
     let target = label(&p.tool, &p.account);
     if p.tool == s.tool && p.account == s.account {
         return Err(tr!("已是 {target}", "it's already on {target}"));
+    }
+    for (tool, account) in [(&s.tool, &s.account), (&p.tool, &p.account)] {
+        if let Some((name, _)) = agent::resolve(cfg, tool).ok().and_then(|(a, _)| crate::sandbox::cage_of(cfg, a.name(), account)) {
+            return Err(tr!(
+                "账号 {account} 只在沙箱 {name} 中使用,沙箱是封闭的:对话不能换到别的账号,也不能从别的账号换进来",
+                "account {account} is only used inside sandbox {name}, which is closed: its conversations don't move to another account, nor others' into it"
+            ));
+        }
     }
     let (from, dest) = (agent::home(cfg, &s.tool, &s.account)?, agent::home(cfg, &p.tool, &p.account)?);
     let r = runtime::load(&s.id);

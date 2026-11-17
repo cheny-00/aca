@@ -27,10 +27,10 @@ use serde::{Deserialize, Serialize};
 
 use aca_core::store::Store;
 use aca_core::{t, tr};
+use aca_records::paths::{state_file, write_atomic};
 
 use crate::ops::Job;
 use crate::overlay::{Flow, Fx, Overlay, kit};
-use crate::state::{state_file, write_atomic};
 use crate::theme;
 
 /// How long deleted ones are kept (seconds)
@@ -364,7 +364,7 @@ impl Page {
             (kit::clip(&titles.join(t!("、", ", ")), room).trim_end().to_string(), what)
         } else if i.group.is_empty() {
             let g = i.sessions.first().map(|s| s.group.as_str()).unwrap_or_default();
-            (i.label().to_string(), if g.is_empty() { String::new() } else { crate::ui::group_label(g).to_string() })
+            (i.label().to_string(), if g.is_empty() { String::new() } else { crate::kit::group_label(g).to_string() })
         } else {
             let n = i.taken();
             (format!("▾ {}", i.group), if n > 0 { tr!("{n} 个会话", "{n} sess.") } else { String::new() })
@@ -437,7 +437,7 @@ impl Overlay for Page {
         out.push(Line::raw(""));
         let Some(_) = self.cur() else { return out };
         if self.armed {
-            out.extend(crate::ui::wrap_width(&self.warning(&self.targets()), w).into_iter().map(|l| Line::styled(l, theme::warn())));
+            out.extend(crate::kit::wrap_width(&self.warning(&self.targets()), w).into_iter().map(|l| Line::styled(l, theme::warn())));
             out.push(Line::raw(""));
             out.push(kit::keys_line(&[("y", t!("永久删除", "delete")), ("Esc", t!("取消", "keep"))], vec![], w));
             return out;

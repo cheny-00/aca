@@ -283,7 +283,7 @@ fn plan_in(store: &Store, cfg: &Config, w: &World, target: &str, opts: &Opts) ->
     };
     let layer = agent::account(cfg, &*agent, &account)?;
     let argv: &[String] = image.as_ref().map_or(&[], |im| &im.argv);
-    let mut live = agent.live(pid, home.as_deref(), argv);
+    let mut live = agent.live(pid, home.as_deref(), argv, &crate::plugin::is_agent_dir);
     let record = import::agent_deck_record(var("AGENTDECK_INSTANCE_ID").as_deref(), &pane.session);
     let known_args = [def.args.as_slice(), layer.args.as_slice()];
     let (mut s, more) = draft(pane, &tool, account, &live, &known_args, argv.len() > 1, record.as_ref(), opts);
@@ -405,7 +405,7 @@ pub fn apply(store: &Store, p: &Plan) -> Res<(Session, String)> {
         a.extend(opt.iter().map(|x| x.to_string()));
     }
     tmux::run(&a).map_err(|e| tr!("无法在 tmux 中记录:{e}", "can't mark it in tmux: {e}"))?;
-    tmux::bind_detach();
+    tmux::bind_detach(crate::plugin::hotkey_binds);
     if !p.known
         && let Err(e) = by_dir(store, &mut s).and_then(|()| store.insert(&s))
     {

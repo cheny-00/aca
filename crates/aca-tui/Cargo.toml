@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 aca-core.workspace = true
+aca-records.workspace = true
 anyhow = "1.0.104"
 memchr = "2.8.3"
 portable-pty = "0.9.0"
@@ -25,6 +26,9 @@ vt100 = "0.16.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+aca-records = { workspace = true, features = ["fixtures"] }
 
 [lints]
 workspace = true

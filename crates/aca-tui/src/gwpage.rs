@@ -204,7 +204,8 @@ impl Overlay for Page {
     }
 
     fn lines(&self, w: usize) -> Vec<Line<'static>> {
-        let wrap = |text: &str, st: Style| crate::ui::wrap_width(text, w).into_iter().map(move |l| Line::styled(l, st)).collect::<Vec<_>>();
+        let wrap =
+            |text: &str, st: Style| crate::kit::wrap_width(text, w).into_iter().map(move |l| Line::styled(l, st)).collect::<Vec<_>>();
         // While off, new agents bypass it and mount MCPs themselves; not running means idle, it starts itself when the first
         // agent connects — none of this goes on screen
         let head = match (self.info.on, self.info.running) {
@@ -285,7 +286,7 @@ impl Overlay for Page {
                 if let Some(r) = self.cur() {
                     let log = gateway::log_of(&aca_core::plugin::mount::safe(&r.name));
                     if log.exists() {
-                        fx.external = Some(crate::ui::External::View { path: log.to_string_lossy().into_owned(), line: 1, temp: false });
+                        fx.external = Some(crate::view::External::View { path: log.to_string_lossy().into_owned(), line: 1, temp: false });
                     } else {
                         fx.say(tr!("{} 暂无日志", "{} has no log yet", r.name));
                     }

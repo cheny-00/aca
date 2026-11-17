@@ -112,7 +112,7 @@ impl Agent for Opencode {
     fn env(&self, tool: &Tool, aca: &str, set: &[(String, String)]) -> Res<Vec<(String, String)>> {
         let file = super::hook_file("opencode.js", PLUGIN)?;
         let outside = std::env::var(CONTENT).ok();
-        let mcp = crate::plugin::mount::opencode_mcp(aca, &tool.mcp);
+        let mcp = opencode_mcp(aca, &tool.mcp);
         Ok(vec![(CONTENT.to_string(), content(theirs(set, outside).as_deref(), &format!("file://{}", file.display()), mcp))])
     }
 
@@ -131,7 +131,7 @@ impl Agent for Opencode {
         (!r.hook_title.is_empty()).then(|| r.hook_title.clone()).or_else(|| pane_title(pane))
     }
 
-    fn live(&self, _pid: u32, _home: Option<&str>, argv: &[String]) -> Live {
+    fn live(&self, _pid: u32, _home: Option<&str>, argv: &[String], _ours: &dyn Fn(&str) -> bool) -> Live {
         let at = argv.iter().position(|a| a == "-s" || a == "--session");
         let conv = at.and_then(|i| argv.get(i + 1)).filter(|v| !v.starts_with('-')).cloned().unwrap_or_default();
         Live { conv, args: super::carry(argv, not_carried), ..Default::default() }
@@ -166,6 +166,16 @@ impl Agent for Opencode {
         }
         if tail.iter().rev().take(2).any(|l| RUNNING.is_match(l)) { Seen::Running(0) } else { Seen::Unsure }
     }
+}
+
+/// The opencode side: the entries under `mcp` in the layered config (local, command and arguments as one array)
+pub fn opencode_mcp(aca: &str, mcp: &[(String, Vec<String>)]) -> serde_json::Map<String, serde_json::Value> {
+    mcp.iter()
+        .map(|(name, args)| {
+            let cmd: Vec<&str> = std::iter::once(aca).chain(args.iter().map(String::as_str)).collect();
+            (name.clone(), serde_json::json!({ "type": "local", "command": cmd, "enabled": true }))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -203,7 +213,7 @@ mod tests {
         assert_eq!(v(content(Some("not json"), "file:///p.js", none())), json!({ "plugin": ["file:///p.js"] }));
         assert_eq!(v(content(Some(r#"{"plugin":"one"}"#), "file:///p.js", none())), json!({ "plugin": ["file:///p.js"] }));
         // Plugins' MCP servers: put together with yours
-        let mcp = crate::plugin::mount::opencode_mcp("/bin/aca", &[("aca".into(), vec!["plugin".into(), "tools".into()])]);
+        let mcp = opencode_mcp("/bin/aca", &[("aca".into(), vec!["plugin".into(), "tools".into()])]);
         let yours = r#"{"mcp":{"gh":{"type":"remote","url":"https://x"}}}"#;
         assert_eq!(
             v(content(Some(yours), "file:///p.js", mcp))["mcp"],
@@ -252,7 +262,7 @@ mod tests {
     #[test]
     fn adopting_takes_the_session_flag_and_carries_the_rest() {
         let argv: Vec<String> = ["opencode", "-s", "ses_9", "-m", "fake/fake-1"].map(String::from).to_vec();
-        let l = Opencode.live(1, None, &argv);
+        let l = Opencode.live(1, None, &argv, &|_| false);
         assert_eq!((l.conv.as_str(), l.args.unwrap()), ("ses_9", vec!["-m".to_string(), "fake/fake-1".to_string()]));
     }
 }

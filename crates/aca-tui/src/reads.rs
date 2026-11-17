@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::state::{state_file, write_atomic};
+use aca_records::paths::{state_file, write_atomic};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mark {

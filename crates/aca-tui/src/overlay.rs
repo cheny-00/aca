@@ -20,7 +20,7 @@ use ratatui::crossterm::event::KeyEvent;
 use ratatui::text::{Line, Span};
 
 use crate::ops::Job;
-use crate::ui::{External, TermReq};
+use crate::view::{External, TermReq};
 
 /// A popup
 pub trait Overlay {
@@ -120,7 +120,7 @@ pub mod kit {
     use ratatui::style::Style;
     use ratatui::text::{Line, Span};
 
-    pub use crate::ui::{button, clip, dim, esc_hint, key_style, keys_line, modal_title, spread};
+    pub use crate::kit::{button, clip, clip_left, dim, esc_hint, key_style, keys_line, modal_title, spread};
 
     /// The highlighted row: pad it to the full width with the selected background
     pub fn picked(line: Line<'static>, w: usize, on: bool) -> Line<'static> {

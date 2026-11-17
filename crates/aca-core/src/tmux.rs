@@ -338,12 +338,13 @@ const DECK_BOUND: &str =
 /// isn't in tmux.conf: a server restart or agent-deck starting another session wipes it, so it's redone after creating a
 /// session and before going into one. When agent-deck starts a session while you're already inside one (it binds once per
 /// session it starts), none of those points come up: a hook is set so tmux switches it back the moment it binds. Going in
-/// waits for this to finish: one list-keys to see the current state, and one tmux call for all the changes
-pub fn bind_detach() {
+/// waits for this to finish: one list-keys to see the current state, and one tmux call for all the changes. `hotkeys`: the
+/// hotkeys plugins want (`plugin::hotkey_binds`), asked only once tmux answers
+pub fn bind_detach(hotkeys: impl FnOnce() -> Option<Vec<(String, String)>>) {
     let Ok(keys) = run(&["list-keys"]) else { return };
     let mut cmds = detach_changes(&keys);
     // The hotkeys plugins want aren't in tmux.conf either: fill them in along with it
-    if let Some(want) = crate::plugin::hotkey_binds() {
+    if let Some(want) = hotkeys() {
         cmds.extend(hotkey_changes(&keys, &want).0);
     }
     let _ = run(&cmds.join(&";".to_string()));
@@ -372,6 +373,50 @@ const HOTKEY_IN: &str = "#{?@aca_id,1,0}";
 const HOTKEY_TABLES: [&str; 4] = ["root", "copy-mode", "copy-mode-vi", "prefix"];
 /// How a hotkey after tmux's prefix key is written: `prefix b`
 pub const PREFIX_KEY: &str = "prefix ";
+/// Not allowed as hotkeys: Ctrl+Q is aca's own (going back); the rest mean something else in a terminal (interrupt, end
+/// of file, suspend, Enter, Tab, newline, backspace). Not with Alt added either (`C-M-c`): before the binding is back in
+/// place (tmux just restarted), that key reaches the agent as Esc plus Ctrl+C
+pub const HOTKEYS_TAKEN: &[&str] = &["C-q", "C-c", "C-d", "C-z", "C-m", "C-i", "C-j", "C-h"];
+
+/// Keys that can be hotkeys (tmux key names), or one after tmux's prefix key (`prefix b`). A bare character isn't allowed
+/// without the prefix: it would swallow what you type in the session. The final character can only be a lowercase letter, a digit or one of `, . / = -` (plus `]` `^` with Ctrl
+/// alone): others need escaping in tmux's key table, and Alt with an uppercase letter, `[` or `]` sends what's the start
+/// of another terminal sequence (ESC O, ESC [, ESC ])
+pub fn hotkey_ok(k: &str) -> Res<()> {
+    // After tmux's prefix key (`prefix b`): nothing typed is swallowed, so a plain character is fine too
+    if let Some(after) = k.strip_prefix(PREFIX_KEY) {
+        let after = after.trim();
+        if after.is_empty() || after.contains(char::is_whitespace) || after.contains(['"', '\'', '\\', ';', '#']) {
+            return Err(tr!(
+                "前缀键之后应写一个 tmux 键名(prefix b、prefix C-y):「{k}」",
+                "after prefix comes one tmux key name (prefix b, prefix C-y): “{k}”"
+            ));
+        }
+        return Ok(());
+    }
+    let f = k
+        .strip_prefix('F')
+        .is_some_and(|n| !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit()) && matches!(n.parse(), Ok(1..=12u8)));
+    let (last, ctrl_only) = match ["C-M-", "M-"].iter().find_map(|p| k.strip_prefix(p)) {
+        Some(c) => (c, false),
+        None => (k.strip_prefix("C-").unwrap_or_default(), true),
+    };
+    let fits = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || ",./=-".contains(c) || (ctrl_only && "]^".contains(c));
+    let chord = last.len() == 1 && last.chars().all(fits);
+    if !f && !chord {
+        return Err(tr!(
+            "热键应写为带 Ctrl / Alt 的 tmux 键名(C-]、M-y、C-M-y)或 F1–F12:「{k}」",
+            "a hotkey is a tmux key name with Ctrl / Alt (C-], M-y, C-M-y) or F1–F12: “{k}”"
+        ));
+    }
+    if HOTKEYS_TAKEN.contains(&k.replacen("C-M-", "C-", 1).as_str()) {
+        return Err(tr!(
+            "{k} 不能用作热键(已被 aca 占用,或在终端中另有含义)",
+            "{k} can't be a hotkey (aca's own, or it means something to the terminal)"
+        ));
+    }
+    Ok(())
+}
 
 /// Which key tables a wanted hotkey goes in, and its name in them: `prefix b` → the prefix table, `b`
 fn hotkey_in<'a>(want: &'a str, table: &str) -> Option<&'a str> {

@@ -7,6 +7,7 @@ name = "aca"
 version = "0.1.2"
 dependencies = [
  "aca-core",
+ "aca-records",
  "aca-tui",
  "serde_json",
 ]
@@ -24,10 +25,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "aca-records"
+version = "0.1.2"
+dependencies = [
+ "aca-core",
+ "memchr",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aca-tui"
 version = "0.1.2"
 dependencies = [
  "aca-core",
+ "aca-records",
  "anyhow",
  "libc",
  "memchr",

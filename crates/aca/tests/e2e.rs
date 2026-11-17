@@ -4592,3 +4592,96 @@ fn printing_into_a_pipe_nobody_reads_any_more_exits_quietly() {
     assert_eq!(o.status.code(), Some(141), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(o.stderr.is_empty(), "{}", String::from_utf8_lossy(&o.stderr));
 }
+
+#[test]
+fn a_sandbox_takes_work_and_messages_from_other_sessions_only_when_it_says_delegate() {
+    let Some(sb) = Sandbox::new("cage-delegate") else { return };
+    let cfg = sb.home.join("config/config.toml");
+    let base = std::fs::read_to_string(&cfg).unwrap();
+    let cage = |more: &str| {
+        write(
+            &cfg,
+            &format!(
+                "{base}[sandbox.work]\nssh = \"aca-e2e-nowhere\"\ndirs = [\"{}\"]\nworkspace = \"{}\"\n{more}\
+                 [accounts.claude]\nteam = {{ sandbox = \"work\" }}\n",
+                sb.proj(),
+                sb.home.join("cage").display()
+            ),
+        )
+    };
+    cage("");
+    let me = sb.aca(&["new", "fake", &sb.proj(), "--hold"]);
+    // You start one inside yourself: fine
+    let inside = sb.aca(&["new", "fake:team", &sb.proj(), "--hold"]);
+
+    // Closed: another session can't start one inside, nor talk to one there
+    let o = sb.as_session(&me, &["new", "fake:team", &sb.proj(), "--hold"], "");
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("delegate = true"), "{o:?}");
+    let o = sb.as_session(&me, &["msg", &inside, "看一下"], "");
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("delegate = true"), "{o:?}");
+
+    // delegate = true: both go in, and the worker is that session's child as anywhere else
+    cage("delegate = true\n");
+    let o = sb.as_session(&me, &["new", "fake:team", &sb.proj(), "--hold"], "");
+    assert!(o.status.success(), "{o:?}");
+    let worker = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    assert_eq!(sb.json(&["show", &worker, "--json"])["parent"], me.as_str());
+    let o = sb.as_session(&me, &["msg", &inside, "看一下"], "");
+    assert!(o.status.success(), "{o:?}");
+}
+
+#[test]
+fn a_worker_delegated_into_a_sandbox_reports_its_turn_back_without_hooks() {
+    let Some(sb) = Sandbox::new("cage-turn") else { return };
+    // The "cage": an ssh that runs the command right here, and a Claude inside that only speaks OSC 7501 — idle, then working
+    // and done for each line it reads — and writes its reply into its config directory in the workspace
+    let bin = sb.home.join("bin");
+    let ws = sb.home.join("cage");
+    write(&bin.join("ssh"), "#!/bin/sh\nwhile [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nexec sh -c \"$2\"\n");
+    write(
+        &bin.join("claude"),
+        &format!(
+            "#!/bin/sh\nsid=x\nwhile [ \"$#\" -gt 0 ]; do [ \"$1\" = --session-id ] && sid=$2; shift; done\n\
+             d='{}/claude/projects/p'; mkdir -p \"$d\"\n\
+             st() {{ printf '\\033]7501;state=%s\\033\\\\' \"$1\"; }}\n\
+             st idle; echo 'fake claude up'\n\
+             while IFS= read -r line; do st working; sleep 1\n\
+             printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"做完了\"}}]}}}}' >> \"$d/$sid.jsonl\"\n\
+             st done; done\n",
+            ws.display()
+        ),
+    );
+    for f in ["ssh", "claude"] {
+        assert!(Command::new("chmod").arg("+x").arg(bin.join(f)).status().unwrap().success());
+    }
+    add_config(
+        &sb,
+        &format!(
+            "[sandbox.work]\nssh = \"work\"\ndirs = [\"{}\"]\nworkspace = \"{}\"\ndelegate = true\n[accounts.claude]\nteam = {{ sandbox = \"work\" }}\n",
+            sb.proj(),
+            ws.display()
+        ),
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let run = |me: Option<&str>, args: &[&str]| {
+        let mut c = sb.cmd();
+        c.env("PATH", &path).args(args);
+        if let Some(me) = me {
+            c.env("ACA_SESSION_ID", me);
+        }
+        let o = c.output().unwrap();
+        assert!(o.status.success(), "aca {args:?}:{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let lead = run(None, &["new", "fake", &sb.proj(), "--hold"]);
+    let w = run(Some(&lead), &["new", "claude:team", &sb.proj(), "--notify", "done", "--say", "做个事"]);
+    let o = sb.cmd().env("PATH", &path).env("ACA_SESSION_ID", &lead).args(["wait", &w, "--timeout", "20"]).output().unwrap();
+    assert_eq!(
+        (o.status.code(), String::from_utf8_lossy(&o.stdout).trim()),
+        (Some(0), format!("{w} 完成一轮:「做完了」").as_str()),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let inbox = sb.json(&["inbox", &lead, "--json"]);
+    assert_eq!((inbox[0]["what"].as_str(), inbox[0]["from"].as_str()), (Some("turn.done"), Some(w.as_str())), "{inbox}");
+}

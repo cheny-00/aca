@@ -11,6 +11,7 @@ license = "MIT"
 # Dependency versions are written only here, once; each crate says `xxx.workspace = true`
 [workspace.dependencies]
 aca-core = { path = "crates/aca-core" }
+aca-records = { path = "crates/aca-records" }
 aca-tui = { path = "crates/aca-tui" }
 libc = "0.2"
 regex = "1.13.1"

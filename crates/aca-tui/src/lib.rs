@@ -1,9 +1,10 @@
 //! aca's interface: one screen lists every session (registered ones, plain tmux ones), shows the highlighted one's live screen,
 //! ⏎ goes into it.
 //!
-//! All data comes from aca-core (the registry, the state hooks write, the panes actually in tmux), and operations on sessions
-//! call its functions too; this crate only handles how to list, how to draw, what keys do, and a few small states of its own
-//! (pins, notes, seen, workspaces; see state.rs).
+//! All data comes from aca-core (the registry, the state hooks write, the panes actually in tmux) and aca-records (conversation
+//! records, usage and cost, quotas, the directory a session really works in), and operations on sessions call aca-core's
+//! functions too; this crate only handles how to list, how to draw, what keys do, and a few small states of its own (pins,
+//! notes, seen, workspaces; see state.rs).
 
 mod accounts;
 mod acts;
@@ -28,8 +29,9 @@ mod handoff;
 mod help;
 mod hl;
 mod ime;
-mod limits;
+mod kit;
 mod mcp;
+mod modrow;
 mod notes;
 mod ops;
 mod overlay;
@@ -42,25 +44,20 @@ mod reads;
 mod refer;
 mod rehome;
 mod setup;
-mod slots;
 mod spaces;
 mod state;
-mod statusline;
 mod subagent;
 mod term;
 mod theme;
 mod tmuxconf;
 mod tools;
 mod trace;
-mod trace_claude;
-mod trace_codex;
 mod trace_page;
 mod trash;
 mod trust;
 mod ui;
 mod undo;
-mod usage;
-mod workdir;
+mod view;
 
 use std::io::{IsTerminal, Write};
 
@@ -75,16 +72,10 @@ pub const KEYS: Tr = Tr::new(include_str!("keys.txt"), include_str!("keys.en.txt
 /// change along with it)
 pub use groups::rename_all as rename_group;
 
-/// `aca show --json`'s `work`: the directory the session is really working in (the same one the interface's diff page uses)
-pub use data::work_dir;
-
-/// `aca output --turns N` / `--file`: the conversation as text, the same extraction `H` hands a new session
-pub use handoff::{text_file as conversation_file, turns as conversation_turns};
-
 /// Go into this tmux session (`tmux` is the session id): if already inside tmux, switch this client to it
 fn attach_now(tmux: &str) -> bool {
     if std::env::var_os("TMUX").is_some() {
-        aca_core::tmux::bind_detach();
+        aca_core::tmux::bind_detach(aca_core::plugin::hotkey_binds);
         let _ = crate::data::switch_to(tmux);
         std::process::exit(0);
     }
@@ -106,7 +97,7 @@ fn loaded(kw: &str) -> ui::App {
         .with_notes(notes::Notes::open(notes::Notes::default_path()))
         .with_marks(reads::Reads::open(reads::Reads::default_path()), spaces::Spaces::open(spaces::Spaces::default_path()))
         .with_trash(trash::Trash::open(trash::Trash::default_path()))
-        .in_space(state::state_file("view").map_or(spaces::HOME, |p| state::View::load(&p).space))
+        .in_space(aca_records::paths::state_file("view").map_or(spaces::HOME, |p| state::View::load(&p).space))
 }
 
 fn print_list(kw: &str) {
@@ -150,7 +141,7 @@ fn print_cost(range: Option<&str>, only: &[String]) {
         Some("all") => 3,
         _ => 1,
     };
-    let r = usage::build_cached(only);
+    let r = aca_records::usage::build_cached(only, theme::pal().series.len(), modrow::mod_note);
     let width = ratatui::crossterm::terminal::size()
         .map(|(w, _)| w as usize)
         .ok()
@@ -255,14 +246,10 @@ fn take_only(args: &mut Vec<String>) -> Vec<String> {
     only
 }
 
-/// The commands outside the interface that share its code: `aca cost | limits | statusline | setup | account | theme | tmux |
-/// next …`. Anything else = None
+/// The commands outside the interface that share its code: `aca cost | setup | account | theme | tmux | next …`. Anything
+/// else = None
 pub fn command(name: &str, args: &[String]) -> Option<i32> {
     Some(match name {
-        // statusLine runs it on every refresh: touches nothing else; after recording the quota it hands the input to the next command
-        "limits" => limits::run(args),
-        // Also runs on every refresh: after recording the quota it draws the status bar itself, handing nothing to another command
-        "statusline" => statusline::run(),
         // tmux's status bar runs it every few seconds: read-only, which sessions need you
         "tmux-status" => bar::run(args),
         // The sessions the status bar's two numbers count: go to the next one (bound to a key, or typed yourself)
@@ -311,7 +298,7 @@ pub fn main(mut args: Vec<String>) -> anyhow::Result<()> {
     // $ in the interface starts this child process to do the reading (it takes a lot of memory, freed when done); the result
         // comes back as JSON
     if args.iter().any(|a| a == "--cost-json") {
-        let r = usage::build_cached(&only);
+        let r = aca_records::usage::build_cached(&only, theme::pal().series.len(), modrow::mod_note);
         let _ = serde_json::to_writer(std::io::stdout().lock(), &r);
         return Ok(());
     }

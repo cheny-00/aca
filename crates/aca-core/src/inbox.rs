@@ -42,6 +42,7 @@ use crate::config::Config;
 use crate::i18n::Tr;
 use crate::paths::{self, Res};
 use crate::runtime::{self, Run, clip};
+use crate::schedule::Due;
 use crate::status::{self, State};
 use crate::store::{Session, Store};
 use crate::{event, t, tmux, tr};
@@ -210,6 +211,14 @@ pub fn scheduled(id: &str) -> Vec<Msg> {
     let mut v: Vec<Msg> = list(id).into_iter().filter(|(_, s)| *s == Stage::Scheduled).map(|(m, _)| m).collect();
     v.sort_by_key(|m| m.at);
     v
+}
+
+/// Scheduled messages in the inbox that aren't due yet (see [`scheduled`]), listed like the ones it scheduled itself
+pub fn scheduled_as_due(id: &str) -> Vec<Due> {
+    scheduled(id)
+        .into_iter()
+        .map(|m| Due { cron: String::new(), recurring: false, prompt: m.text, next: Some(m.at), inbox: true })
+        .collect()
 }
 
 /// Whether there's anything to wake it for
@@ -596,6 +605,10 @@ pub fn notify(id: &str, ev: &str, cfg: &Config) -> Option<Msg> {
     let store = Store::open().ok()?;
     let s = store.get(id).ok()?;
     let parent = store.get(&s.parent).ok().filter(|p| p.id != s.id)?;
+    // Nothing goes into a cage from another session (see crate::sandbox)
+    if crate::sandbox::cage_of_session(cfg, &parent).is_some() {
+        return None;
+    }
     let m = post(Msg {
         from: s.id.clone(),
         who: who(&s, &r),
@@ -697,7 +710,8 @@ pub fn deliver(store: &Store, cfg: &Config, id: &str, retry: bool) -> Res<Sent> 
             later(&s.id, BELL_CHECK_SECS, &["--check", &ids.join(",")]);
             Ok(Sent::Bell)
         }
-        Delivery::Queue if !r.conv.is_empty() => {
+        // Not into a cage's queue: that's a Codex run here on its config directory, which the one inside has open too
+        Delivery::Queue if !r.conv.is_empty() && crate::sandbox::cage_of_session(cfg, &s).is_none() => {
             if pane.is_some() {
                 match status::one(cfg, &s, true).state {
                     State::Running => {
@@ -831,6 +845,16 @@ pub fn send(store: &Store, cfg: &Config, to: &str, text: &str, at: u64) -> Res<(
         }
         key => store.get(key)?,
     };
+    // A cage is closed (see crate::sandbox): you can talk to its sessions, other sessions can't (unless it takes work in)
+    if let (Some(m), Some((name, _))) = (&me, crate::sandbox::cage_of_session(cfg, &to).filter(|(_, b)| !b.delegate))
+        && m.id != to.id
+    {
+        return Err(tr!(
+            "{} 在沙箱 {name} 中,沙箱是封闭的:不从别的会话往里传话([sandbox.{name}] 写 delegate = true 打开)",
+            "{} is inside sandbox {name}, which is closed: no messages go in from other sessions (delegate = true in [sandbox.{name}] opens it)",
+            to.id
+        ));
+    }
     let (from, who) = match &me {
         Some(m) if m.id == to.id && at == 0 => {
             return Err(t!("不能发送给自己(定时的可以:--in)", "can't send to yourself (a scheduled one can: --in)").into());

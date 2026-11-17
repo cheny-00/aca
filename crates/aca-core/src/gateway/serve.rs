@@ -388,7 +388,7 @@ pub(crate) fn facts(session: &str) -> (String, String, String) {
     let Some(s) = (!session.is_empty()).then(|| crate::store::Store::open().ok()?.get(session).ok()).flatten() else {
         return Default::default();
     };
-    let kind = crate::config::load().tool(&s.tool).map(|t| t.kind).unwrap_or_default();
+    let kind = crate::agent::tool(&crate::config::load(), &s.tool).map(|t| t.kind).unwrap_or_default();
     (s.tool, kind, s.account)
 }
 

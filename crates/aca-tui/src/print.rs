@@ -16,12 +16,13 @@ use aca_core::runtime::{Run, mark};
 use aca_core::status::{Row, State};
 use aca_core::store::{Group, Store};
 use aca_core::{t, tr};
+use aca_records::words::state_name;
 use ratatui::style::{Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
 use crate::ansi::Styled;
 use crate::trace::{self, seg};
-use crate::{create, data, hl, theme, ui};
+use crate::{hl, kit, theme};
 
 /// stdout is a terminal = a person is looking
 fn human() -> bool {
@@ -77,7 +78,7 @@ pub fn age(sec: u64) -> String {
     }
 }
 
-/// A state icon's color (same as the interface's list, see `ui::icon`) and its name
+/// A state icon's color (same as the interface's list, see `kit::icon`) and its name
 fn state(s: State) -> (Style, &'static str) {
     let p = theme::pal();
     let strong = |c| Style::new().fg(c).add_modifier(Modifier::BOLD);
@@ -90,24 +91,12 @@ fn state(s: State) -> (Style, &'static str) {
     (style, state_name(s))
 }
 
-/// What a state is called
-pub(crate) fn state_name(s: State) -> &'static str {
-    match s {
-        State::Running => t!("运行中", "running"),
-        State::Ask => t!("等待回应", "needs you"),
-        State::Unread => t!("未读", "unread"),
-        State::Idle => t!("空闲", "idle"),
-        State::Error => t!("出错", "error"),
-        State::Exited | State::Stopped => t!("已停止", "stopped"),
-    }
-}
-
 /// "tool:account": the account colored by its agent (Claude orange, Codex blue, see theme.rs), the tool name before it in the
 /// minor color; with no account, just the tool name.
 /// `brief` = print only the account (the color tells which agent, as in the interface's list): for a narrow terminal where
 /// titles don't fit
 fn who(cfg: &Config, tool: &str, account: &str, brief: bool) -> Styled {
-    let st = ui::agent_style(data::agent_of_tool(cfg, tool));
+    let st = kit::agent_style(aca_records::agent::agent_of_tool(cfg, tool));
     let name = seg(aca_core::agent::account_label(account), st);
     match (account.is_empty(), brief) {
         (true, _) => vec![seg(tool, st)],
@@ -198,7 +187,7 @@ fn list(cfg: &Config, rows: &[Row], all: &[String], w: usize, now: u64) -> Vec<S
         let mut line = vec![spaces(2), seg(r.glyph(), state(r.state).0), spaces(1)];
         line.extend(id_cell(&ids[i], idw));
         line.push(spaces(2));
-        line.push(seg(ui::clip(&trace::clean(&r.title), titlew), if off { theme::minor() } else { Style::new() }));
+        line.push(seg(kit::clip(&trace::clean(&r.title), titlew), if off { theme::minor() } else { Style::new() }));
         line.push(spaces(2));
         line.extend(whos[i].clone());
         line.push(seg(format!("{}{}", " ".repeat(whow - wide(&whos[i]) + 2 + agew - ages[i].width()), ages[i]), theme::minor()));
@@ -207,7 +196,7 @@ fn list(cfg: &Config, rows: &[Row], all: &[String], w: usize, now: u64) -> Vec<S
         if !r.ask.is_empty() {
             // When it needs you, its question goes under the title
             let indent = 4 + idw + 2;
-            let ask = ui::clip(&trace::clean(&r.ask), w.saturating_sub(indent + 2).max(TITLE_MIN));
+            let ask = kit::clip(&trace::clean(&r.ask), w.saturating_sub(indent + 2).max(TITLE_MIN));
             out.push(vec![spaces(indent), seg("└ ", theme::faint()), seg(ask.trim_end(), Style::new().fg(theme::pal().red))]);
         }
     }
@@ -274,7 +263,7 @@ fn card(cfg: &Config, row: &Row, run: &Run, all: &[String], w: usize, now: u64, 
     field("id", id_cell(&(row.id.clone(), lit), 0));
     field(t!("账号", "account"), who(cfg, &row.tool, &row.account, false));
     field(t!("分组", "group"), if row.group.is_empty() { none(t!("(未分组)", "(no group)")) } else { vec![text(row.group.as_str())] });
-    field(t!("目录", "dir"), vec![text(create::tilde(&row.dir))]);
+    field(t!("目录", "dir"), vec![text(aca_records::words::tilde(&row.dir))]);
     field(t!("对话", "conv"), if row.conv.is_empty() { none(t!("暂无", "none yet")) } else { vec![text(row.conv.as_str())] });
     field(
         "tmux",
@@ -482,7 +471,7 @@ fn group_lines(groups: &[Group]) -> Vec<Styled> {
                 seg(format!("{:>3}  ", g.order), theme::minor()),
                 seg(g.path.as_str(), bold()),
                 spaces(pad),
-                seg(create::tilde(&g.default_path), theme::minor()),
+                seg(aca_records::words::tilde(&g.default_path), theme::minor()),
             ]
         })
         .collect()

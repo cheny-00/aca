@@ -13,7 +13,7 @@
 //! - sessions already archived before the delete (including ones `d` deleted that are still in the trash) are recorded as
 //!   archived and come back archived
 //!
-//! The group's workspace record and fold state are put in the trash / cleared by the interface (`ui::job_done`).
+//! The group's workspace record and fold state are put in the trash / cleared by the interface (`App::job_done` in ui/jobs.rs).
 
 use std::collections::HashMap;
 
@@ -55,7 +55,7 @@ pub fn rename_all(store: &Store, from: &str, to: &str) -> Res<usize> {
     // unfold, notes stay under the old name
     let _ = crate::spaces::Spaces::open(crate::spaces::Spaces::default_path()).rename_group(crate::data::REGISTERED, from, to);
     let _ = crate::notes::Notes::open(crate::notes::Notes::default_path()).rename_group(from, to);
-    if let Some(p) = crate::state::state_file("view") {
+    if let Some(p) = aca_records::paths::state_file("view") {
         let mut v = crate::state::View::load(&p);
         if v.rename_group(from, to) {
             let _ = v.save(&p);
@@ -203,7 +203,7 @@ fn edit(group: &str, to: &str, dir: Option<&str>) -> Outcome {
         return Outcome::Failed(tr!(
             "未修改:{} 已是分组 {} 的默认目录",
             "unchanged: {} is already the default directory of group {}",
-            crate::create::tilde(d),
+            aca_records::words::tilde(d),
             g.path
         ));
     }
@@ -222,7 +222,7 @@ fn edit(group: &str, to: &str, dir: Option<&str>) -> Outcome {
                 if said.is_empty() { "" } else { t!("已重命名,", "renamed, ") }
             ));
         }
-        let d = if d.is_empty() { t!("已清除", "forgotten").to_string() } else { crate::create::tilde(d) };
+        let d = if d.is_empty() { t!("已清除", "forgotten").to_string() } else { aca_records::words::tilde(d) };
         said.push(if said.is_empty() {
             tr!("分组 {to} 的默认目录:{d}", "default directory of group {to}: {d}")
         } else {
@@ -290,7 +290,7 @@ mod tests {
     fn spaces_and_the_saved_view_follow_a_renamed_group() {
         let dir = std::env::temp_dir().join(format!("aca-groups-rename-{}", std::process::id()));
         let path = dir.join("spaces");
-        crate::state::write_atomic(&path, "group\tdefault\tfun/app\th\ngroup\tdefault\tfun/apple\t2\ngroup\t\t-\t3\n").unwrap();
+        aca_records::paths::write_atomic(&path, "group\tdefault\tfun/app\th\ngroup\tdefault\tfun/apple\t2\ngroup\t\t-\t3\n").unwrap();
         let mut sp = crate::spaces::Spaces::open(Some(path.clone()));
         sp.rename_group("default", "fun/app", "deck").unwrap();
         let again = crate::spaces::Spaces::open(Some(path));

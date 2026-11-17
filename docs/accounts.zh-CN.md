@@ -64,6 +64,75 @@ aca account status                        # 各个账号是否已登录(是向�
   (`codex login` 会立刻删除 `auth.json`)。对已经登录的账号,账号页面会先向你确认。
 - aca 从不保存或复制凭据,也从不往这些配置目录里写东西。唯一的例外需要你主动选择:下面说的状态栏设置。
 
+## 放在沙箱里的账号
+
+适用于必须和这台 Mac 隔开的账号,比如公司发的账号。它放在一个经 ssh 进入的笼子里(容器、虚拟机、另一台电脑),
+aca 在里面启动它的会话。Mac 上的目录用同一个路径挂进笼子,两边的路径意思一样。
+
+```toml
+[sandbox.work]
+ssh = "work"                     # ~/.ssh/config 里的 Host
+up = "~/cage/up"                 # ssh 连不上时先运行它
+dirs = ["~/work/app"]            # 挂进去的项目目录
+workspace = "~/cages/work"       # 也挂进去:claude/ 是笼子里 Claude 的配置目录,worktrees/ 放它的 worktree
+space = "3"                      # 它的会话放进界面的哪个工作区
+
+[accounts.claude]
+team = { sandbox = "work" }      # 不写 home:它的配置目录是笼子里的那个
+
+[accounts.codex]
+team = { sandbox = "work" }      # Codex 也一样
+```
+
+- `aca new claude:team ~/work/app` 经 ssh 在笼子里运行 Claude。这个会话和别的会话一样能列出、预览、进入。
+  带进去的只有工具自己的参数、`[sandbox.work]` 和账号的 `env`。hook 和 Mac 上的其他文件不带进去,所以它的状态来自 Claude 自己的上报和屏幕。
+- 它的会话只能在 `dirs` 列出的目录里启动,或者在 workspace 的 `worktrees/` 里;`-w` 新建的 worktree 就放在那里。
+- `aca run claude:team` 也在笼子里运行,所以登录也在笼子里完成。登录和对话记录在 `<workspace>/claude/` 里,
+  这台 Mac 读得到。
+- Codex 也一样,配置目录是 `<workspace>/codex/`。`aca run codex:team login` 在笼子里登录,用这台 Mac 的浏览器:
+  打开它打印的链接,登录完浏览器跳回的地址会转进笼子,不用再复制什么。通过 SSH 连到这台 Mac 时改用设备码
+  (ChatGPT Business / Enterprise 工作区要管理员先允许设备码登录)。它在用哪个对话,要等重启时才知道:
+  aca 取它在会话目录里最新开始的那个对话。目前只有 Claude Code 和 Codex 的账号能绑定沙箱。
+- `aca new shell:work` 在笼子里开一个终端,不用另外配置;界面里按 `^E` 就有这一项。
+  会话目录挂进去了就从那里开始,否则落在笼子登录时的默认目录。
+- **挂进去的目录上的 git 在笼子里运行。** 笼子能往仓库的 `.git/config` 和 hooks 里写命令,Mac 上的 git 会以你的身份运行它们。
+  所以 aca 自己对挂进去的目录运行 git 时(看改动、worktree、状态栏),都经 ssh 在笼子里运行。
+  你自己在 Mac 上用这个目录(编辑器、自己的 git),仍然等于信任笼子写进去的东西。
+- **封闭。** aca 不往里送任何东西:不从别的会话启动它的会话(派活),不从别的会话传话,不发 worker 的通知,
+  对话不换到别的账号,也不从别的账号换进来,`aca.remote` 也不往里派任务(不管用哪个能连到它的名字)。你自己仍然可以给它的会话发话。这只约束 aca:
+  你的 agent 如果读得到 ssh 钥匙,还是能自己连进去。
+- **接活。** `[sandbox.work]` 写 `delegate = true`,别的会话就能往里派活、给它传话,`aca wait`、`--notify` 和平常一样。
+  干完的结果会回到派活的会话:笼子里的东西会到这台 Mac 上的 agent 面前。笼子里没有 hook,一轮的开始和结束来自 agent 自己的上报。
+  换账号、`aca.remote` 照旧封闭。
+
+### 不进笼子:在本机换时区、换出口
+
+不写 `ssh` 的 `[sandbox.*]` 在本机跑,只是给绑定它的账号带上它的 `env`。适用于只要求换时区、经公司代理出去的账号。
+
+```toml
+[sandbox.unis]
+env = { TZ = "America/Los_Angeles", HTTPS_PROXY = "http://127.0.0.1:28888", HTTP_PROXY = "http://127.0.0.1:28888", NO_PROXY = "localhost,127.0.0.1" }
+workspace = "~/cages/unis"       # 绑定它的账号的配置目录:codex/、claude/
+
+[accounts.codex]
+team-unis = { sandbox = "unis" }
+```
+
+- 它的会话和普通账号一样在本机启动,hook、插件、派活、传话、换账号都照常,只是多了这组变量,配置目录是
+  `<workspace>/codex/`。账号自己的 `env` 优先于它的。`aca run codex:team-unis login` 在本机登录。
+- `aca new shell:unis` 开一个带这组变量的终端。
+- **不隔开。** 只有认这些变量的程序跟着走。Codex 自己连模型会走代理;agent 运行的命令里不认代理变量的(ssh、自己开连接的程序)
+  会直接出去,Codex 启动的 MCP 服务也拿不到代理变量(它只传几个固定的变量,`TZ` 在里面);浏览器登录那一步用的是 Mac 上的浏览器。
+  必须和这台 Mac 隔开的账号,用上面的笼子。
+
+两种在界面里都是特殊环境:按 `^E` 单独列出(`n` 里没有),每个环境一块,标题写它在哪跑、时区和代理,
+每个账号写着登录没有;列表里显示成 `team@work`、`team-unis@unis`。
+
+在 `^E` 里选中账号按 `l` 登录:下方开一个终端,在它的环境里运行登录(笼子里的在笼子里,unis 的带着它的变量)。
+已经登录的 Codex 账号会先问一句,因为 Codex 一开始登录就清掉原来的登录。登录链接弹出来时选「在别的电脑登录」:
+链接复制好了,拿到别的电脑上打开、登录,浏览器最后会跳到一个打不开的 `http://localhost:1455/auth/callback?code=…`,
+把这个地址粘贴回 aca,按 ⏎,aca 替那台浏览器把它送给这里等着的登录。`code` 几分钟就过期,要尽快贴回来。
+
 ## Claude 的订阅额度和状态栏
 
 Claude Code 只把订阅额度(5 小时和 7 天的额度各用了多少)提供给它的状态栏命令。

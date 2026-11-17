@@ -313,7 +313,7 @@ pub fn edit_file(id: Option<&str>, mine: Option<&str>, fx: &mut Fx) -> Option<Ed
         }
     };
     let before = mtime(&path);
-    fx.external = Some(crate::ui::External::Edit { path: path.to_string_lossy().into_owned(), line });
+    fx.external = Some(crate::view::External::Edit { path: path.to_string_lossy().into_owned(), line });
     Some(Edited { path, before, sync })
 }
 
@@ -330,7 +330,7 @@ pub fn back_from(ed: Edited, fx: &mut Fx) {
 pub fn show_log(id: &str, name: &str, fx: &mut Fx) {
     let log = plugin::log_file(id);
     if log.exists() {
-        fx.external = Some(crate::ui::External::View { path: log.to_string_lossy().into_owned(), line: 1, temp: false });
+        fx.external = Some(crate::view::External::View { path: log.to_string_lossy().into_owned(), line: 1, temp: false });
     } else {
         fx.say(tr!("{name} 暂无日志", "{name} has no log yet"));
     }
@@ -420,7 +420,7 @@ fn hint_tall(d: &Detail, w: usize) -> usize {
         .settings
         .iter()
         .filter(|s| !s.desc.is_empty())
-        .map(|s| 1 + crate::ui::wrap_width(&tr!("{}:{}", "{}: {}", s.name, s.desc), w).len().min(HINT_MOST))
+        .map(|s| 1 + crate::kit::wrap_width(&tr!("{}:{}", "{}: {}", s.name, s.desc), w).len().min(HINT_MOST))
         .max()
         .unwrap_or(0)
 }
@@ -587,7 +587,7 @@ impl Page {
     /// The right column: what the highlighted plugin is and what can be changed. Also returns which row is highlighted
     fn right(&self, w: usize) -> (Vec<Line<'static>>, Option<usize>) {
         let wrap = |text: &str, st: Style, most: usize| {
-            crate::ui::wrap_width(text, w).into_iter().take(most).map(move |l| Line::styled(l, st)).collect::<Vec<_>>()
+            crate::kit::wrap_width(text, w).into_iter().take(most).map(move |l| Line::styled(l, st)).collect::<Vec<_>>()
         };
         let mut out = vec![];
         if let Some(text) = &self.typing {
@@ -613,7 +613,7 @@ impl Page {
     /// computed for every plugin when sizing the box height
     fn right_of(&self, r: &Row, detail: Option<&Detail>, w: usize) -> (Vec<Line<'static>>, Option<usize>) {
         let wrap = |text: &str, st: Style, most: usize| {
-            crate::ui::wrap_width(text, w).into_iter().take(most).map(move |l| Line::styled(l, st)).collect::<Vec<_>>()
+            crate::kit::wrap_width(text, w).into_iter().take(most).map(move |l| Line::styled(l, st)).collect::<Vec<_>>()
         };
         let mut out = vec![Self::header(r, w)];
         out.push(Line::raw(""));
@@ -672,7 +672,7 @@ impl Page {
         };
         let mut out = vec![Line::raw("")];
         let text = tr!("{name}:{desc}", "{name}: {desc}");
-        out.extend(crate::ui::wrap_width(&text, w).into_iter().take(HINT_MOST).map(|l| Line::styled(l, kit::dim())));
+        out.extend(crate::kit::wrap_width(&text, w).into_iter().take(HINT_MOST).map(|l| Line::styled(l, kit::dim())));
         out
     }
 
@@ -698,7 +698,7 @@ impl Page {
     /// Notices at the bottom (confirm before removing, plugins.toml mismatch, sessions needing a restart), each two lines at most
     fn banners(&self, w: usize) -> Vec<Line<'static>> {
         let wrap =
-            |text: &str| crate::ui::wrap_width(text, w).into_iter().take(2).map(|l| Line::styled(l, theme::warn())).collect::<Vec<_>>();
+            |text: &str| crate::kit::wrap_width(text, w).into_iter().take(2).map(|l| Line::styled(l, theme::warn())).collect::<Vec<_>>();
         let mut out = vec![];
         if let Some(r) = self.cur().filter(|_| self.armed) {
             let what = match r.from {
@@ -1373,7 +1373,7 @@ mod tests {
             assert!(!p.armed);
             // e: your own one opens its manifest
             let (fx, _) = press(&mut p, KeyCode::Char('e'));
-            assert_eq!(fx.external, Some(crate::ui::External::Edit { path: "/c/aca/user/aca-plugin.toml".into(), line: 1 }));
+            assert_eq!(fx.external, Some(crate::view::External::Edit { path: "/c/aca/user/aca-plugin.toml".into(), line: 1 }));
         });
     }
 

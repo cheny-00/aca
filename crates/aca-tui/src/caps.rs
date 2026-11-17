@@ -96,7 +96,7 @@ pub fn run(req: &Req) -> (bool, String) {
 /// Start it: a pane while the interface isn't in tmux has to give up the terminal; everything else goes to the background
 fn start(req: Req, fx: &mut Fx) {
     if req.item.kind == ItemKind::Pane && std::env::var_os("TMUX").is_none() {
-        fx.external = Some(crate::ui::External::Plugin(req));
+        fx.external = Some(crate::view::External::Plugin(req));
         return;
     }
     fx.say(tr!("正在运行 {}…", "running {}…", req.title()));
@@ -219,7 +219,8 @@ impl Overlay for Menu {
     }
 
     fn lines(&self, w: usize) -> Vec<Line<'static>> {
-        let wrap = |text: &str, st: Style| crate::ui::wrap_width(text, w).into_iter().map(move |l| Line::styled(l, st)).collect::<Vec<_>>();
+        let wrap =
+            |text: &str, st: Style| crate::kit::wrap_width(text, w).into_iter().map(move |l| Line::styled(l, st)).collect::<Vec<_>>();
         let on = match self.target.on {
             "session" => tr!("命令 · 对「{}」", "Commands · for “{}”", self.target.label),
             "group" => tr!("命令 · 对分组 {}", "Commands · for group {}", self.target.label),
@@ -536,7 +537,8 @@ impl Overlay for List {
     }
 
     fn lines(&self, w: usize) -> Vec<Line<'static>> {
-        let wrap = |text: &str, st: Style| crate::ui::wrap_width(text, w).into_iter().map(move |l| Line::styled(l, st)).collect::<Vec<_>>();
+        let wrap =
+            |text: &str, st: Style| crate::kit::wrap_width(text, w).into_iter().map(move |l| Line::styled(l, st)).collect::<Vec<_>>();
         let n = self.list.rows.len();
         let at = if n > LIST_SHOWN { vec![Span::styled(format!("{}/{n}  ", self.sel + 1), kit::dim())] } else { vec![] };
         let mut out = vec![kit::modal_title(&self.req.title(), theme::accent(), [at, kit::esc_hint(t!("返回", "back"))].concat(), w)];

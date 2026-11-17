@@ -8,9 +8,9 @@
 use aca_core::session;
 use aca_core::store::Store;
 use aca_core::{t, tr};
+use aca_records::agent::Agent;
 
 use crate::create::{NewReq, Removed, fzf};
-use crate::data::Agent;
 use crate::handoff::Source;
 
 /// The session to act on
@@ -525,7 +525,7 @@ pub fn pick_group(rows: &[GroupRow], what: &str, here: &str) -> Result<Option<St
         tr!(
             "--header=移动{what} · 只换分组,目录不变:{}",
             "--header=move {what} · only the group changes, it stays in {}",
-            crate::create::tilde(here)
+            aca_records::words::tilde(here)
         )
     };
     let args = [
@@ -550,7 +550,7 @@ fn group_lines(rows: &[GroupRow]) -> Vec<String> {
     rows.iter()
         .map(|r| {
             let pad = " ".repeat(w - r.group.width());
-            let dir = crate::create::tilde(&r.dir);
+            let dir = aca_records::words::tilde(&r.dir);
             let dir = match (r.dir.is_empty(), r.same) {
                 (true, _) => String::new(),
                 (false, true) => format!("{green}{dir}  {}{off}", t!("同目录", "same directory")),

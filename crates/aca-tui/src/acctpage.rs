@@ -24,19 +24,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use aca_core::{t, tr};
+use aca_records::agent::Agent;
+use aca_records::usage::Quota;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::accounts::{self, Account, Login};
-use crate::data::Agent;
+use crate::kit::agent_style;
 use crate::overlay::{Flow, Fx, Overlay, kit};
 use crate::plugins::{DIVIDER, SPLIT_W, flat, pad, scroll};
 use crate::setup::{fold, tail};
 use crate::theme;
-use crate::ui::{TermReq, agent_style};
-use crate::usage::Quota;
+use crate::view::TermReq;
 
 /// Which tool, in headers and forms: its color, bold (Claude Code vs Codex at a glance)
 pub(crate) fn who_span(a: Agent) -> Span<'static> {
@@ -271,6 +272,26 @@ fn own_spec(a: Agent) -> String {
     accounts::fam(a).unwrap_or("claude").to_string()
 }
 
+/// A terminal at the bottom running an account's login (`run`; ⏎ here, `l` among `^E`'s). Login doesn't let the tool open the
+/// default browser itself: the link goes to the UI (a file in `links`), which pops up a choice of what to open it with (see
+/// browser.rs). Codex doesn't hand it over, nor does Claude when remote (it gives the paste-a-code one), so the UI reads it off
+/// the screen; a file left from last time is deleted first so the old link doesn't pop up right away
+pub fn login_term(links: &std::path::Path, home: &str, remote: bool, name: &str, a: Agent, run: String) -> TermReq {
+    let tool = if a == Agent::Codex { "codex" } else { "claude" };
+    let file = links.join(format!("login-{tool}-{name}.url"));
+    let _ = std::fs::create_dir_all(links);
+    let _ = std::fs::remove_file(&file);
+    TermReq {
+        key: format!("account:{name}"),
+        family: String::new(),
+        title: tr!("登录 {} · {name}", "log in {} · {name}", accounts::who(a)),
+        w: aca_records::workdir::Where { dir: home.to_string(), ..Default::default() },
+        env: vec![(aca_core::agent::LOGIN_LINK.to_string(), file.to_string_lossy().into_owned())],
+        run: Some(run),
+        link: Some(crate::term::Catch { file, screen: a == Agent::Codex || remote }),
+    }
+}
+
 /// How a login answer is shown: mark, a phrase, color. None = still asking
 fn login_said(l: Option<Login>) -> (&'static str, String, Style) {
     match l {
@@ -436,7 +457,7 @@ impl Page {
             asking: None,
             quotas: Arc::default(),
             at: 0,
-            off: crate::usage::local_offset(),
+            off: aca_records::usage::local_offset(),
             mods: false,
             editing: None,
             args_err: String::new(),
@@ -506,13 +527,13 @@ impl Page {
                 }
             })
             .collect();
-        self.mods = cfg.tool("claude").is_some_and(|t| t.mods);
+        self.mods = aca_core::agent::tool(&cfg, "claude").is_some_and(|t| t.mods);
         self.own = accounts::defaults(&text, home, self.env.installed);
         let (rows, own) = (&self.rows, &self.own);
         self.fams = [Agent::Claude, Agent::Codex]
             .into_iter()
             .filter_map(|a| {
-                let args = cfg.tool(accounts::fam(a)?).map(|t| t.args).unwrap_or_default();
+                let args = aca_core::agent::tool(&cfg, accounts::fam(a)?).map(|t| t.args).unwrap_or_default();
                 let shown = rows.iter().any(|r| r.a.agent == a) || own.iter().any(|o| o.agent == a) || !args.is_empty();
                 shown.then_some(Fam { agent: a, args })
             })
@@ -575,7 +596,7 @@ impl Page {
 
     /// Refetch every account's quota
     fn fetch_quotas(&mut self) {
-        self.at = crate::limits::now();
+        self.at = aca_records::limits::now();
         let (slot, get) = (self.quotas.clone(), self.env.quotas);
         let go = move || {
             let got = get();
@@ -908,23 +929,8 @@ impl Page {
         fx.term = Some(self.term(&r.a.name, r.a.agent, accounts::relogin_cmd(r.a.agent, &r.a.name)));
     }
 
-    /// Login doesn't let the tool open the default browser itself: the link goes to the UI (a file), which pops up a choice of what
-    /// to open it with (see browser.rs). Codex doesn't hand it over, nor does Claude when remote (it gives the paste-a-code one), so
-    /// the UI reads it off the screen; a file left from last time is deleted first so the old link doesn't pop up right away
     fn term(&self, name: &str, a: Agent, run: String) -> TermReq {
-        let tool = if a == Agent::Codex { "codex" } else { "claude" };
-        let file = self.env.links.join(format!("login-{tool}-{name}.url"));
-        let _ = std::fs::create_dir_all(&self.env.links);
-        let _ = std::fs::remove_file(&file);
-        TermReq {
-            key: format!("account:{name}"),
-            family: String::new(),
-            title: tr!("登录 {} · {name}", "log in {} · {name}", accounts::who(a)),
-            w: crate::workdir::Where { dir: self.env.home.clone(), ..Default::default() },
-            env: vec![(aca_core::agent::LOGIN_LINK.to_string(), file.to_string_lossy().into_owned())],
-            run: Some(run),
-            link: Some(crate::term::Catch { file, screen: a == Agent::Codex || self.env.remote }),
-        }
+        login_term(&self.env.links, &self.env.home, self.env.remote, name, a, run)
     }
 
     /// The form's directory is filled in: record it in config.toml; if the directory was just created, open a terminal to log in
@@ -1265,7 +1271,7 @@ mod tests {
 
     #[test]
     fn the_right_side_shows_quotas_and_launch_args_and_p_changes_them() {
-        use crate::usage::Win;
+        use aca_records::usage::Win;
         let config = CONFIG.replace("account = \"sub\"\n", "account = \"sub\"\nargs = [\"--x\"]\n");
         let (root, mut p) = page_with("args", &config);
         p.env.quotas = || {

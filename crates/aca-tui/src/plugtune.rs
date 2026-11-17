@@ -404,7 +404,7 @@ impl Detail {
             out.push(Line::raw(""));
         }
         for n in &d.notes {
-            out.extend(crate::ui::wrap_width(&format!("⚠ {n}"), w).into_iter().map(|l| Line::styled(l, theme::warn())));
+            out.extend(crate::kit::wrap_width(&format!("⚠ {n}"), w).into_iter().map(|l| Line::styled(l, theme::warn())));
         }
         let label_w = d.info.iter().map(|(l, _)| l.width()).max().unwrap_or(0) + 2;
         for (l, v) in &d.info {

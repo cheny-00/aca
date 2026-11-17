@@ -56,6 +56,7 @@ pub const ACTS: &[Act] = &[
     act("n", "新建", "new", &[]),
     act("N", "按当前配置新建", "new with current", &[]),
     act("^N", "新分组", "new group", &[]),
+    act("^E", "特殊环境", "special environments", &[]),
     act("e", "便签", "note", S),
     act("^G", "用编辑器写便签", "note in the editor", S),
     act("s", "发送", "send", S),

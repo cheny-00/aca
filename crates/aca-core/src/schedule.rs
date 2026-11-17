@@ -28,6 +28,7 @@ use std::sync::{LazyLock, Mutex};
 use regex::Regex;
 use serde_json::Value;
 
+use crate::paths::iso;
 use crate::runtime::Run;
 
 /// How long after a recurring job is created Claude deletes it itself
@@ -51,14 +52,6 @@ pub struct Due {
     pub next: Option<u64>,
     /// A scheduled message in the aca inbox (`aca msg --in`), not one in its process
     pub inbox: bool,
-}
-
-/// Scheduled messages in the inbox that aren't due yet (see [`crate::inbox::scheduled`]), listed like the ones it scheduled itself
-pub fn inbox(id: &str) -> Vec<Due> {
-    crate::inbox::scheduled(id)
-        .into_iter()
-        .map(|m| Due { cron: String::new(), recurring: false, prompt: m.text, next: Some(m.at), inbox: true })
-        .collect()
 }
 
 /// What was scheduled since this start and isn't due yet, soonest first
@@ -261,27 +254,6 @@ fn read(path: &Path, from: u64, now: u64, seen: &mut Seen) -> u64 {
     }
 }
 
-/// `2026-10-15T08:00:36.843Z` → seconds. Only UTC is recognized (it's what Claude writes)
-pub(crate) fn iso(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[10] != b'T' || !s.ends_with('Z') {
-        return None;
-    }
-    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let days = days_from_civil(n(0..4)?, n(5..7)?, n(8..10)?);
-    u64::try_from(days * 86400 + n(11..13)? * 3600 + n(14..16)? * 60 + n(17..19)?).ok()
-}
-
-/// Gregorian date → days since 1970-01-01 (Howard Hinnant's algorithm; a day past the end of the month just counts on)
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
 /// A moment in local time: year, month (1–12), day, weekday (0 = Sunday), hour, minute
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Day {
@@ -412,6 +384,7 @@ fn next_fire(cron: &str, after: u64, local: &dyn Fn(u64) -> Day, at: &dyn Fn(i64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::days_from_civil;
     use std::io::Write;
 
     /// Tests take UTC as local time, whatever the machine's time zone

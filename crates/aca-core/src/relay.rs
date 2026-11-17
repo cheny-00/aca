@@ -190,6 +190,8 @@ pub fn record(id: &str, pid: u32, r: &Report) {
     });
     if changed {
         event::emit("agent.status", id, json!({ "state": state, "kind": r.kind, "msg": r.msg }));
+        // Inside a sandbox this is all there is: it stands in for the hooks too
+        crate::hook::reported(id, state, &r.kind, &r.msg);
     }
 }
 
@@ -403,6 +405,10 @@ pub fn run(argv: &[String]) -> i32 {
     drop(tx);
     let _ = recorder.join();
     drop(raw);
+    // Ended by itself (/exit): a session inside a sandbox has no hook to say so
+    if let Ok(id) = std::env::var("ACA_SESSION_ID") {
+        crate::hook::reported(&id, "exited", "", "");
+    }
     status
 }
 

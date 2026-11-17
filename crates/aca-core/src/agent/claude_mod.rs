@@ -9,7 +9,7 @@
 //! being back to running without the mod.
 //!
 //! The interface will change, so:
-//! - **The mod only forwards** (`claude_mod.js`): one event, one `$` call. Parsing the format is on aca's side (aca-tui's
+//! - **The mod only forwards** (`claude_mod.js`): one event, one `$` call. Parsing the format is on aca's side (aca-records'
 //!   `limits.rs`); when it changes, fix the Rust, not the mod
 //! - **Before starting, let this Claude version check it itself** (`claude plugin validate --json`, 0.6 seconds): recorded
 //!   once per program file; a version that fails doesn't get it. It catches a renamed or removed event; it doesn't catch a

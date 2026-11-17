@@ -17,7 +17,7 @@
 //! detached, a `.mcp.json` left with only an empty table is deleted.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::style::{Modifier, Style};
@@ -25,8 +25,9 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use aca_core::{t, tr};
+use aca_records::agent::Agent;
 
-use crate::data::{Agent, Session};
+use crate::data::Session;
 use crate::ops::{Job, Outcome, Target};
 use crate::overlay::{Flow, Fx, Overlay, kit};
 use crate::theme;
@@ -358,16 +359,9 @@ fn home_from_config(cfg: &aca_core::config::Config, tool: &str, account: &str) -
     aca_core::agent::account(cfg, &*agent, account).map(|a| a.home).unwrap_or_default()
 }
 
+/// Inside the sandbox `dir` is mounted into, if any (see aca_core::sandbox)
 fn git(dir: &str, args: &[&str]) -> Option<String> {
-    let o = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let o = aca_core::sandbox::git(Path::new(dir), args, &[("GIT_OPTIONAL_LOCKS", "0")]).stderr(Stdio::null()).output().ok()?;
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string())
 }
 

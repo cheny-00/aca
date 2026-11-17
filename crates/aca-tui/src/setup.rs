@@ -33,6 +33,7 @@ use aca_core::config::Config;
 use aca_core::i18n::Tr;
 use aca_core::paths::{self, Res};
 use aca_core::{t, tr};
+use aca_records::agent::Agent;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
@@ -44,7 +45,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::accounts;
 use crate::acctpage::{Form, Went, who_span};
-use crate::data::Agent;
 use crate::overlay::{Flow, Fx, Overlay, kit};
 use crate::theme;
 
@@ -162,7 +162,7 @@ pub(crate) fn session_accounts() -> Vec<(Agent, String, String)> {
         "" => s.dir.rsplit('/').find(|p| !p.is_empty()).unwrap_or(&s.id).to_string(),
         t => t.to_string(),
     };
-    all.into_iter().map(|s| (crate::data::agent_of_tool(&cfg, &s.tool), s.account.clone(), name(&s))).collect()
+    all.into_iter().map(|s| (aca_records::agent::agent_of_tool(&cfg, &s.tool), s.account.clone(), name(&s))).collect()
 }
 
 /// Whose Claude status bar this config directory uses now (written in the right-hand column of the accounts page, named as in
@@ -1092,7 +1092,7 @@ impl Page {
                 rows.push(Row { agent, name: "claude".into(), shown, new: None, plain: true, wire, why: "" });
             }
         }
-        let mods = env.config().tool("claude").is_some_and(|t| t.mods);
+        let mods = aca_core::agent::tool(&env.config(), "claude").is_some_and(|t| t.mods);
         Page { env, rows, sel: 0, can_add, form: None, saved, mods, done: None }
     }
 
@@ -1298,7 +1298,7 @@ impl Page {
         };
         out.extend(said(text, st));
         if wire.pick == Mode::Aca {
-            let sample = crate::statusline::sample(&row.name);
+            let sample = aca_records::statusline::sample(&row.name);
             let lines: Vec<&str> = sample.lines().collect();
             out.extend(crate::ansi::wrap(&crate::ansi::parse_lines(&lines), w).iter().map(crate::ansi::to_line));
         }
@@ -1318,7 +1318,7 @@ impl Page {
         };
         let dir_w = room.saturating_sub(2 + tag.width());
         let dir = if row.shown.is_empty() { t!("(默认目录)", "(default directory)") } else { row.shown.as_str() };
-        let mut left = vec![Span::raw(" "), Span::styled(kit::clip(&row.name, name_w), crate::ui::agent_style(row.agent))];
+        let mut left = vec![Span::raw(" "), Span::styled(kit::clip(&row.name, name_w), crate::kit::agent_style(row.agent))];
         if dir_w >= 8 {
             // Too-long directory keeps its end: several accounts' directories mostly differ only in the last few characters
             left.extend([Span::raw("  "), Span::styled(tail(dir, dir_w), kit::dim())]);

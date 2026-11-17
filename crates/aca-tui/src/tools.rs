@@ -1,5 +1,9 @@
-//! The `n` tool menu: shell always on top, then every account registered in config.toml (named after the account, Claude
-//! first, then Codex; a family with no account at all is listed as itself), and last the named tools (`[tools.<name>]`).
+//! The `n` tool menu: shell always on top; then every account registered in config.toml (named after the account, Claude
+//! first, then Codex; a family with no account at all is listed as itself), and the named tools (`[tools.<name>]`).
+//!
+//! The special environments' rows (`[sandbox.<name>]`, see aca-core's sandbox.rs) come last in [`load`] and have a panel of
+//! their own (`^E`): each environment's together, a terminal in it (`shell:<name>`) then the accounts bound to it, under a
+//! heading that says what it is (`ssh work`, `本机 · Los_Angeles · 代理 127.0.0.1:28888`).
 //!
 //! Order and what to hide are set in config.toml (both optional):
 //!
@@ -12,10 +16,9 @@
 //! One that needs args is made a tool (`[tools.ccx] kind = "claude"`, `args = […]`, `account = "sub"`), see aca-core's
 //! config.rs.
 
-use aca_core::config::Config;
-use aca_core::t;
-
-use crate::data::{Agent, agent_of_tool};
+use aca_core::config::{Config, Sandbox};
+use aca_core::{t, tr};
+use aca_records::agent::{Agent, agent_of_tool};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tool {
@@ -26,11 +29,15 @@ pub struct Tool {
     pub account: String,
     /// Which family, for coloring in the menu
     pub agent: Agent,
-    /// The text after the name in the menu: a named tool shows its command; an account shows nothing (the menu puts the
-    /// family and quota there)
+    /// The text after the name in the menu: a named tool shows its command, a terminal says so; an account shows nothing (the
+    /// menu puts the family and quota there)
     pub note: String,
     /// Why it can't be used (the tool's default account isn't registered), shown in the menu in place of the note
     pub problem: Option<String>,
+    /// The special environment it runs in (`[sandbox.<it>]`); empty = this Mac as it is. Non-empty = one of `^E`'s rows
+    pub within: String,
+    /// What that environment is ([`under`]), for the heading of its rows
+    pub under: String,
 }
 
 #[cfg(test)]
@@ -52,20 +59,59 @@ pub struct Layout {
     pub hide: Vec<String>,
 }
 
-/// Read the menu (hidden ones left out)
+/// Read the menu (hidden ones left out): this Mac's, then the special environments' (X picks from all of them)
 pub fn load() -> Vec<Tool> {
     menu(&aca_core::config::load(), &Layout { menu: crate::config::list("ui", "menu"), hide: crate::config::list("ui", "hide") })
 }
 
+/// The menu split as the interface shows it: `n`'s rows, and `^E`'s (the special environments')
+pub fn split(v: Vec<Tool>) -> (Vec<Tool>, Vec<Tool>) {
+    v.into_iter().partition(|t| t.within.is_empty())
+}
+
 fn entry(cfg: &Config, name: String, tool: &str, account: &str, note: String) -> Tool {
     let problem = aca_core::agent::pick(cfg, &spec(tool, account)).err();
-    Tool { name, tool: tool.into(), account: account.into(), agent: agent_of_tool(cfg, tool), note, problem }
+    let (within, under) = match aca_core::sandbox::of(cfg, tool, account) {
+        Some((n, b)) => (n.to_string(), self::under(b)),
+        None => (String::new(), String::new()),
+    };
+    Tool { name, tool: tool.into(), account: account.into(), agent: agent_of_tool(cfg, tool), note, problem, within, under }
+}
+
+/// What a special environment is: where it runs (`ssh work`, or `本机` (this Mac)), then the time zone and the proxy its env
+/// sets (`Los_Angeles · 代理 127.0.0.1:28888`)
+pub fn under(b: &Sandbox) -> String {
+    let mut parts = vec![if b.cage() { format!("ssh {}", b.ssh.trim()) } else { t!("本机", "this Mac").to_string() }];
+    // Either case counts (curl reads only the lowercase http_proxy); empty = not set
+    let set = |names: &[&str]| {
+        names.iter().find_map(|n| {
+            b.env.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.trim().to_string()).filter(|v| !v.is_empty())
+        })
+    };
+    if let Some(tz) = set(&["TZ"]) {
+        parts.push(tz.trim_start_matches(':').rsplit('/').next().unwrap_or_default().to_string());
+    }
+    if let Some(p) = set(&["HTTPS_PROXY", "ALL_PROXY", "HTTP_PROXY"]) {
+        parts.push(tr!("代理 {}", "proxy {}", proxy_addr(&p)));
+    }
+    parts.join(" · ")
+}
+
+/// A proxy URL as its address: `http(s)://` dropped, any other scheme kept (`socks5h://…`), and never the `user:password@`
+fn proxy_addr(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let addr = rest.rsplit_once('@').map_or(rest, |(_, a)| a).trim_end_matches('/');
+    if scheme.is_empty() || scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+        addr.to_string()
+    } else {
+        format!("{scheme}://{addr}")
+    }
 }
 
 /// A named tool: which family, what command, which args, which account
 fn tool_note(name: &str, t: &aca_core::config::Tool) -> String {
     let cmd = if !t.cmd.is_empty() {
-        t.cmd.iter().map(|c| crate::create::tilde(c)).collect::<Vec<_>>().join(" ")
+        t.cmd.iter().map(|c| aca_records::words::tilde(c)).collect::<Vec<_>>().join(" ")
     } else if !t.kind.is_empty() {
         t.kind.clone()
     } else {
@@ -86,17 +132,29 @@ pub fn menu(cfg: &Config, lay: &Layout) -> Vec<Tool> {
 
 /// `installed` asks whether a program is installed (swapped out in tests)
 fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Tool> {
+    let families = || aca_core::agent::kinds().filter(|k| *k != "shell");
+    let bound = |fam: &str, account: &str| aca_core::sandbox::of(cfg, fam, account).map(|(n, _)| n.to_string());
+    // The special environments': each one's together, a terminal in it then the accounts bound to it in built-in order
+    let mut special: Vec<Tool> = vec![];
+    for name in cfg.sandbox.keys() {
+        special.push(entry(cfg, format!("shell:{name}"), "shell", name, t!("终端", "terminal").into()));
+        for fam in families() {
+            for n in cfg.accounts.get(fam).into_iter().flat_map(|m| m.keys()).filter(|n| bound(fam, n).as_ref() == Some(name)) {
+                special.push(entry(cfg, n.clone(), fam, n, String::new()));
+            }
+        }
+    }
     let mut out: Vec<Tool> = vec![];
-    // Registered accounts: in built-in order (Claude, Codex, pi, opencode), each family's by name
-    for fam in aca_core::agent::kinds().filter(|k| *k != "shell") {
+    // The other registered accounts: in built-in order (Claude, Codex, pi, opencode), each family's by name
+    for fam in families() {
         let all = cfg.accounts.get(fam);
-        for n in all.into_iter().flat_map(|m| m.keys()) {
+        for n in all.into_iter().flat_map(|m| m.keys()).filter(|n| bound(fam, n).is_none()) {
             out.push(entry(cfg, n.clone(), fam, n, String::new()));
         }
         // A family with no account at all: list it as itself (with its own default config dir). Claude and Codex always;
         // the later-added families only when installed (or given their section in config.toml), so people without them
         // don't get unusable rows in the menu
-        let prog = cfg.tool(fam).and_then(|t| t.cmd.first().cloned()).unwrap_or_else(|| fam.to_string());
+        let prog = aca_core::agent::tool(cfg, fam).and_then(|t| t.cmd.first().cloned()).unwrap_or_else(|| fam.to_string());
         let wanted = matches!(fam, "claude" | "codex") || cfg.tools.contains_key(fam) || installed(&prog);
         if all.is_none_or(|m| m.is_empty()) && wanted {
             out.push(entry(cfg, fam.into(), fam, "", String::new()));
@@ -109,6 +167,7 @@ fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Too
     out.retain(|t| !lay.hide.contains(&t.name));
     // Ones given an order go first (stable sort: the rest keep the order above)
     out.sort_by_key(|t| lay.menu.iter().position(|n| *n == t.name).unwrap_or(usize::MAX));
+    special.retain(|t| !lay.hide.contains(&t.name));
     let shell = Tool {
         name: "shell".into(),
         tool: "shell".into(),
@@ -116,8 +175,11 @@ fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Too
         agent: Agent::None,
         note: t!("仅打开终端", "just a terminal").into(),
         problem: None,
+        within: String::new(),
+        under: String::new(),
     };
     out.insert(0, shell);
+    out.extend(special);
     out
 }
 
@@ -154,6 +216,8 @@ mod tests {
         // The tool's default account isn't registered: flagged
         assert!(v[5].problem.as_ref().is_some_and(|p| p.contains("nope")), "{:?}", v[5].problem);
         assert!(v.iter().enumerate().all(|(i, t)| i == 5 || t.problem.is_none()));
+        // No special environment: all of them are n's
+        assert!(split(v).1.is_empty());
     }
 
     #[test]
@@ -176,6 +240,46 @@ mod tests {
         // One with its own cmd: whether that command is installed
         let wrapped = aca_core::config::parse("[tools.pi]\ncmd = [\"/opt/pi/bin/pi\"]\n");
         assert_eq!(names(&menu_with(&wrapped, &Layout::default(), none)), ["shell", "claude", "codex", "pi"]);
+    }
+
+    #[test]
+    fn each_special_environment_comes_last_with_a_terminal_in_it_and_its_accounts() {
+        let cfg = aca_core::config::parse(
+            "[sandbox.work]\nssh = \"work\"\n\
+             [sandbox.unis]\nworkspace = \"/w/unis\"\n\
+             env = { TZ = \"America/Los_Angeles\", https_proxy = \"http://me:secret@127.0.0.1:28888/\" }\n\
+             [accounts.claude]\nsub = \"~/.c\"\nteam = { sandbox = \"work\" }\n\
+             [accounts.codex]\ncx = \"~/.cx\"\nteam = { sandbox = \"work\" }\nteam-unis = { sandbox = \"unis\" }\n\
+             [accounts.shell]\nplain = { env = { X = \"1\" } }\n",
+        );
+        let v = menu_with(&cfg, &Layout::default(), none);
+        // This Mac's first; each environment's together after (by name), a terminal in it first
+        assert_eq!(names(&v), ["shell", "sub", "cx", "shell:unis", "team-unis", "shell:work", "team", "team"]);
+        let rows: Vec<_> = v[3..].iter().map(|t| (t.spec(), t.within.as_str(), t.under.as_str())).collect();
+        // What each environment is, never the proxy's password
+        let la = "本机 · Los_Angeles · 代理 127.0.0.1:28888";
+        assert_eq!(
+            rows,
+            [
+                ("shell:unis".into(), "unis", la),
+                ("codex:team-unis".into(), "unis", la),
+                ("shell:work".into(), "work", "ssh work"),
+                ("claude:team".into(), "work", "ssh work"),
+                ("codex:team".into(), "work", "ssh work"),
+            ]
+        );
+        assert!(v[..3].iter().all(|t| t.within.is_empty()) && v.iter().all(|t| t.problem.is_none()));
+        assert_eq!((v[3].agent, v[3].note.as_str()), (Agent::None, "终端"));
+        // A registered terminal in no environment isn't listed
+        assert!(!v.iter().any(|t| t.name == "shell:plain"));
+        // An order in [ui] doesn't move them; hiding still works
+        let lay = Layout { menu: vec!["cx".into(), "sub".into()], hide: vec![] };
+        assert_eq!(names(&menu_with(&cfg, &lay, none))[..3], ["shell", "cx", "sub"]);
+        let lay = Layout { menu: vec![], hide: vec!["shell:work".into()] };
+        assert!(!names(&menu_with(&cfg, &lay, none)).contains(&"shell:work"));
+        // As the interface shows them: n's, and ^E's
+        let (n, e) = split(v);
+        assert_eq!((names(&n), e.len()), (vec!["shell", "sub", "cx"], 5));
     }
 
     #[test]
