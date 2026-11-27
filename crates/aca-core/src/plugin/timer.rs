@@ -155,10 +155,38 @@ fn xml(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// Runs `<this aca> plugin timer tick <plugin.command>` when due. PATH is copied from when it was switched on (launchd's
-/// own PATH has no tmux or jq)
+/// Keep the environment recorded when the timer was enabled. Add only locale keys the caller actually has.
+fn environment(old: &str, path: &str, locale: &[(&str, String)], current: bool) -> Option<String> {
+    let saved = old
+        .split_once("<key>EnvironmentVariables</key>")
+        .and_then(|(_, tail)| tail.trim_start().strip_prefix("<dict>"))
+        .and_then(|tail| tail.split_once("</dict>"));
+    let mut env = saved.map_or_else(
+        || format!("\n        <key>PATH</key>\n        <string>{}</string>", xml(path)),
+        |(env, _)| env.trim_end().to_owned(),
+    );
+    let mut added = false;
+    for (key, value) in locale {
+        let tag = format!("<key>{key}</key>");
+        if !env.contains(&tag) {
+            env.push_str(&format!("\n        {tag}\n        <string>{}</string>", xml(value)));
+            added = true;
+        }
+    }
+    (!current || added).then_some(env)
+}
+
+fn locales() -> Vec<(&'static str, String)> {
+    ["LANG", "LC_ALL", "LC_CTYPE"].into_iter().filter_map(|k| Some((k, std::env::var(k).ok()?))).collect()
+}
+
+/// Runs `<this aca> plugin timer tick <plugin.command>` when due with the enabling shell's PATH and locales.
 pub fn plist(label: &str, exe: &str, q: &str, every: u64, path: &str, log: &str) -> String {
-    let (label, exe, q, path, log) = (xml(label), xml(exe), xml(q), xml(path), xml(log));
+    plist_text(label, exe, q, every, &environment("", path, &locales(), false).unwrap(), log)
+}
+
+fn plist_text(label: &str, exe: &str, q: &str, every: u64, env: &str, log: &str) -> String {
+    let (label, exe, q, log) = (xml(label), xml(exe), xml(q), xml(log));
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -178,9 +206,7 @@ pub fn plist(label: &str, exe: &str, q: &str, every: u64, path: &str, log: &str)
     <key>StartInterval</key>
     <integer>{every}</integer>
     <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>{path}</string>
+    <dict>{env}
     </dict>
     <key>StandardOutPath</key>
     <string>{log}</string>
@@ -222,46 +248,86 @@ fn loaded(label: &str) -> bool {
 
 /// Makes launchd match the record: load it if `want` (reload if every changed), otherwise unload
 fn apply(st: &mut State, want: bool) -> Res<()> {
+    reconcile(st, want, false)
+}
+
+fn reconcile(st: &mut State, want: bool, upgrade_locale: bool) -> Res<()> {
     let label = label(&st.plugin, &st.run);
     let path = plist_path(&label);
-    let service = format!("{}/{label}", domain());
     if !want {
         st.installed = 0;
         // Delete the file before unloading: the running fire was started by it and gets taken down with the unload
         let _ = std::fs::remove_file(&path);
         if !isolated() && loaded(&label) {
+            let service = format!("{}/{label}", domain());
             ctl(&["bootout", &service]).map_err(|e| tr!("无法卸载系统定时器:{e}", "the system timer didn't uninstall: {e}"))?;
         }
         return Ok(());
     }
     let up = loaded(&label);
-    if up && st.installed == st.every {
+    let current = up && st.installed == st.every;
+    if current && !upgrade_locale {
         return Ok(());
     }
-    if up && !isolated() {
-        let _ = ctl(&["bootout", &service]);
+    if let Some(env) = read_environment(&path, &locales(), current)? {
+        install(st, &label, &path, &env, up)?;
+        st.installed = st.every;
     }
+    Ok(())
+}
+
+fn read_environment(path: &Path, locale: &[(&str, String)], current: bool) -> Res<Option<String>> {
+    let old = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(tr!("无法读取定时器的 plist:{e}", "can't read the timer's plist: {e}")),
+    };
+    let locale = if !old.is_empty() && std::env::var_os("ACA_PLUGIN_TIMER").is_some() { &[] } else { locale };
+    Ok(environment(&old, &std::env::var("PATH").unwrap_or_default(), locale, current))
+}
+
+fn install(st: &State, label: &str, path: &Path, env: &str, up: bool) -> Res<()> {
+    let service = format!("{}/{label}", domain());
     let log = dir().join("launchd.log");
-    let text = plist(
-        &label,
-        &crate::agent::self_exe(),
-        &st.qualified(),
-        st.every,
-        &std::env::var("PATH").unwrap_or_default(),
-        &log.to_string_lossy(),
-    );
+    let text = plist_text(label, &crate::agent::self_exe(), &st.qualified(), st.every, env, &log.to_string_lossy());
     if let Some(d) = path.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    paths::write_atomic(&path, &text).map_err(|e| tr!("无法写入定时器的 plist:{e}", "can't write the timer's plist: {e}"))?;
+    if up && !isolated() {
+        ctl(&["bootout", &service]).map_err(|e| tr!("无法卸载系统定时器:{e}", "the system timer didn't unload: {e}"))?;
+    }
+    paths::write_atomic(path, &text).map_err(|e| tr!("无法写入定时器的 plist:{e}", "can't write the timer's plist: {e}"))?;
     if !isolated() {
         // For a service that was once on the disabled list, bootstrap only reports "5: Input/output error"
         let _ = ctl(&["enable", &service]);
         ctl(&["bootstrap", &domain(), &path.to_string_lossy()])
             .map_err(|e| tr!("系统定时器安装失败:{e}", "the system timer didn't install: {e}"))?;
     }
-    st.installed = st.every;
     Ok(())
+}
+
+/// Opening the UI or explicitly syncing plugins also checks already-installed timers after an upgrade.
+pub fn refresh_locales() -> Vec<String> {
+    let locale = locales();
+    if locale.is_empty() || std::env::var_os("ACA_PLUGIN_TIMER").is_some() {
+        return vec![];
+    }
+    let refresh = |st: &State| -> Res<()> {
+        let label = label(&st.plugin, &st.run);
+        let path = plist_path(&label);
+        // A current plist needs no launchctl process on startup or sync.
+        if let Some(env) = read_environment(&path, &locale, true)?
+            && loaded(&label)
+        {
+            install(st, &label, &path, &env, true)?;
+        }
+        Ok(())
+    };
+    all()
+        .into_iter()
+        .filter(|st| st.on && st.installed != 0 && st.installed == st.every)
+        .filter_map(|st| refresh(&st).err().map(|e| format!("{}: {e}", st.qualified())))
+        .collect()
 }
 
 /// Inside this timer's own running fire (its command called `aca plugin timer on / off` again): launchd waits until this
@@ -301,7 +367,7 @@ pub fn on(q: &str) -> Res<String> {
     }
     st.on = true;
     st.every = t.secs();
-    let r = if inside(q) { Ok(()) } else { apply(&mut st, true) };
+    let r = if inside(q) { Ok(()) } else { reconcile(&mut st, true, std::env::var_os("ACA_PLUGIN_TIMER").is_none()) };
     save(&st)?;
     r?;
     Ok(if was {
@@ -616,6 +682,26 @@ mod tests {
         assert!(p.contains("<key>StartInterval</key>\n    <integer>300</integer>"));
         assert!(p.contains("<string>/opt/bin:/usr/bin</string>") && !p.contains("KeepAlive</key>"));
         assert!(plist("l", "/a&b/aca", "q", 60, "", "").contains("<string>/a&amp;b/aca</string>"));
+    }
+
+    #[test]
+    fn a_locale_upgrade_adds_only_missing_keys_from_any_shell_locale() {
+        let ctype = [("LC_CTYPE", "UTF-8".into())];
+        let env = environment("", "/opt/bin", &ctype, false).unwrap();
+        let old = plist_text("label", "aca", "p.c", 60, &env, "log");
+        assert!(old.contains("<key>LC_CTYPE</key>\n        <string>UTF-8</string>"));
+        assert!(!old.contains("<key>LANG</key>") && !old.contains("<key>LC_ALL</key>"));
+        let env = environment(&old, "", &[("LC_ALL", "C".into())], true).unwrap();
+        assert!(env.contains("<key>LC_ALL</key>\n        <string>C</string>"));
+        assert!(!env.contains("<key>LANG</key>"));
+        let all = [("LANG", "zh_TW.UTF-8".into()), ("LC_ALL", "C<&>".into()), ("LC_CTYPE", "C".into())];
+        let env = environment(&old, "/other", &all, true).unwrap();
+        let new = plist_text("label", "aca", "p.c", 60, &env, "log");
+        for value in ["/opt/bin", "UTF-8", "zh_TW.UTF-8", "C&lt;&amp;&gt;"] {
+            assert!(new.contains(&format!("<string>{value}</string>")), "{new}");
+        }
+        assert_eq!(environment(&new, "", &all, true), None);
+        assert_eq!(environment(&new, "", &[], true), None);
     }
 
     #[test]

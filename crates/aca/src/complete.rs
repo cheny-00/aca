@@ -100,7 +100,7 @@ fn kind(p: &str) -> Kind {
         "id" | "会话 id" => Kind::Session,
         "分组" | "GROUP" => Kind::Group { dot: true },
         // In the group subcommands, the PATH placeholder is the group's own path (work/app)
-        "路径" | "PATH" => Kind::Group { dot: false },
+        "路径" | "PATH" | "分组名" | "GROUP-NAME" => Kind::Group { dot: false },
         "目录" | "默认目录" | "本地目录" | "DIR" | "DEFAULT-DIR" | "LOCAL-DIR" => Kind::Dir,
         "工具[:账号]" | "工具名" | "TOOL[:ACCOUNT]" | "TOOL-NAME" => Kind::Tool,
         "tmux 会话" | "%窗格" | "TMUX-SESSION" | "%PANE" => Kind::Tmux,
@@ -128,6 +128,7 @@ const FREE: &[&str] = &[
     "位置",
     "秒",
     "时长",
+    "渠道",
     "名字",
     "值",
     "从哪套",
@@ -166,6 +167,9 @@ const FREE: &[&str] = &[
     "能力…",
     "目标",
     "键",
+    "笔记 id",
+    "单号",
+    "标准",
 ];
 
 /// One slot in a usage: fixed words (pick one of several) and / or one placeholder argument
@@ -284,14 +288,16 @@ fn parse(usage: &str) -> Form {
 enum Next<'a> {
     /// An option that takes a value was just typed
     Value(&'a Item),
-    /// Continue from this positional slot
-    At(usize),
+    /// Continue from this positional slot. The flag: it's one that repeats and already has something, so it may be over
+    /// (`move <id>… <GROUP>`: after one id, the next word is another id or the group)
+    At(usize, bool),
     /// After `--`: nothing completed
     Rest,
 }
 
 fn walk<'a>(f: &'a Form, typed: &[String]) -> Option<Next<'a>> {
     let mut at = 0;
+    let mut filled = false;
     let mut pending: Option<&Item> = None;
     for w in typed {
         if pending.take().is_some() {
@@ -307,6 +313,7 @@ fn walk<'a>(f: &'a Form, typed: &[String]) -> Option<Next<'a>> {
         loop {
             let it = f.items.get(at)?;
             if it.takes(w) {
+                filled = it.many;
                 at += usize::from(!it.many);
                 break;
             }
@@ -316,7 +323,7 @@ fn walk<'a>(f: &'a Form, typed: &[String]) -> Option<Next<'a>> {
             at += 1;
         }
     }
-    Some(pending.map_or(Next::At(at), Next::Value))
+    Some(pending.map_or(Next::At(at, filled), Next::Value))
 }
 
 /// One candidate: (kind, value, note)
@@ -415,6 +422,12 @@ fn complete_with(words: &[String], values: &dyn Fn(Kind, &str) -> Vec<Cand>) -> 
         c.usage.iter().filter_map(|u| u.split_once(' ').map_or(Some(""), |(n, rest)| (n == cmd).then_some(rest))).map(parse).collect();
     let mut flags: Vec<(String, String)> = vec![];
     let mut seen_flag = |name: &str, arg: Option<&Item>| {
+        if matches!(name, "--watch" | "--no-watch")
+            && ((cmd == "new" && !args.iter().any(|a| a == "--task"))
+                || args.iter().any(|a| matches!(a.as_str(), "--watch" | "--no-watch")))
+        {
+            return;
+        }
         if !typed.iter().any(|w| w == name) && !flags.iter().any(|f| f.0 == name) {
             flags.push((name.to_string(), flag_note(c, name, arg)));
         }
@@ -424,14 +437,15 @@ fn complete_with(words: &[String], values: &dyn Fn(Kind, &str) -> Vec<Cand>) -> 
         match walk(f, args) {
             None | Some(Next::Rest) => {}
             Some(Next::Value(it)) => items.push((it, "")),
-            Some(Next::At(at)) => {
+            Some(Next::At(at, filled)) => {
                 for (name, arg) in &f.flags {
                     seen_flag(name, arg.as_ref());
                 }
-                // Look ahead through the optional slots, up to the first required one
-                for it in &f.items[at.min(f.items.len())..] {
+                // Look ahead through the optional slots, up to the first required one; a repeating slot that already has
+                // something may be over, so what follows it is offered too
+                for (i, it) in f.items[at.min(f.items.len())..].iter().enumerate() {
                     items.push((it, &f.usage));
-                    if !it.optional {
+                    if !it.optional && !(i == 0 && filled) {
                         break;
                     }
                 }
@@ -704,10 +718,7 @@ mod tests {
         // eating the leading spaces
         assert_eq!((note("--x  丢了缩进", "--x", ""), note("    --x  接着上一条的", "--x", "")), (None, None));
         let start = help::find("start").unwrap();
-        assert_eq!(
-            (brief(start, "start"), brief(start, "stop")),
-            ("启动(继续原来的对话)".into(), "停止(agent 退出,窗格和登记保留)".into())
-        );
+        assert_eq!((brief(start, "start"), brief(start, "stop")), ("启动已停的会话".into(), "停止(agent 退出,窗格和登记保留)".into()));
         let d = |s: &str, v: &str| cands(s).into_iter().find(|c| c.1 == v).map(|c| c.2).unwrap_or_default();
         assert!(d("group ", "rename").starts_with("<路径> <新路径> · 重命名"), "{}", d("group ", "rename"));
         assert!(d("new claude -", "-g").starts_with("分组 · 可以带层级"), "{}", d("new claude -", "-g"));
@@ -826,12 +837,27 @@ mod tests {
     }
 
     #[test]
+    fn group_filter_and_ticket_watch_match_the_command_context() {
+        assert_eq!(got("ls -g "), [("group".to_string(), "<分组>".to_string())]);
+        assert!(!has("new claude -", "flag", "--watch") && !has("new claude -", "flag", "--no-watch"));
+        for cmd in ["task add", "task give 1 abc", "task set 1", "new claude --task 1"] {
+            for flag in ["--watch", "--no-watch"] {
+                assert!(has(&format!("{cmd} -"), "flag", flag));
+                assert!(!has(&format!("{cmd} --watch -"), "flag", flag));
+            }
+        }
+    }
+
+    #[test]
     fn rename_offers_auto_and_move_offers_dot() {
         assert_eq!(got("move ").first(), Some(&("session".to_string(), "<会话>".to_string())));
         assert!(has("move abc ", "group", "."));
         assert!(has("rename abc -", "flag", "--auto"));
+        // move takes several sessions and the group last: after one id, the next word is another session or the group
+        assert!(has("move abc ", "session", "<会话>") && has("move abc def ", "group", "."));
+        assert!(has("move -", "flag", "--tree"));
         // All positional arguments filled: nothing to complete
-        assert!(got("move abc work ").is_empty());
+        assert!(got("order abc 3 ").is_empty());
         // adopt completes unregistered tmux sessions, and takes several
         assert!(has("adopt ", "tmux", "<tmux>") && has("adopt a b ", "tmux", "<tmux>"));
         // unarchive completes sessions too (the real one lists only archived ones)

@@ -11,6 +11,8 @@ enum SetRow {
     Accounts,
     Tools,
     GroupDir,
+    /// Where sessions that belong to no project start (`[scratch] dir`)
+    Scratch,
     Config,
     /// Added by a feature itself (`App::with_setting`): index in `Settings::extra`
     Extra(usize),
@@ -23,11 +25,12 @@ impl SetRow {
     fn key(self) -> Option<char> {
         match self {
             SetRow::Theme => Some('t'),
-            SetRow::Lang => Some('l'),
+            SetRow::Lang => Some('u'),
             SetRow::Ime => Some('i'),
             SetRow::Accounts => Some('a'),
             SetRow::Tools => Some('n'),
-            SetRow::GroupDir => Some('g'),
+            SetRow::GroupDir => Some('p'),
+            SetRow::Scratch => Some('s'),
             SetRow::Config => Some('e'),
             SetRow::Extra(_) | SetRow::Problems => None,
         }
@@ -41,6 +44,7 @@ impl SetRow {
             SetRow::Accounts => t!("账号", "accounts"),
             SetRow::Tools => t!("工具菜单", "tool menu"),
             SetRow::GroupDir => t!("新分组目录", "new group directory"),
+            SetRow::Scratch => t!("随手问目录", "scratch directory"),
             SetRow::Config => "config.toml",
             SetRow::Extra(_) | SetRow::Problems => "",
         }
@@ -64,6 +68,8 @@ pub(super) struct Settings {
     lang: Lang,
     ime: bool,
     group_dir: String,
+    /// Empty = not set
+    scratch_dir: String,
     bad: Vec<String>,
     accts: Vec<crate::accounts::Account>,
     /// Rows added by features, asked for on open
@@ -87,8 +93,8 @@ impl Settings {
         if cfg!(target_os = "macos") {
             v.push(SetRow::Ime);
         }
-        v.extend([SetRow::Accounts, SetRow::Tools, SetRow::GroupDir, SetRow::Config]);
-        v.extend((0..self.extra.len()).map(SetRow::Extra));
+        v.extend([SetRow::Accounts, SetRow::Tools, SetRow::GroupDir, SetRow::Scratch, SetRow::Config]);
+        v.extend(self.extra.iter().enumerate().filter(|(_, row)| !row.value.is_empty()).map(|(i, _)| SetRow::Extra(i)));
         if !self.bad.is_empty() {
             v.push(SetRow::Problems);
         }
@@ -108,11 +114,29 @@ impl Settings {
             r => r.name(),
         }
     }
+
+    /// The page's keys: ⏎ (the bottom bar's), then each row's own key and name; on the problems page, e
+    fn keys(&self) -> Vec<crate::sheet::Key> {
+        use crate::sheet::{key, more};
+        if self.page == SetPage::Problems {
+            return vec![key("e", t!("编辑 config.toml", "edit config.toml")), more("Esc", t!("返回设置", "back to settings"))];
+        }
+        let mut v = vec![key("⏎", t!("修改", "change"))];
+        v.extend(self.rows().into_iter().filter_map(|r| self.key(r).map(|c| more(c.to_string(), self.name(r)))));
+        v.extend([more("↑↓", t!("选择", "select")), more("Esc", t!("关闭", "close"))]);
+        v
+    }
+}
+
+/// The theme list's keys, for its bottom bar and `?`
+fn theme_keys() -> Vec<crate::sheet::Key> {
+    use crate::sheet::{key, more};
+    vec![key("↑↓", t!("预览", "preview")), key("⏎", t!("应用", "use it")), more("Esc", t!("不换", "keep the old one"))]
 }
 
 /// The palette list (「主题」 ("theme") in `^S`, see `open_themes`): all themes (each one's colors prepared up front; moving onto one
 /// switches the whole interface to it), which one is highlighted,
-/// the one in use before opening (Esc switches back), the one saved in config (marked ●)
+/// the one in use before opening (Esc switches back), the one saved in config (marked ✓)
 pub(super) struct ThemeMenu {
     list: Vec<(theme::Theme, &'static theme::Pal)>,
     sel: usize,
@@ -141,6 +165,7 @@ impl App {
         let Some(m) = self.theme_menu.as_mut() else { return };
         let n = m.list.len();
         match k.code {
+            KeyCode::Char('?') if !k.modifiers.contains(KeyModifiers::CONTROL) => return self.open_sheet(&theme_keys()),
             KeyCode::Down | KeyCode::Char('j') => m.sel = (m.sel + 1) % n,
             KeyCode::Up | KeyCode::Char('k') => m.sel = (m.sel + n - 1) % n,
             KeyCode::Enter => {
@@ -184,6 +209,7 @@ impl App {
             lang: i18n::lang(),
             ime: (self.ime_auto)(),
             group_dir: (self.new_group_dir)(),
+            scratch_dir: words::tilde(&(self.scratch_dir)()),
             bad,
             accts: (self.accounts_lister)(),
             extra: self.setting_rows.iter().map(|r| ExtraRow { key: r.key(), name: r.name(), value: r.value(), mark: r.mark() }).collect(),
@@ -244,6 +270,10 @@ impl App {
         if ctrl && k.code == KeyCode::Char('s') {
             self.settings = None;
             return;
+        }
+        if !ctrl && k.code == KeyCode::Char('?') {
+            let keys = s.keys();
+            return self.open_sheet(&keys);
         }
         match s.page {
             SetPage::Main => {
@@ -316,18 +346,25 @@ impl App {
             SetRow::Accounts => {
                 if let Some(page) = self.accounts_page {
                     self.leave_settings();
-                    self.open(page(false));
+                    self.open(page(self.accounts_opening()));
                 }
             }
             SetRow::Tools | SetRow::Config => {
                 self.leave_settings();
                 let path = crate::config::path().to_string_lossy().into_owned();
-                self.external = Some(External::Config { path, template: CONFIG_TEMPLATE.to_string() });
+                // The tool menu's order and hiding (menu / hide) are under [ui]: n stops there, e opens at the top
+                let section = (r == SetRow::Tools).then_some("ui");
+                self.external = Some(External::Config { path, template: CONFIG_TEMPLATE.to_string(), section });
             }
             SetRow::GroupDir => {
                 let text = s.group_dir.clone();
                 self.leave_settings();
                 self.prompt = Some(Prompt { ask: Ask::GroupDir, text, hint: String::new() });
+            }
+            SetRow::Scratch => {
+                let text = s.scratch_dir.clone();
+                self.leave_settings();
+                self.prompt = Some(Prompt { ask: Ask::ScratchDir { desk: false }, text, hint: String::new() });
             }
             SetRow::Extra(i) => {
                 let mut fx = Fx::default();
@@ -347,7 +384,7 @@ impl App {
 }
 
 /// Color theme list. Unlike other popups it doesn't grey out what's below: the aca below is the preview. On desktop it floats in the
-/// bottom-left corner (most of the list and preview stay visible), on a phone it rises from the bottom. One theme per row: ● on the saved
+/// bottom-left corner (most of the list and preview stay visible), on a phone it rises from the bottom. One theme per row: ✓ on the saved
 /// one, name, its own accent color, state colors (red green yellow), account colors
 pub(super) fn draw_themes(f: &mut Frame, m: &ThemeMenu) {
     let (outer, w) = side_width(f.area(), 50);
@@ -365,7 +402,7 @@ pub(super) fn draw_themes(f: &mut Frame, m: &ThemeMenu) {
         let p = &t.pal;
         let block = |c: Color, n: usize| Span::styled("█".repeat(n), Style::new().fg(c));
         let mut spans = vec![
-            if t.name == m.now { Span::styled("● ", theme::accent()) } else { Span::raw("  ") },
+            if t.name == m.now { Span::styled("✓ ", theme::accent()) } else { Span::raw("  ") },
             Span::styled(clip(&t.name, name_w), Style::new().add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             block(p.accent, 2),
@@ -383,15 +420,26 @@ pub(super) fn draw_themes(f: &mut Frame, m: &ThemeMenu) {
         body.push(line);
     }
     body.push(Line::raw(""));
-    body.push(keys_line(&[("↑↓", t!("预览", "preview")), ("⏎", t!("应用", "use it"))], vec![], w));
+    body.push(keys_line_help(&crate::sheet::foot(&theme_keys()), vec![], w));
     side_panel(f, outer, body);
 }
 
 /// `^S` settings page: a centered popup (greys out what's below like Tab / S; when picking a theme, it becomes the color theme list in the
 /// bottom-left that doesn't grey out). One item per row, "key  name  current value", › = go in to pick, ↗ = open in an editor; Problems get
 /// their own page, accounts are a separate popup (acctpage.rs)
-pub(super) fn draw_settings(f: &mut Frame, s: &Settings) {
-    modal(f, 54, theme::pal().accent, |w| settings_lines(s, w));
+pub(super) fn draw_settings(f: &mut Frame, s: &Settings, note: Option<&str>) {
+    let name_w = s.rows().iter().map(|&r| s.name(r).width()).max().unwrap_or(0);
+    let value_w = s.extra.iter().map(|x| x.value.iter().map(Span::width).sum::<usize>()).max().unwrap_or(0);
+    let width = (name_w + value_w + 11).clamp(54, u16::MAX as usize) as u16;
+    let phone = !super::screen::floating(f.area());
+    modal(f, width, theme::pal().accent, |w| {
+        let mut lines = settings_lines(s, w);
+        if phone && let Some(note) = note {
+            lines.pop();
+            lines.extend(wrap_width(note, w).into_iter().map(|l| Line::styled(l, theme::warn())));
+        }
+        lines
+    });
 }
 
 fn settings_lines(s: &Settings, w: usize) -> Vec<Line<'static>> {
@@ -447,6 +495,7 @@ fn settings_lines(s: &Settings, w: usize) -> Vec<Line<'static>> {
                         "›",
                     ),
                     SetRow::GroupDir => (vec![Span::raw(s.group_dir.clone())], ""),
+                    SetRow::Scratch => (vec![Span::raw(s.scratch_dir.clone())], ""),
                     SetRow::Tools | SetRow::Config => (vec![], "↗"),
                     SetRow::Extra(x) => s.extra.get(x).map_or((vec![], ""), |x| (x.value.clone(), x.mark)),
                     SetRow::Problems => (vec![Span::styled(tr!("{} 处错误", "problems: {}", s.bad.len()), theme::warn())], "›"),
@@ -457,12 +506,27 @@ fn settings_lines(s: &Settings, w: usize) -> Vec<Line<'static>> {
                     left.push(Span::raw(clip(s.name(r), name_w)));
                     left.push(Span::raw("  "));
                 }
-                left.extend(val);
+                for span in val {
+                    // On a phone keep each channel's status and missing labels intact when the whole row is wider than the screen.
+                    if matches!(r, SetRow::Extra(_)) && left.iter().map(Span::width).sum::<usize>() + span.width() > w {
+                        body.push(pad(Line::from(std::mem::take(&mut left)), i == s.sel));
+                        let text = span.content.trim_start_matches([' ', '·']);
+                        let mut parts = wrap_width(text, w).into_iter().peekable();
+                        while let Some(part) = parts.next() {
+                            left.push(Span::styled(part, span.style));
+                            if parts.peek().is_some() {
+                                body.push(pad(Line::from(std::mem::take(&mut left)), i == s.sel));
+                            }
+                        }
+                    } else {
+                        left.push(span);
+                    }
+                }
                 let right = if mark.is_empty() { vec![] } else { vec![Span::styled(mark, theme::faint())] };
                 body.push(pad(spread(left, right, w), i == s.sel));
             }
             body.push(Line::raw(""));
-            body.push(keys_line(&[("⏎", t!("修改", "change"))], vec![], w));
+            body.push(keys_line_help(&crate::sheet::foot(&s.keys()), vec![], w));
         }
         SetPage::Problems => {
             body = vec![modal_title(t!("错误项", "Problems"), theme::accent(), esc_hint(t!("返回", "back")), w), Line::raw("")];
@@ -470,7 +534,7 @@ fn settings_lines(s: &Settings, w: usize) -> Vec<Line<'static>> {
                 body.extend(wrap_width(b, w).into_iter().map(|l| Line::styled(l, theme::warn())));
             }
             body.push(Line::raw(""));
-            body.push(keys_line(&[("e", t!("编辑 config.toml", "edit config.toml"))], vec![], w));
+            body.push(keys_line_help(&crate::sheet::foot(&s.keys()), vec![], w));
         }
     }
     body
@@ -483,23 +547,25 @@ const CONFIG_TEMPLATE: Tr = Tr::new(
 );
 
 /// Which of the tool menu's two sets it shows: `n`'s (true = the special environments' are there for `^E`), or the special
-/// environments' (back: switched to from `n`'s, Esc goes back; relogin: the row asked whether to log in again)
+/// environments' (back: switched to from `n`'s, Esc goes back)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Set {
     Here(bool),
-    Special { back: bool, relogin: Option<usize> },
+    Special { back: bool },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ui::tests::{
-        FakePage, FakeRow, SaysRow, ctrl, fixture, keys, life_and_work, press, reader_rows, sessions, shows, target, tool,
+        FakePage, FakeRow, SaysRow, ctrl, fixture, keys, life_and_work, press, reader_rows, sessions, shows, target, tool, typ,
     };
 
     #[test]
     fn plus_in_the_tool_menu_opens_the_accounts_page_ready_to_add() {
-        let mut app = fixture().with_tools(|| Ok(vec![])).with_accounts(|adding| Box::new(FakePage(if adding { 7 } else { 0 })));
+        let mut app = fixture()
+            .with_tools(|| Ok(vec![]))
+            .with_accounts(|o| Box::new(FakePage(if o == crate::acctpage::Opening::Adding { 7 } else { 0 })));
         app.tools_loader = || Ok(vec![tool("work", "claude", "work", Agent::Claude)]);
         press(&mut app, KeyCode::Char('n'));
         shows(&reader_rows(&mut app, 60, 14), &["+ 添加账号"]);
@@ -521,10 +587,9 @@ mod tests {
     fn the_theme_list_previews_each_theme_on_the_whole_screen_and_esc_puts_it_back() {
         let mut app = App::new(String::new(), life_and_work());
         let latte = theme::pal().accent;
-        // Takes no single key (C is pick something to copy)
+        // Takes no single key on the list
         keys(&mut app, "C");
-        assert!(app.theme_menu.is_none() && app.modal_open());
-        keys(&mut app, "⎋");
+        assert!(app.theme_menu.is_none() && !app.modal_open());
         app.open_themes();
         let m = app.theme_menu.as_ref().unwrap();
         assert_eq!(m.list.iter().map(|x| x.0.name.as_str()).collect::<Vec<_>>(), ["latte", "mocha"]);
@@ -540,7 +605,7 @@ mod tests {
         let rows = reader_rows(&mut app, 100, 30);
         let y = rows.iter().position(|r| r.contains("配色")).unwrap();
         assert!(y > 10 && rows[y].find("配色").unwrap() < 10, "{rows:#?}");
-        assert!(rows.iter().any(|r| r.contains("● latte")) && rows.iter().any(|r| r.contains("深色")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("✓ latte")) && rows.iter().any(|r| r.contains("深色")), "{rows:#?}");
         keys(&mut app, "⎋");
         assert!(app.theme_menu.is_none());
         assert_eq!(theme::pal().accent, latte);
@@ -600,20 +665,20 @@ mod tests {
     }
 
     #[test]
-    fn l_in_settings_switches_the_language_right_away_and_saves_it() {
+    fn u_in_settings_switches_the_language_right_away_and_saves_it() {
         i18n::with(Lang::Zh, || {
             let mut app = settings_app();
             wrote();
             ctrl(&mut app, 's');
-            shows(&reader_rows(&mut app, 100, 30), &["l  语言", "zh  en"]);
-            press(&mut app, KeyCode::Char('l'));
+            shows(&reader_rows(&mut app, 100, 30), &["u  语言", "zh  en"]);
+            press(&mut app, KeyCode::Char('u'));
             assert_eq!(wrote(), [("ui".to_string(), "lang".to_string(), "\"en\"".to_string())]);
             assert_eq!(i18n::lang(), Lang::En);
             // Settings page still open, already in English
-            shows(&reader_rows(&mut app, 100, 30), &["Settings", "l  language", "zh  en"]);
+            shows(&reader_rows(&mut app, 100, 30), &["Settings", "u  language", "zh  en"]);
             press(&mut app, KeyCode::Enter);
             assert_eq!((wrote()[0].2.as_str(), i18n::lang()), ("\"zh\"", Lang::Zh));
-            shows(&reader_rows(&mut app, 100, 30), &["设置", "l  语言"]);
+            shows(&reader_rows(&mut app, 100, 30), &["设置", "u  语言"]);
         });
     }
 
@@ -624,11 +689,21 @@ mod tests {
             app.bill_got = Some(Instant::now());
             ctrl(&mut app, 's');
             shows(&reader_rows(&mut app, 100, 30), &["假功能", "关着"]);
-            press(&mut app, KeyCode::Char('l'));
+            press(&mut app, KeyCode::Char('u'));
             app.lang_changed();
             shows(&reader_rows(&mut app, 100, 30), &["fake feature", "off", "language"]);
             assert!(app.bill_got.is_none() && app.bill_data.is_none());
         });
+    }
+
+    #[test]
+    fn an_empty_feature_value_hides_its_row_and_shortcut_without_shifting_other_keys() {
+        let app = settings_app().with_setting(Box::new(FakeRow));
+        let mut s = app.load_settings(SetPage::Main, 0);
+        s.extra.insert(0, ExtraRow { key: 'c', name: "channels", value: vec![], mark: "" });
+        assert!(!s.rows().contains(&SetRow::Extra(0)));
+        assert!(s.rows().iter().any(|&r| s.key(r) == Some('d')));
+        assert!(!s.keys().iter().any(|k| k.key == "c"));
     }
 
     #[test]
@@ -715,7 +790,7 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.theme_menu.is_none() && app.settings.as_ref().is_some_and(|s| s.sel == 0));
 
-        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('p'));
         assert!(matches!(app.prompt.as_ref().map(|p| (&p.ask, p.text.as_str())), Some((Ask::GroupDir, "~/workspace"))));
         ctrl(&mut app, 'u');
         press(&mut app, KeyCode::Enter);
@@ -726,18 +801,19 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(wrote(), [("new_group".to_string(), "default_path".to_string(), "\"~/code\"".to_string())]);
         assert!(app.prompt.is_none() && app.settings.as_ref().is_some_and(|s| s.rows()[s.sel] == SetRow::GroupDir));
-        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('p'));
         press(&mut app, KeyCode::Esc);
         assert!(app.prompt.is_none() && app.settings.is_some() && app.msg.is_none());
 
         press(&mut app, KeyCode::Char('n'));
-        let Some(External::Config { path, template }) = app.external.take() else { panic!("{:?}", app.external) };
-        assert!(path.ends_with("config.toml") && template.starts_with('#'));
+        // n opens it at [ui], where menu / hide order and hide the tool menu; e at the top
+        let Some(External::Config { path, template, section }) = app.external.take() else { panic!("{:?}", app.external) };
+        assert!(path.ends_with("config.toml") && template.starts_with('#') && section == Some("ui"));
         assert!(app.settings.is_none());
         app.external_done(None);
         assert!(app.settings.as_ref().is_some_and(|s| s.rows()[s.sel] == SetRow::Tools));
         press(&mut app, KeyCode::Char('e'));
-        assert!(matches!(app.external.take(), Some(External::Config { path, .. }) if path.ends_with("config.toml")));
+        assert!(matches!(app.external.take(), Some(External::Config { path, section: None, .. }) if path.ends_with("config.toml")));
         // An editor not opened from the settings page doesn't bring the settings page back on return
         app.external_done(None);
         app.settings = None;
@@ -746,8 +822,35 @@ mod tests {
     }
 
     #[test]
+    fn s_in_settings_sets_the_scratch_directory_once_its_group_is_made_sure_of() {
+        let ensure = |dir: &str| if dir.ends_with("/nope") { Err("无法创建目录".to_string()) } else { Ok("随手问".to_string()) };
+        let mut app = settings_app().with_scratch(String::new, ensure);
+        wrote();
+        ctrl(&mut app, 's');
+        shows(&reader_rows(&mut app, 100, 30), &["s  随手问目录"]);
+        press(&mut app, KeyCode::Char('s'));
+        assert!(matches!(app.prompt.as_ref().map(|p| (&p.ask, p.text.as_str())), Some((Ask::ScratchDir { desk: false }, ""))));
+        // A directory that can't get its group isn't written down
+        typ(&mut app, "~/nope");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.prompt.as_ref().is_some_and(|p| p.hint == "无法创建目录") && wrote().is_empty() && !app.refresh);
+        ctrl(&mut app, 'u');
+        typ(&mut app, "~/home");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(wrote(), [("scratch".to_string(), "dir".to_string(), "\"~/home\"".to_string())]);
+        // Back on its row, and the list is read again (the group is new)
+        assert!(app.prompt.is_none() && app.refresh && app.settings.as_ref().is_some_and(|s| s.rows()[s.sel] == SetRow::Scratch));
+        // Emptied: no scratch group any more, and no group is asked for
+        press(&mut app, KeyCode::Char('s'));
+        ctrl(&mut app, 'u');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(wrote(), [("scratch".to_string(), "dir".to_string(), "\"\"".to_string())]);
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
     fn a_in_settings_opens_the_accounts_page_and_closing_it_comes_back() {
-        let mut app = settings_app().with_accounts(|adding| Box::new(FakePage(if adding { 7 } else { 0 })));
+        let mut app = settings_app().with_accounts(|o| Box::new(FakePage(if o == crate::acctpage::Opening::Adding { 7 } else { 0 })));
         ctrl(&mut app, 's');
         // The settings row only counts how many of each; accounts are managed in their own popup (acctpage.rs)
         shows(&reader_rows(&mut app, 100, 30), &["a  账号", "Claude 1  Codex 1"]);
@@ -791,9 +894,9 @@ mod tests {
         for t in [
             "设置",
             "t  主题         latte",
-            "l  语言         zh  en",
+            "u  语言         zh  en",
             "Claude 1  Codex 1",
-            "g  新分组目录   ~/workspace",
+            "p  新分组目录   ~/workspace",
             "e  config.toml",
         ] {
             at(t);

@@ -1,33 +1,90 @@
-Keys in the aca interface — press ? in the interface for a one-screen cheat sheet; this is every key in detail.
+Keys in the aca interface — press ? on any page of the interface for that page's keys; this is every key in detail.
 Once inside a session: Ctrl+Q (or tmux prefix + d) brings you back to the interface; the session keeps running.
 Ctrl+Q is bound by aca in tmux and only counts in aca's sessions (including windows / panes opened inside them); in an
 ordinary tmux session the key still goes to the program inside, so come back with prefix + d. If you bound Ctrl+Q yourself, aca leaves it alone.
+The key that opened a page or popup closes it again (as Esc does).
 
 Moving around
-  ↑↓ j k    select · g / G top, bottom · J / K next, previous section · digits jump directly (1 then 2 = number 12) · tap to select, tap again to enter
+  ↑↓ j k    select · g / G top, bottom · J / K next, previous group · digits jump directly (1 then 2 = number 12) · tap to select, tap again to open
   Wheel     over the list switches sessions; over the preview scrolls back through the output (z reads further back)
-  h l ← →   out / in a level: h goes from a window / subagent / subsession to the session it hangs off; on a session or an
-            unfolded group heading it folds that group (the highlight lands on the fold row); viewing one group it
-            goes back to all groups (the highlight stays). l unfolds on a fold row, on a group heading enters the
-            group's first session: only h folds, only l unfolds.
+  h l ← →   out / in a level: h goes from a window / subagent / subsession to the session it hangs off; already at the
+            outermost level (a session, a group heading) the cursor goes onto the rail, on the row of where the list is
+            (All, or the group viewed). Under 130 columns the screen keeps no rail: h lays it over the left.
+            l on a group heading goes into that group (the list shows only its sessions; so does Enter).
             A session that sent out subagents (a +N after its title, or the line atop the preview): l unfolds them
-            into rows, l again enters the first; h on a session with them unfolded folds them back first, and only
-            the next h folds the group. On a session with none, l does nothing.
-            A slip never narrows the list to one group (switching groups is { } / Tab)
-  Space     jump: the numbers turn into yellow letters, press one to enter that one; Esc cancels
-  i         enter the most recent one to look at (◆ needs you / ◐ unread); come back and press i again for the next
-            (ones you've seen with no new output since are skipped)
-  /         filter
+            into rows, l again enters the first; h on a session with them unfolded folds them back first. On a
+            session with none, l does nothing.
+  Rail      down the left of a screen 130 columns or wider: All, Pinned, every group (subgroups further in), the Trash;
+            at the right of each row how many sessions going there lists (by what w is on, or the state picked), and
+            how many of them are ◆ ◐ ✕ ●. With the
+            cursor on it: ↑↓ j k go to the next place (the list shows it at once, beside it the group's directory and
+            pinned notes), g / G first, last; Enter / l / → go in: the cursor is back in the list, on the row it was
+            on when that place was left; on the Trash, Enter opens it. On a group's row N, r, d, e, t, Q, ⇧↑ ⇧↓ work
+            as on its heading, Tab turns the middle to the group's other page, and o, s open and reply to its
+            router (see “A group's router” below); on the All row those two open and reply to the desk; keys that
+            act on a session do nothing there. Click a row to go there, click again to go in.
+            Esc inside a group goes onto the rail too.
+            With a scratch directory set (s in ^S, [scratch] dir in config.toml): the group that works in it (one
+            named "scratch" is created if none does) comes right after All, before Pinned, and first in the list;
+            with no group's session under the cursor (the rail's All row, a plain tmux session, an empty list) N / n
+            start the new session in that group, in its directory. It can be renamed, not deleted.
+            A ⌂ leads its name, and stands for it in the names of the groups under it (fun/manga is written ⌂/manga).
+            What you type as a group's name, and the command line, keep the whole path.
+            A screen under 130 columns: h (or a click on the tag at the left of the top bar) lays the rail over the
+            left (the whole width on a phone); Enter / l go in and put it away, h / Esc put it away and go back to
+            what the list showed before. There, Esc inside a group goes back to all groups
+  Tab       inside a group: its next page, round tasks / sessions / notes (the top row says how many each has —
+            for tasks, the tickets not done — the one showing underlined); a group comes back on the page it was
+            left on, and on its tasks while it has tickets not done. All groups has one page: Tab does nothing.
+            The tasks page: two lines a ticket (its state, title, #number, how long ago; then the one thing that
+            matters most now: what its session asks, the line on the ticket, what was said handing it over, the
+            result once done). ✓ done  · todo, one being done has its session's own mark. Done ones first, then
+            by number; beside it the one under the cursor: what counts as done, who handed it to whom and what
+            they said, and below that the session doing it. ↑↓ j k, digits, g / G pick; Enter opens the session
+            doing it, s replies to it / answers it; n makes one (its title, then what counts as done), e rewrites
+            it; m hands it to one of the group's sessions (which is sent the ticket; "take it back" = to nobody),
+            c marks it done, d then y deletes it (for good); h / Esc go out onto the rail.
+            After a session's title is the ticket it's doing (#9), or with none the one it finished last (✓ #8);
+            after a group's name on the rail, done / all. What waits for what and what comes next is the group's
+            router's to decide: aca keeps, shows and passes word. The command line is aca task (aca help task)
+            The notes page: two lines a note (★ = pinned, its name = its first line, who wrote it, how long since
+            it changed; then how it goes on), pinned ones first, then the most recently changed; beside it the one
+            under the cursor in full. ↑↓ j k, digits, g / G pick; e rewrites it, n writes a new one (written at the
+            right, its first line is its name; saved as you type, Enter is a newline, Esc finishes, an empty one
+            isn't kept, ^G writes it in $EDITOR); p pins / unpins; d then y deletes (into the trash: ^Z / b bring
+            it back); h / Esc go out onto the rail. Keys that act on a session do nothing there. Agents read and
+            write the same notebook with aca note (see aca help note)
+  Space     jump: the number of each session on screen turns into yellow letters, press them to open that one; Space
+            again or Esc cancels. Each group has a capital letter of its own while they show, before its name on the
+            rail (with no rail: on its heading in all groups; on a rail laid over with h, on that): ⇧ and the letter goes
+            into that group, on the page and row it was left on (a group with no session: onto its rail row). A group
+            keeps its letter whatever is listed (taken from its name, in the rail's order); adding, deleting or
+            reordering groups can change it. A capital no group has only puts the letters away
+  a         to all groups, jumping: from inside a group or from the rail, the list becomes all groups (on the row it
+            was left on) with the letters showing. a again while they show, or later in all groups, goes back to the
+            group and row a was pressed on (onto the rail if the cursor was there). With nowhere to go back to (all
+            groups was never left) a is the same as Space
+  `         pick a group on the rail: the cursor goes onto the rail (with no rail one is laid over the left), on the
+            row of where the list is, with the groups' letters showing (the same letters as ⇧ and a letter after
+            Space; no ⇧ here). A letter puts the cursor on that group's row: its sessions in the middle, the exchange
+            with its router beside; then that row's keys, ⏎ goes in, o into its router, s says something to it.
+            ` again or Esc while the letters show goes back to where ` was pressed; any other key puts the letters
+            away and acts as usual (j k move along the rail)
+  i         open the next one to look at: ◆ needs you first, then ◐ unread, within a kind the most recently active first
+            (the order Ctrl+Alt+N goes in); come back and press i again for the next (ones you've seen with no new
+            output since are skipped)
+  /         filter; the highlight goes to the match with the most recent activity (open ones first)
 
-Going in, or just looking
-  ⏎         enter. Not running (■): start it again in place, the conversation continues
-  E         enter with the note (Shift+Enter works too in desktop kitty): see “Notes” below
-  z         full-screen reading: just look at the output without entering, scroll back through history (↑↓/jk scroll,
-            Space/b page, u/d half page, g/G top/bottom, J/K switch session, Tab shows the diff, Enter goes in, Esc/q/z back)
+Opening, or just looking
+  ⏎         open. Not running (■): start it again in place. A Claude router starts fresh; other sessions resume
+  E         open with the draft (Shift+Enter works too in desktop kitty): see “Drafts” below
+  z         full-screen reading: just look at the output without opening it, scroll back through history (↑↓/jk scroll,
+            Space/b page, ^D/^U half page, g/G top/bottom, J/K switch session, Tab shows the diff, c copies (as c on the list), Enter opens it,
+            Esc/q/z back)
   x         the diff: of the git repository the session is really working in, with the file list on top; by default
             uncommitted changes (new files included), m switches to including commits (against the fork point from the
             main branch), press again to switch back; n / p next / previous file, e opens the spot at the top of the
-            screen in $EDITOR (at that line), l opens lazygit in this repository and rereads after; Tab switches to the
+            screen in $EDITOR (at that line), y opens lazygit in this repository and rereads after; Tab switches to the
             record, z to the output, the rest as in full-screen reading; refreshes every 2 seconds, read-only (the index
             is never touched)
   Z         session record (like a Langfuse / Phoenix trace): two panes on the desktop, the conversation on the left
@@ -59,14 +116,14 @@ Going in, or just looking
   y         open yazi in the directory it's really working in (a stopped session uses the directory it recorded);
             q inside quits back to aca; in a tmux popup it runs in a split next to that pane, zoomed, and switches
             there; q closes that split
-  c / B     copy the last reply / copy a reference to the session: two lines saying which session it is, the dir it
-            works in, and the commands to read it (aca output) and message it (aca msg), for pasting to another
-            agent (on a phone via OSC 52 into the phone's clipboard)
+  c         copy; the next key says what (the bottom bar lists them): c the last reply · b a reference to the
+            session: two lines saying which session it is, the dir it works in, and the commands to read it (aca
+            output) and message it (aca msg), for pasting to another agent · i aca id (for commands like aca move <id>)
+            · s session id (Claude / Codex's own, for claude --resume) · p path · a all (the dir it really works in,
+            the conversation id and the config dir, for pasting outside aca). Missing ones say why; Esc cancels. On a
+            phone it goes via OSC 52 into the phone's clipboard
   prefix b  insert a reference (the same key as inside a session): pick a session, its reference goes into the
             highlighted session's input box, no Enter; then back on that row. Esc cancels
-  C         pick one to copy: i aca id (for commands like aca move <id>) · s session id (Claude / Codex's conversation
-            id, for claude --resume) · p path · a all (the dir it really works in, the conversation id and the config
-            dir, for pasting outside aca); ↑↓ to pick then Enter works too; missing ones say why
 
   The directory it's really working in: the current directory Claude / Codex track themselves (following cd and
   worktrees); if that's not a repository, the repository its recently changed files are in; when it differs from
@@ -85,14 +142,20 @@ Creating, taking over
             yourself), press again to switch back
   n         new: choose a tool and account (digits pick directly), then fill the path. The menu
             lists accounts registered in config.toml (named by account, Claude first then Codex; a harness with no
-            account registered is listed by itself), each with its vendor and quota (as in X's box), then tools you
+            account registered is listed by itself), one row each: name, tool, logged in or not, quota (the same row
+            wherever accounts are listed), then tools you
             named yourself ([tools.<name>], with their command);
-            menu in [ui] reorders them, hide hides them. shell is always on top (press 1).
-            + in the menu adds an account: it opens the accounts page (a under ^S), three steps: pick Claude Code or
+            ⇧↑↓ moves the selected row, including shell. The order is saved in [ui] menu; hide hides entries.
+            i in the menu logs the highlighted account in (asking first when it is), a opens the accounts page on it;
+            + adds an account: it opens the accounts page, three steps: pick Claude Code or
             Codex first, then the name and the config directory, recorded under [accounts.…] in config.toml; a
             directory that belongs to the other tool (~/.codex as a Claude account) is refused. A new directory gets
             a terminal in the lower half to log in
             (that's aca run TOOL:ACCOUNT -- login: authentication is the tool's own business, aca keeps no credentials)
+  ^E        special environments: accounts bound to a cage or a set of environment variables aren't in n; they're
+            listed here, one block per environment, its heading saying where it runs, its time zone and proxy;
+            ⏎ / digits create with it, i logs in, a the accounts page. ^E in n switches here too, and then Esc goes
+            back to n (aca help config)
   ^N        new group: name it first (“parent/name” works, spaces become -), then Enter goes straight to fzf to pick a
             directory (the first line is the default directory, [new_group] default_path in config.toml, ~/workspace
             if unset); the new session opens in this group, and the directory becomes the group's default path
@@ -103,15 +166,16 @@ Creating, taking over
   H         hand off: open another session to carry on its work. Pick the new session's tool / account first (the n
             menu, without shell); it's created in its directory and group, and the handoff note is sent over: its
             conversation record, an extracted text version (what both sides said, subagent reports, the files it
-            changed, in ~/.local/state/aca/ui/handoff/), the directory, the conversation id, and its note; the new
-            session reads it all and carries on, asking you first only if the original ended with a question its note
-            doesn't answer. The original is left alone. If it can't be sent it stays in the new session's note (s sends)
+            changed, in ~/.local/state/aca/ui/handoff/), the directory, the conversation id, and its draft; the new
+            session reads it all and carries on, asking you first only if the original ended with a question its draft
+            doesn't answer. The original is left alone; while it's still running the popup says both would change this
+            directory at once. If it can't be sent it stays in the new session's draft (s replies with it)
   X         carry on under another account (for when one ran out of quota mid-task): no new session — it restarts in
-            place on another account of the same kind and resumes this conversation, its record copied to the new
-            account's config directory, the context whole; row, tmux session, title and note stay. The box shows the
+            place on another account of the same kind. A Claude router starts a new shift. Other sessions resume
+            with their record copied to the new account. The row, tmux session, title and draft stay. The box shows the
             current account and its quota on top, then the accounts it can move to: logged in or not, and quota
             (5h / 7d used; amber past 70%, red past 90%, as on the billing page). ⏎ or a digit switches; a logged-out
-            one can't be picked: a opens the accounts page to log in, + adds an account (then X again). If it's
+            one can't be picked: i logs it in right here (then X again), a opens the accounts page, + adds one. If it's
             running or needs you the box says switching interrupts the turn. The new account's cache is cold:
             the first turn writes the whole context again. A session stopped by quota or login shows the error and
             "X switch account" under its row. Same as aca restart <id> --as ACCOUNT
@@ -122,28 +186,31 @@ Creating, taking over
 
 On sessions
   D         stop (asks first, y): the agent exits, its pane stays with the last screen (other windows inside are unaffected), the
-            registration stays, the list shows ■; ⏎ starts it again in place and the conversation continues (Codex
+            registration stays, the list shows ■; ⏎ starts it again in place (a Claude router starts fresh; Codex
             only has a conversation id once it has talked; one that never did starts fresh).
             Sessions gone from tmux entirely (after a reboot) and restored archived ones are listed the same way, ⏎
             recreates them; one whose last turn ended in an error shows ✕.
-            One aca stopped for idling shows ☾ and "auto-stopped" on its row; ⏎ resumes it the same way. Put
+            One aca stopped for idling shows ☾ and "auto-stopped" on its row; ⏎ starts it the same way. For ordinary sessions, put
             [idle] stop_after = "3h" in config.toml and while the interface is open, every 5 minutes it stops the
             sessions idle that long; never one mid-turn, attached, with background tasks, with unsent text in its
             input box or with something scheduled not yet due (CronCreate, /loop, aca msg --in) (see aca help stop).
             [idle] remove_after = "30d": ones stopped that long are deleted into the trash like d while the
-            interface is open, as one entry that ^Z / b brings back; not pinned ones or ones with a note
+            interface is open, as one entry that ^Z / b brings back; not pinned ones or ones with a draft
             D on a window / pane opened inside a session, or on an ordinary tmux session: stops only that pane (the
             program stops, the pane stays, shows ■), ⏎ starts its original command again in place
-  R         restart (in place, the conversation continues, other windows untouched): asks first if it's running / needs you
+  R         restart in place (a Claude router starts fresh; other sessions resume by default): asks first if it's running / needs you
   r         rename (in a popup with the title prefilled; the tmux session name follows, and it stops following the
             agent's own title).
-            On a group (heading / fold row) r edits the group: rename first (“parent/name” = move under another group;
-            subgroups and sessions follow, workspaces and folds too), then Enter edits the default directory (prefilled;
+            On a group (its heading / its rail row) r edits the group: rename first (“parent/name” = move under another
+            group; subgroups and sessions follow, workspaces too), then Enter edits the default directory (prefilled;
             Tab completes; empty = forget it; N / t on the group use it, aca new -g . in this directory goes into this
             group; a directory is the default of one group at most). Same as aca group rename / dir
   m         move to another group: only the group changes, the session keeps running in its directory. Pick with fzf;
             each row shows that group's directory (its default, or where its sessions are), the one in the same
-            directory first, then list order; type a name that doesn't exist and press Enter = create that group and move it in
+            directory first, then list order; type a name that doesn't exist and press Enter = create that group and move it in.
+            The new group goes under the session's group and works in a directory of that name under that group's
+            (made if missing; none when that group has no directory); this is written above the list before you press
+            Enter, and Tab changes the directory first. A name with a / in it is the whole path from the top (/name = at the top)
   ⇧↑ ⇧↓     move up / down within the group; on a group it moves the group
   d         delete the selected session; only y deletes, any other key cancels. A registered session goes to the trash
             (tmux session closed, registration kept) and is really deleted a day later; until then ^Z / b bring it
@@ -151,17 +218,19 @@ On sessions
             are killed directly, no undo; if an ordinary tmux session has other windows, only the first pane closes and
             the rest move up; d on the last one closes the whole session.
             Before closing, the processes inside are cleaned up (SIGHUP + SIGTERM, SIGKILL after two seconds).
-            On a group (heading / fold row / empty group) d deletes the group: the confirmation says how many sessions
+            On a group (its heading / its rail row / an empty group) d deletes the group: the confirmation says how many sessions
             and subgroups go with it, y deletes. Subgroups and the sessions inside (archived ones too) go to the trash
-            as one entry: ^Z / b bring the whole group back, with its order, default directory, workspace and note
+            as one entry: ^Z / b bring the whole group back, with its order, default directory, workspace and notes
   b         trash: what d deleted stays a day, one row per delete (a deleted group with its sessions is one row), newest
-            first. ⏎ brings it back (sessions come back stopped, ⏎ again resumes the conversation), d then y deletes it
-            for good now. Selects as in the list (v range, V range unselect, Space one row, Esc unselects all, then
+            first. ⏎ brings it back (sessions come back stopped, ⏎ again starts it), d then y deletes it
+            for good now. A note deleted on its own (d on the notes page, aca note rm) is a row too (✎ name): ⏎ puts
+            it back in its group (a group deleted meanwhile comes back with it).
+            Selects as in the list (v range, V range unselect, Space one row, Esc unselects all, then
             closes), and ⏎ / d act on the selected rows together. Entries older than a day are deleted when an
             interface opens, refreshes or exits
   ^Z        undo the last step (step by step, up to 10, cleared on exit): d delete (what was open starts again) / D stop
-            (starts again, resuming the conversation) / m move / r rename / M attach-detach MCP / p pin / u seen-unread /
-            Q send to workspace / e note / r on a group / a batch done with v (all in one step); R restart, s send,
+            (starts again) / m move / r rename / M attach-detach MCP / p pin / u seen-unread /
+            Q send to workspace / e draft / r on a group / a batch done with v (all in one step); R restart, s reply,
             f fork, A adopt aren't undone
   M         MCP: lists this session's MCPs, [ ] editable, · read-only. A Claude session can attach the ones from
             config.toml ([mcps.<name>], every key but description goes into .mcp.json as-is) to the project (Space
@@ -174,11 +243,11 @@ On sessions
             [mcps.<name>] served by the gateway isn't offered again under project
   p         pin / unpin. Pinned ones sit in their own block at the top (earliest pinned first), listed even after a
             day without activity
-  u         seen / unread: on ◐ marks it seen, on ○ marks it unread (◐ until you go in); going in counts as
+  u         seen / unread: on ◐ marks it seen, on ○ marks it unread (◐ until you open it); opening it counts as
             seen too (passing through the one you just left on the way into another, so ^` gets you back, does not),
             and finishing another turn brings back ◐
   v / V     select several and act on them together (as in yazi): v starts a range at the highlighted row, ↑↓ j k /
-            digits / J K / a tap stretch it, and Esc keeps it; V stretches a range the same way that unselects.
+            digits / J K / a tap stretch it, and Esc ends it; V stretches a range the same way that unselects.
             v or V in the middle of a range drops the range not kept yet and starts a new one at the highlighted row.
             Space selects / unselects one and moves down (on a group heading: the sessions listed in it; in a range
             too, which then stretches). Not in a range, Esc unselects all.
@@ -187,54 +256,101 @@ On sessions
             be interrupted; restart doesn't ask when none is running) · m move · u read / unread · p pin / unpin ·
             Q+key send to a workspace. Done = no longer selected; deleted together = one trash entry, and ^Z undoes
             the whole batch in one step. Only registered sessions (not windows, subagents,
-            ordinary tmux sessions or fold rows); filtered-out and folded ones stay selected. With just one selected
+            or ordinary tmux sessions); filtered-out ones stay selected. With just one selected
             it's the same as pressing the key on it
 
   Windows opened inside a session / split panes: d closes only that pane, D stops only that pane; R / r / m don't apply.
-  Ordinary tmux sessions (unregistered): you can enter, look, D / d; renaming, restarting, forking, moving need A first.
+  Ordinary tmux sessions (unregistered): you can open, look, D / d; renaming, restarting, forking, moving need A first.
 
-Notes (the next thing to say to this session)
+Drafts (the next thing to say to this session)
   e         write: in the upper half of the preview (in a popup when the preview is off); saved as you type, Enter
             is a newline, Esc finishes, ^G writes it in $EDITOR (^G works straight from the list too). The list
-            shows ✎. Normally it's just a note; Enter going in leaves it alone.
-            On a group (heading / fold row) it's the group's own: overall thoughts, ✎ after the group name, shown
-            under its directory in the preview; never filled into or sent to a session, follows the group when
-            renamed, goes to the trash with the group
-  E         go in with the note: filled into its input box, not sent, then deleted, like Claude Code's stash;
-            when it needs you (◆), is stopped, or isn't Claude / Codex, it doesn't go in and says why
-  s         send the note to it directly (pasted into the input box and Enter, you stay in the list), deleted once
-            sent; no note sends nothing, and it asks first anyway (y sends); when it can send: same as E
+            shows ✎. It's only kept; opening the session with Enter leaves it alone.
+            On a group (its heading / its rail row) e writes a new note in the group's notebook instead (see the
+            notes page under Tab above): ✎ after the group name when it has notes, the pinned ones named under its
+            directory in the preview (★ name); never filled into or sent to a session, they follow the group when
+            it's renamed and go to the trash with it
+  E         open with the draft: filled into its input box, not sent, then deleted, like Claude Code's stash;
+            when it needs you (◆), is stopped, or isn't Claude / Codex, it doesn't open and says why
+  s         reply: say something to it without going in. Written where e writes, under 「↩ Reply」, its draft already
+            in it if it has one; ⏎ sends it (pasted into its input box and Enter, you stay in the list; a running one
+            queues it), ^J / Shift+⏎ is a newline, Esc keeps it as the draft unsent, ^G writes it in $EDITOR. Saved to
+            the draft as you type, deleted once sent. ⏎ looks at its state again: if it's waiting for you now, nothing
+            is sent and the text stays in its draft. On the row of a window / split pane opened inside a session with a
+            built-in agent in it (an agent team's teammate) it goes into that pane. On a stopped Claude router's row, s
+            wakes it with your message. For other stopped sessions or agents outside the built-in set, it says why you can't reply.
+            On one waiting for you (◆) it answers instead: its question is listed, a single choice takes the option's
+            number, a permission prompt y to allow (this once) / n to deny, a startup prompt the option's number;
+            anything else (several questions, multiple choice, writing your own answer) takes ⏎ to go in and answer.
+            Esc / q / s close it, any other key just closes it too, nothing answered; it closes by itself when the
+            question changes
+
+A group's router (the session that hands the group's work to the right sessions for you)
+  @         a group has at most one router, one of its own sessions. An @ in the color of the router's state leads
+            the group's name on the rail, its heading in all groups, and the router's own row. With the cursor on the
+            group's row (on the rail / its heading) the column beside is the exchange with it: ❯ what you said ·
+            ● what it answered · @ → name what it handed a session, a session it started · @ ← group name a session
+            it pulled over · name ❯ what another session sent it; “not delivered” on what hasn't arrived, bold for what
+            came since you last looked, and the bottom line (❯) is where a reply to it goes. Only the latest is
+            listed. A gray @ means stopped. A Claude router stops after [router] idle (one hour by default). Send with s
+            to wake it, or start it with o or with ⏎ on its own row. Every start opens a fresh conversation.
+            The first message is aca's handoff with tickets, recent exchanges and pending messages.
+            Its role file sets the rules. It gets aca's dispatch tools and a question tool, no Bash, and skips
+            the project's CLAUDE.md and memory.
+            A Codex router gets its rules in its opening message, stays up when idle, holds incoming messages
+            while stopped, and resumes the previous conversation when you start it.
+            When the router passes on your request, aca carries your words to the worker. Ask it to watch a ticket
+            for updates. Unwatched results go straight into the exchange. Completion wakes the router only for a
+            watched ticket or when the group has another ticket to assign
+  o         into the router of the group the row is in (one that isn't running is started first): on a group's row
+            that group's, on a session's row the one of the group the session is in, the desk for the scratch group
+            and its sessions; back from it with Ctrl+Q the cursor is still on that row (an interface opened inside
+            tmux switches over to it and closes, as ⏎ does).
+            With no router yet, the new-session box opens in the group's directory. Use ↑ to choose a Claude or
+            Codex tool and account, then ⏎ to create and open “<group> router”. Naming an existing session, or nobody:
+            aca group router (aca help group).
+            Plain tmux sessions and ones in no group have none. Another group's router: ` and its letter, then o
+  s         on a group's row: say something to its router, written on the bottom line of that column, with the keys
+            of s on a session's row (⏎ sends, Esc keeps it as its draft); when it needs you (◆) it's the answer box,
+            where ⏎ goes into its conversation. Send to a stopped Claude router as usual. For a stopped Codex router, press o to start it
+  Desk      the router of the scratch group (see “Rail” above) is the desk: hand it what you don't know whom to give
+            to, and it passes it to the right session or a project's router, starting a session when there is none.
+            Its @ leads the rail's All row (the scratch group's name has none). With the cursor on the All row, or on
+            the scratch group's, the column beside is the exchange with it, and o, s work as above. With no desk yet,
+            o opens the new-session box for a session named “desk” in the scratch directory. Use ↑ to choose its tool and account.
+            With no scratch directory set, that is asked for first.
+            In the list it comes first in the scratch group (⇧↑ ⇧↓ don't move it), and the group's sessions that are
+            nobody's child are drawn under it: drawn only — they aren't its children, and are notified about, moved
+            and deleted as before
 
 Seeing only part
-  o / O     fold / unfold the current section (folded it's one line, marked ◆ if anything inside needs you; Enter on
-            a fold row unfolds too) / all; h / l fold and unfold too (see "Moving around")
-  Tab       group list (a floating list, only this workspace's): type a group name's letter to switch there, Space =
-            all groups, ↑↓ pick ⏎ switch; the highlight starts on the last group you looked at, so Tab ⏎ switches
-            back; Esc / Tab / q close. Clicking the tab at the left of the top bar opens it too
-  { }       previous / next group (only that group) · ⇧Tab back to the group you were just on (same as Tab ⏎; again switches back)
-  W         only the highlighted session's group, W again back to all
-  w         only open ones (everything but stopped): starts from all, so ones from days ago are there too, and *
-            inside narrows to recent days; w again goes back to the previous days
-  a         all, again goes back to recent days
-  *         change days: 1 day → 3 days → 7 days → 1 day (the top bar shows which); in "all" it goes back to recent
-            days. All belongs to a: the two keys each do one thing
-  F         only one state: a small list, one row per state — ● running / ◆◐ needs you, unread / ○ idle / ✕ error
-            (still open) / ■ stopped (☾ and closed ✕ count too) / ☾ auto-stopped (stopped by aca for idling), with how
-            many of each; ↑↓ ⏎ or the key at the start of a row shows only that state, ⏎ on the one already picked or
-            Space = all. Those row keys (! @ # & ^ %) also work straight from the list; again or Esc cancels
-            Days, open and state are three layers that stack, each taken off by its own key: # among the open
-            ones shows the open idle ones (of any age), # again goes back to the open ones; * among the open ones
-            shows the open ones of recent days; w with ! picked shows the open running ones, w again leaves ! picked.
-            Nothing open is stopped: of w and ^ / % the later one counts, the earlier one steps aside and comes back
-            when the later one is taken off (or swapped).
+  W        into the highlighted session's group (the highlight stays on that session), W again there goes back to
+            all groups. For another group: h, onto the rail
+  w         which to list: switches between Open and 7 days. 7 days lists everything Open does and more; the top
+            bar says how many each has (in the current group):
+              Open      everything whose pane is still there (● ◆ ◐ ○ ✕), plus pinned ones and ones someone is
+                        in. The default
+              7 days    all of the above, plus stopped ones whose time on the row (last activity) is under 7 days
+            Ones stopped earlier: 0 lists every session, F 5 only stopped ones, or / search.
+            A session listed brings its windows, child sessions and the sessions above it along; empty groups are
+            listed in every one. Beside a rail this row is over the list only, without the group's name and the
+            count per state (the rail has them)
+  0         every session, whatever its state and however long ago it stopped: the top bar gets a third cell,
+            "Every 120". 0 again or Esc goes back to what w was on, w goes on to the other one. A 0 typed right
+            after another digit is that number's next digit (1 then 0 = number 10)
+  F         only one state: a small list, one row per state — 0 every / ● running / ◆◐ needs you, unread / ○ idle /
+            ✕ error (still open) / ■ stopped (☾ and closed ✕ count too) / ☾ auto-stopped (stopped by aca for idling),
+            with how many of each; ↑↓ ⏎ or the key at the start of a row shows only that state. Picked, every
+            session in that state is listed whatever w is on, and the top bar says "only ■ stopped 88"; 0 every
+            is the same as 0 on the list. Esc or picking it again
+            (⏎ on the one already picked too) goes back to what w was on, w goes on to the other one.
             The state combines with the group, ignored while searching; not remembered
 
 Workspaces (keep work and life apart)
-  q+key     switch there · Q+key sends the highlighted session there (on a fold row = the whole group) · [ ] previous /
-            next · ` back to the last one
-  S         list them (↑↓ ⏎ or press the key to switch, ^R renames). Keys are lowercase letters / digits; h is hidden:
-            not listed in S, skipped by [ ]
-            Where a session lives: placed by you → a child follows its parent → follows its group (Q on a fold row
+  S         list them: press a workspace's key to switch there (↑↓ ⏎ works too), ^R renames. Keys are lowercase
+            letters / digits; h is hidden: not listed in S, S h gets you there; a key never used = a new one, switched to
+  Q+key     send the highlighted session there (on a group = the whole group, with a selection = the selected ones)
+            Where a session lives: placed by you → a child follows its parent → follows its group (Q on a group
             records the group too, so new ones in it go there later) → 1; sessions created / forked in the interface
             land in the current one, m keeps them where they are
 
@@ -243,7 +359,7 @@ Panels and settings
             accounts too: what that usage would cost bought through the API);
             today / 7 days / 30 days / all, the selected period further by day (today by hour, all by month), account,
             model and session; models missing from the price list are listed in tokens, not priced. ←→ / Tab / 1-4
-            change the period, ↑↓ scroll, r rereads, Esc / q / $ back. m more / less: call counts, tokens and cache,
+            change the period, ↑↓ scroll, ^R rereads, Esc / q / $ back. m more / less: call counts, tokens and cache,
             the input / cache / output split, by weekday and hour, by directory (folded away normally).
             a picks which accounts to show (a floating list: ⏎ / a digit shows only it, Space ticks several, v then ↑↓
             selects a range, then ⏎; 0 all).
@@ -252,81 +368,90 @@ Panels and settings
             Codex's are read from its own conversation records; past the reset time with no new number it says “reset”.
             Reads local conversation records only, no network; a call recorded several times counts once.
             Each time a subprocess reads all records (a second or two); while open it rereads every 5 minutes
-  P         plugins (like vim's plugin manager), in a box that keeps its size: one plugin per row on the left (● on /
-            ○ off / ✕ manifest problem, name), the ones that ship with aca and aren't installed yet under “Available”;
+  P         plugins (like vim's plugin manager), in a box that keeps its size: one plugin per row on the left ([✓] on /
+            [ ] off / ✕ manifest problem, name), the ones that ship with aca and aren't installed yet under “Available”;
             the highlighted one's details on the right — name and version, where from, on or not, what it does,
-            then what you can change: settings (the highlighted one's description at the bottom), tools for agents, its keys in the plugin menu (: below). Stacked on a phone.
+            then what you can change: settings (the highlighted one's description at the bottom), tools for agents, its keys in the list's ?. Stacked on a phone.
             One whose hook or timer failed last time, or whose gateway server stopped, is marked “failing” and the right
             side says where and when (gone once a run succeeds, or after a day); while any is, the top bar shows ⚠ and a count.
-            ⏎ moves into the right side (Esc back to the list), all written to plugins.toml: a setting ⏎ edits, Space
+            ⏎ / l moves into the right side (Esc / h back to the list), all written to plugins.toml: a setting ⏎ edits, Space
             flips a switch, - goes back to the default; webhook URLs and the like are masked and editing starts empty;
-            tools (✓ given ○ not; ones marked agent? are given only if you allow them), Space switches; menu keys, ⏎ then
+            tools ([✓] given [ ] not; ones marked agent? are given only if you allow them), Space switches; menu keys, ⏎ then
             a key sets one, ⌫ removes it, - goes back to the manifest's, a key it lost is named below. ⏎ on an available
             one installs it. i installs from elsewhere (a git URL, owner/repo or a local directory) · Space on / off
-            (agents change on their next start) · u updates it, U all · x twice removes it (a git one's directory is
-            deleted, a linked one only unregistered) · l shows its log · r reloads. Built-in ones upgrade with aca.
+            (agents change on their next start) · u updates it, U all · d removes it, asking first, y goes ahead (a git one's directory is
+            deleted, a linked one only unregistered) · z shows its log · ^R reloads. Built-in ones upgrade with aca.
             e opens plugins.toml in an editor at the highlighted plugin's block; when you come back it syncs to it (only
             if you changed it). Your own one (~/.config/aca/user/, nothing to install) opens its manifest instead, which
             applies as soon as it's saved. When plugins.toml doesn't match this machine (changed elsewhere, pulled with
             dotfiles) the difference is named at the bottom and S syncs; running sessions that started with different
             plugins are named there too. m on the gateway row manages the MCPs under it: one server per row (up / idle /
             crashed, tools, calls a day, sessions using it); Space serves or unserves an [mcps.<name>] from config.toml,
-            r restarts this one, R all, l shows its log, s stops its process (it starts again on demand), o turns the
+            r restarts this one, R all, z shows its log, s stops its process (it starts again on demand), o turns the
             gateway on / off (new agents then mount their MCPs directly). The command line can do the same: aca help plugin
-  :         commands: what you can do to the highlighted row (session / group / elsewhere), one per line, its key in
-            front, and on the right whether it is aca's or a plugin's. ↑↓ picks, ⏎ runs, / filters as you type (two
-            letters find a key you forgot). aca's rows are the list's own keys; the commands, panes and views your
-            plugins give you come first, and a key the plugin bound runs at once (it wins over aca's). One with
-            arguments asks for them first (⏎ next field, ⏎ on the last runs; Tab moves). Short output goes to the bottom bar;
-            long output and views open in the full-screen reader (r reruns, c copies, Esc returns); panes open in a
+  Plugins   the commands, panes and views your plugins give you come first in the list's ? (they can only be pressed
+            there), with the plugin named on the right; a key the plugin bound runs at once (it wins over aca's, whose row
+            then shows no key; ⏎ still runs it). One with arguments asks for them first (⏎ next field, ⏎ on the last runs; Tab moves). Short output goes to the bottom bar;
+            long output and views open in the full-screen reader (^R reruns, c copies, Esc returns); panes open in a
             tmux popup. A list view opens as a page: one row per item, the highlighted row's details below, and at
-            the bottom the keys that work on this row (the plugin decides); ones that need two presses warn first.
-            Afterwards the result shows under the list and the list rereads; r rereads (unless the plugin took r).
+            the bottom the keys that work on this row (the plugin decides); ones the plugin marks ask first, y goes ahead.
+            Afterwards the result shows under the list and the list rereads; ^R rereads.
             Two of the built-in plugins:
             m mounts (aca.tailnet): one row per tailscale serve mount — the tailnet address, where on this machine it
-              goes, whether the target listens (✕ = not listening / file gone); ⏎ copies the address, x twice removes
+              goes, whether the target listens (✕ = not listening / file gone); ⏎ copies the address, x (asking first) removes
               it (then says how to add it back; foreground mounts can't be removed), a mounts a local port, p switches
               publishing (only with tpub on PATH). Only the tailnet, never the internet
-            t remote tasks (aca.remote; r in the : menu sends one): one row per task — waiting (● for how long), lost (? no
+            t remote tasks (aca.remote; r in the list's ? sends one): one row per task — waiting (● for how long), lost (? no
               callback in time), ended (✓ / ✕ exit code, delivered to the session or not), below that the session and
-              the last lines of the result; ⏎ copies the command to view the log, x twice removes it (the remote task
+              the last lines of the result; ⏎ copies the command to view the log, x (asking first) removes it (the remote task
               won't stop, it's just no longer awaited), r fetches from the server now
   ^S        settings (everything rarely used; press the key at the start of a row, or ↑↓ ⏎): t theme (↑↓ previews the
-            whole screen, ⏎ uses it) · l language zh / en (switches on the spot) · i auto English input (back on the list the input method switches to English, desktop only)
+            whole screen, ⏎ uses it) · u language zh / en (switches on the spot) · i auto English input (back on the list the input method switches to English, desktop only)
             on / off ·
-            a the accounts page (a large popup, two columns): accounts on the left, Claude Code and Codex in two
-              sections, each showing whether it's logged in (the tool itself is asked); a missing directory or one
+            a the accounts page (landing on the highlighted session's account; a large popup, two
+              columns): accounts on the left, Claude Code and Codex in two
+              sections, one row each: name (@environment when bound to one), logged in or not (the tool itself is
+              asked), quota; a missing directory or one
               that belongs to the other tool is marked ⚠. On the right, the highlighted account in full: config
               directory, who is logged in, quotas (as in the n menu; none for API key logins), whose status bar
-              it shows, launch arguments, which sessions use it, whether it's a default account, whether the n
+              it shows, launch arguments, how many sessions use it (how many running), whether it's a default account, whether the n
               menu hides it.
-              ⏎ logs in (asks first when the account is logged in, y to go: the tool's login replaces the current
+              i logs in (asks first when the account is logged in, y to go: the tool's login replaces the current
               one, and Codex deletes it the moment login starts) · no browser opens by itself: when the link comes,
               a list offers copying it first, then the installed browsers (the default one marked), Esc leaves it;
               over SSH only a link you can finish on another device (Claude: paste the page's code back; Codex: a
               device code) ·
-              + adds an account · d unregisters (says what
+              + adds an account · d (or Delete) unregisters (says what
               goes and who uses it first, y to confirm; the directory stays) · ⇧↑ ⇧↓ reorder (the n menu's order,
               kept under [ui] menu) · p edits launch arguments: on an account, its own; on a heading (Claude Code,
               Codex), what every account of that tool gets ([tools.<tool>] args, placed before the account's own);
               written as in a shell (quote what has spaces), ⏎ saves, new sessions use them. A tool that's installed
               with no accounts gets a heading too, saying whether the directory used without an account is logged in ·
-              s each account's status bar · r asks about logins and quotas again ·
-            n edit the tool menu in an editor · g the default directory for new groups · e edit config.toml in an editor ·
+              s each account's status bar · ^R asks about logins and quotas again ·
+            n edit the tool menu in an editor (config.toml at [ui], where its order and hiding go) ·
+            p the default directory for new groups · e edit config.toml in an editor ·
             m Claude mod on / off: start Claude with aca's mod, subscription quotas without the status bar (off by
               default; "no effect" next to it when this Claude version can't load it; open sessions follow on their next start)
-            · ⚠ what's written wrong (if anything).
-            All kept in ~/.config/aca/config.toml, taking effect at once; terminals with ACA_THEME / ACA_LANG / ACA_IME /
-            ACA_HOOKS_URL / ACA_HOOKS_TOKEN set follow the environment variables
+            · f trust folders on / off: when a session starts and asks whether to trust its folder, answer yes for you (off by
+              default, kept as [trust] folder) ·
+            c channels on / off for all installed external channels. Back in the list, press P to fill missing settings ·
+            ⚠ what's written wrong (if anything).
+            Channel switches are kept in plugins.toml, the other settings in ~/.config/aca/config.toml, taking effect at once;
+            terminals with ACA_THEME / ACA_LANG / ACA_IME / ACA_HOOKS_URL / ACA_HOOKS_TOKEN set follow the environment variables
   L         layout: desktop (wider than 100 columns) preview on the right → preview below → list only; phone split →
             mostly preview → list only; each side remembers its own
   ^R / ^L   refresh now / restart the interface: switch to the newly installed program (same terminal, no need to quit
             and reopen); the view is restored, and operations running in the background (restart, delete…) finish first
-  ?         key cheat sheet (grouped by use, with a legend): press a key inside and the lines explaining it light up,
-            without doing it
-  q q       quit. In a plain terminal Esc stops at the bottom (after clearing the search and the state filter) instead
-            of quitting, so one Esc too many doesn't close the whole interface; in the tmux popup and when following,
-            Esc still closes it
+  ?         this page's keys: on every page and popup (not while typing, in a confirm box, or after q / Q / c waiting
+            for the next key), one per line, named as the bottom bar names them. A full-screen page's bottom bar ends
+            with Esc back • ? keys, a popup's line of keys with ? keys. A row's key does that row, any other key is
+            pressed on the page; ↑↓ j k move, g G top / bottom, ⏎ runs the highlighted row, / filters, Esc / q / ? close (those only move
+            or close; a row with one of them runs with ⏎). The list's ? has the legend on top, then the plugins' commands,
+            then aca's keys by section, only the ones that work on the highlighted row. Too long for one column, a wide
+            screen gets two or three side by side (the first filled first); j k run down one and on into the next
+  q q       quit. In a plain terminal Esc stops at the bottom (after clearing the search and the state filter, and stepping
+            out of a group) instead of quitting, so one Esc too many doesn't close the whole interface; in the tmux popup
+            and when following, Esc still closes it (inside a group it steps out first, and closes on the next press)
 
 As a switcher (a tmux popup)
   aca tmux install sets it up: Ctrl+\ without the prefix opens it, on the right (56 columns) on a wide enough window,
@@ -337,7 +462,7 @@ As a switcher (a tmux popup)
   Ctrl+Alt+N  pressed inside a session (no list): goes to the next one to look at, ◆ before ◐; again for the one
             after (aca help next). aca binds it, the way Ctrl+Q is; another key: aca tmux key next <key>
   prefix b  tmux's prefix key (Ctrl+B by default), then b, inside a session: pops up the list on the right; ⏎ puts
-            the picked session's reference (the two lines B copies) into the input box, no Enter (aca ui --ref). aca
+            the picked session's reference (the two lines c b copies) into the input box, no Enter (aca ui --ref). aca
             binds it too; another key: aca tmux key ref <key> (prefix b means b after the prefix key)
   --client  Enter switches only the client that pressed the key (phone and desktop each their own), and it opens with
             that client's current session highlighted
@@ -354,9 +479,10 @@ As a switcher (a tmux popup)
   ^`        back to the previous session (same as ^` in tmux)
 
 Reading the list
-  Order     sections by group (▾ group  count); group order and order within a group come from the registry (⇧↑ ⇧↓
-            move them); ungrouped sessions come after the last group, ordinary tmux sessions (not created by aca) in
-            the bottom section; changes in state or activity don't move anything.
+  Order     by group, each under a line with its name and how many sessions it has (on the desktop the number is at the
+            right, under the times; on a narrow screen ▾ group  count); group order and order within a group come from the registry (⇧↑ ⇧↓
+            move them); ungrouped sessions come after the last group, ordinary tmux sessions (not created by aca) at
+            the bottom; changes in state or activity don't move anything.
             One row per session (numbered on the desktop; directory and branch are in the preview header), with an
             extra row under one that needs you showing what it asks.
             Windows opened / panes split inside a session hang under it (├ #2 / └ #2.1, tmux's numbering), each with
@@ -380,34 +506,36 @@ Reading the list
             once it has reported, its report comes first and is read from the top (newer Codex versions encrypt
             what a child is told, so only the task name can be shown). ⏎ / Z opens the session's record at that
             subagent, Esc returns to the list (← goes up a level, to whoever started it); it isn't a session, so
-            rename, delete, notes and the like don't apply. Only the record files are read, the same ones Z
+            rename, delete, drafts and the like don't apply. Only the record files are read, the same ones Z
             shows; when the path the hooks reported can't be used (no aca hooks, or Claude moved the record on
             entering / leaving a worktree) the record is found through the process; a Codex session without
             hooks can't be matched to its conversation and shows none. Teammates split off by Claude's agent
             teams are real panes and are listed as panes
   State     ● running (the last column is how long)  ◆ needs you (a choice / confirmation)  ◐ unread (finished, not seen yet)
             ○ idle  ✕ error  ■ stopped (the agent exited / stopped with D / gone from tmux)  ☾ auto-stopped (by aca, for idling)
-            ✎ has a note  ★ pinned  ⇄ open elsewhere too
+            The top bar counts what the list lists (the group, w's choice, a state picked, a search).
+            ✎ has a draft  ★ pinned  ⇄ open elsewhere too
             ◷ 08:57 after a title: something scheduled not yet due, with when the first one runs and +N for more;
             the preview lists them. Claude's CronCreate and /loop's next wakeup live only in its process: stopping
-            or restarting drops them. A scheduled message (aca msg --in) waits in the inbox and, if the session
-            isn't running when it's due, comes once it starts. With any of these it isn't auto-stopped while idle
+            or restarting drops them. A scheduled inbox message (aca msg --in) keeps an ordinary session up until it is due.
+            A Claude router can stop and wake at delivery
             Registered sessions: what the screen shows (asking, running) wins, what it can't show (unread,
             error) comes from the hooks; other sessions go by the screen only.
             Open = ● ◆ ◐ ○ ✕ (everything but stopped)
-  Account   orange = Claude Code, blue = Codex; registered sessions show the registered account, hand-started ones (a
-            shell session / claude / codex in an ordinary tmux session) are matched to account names in config.toml by
-            their process's config directory, and the directory follows cd
+  Account   in gray, the ▪ before it in the tool's color: orange = Claude Code, blue = Codex; registered sessions
+            show the registered account, hand-started ones (a shell session / claude / codex in an ordinary tmux
+            session) are matched to account names in config.toml by their process's config directory, and the
+            directory follows cd
   Time      last column: now / 40s / 12m / 2h / 3d. A registered Claude / Codex that isn't running counts from what its
             hooks reported (the turn finished, it started asking, aca started it): redrawing while idle (settings changed,
             the window resized) isn't activity
   Preview   state, how long ago, uncommitted changes (files +added −removed, nothing when clean), the directory
-            it's really working in, the branch; then the note if there is one
+            it's really working in, the branch; then the draft if there is one
 
 Where things are kept
-  Group, range (and days), layout (one each for desktop and phone), the highlighted session, folds: still there next
-  time (not restored when opened with a keyword).
+  Which to list (w), layout (one each for desktop and phone), the highlighted session: still there next time (not
+  restored when opened with a keyword). It always opens on all groups.
   All under ~/.local/state/aca/ui/: view, pinned, read, spaces (workspaces), notes; shared by phone and desktop.
   Colors: latte (light) by default, change with the theme in ^S or aca theme use; ACA_THEME=<theme> (dark / light are
   mocha / latte) overrides it.
-  Language: English by default; l in ^S settings flips between zh / en on the spot (saved as [ui] lang in config.toml); ACA_LANG=zh works too.
+  Language: English by default; u in ^S settings flips between zh / en on the spot (saved as [ui] lang in config.toml); ACA_LANG=zh works too.

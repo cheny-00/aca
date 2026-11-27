@@ -12,8 +12,10 @@ mod acctpage;
 mod ansi;
 mod bar;
 mod bill;
+mod book;
 mod browser;
 mod caps;
+mod channels;
 mod clicked;
 mod clip;
 mod config;
@@ -44,11 +46,13 @@ mod reads;
 mod refer;
 mod rehome;
 mod setup;
+mod sheet;
 mod spaces;
 mod state;
 mod subagent;
 mod term;
 mod theme;
+mod tickets;
 mod tmuxconf;
 mod tools;
 mod trace;
@@ -64,13 +68,25 @@ use std::io::{IsTerminal, Write};
 use aca_core::i18n::Tr;
 use aca_core::{t, tr};
 
-/// Details of every key in the interface (`aca help keys`). The interface's `?` is a separate one-screen cheat sheet (help.rs).
+/// This crate's unit tests keep to a throwaway directory: the interface reads and writes the registry, the events log and
+/// the settings in many places, and a test run must not touch the real ones. Called wherever a test can first get to them
+#[cfg(test)]
+pub(crate) fn test_home() {
+    aca_core::paths::keep_in(std::env::temp_dir().join("aca-tui-unit-tests"));
+}
+
+/// Details of every key in the interface (`aca help keys`). The interface's `?` lists each page's keys itself (sheet.rs, acts.rs).
 /// Long-form docs have one copy per language: when you change keys.txt, change keys.en.txt too
 pub const KEYS: Tr = Tr::new(include_str!("keys.txt"), include_str!("keys.en.txt"));
 
 /// `aca group rename`: the same code as `r` on a group in the interface (the places the interface remembers group names
 /// change along with it)
 pub use groups::rename_all as rename_group;
+/// `aca note`: a group's note an interface kept in its own file is in the registry before the notes are read
+pub use book::adopt_file as adopt_group_notes;
+pub use config::new_group_dir;
+pub use groups::scratch as scratch_group;
+pub use groups::within as group_within;
 
 /// Go into this tmux session (`tmux` is the session id): if already inside tmux, switch this client to it
 fn attach_now(tmux: &str) -> bool {
@@ -95,8 +111,13 @@ fn loaded(kw: &str) -> ui::App {
     ui::App::new(kw.to_string(), data::collect())
         .with_pins(pins::Pins::open(pins::Pins::default_path()))
         .with_notes(notes::Notes::open(notes::Notes::default_path()))
+        // A copy: printing writes nothing (a group's note still in the notes file shows, and stays there)
+        .with_book(book::Book::copy())
         .with_marks(reads::Reads::open(reads::Reads::default_path()), spaces::Spaces::open(spaces::Spaces::default_path()))
         .with_trash(trash::Trash::open(trash::Trash::default_path()))
+        // The scratch group's sessions come first here as in the interface. Only found, never made: printing writes nothing
+        .with_group_hints(data::group_hints)
+        .with_scratch(config::scratch_dir, |_| Err(String::new()))
         .in_space(aca_records::paths::state_file("view").map_or(spaces::HOME, |p| state::View::load(&p).space))
 }
 
@@ -109,7 +130,7 @@ fn print_list(kw: &str) {
         .or_else(|| std::env::var("COLUMNS").ok()?.parse().ok())
         .unwrap_or(50);
     let color = std::io::stdout().is_terminal();
-    let mut lines: Vec<String> = ui::list_rows(&rows, app.sectioned(), width, None, app.fold_info(), app.who_width(), false)
+    let mut lines: Vec<String> = ui::list_rows(&rows, app.sectioned(), width, None, app.who_width(), false)
         .into_iter()
         .flat_map(|r| r.lines)
         .map(|segs| segs.iter().map(|(t, st)| if color { ansi(t, *st) } else { t.clone() }).collect())
@@ -121,8 +142,9 @@ fn print_list(kw: &str) {
             tr!("没有匹配「{kw}」的会话", "nothing matches “{kw}”")
         });
     }
+    // The list here is always the default scope (open ones), so whatever it leaves out has stopped
     if hidden > 0 {
-        lines.push(tr!("还有 {hidden} 个更早的", "{hidden} more, older"));
+        lines.push(tr!("另有 {hidden} 个已停止", "{hidden} more, stopped"));
     }
     // Piped into head or the like that closes the pipe early: exit quietly, don't panic
     let mut out = std::io::stdout().lock();
@@ -290,6 +312,11 @@ pub fn main(mut args: Vec<String>) -> anyhow::Result<()> {
     // Passed by the interface's own exec when ^L restarts it: where to open (list / bill: the time range); not for people
     let restarted = take_opt(&mut args, "--restarted");
     let only = take_only(&mut args);
+    // m's list (fzf) runs this child process as a name is typed and on Tab: what would that name make (see ops.rs)
+    if let Some(i) = args.iter().position(|a| a == "--typed-group") {
+        let _ = write!(std::io::stdout(), "{}", ops::typed_says(args.get(i + 1).is_some_and(|a| a == "tab")));
+        return Ok(());
+    }
     // On exit the interface starts this child process to really delete what has expired in the trash (see trash.rs)
     if args.iter().any(|a| a == "--purge") {
         trash::purge();

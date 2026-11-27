@@ -15,6 +15,7 @@ pub enum Agent {
     Codex,
     Pi,
     Opencode,
+    Agy,
     /// A declared tool (a `[tools.<name>]` in config.toml without a kind)
     Other,
 }
@@ -26,6 +27,7 @@ pub fn kind_of(name: &str) -> Agent {
         "codex" => Agent::Codex,
         "pi" => Agent::Pi,
         "opencode" => Agent::Opencode,
+        "agy" => Agent::Agy,
         _ => Agent::Other,
     }
 }
@@ -46,12 +48,13 @@ pub fn builtin(agent: Agent) -> Option<&'static dyn aca_core::agent::Agent> {
         Agent::Codex => "codex",
         Agent::Pi => "pi",
         Agent::Opencode => "opencode",
+        Agent::Agy => "agy",
         Agent::None | Agent::Other => return None,
     };
     aca_core::agent::builtin(kind)
 }
 
-/// Which environment variable takes this vendor's config dir; None where there's no such thing (shell, declared tools, opencode)
+/// Which environment variable takes this vendor's config dir; None where there's no such thing (shell, declared tools, opencode, agy)
 pub fn home_var(agent: Agent) -> Option<&'static str> {
     builtin(agent)?.home_var()
 }

@@ -1,0 +1,126 @@
+id = "aca.router"
+role = "router"
+name = "aca router"
+version = "0.1.0"
+api = 1
+description = "给项目 router 和总台的会话、任务和笔记工具。"
+description_en = "Session, ticket and notebook tools for project routers and the desk."
+
+[agent]
+for = ["claude"]
+dir = "agent"
+
+[[commands]]
+id = "sessions"
+title = "查看项目会话"
+title_en = "List sessions"
+desc = "List sessions in group (defaults to your project), with state, age, tool:account, directory and current tickets."
+args = { group = "string?" }
+expose = ["agent"]
+command = ["sh", "router.sh", "sessions"]
+
+[[commands]]
+id = "look"
+title = "查看会话近况"
+title_en = "Inspect a session"
+desc = "Read the current state, question and last reply (last 2000 characters) of session id."
+args = { id = "string" }
+expose = ["agent"]
+command = ["sh", "router.sh", "look"]
+
+[[commands]]
+id = "tickets"
+title = "查看项目任务"
+title_en = "List tickets"
+desc = "List open tickets and results from the last 24 hours in group (defaults to your project)."
+args = { group = "string?" }
+expose = ["agent"]
+command = ["sh", "router.sh", "tickets"]
+
+[[commands]]
+id = "ticket"
+title = "开任务单"
+title_en = "Create a ticket"
+desc = "Create a ticket with title and completion criteria in group (default: your project). Optionally assign it to session to, with instructions say and a one-line note. Returns #N. Optional watch enables or disables notifications for this ticket."
+args = { title = "string", criteria = "string", to = "string?", say = "string?", note = "string?", group = "string?", watch = "bool?" }
+expose = ["agent"]
+command = ["sh", "router.sh", "ticket"]
+
+[[commands]]
+id = "start"
+title = "新建会话做任务"
+title_en = "Start a session"
+desc = "Start a session with title and instructions say on ticket (number), or create a ticket with criteria. group defaults to yours, tool to the project's latest tool:account, dir to its directory (relative paths start there). branch requests a worktree. Returns #N and session id. Optional watch enables or disables notifications for this ticket."
+args = { title = "string", say = "string", criteria = "string?", ticket = "int?", tool = "string?", dir = "string?", branch = "string?", group = "string?", watch = "bool?" }
+expose = ["agent"]
+command = ["sh", "router.sh", "start"]
+
+[[commands]]
+id = "give"
+title = "交出或取回任务"
+title_en = "Assign or take back a ticket"
+desc = "Hand ticket (number) to session to with optional instructions say. Use '-' for to to take it back. Optional watch enables or disables notifications for this ticket."
+args = { ticket = "int", to = "string", say = "string?", watch = "bool?" }
+expose = ["agent"]
+command = ["sh", "router.sh", "give"]
+
+[[commands]]
+id = "set"
+title = "修改任务单"
+title_en = "Edit a ticket"
+desc = "Update ticket (number) with note (one line), title or completion criteria. Optional watch enables or disables notifications for this ticket."
+args = { ticket = "int", note = "string?", title = "string?", criteria = "string?", watch = "bool?" }
+expose = ["agent"]
+command = ["sh", "router.sh", "set"]
+
+[[commands]]
+id = "message"
+title = "给会话传话"
+title_en = "Message a session"
+desc = "Deliver text verbatim to session to."
+args = { to = "string", text = "string" }
+expose = ["agent"]
+command = ["sh", "router.sh", "message"]
+
+[[commands]]
+id = "move"
+title = "把会话拉到项目"
+title_en = "Move sessions"
+desc = "Move sessions ids (space-separated) and their same-group descendants to group (defaults to your project)."
+args = { ids = "string", group = "string?" }
+expose = ["agent"]
+command = ["sh", "router.sh", "move"]
+
+[[commands]]
+id = "note"
+title = "写项目笔记"
+title_en = "Write a project note"
+desc = "Save text in your project's notebook. The first line names the note."
+args = { text = "string" }
+expose = ["agent"]
+command = ["sh", "router.sh", "note"]
+
+[[commands]]
+id = "notes"
+title = "列出项目笔记"
+title_en = "List project notes"
+desc = "List the notes in your project's notebook."
+expose = ["agent"]
+command = ["sh", "router.sh", "notes"]
+
+[[commands]]
+id = "wake_me"
+title = "定时叫醒自己"
+title_en = "Schedule a wake-up"
+desc = "Send yourself text after a duration such as 15m or 1h30m."
+args = { after = "string", text = "string" }
+expose = ["agent"]
+command = ["sh", "router.sh", "wake_me"]
+
+[[commands]]
+id = "groups"
+title = "查看项目和 router"
+title_en = "List projects and routers"
+desc = "List the project names, directories and their current routers."
+expose = ["agent"]
+command = ["sh", "router.sh", "groups"]

@@ -4,14 +4,14 @@ use super::*;
 
 impl App {
     pub fn on_key(&mut self, k: KeyEvent) {
+        // `?` is open: it takes every key; a row picked there hands its key back here, to the page below
+        if self.sheet.is_some() {
+            return self.on_sheet_key(k);
+        }
         // ^`: back to the previous session, like ^` in tmux. With a popup open tmux doesn't apply key bindings;
         // it turns it into NUL for aca, which arrives as ^Space (a real ^Space is taken by macOS to switch input method,
-        // never gets here); in the keys popup it's only looked up
-        if crate::data::in_popup()
-            && k.code == KeyCode::Char(' ')
-            && k.modifiers.contains(KeyModifiers::CONTROL)
-            && !self.reader.as_ref().is_some_and(|r| r.help)
-        {
+        // never gets here)
+        if crate::data::in_popup() && k.code == KeyCode::Char(' ') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return self.back_session();
         }
         // A popup covers the terminal (popped when a login link appears, see browser.rs):
@@ -23,8 +23,8 @@ impl App {
             return self.on_term_key(&key, k);
         }
         // ^\: the key that opened the popup, press it again to close (with a popup open tmux doesn't apply key bindings, so the key arrives
-        // here). You stay on the session now showing beside; in the keys popup it's only looked up
-        if (self.following.is_some() || crate::data::in_popup()) && closes_popup(k) && !self.reader.as_ref().is_some_and(|r| r.help) {
+        // here). You stay on the session now showing beside
+        if (self.following.is_some() || crate::data::in_popup()) && closes_popup(k) {
             self.quit = true;
             return;
         }
@@ -56,17 +56,21 @@ impl App {
         if self.space_menu.is_some() {
             return self.on_space_menu_key(k);
         }
-        if self.group_menu.is_some() {
-            return self.on_group_menu_key(k);
-        }
         if self.only_menu.is_some() {
             return self.on_only_menu_key(k);
+        }
+        if self.give_menu.is_some() {
+            return self.on_give_key(k);
         }
         if self.theme_menu.is_some() {
             return self.on_theme_key(k);
         }
         if self.settings.is_some() {
             return self.on_settings_key(k);
+        }
+        // The answer box: its own keys (see `on_answer_key`)
+        if matches!(self.confirm, Some(Confirm::Answer { .. })) {
+            return self.on_answer_key(k);
         }
         // Confirm: only y counts, any other key (Enter included) cancels — delete can't be undone, restart interrupts it
         if let Some(c) = self.confirm.take() {
@@ -91,6 +95,10 @@ impl App {
                 Confirm::Remove(r) if r.pane.is_some() => said = no(t!("未关闭", "not closed")),
                 Confirm::Remove(_) => said = no(t!("未删除", "not deleted")),
                 Confirm::Group(g) if yes => {
+                    // Deleted while it (or a subgroup of it) is the one viewed, from its rail row: back to all groups
+                    if self.group.as_deref().is_some_and(|cur| groups::within(cur, &g.group)) {
+                        self.group = None;
+                    }
                     // Remove the group's sessions from the list first, without waiting for the background stop / delete
                     let job = Job::Group(groups::Act::Delete { profile: g.profile, group: g.group });
                     self.vanish.push(Vanish { job: job.clone(), until: None, running: g.running });
@@ -111,10 +119,14 @@ impl App {
                 Confirm::Pane { restart, .. } => {
                     said = no(if restart { t!("未重启", "not restarted") } else { t!("未停止", "not stopped") })
                 }
-                Confirm::Send { t, pane, key, text } if yes => self.job = Some(Job::Send { t, pane, text, key }),
-                Confirm::Send { .. } => said = no(t!("未发送", "not sent")),
+                // Handled above
+                Confirm::Answer { .. } => {}
                 Confirm::Adopt { t, plan } if yes => self.job = Some(Job::Adopt { t, plan }),
                 Confirm::Adopt { .. } => said = no(t!("未接管", "not adopted")),
+                Confirm::Note { id, name } if yes => self.note_gone(&id, &name),
+                Confirm::Note { .. } => said = no(t!("未删除", "not deleted")),
+                Confirm::Task { n, .. } if yes => self.job = Some(Job::Task(TaskAct::Remove { n })),
+                Confirm::Task { .. } => said = no(t!("未删除", "not deleted")),
                 Confirm::Many { act, ts, .. } if yes => self.run_many(act, ts),
                 Confirm::Many { act, .. } => {
                     said = no(match act {
@@ -144,7 +156,11 @@ impl App {
                 KeyCode::Backspace => {
                     self.filter.pop();
                 }
-                KeyCode::Enter => self.filtering = false,
+                // Done typing: the list stays as it is, the highlight where it was
+                KeyCode::Enter => {
+                    self.filtering = false;
+                    return;
+                }
                 KeyCode::Esc => {
                     self.filter.clear();
                     self.filtering = false;
@@ -156,9 +172,19 @@ impl App {
             self.selected = None;
             self.head = None;
             self.list.select(Some(0));
-            return self.rebuild();
+            // The list scrolls again from the top, only as far as the highlight needs (a longer list before may have left it scrolled)
+            *self.disp.offset_mut() = 0;
+            self.rebuild();
+            // A word typed: the highlight on the match most recently active; cleared, back to the top as before
+            if !self.filter.is_empty() {
+                self.land_on_latest();
+            }
+            return;
         }
         if self.jump.is_some() && self.on_jump_key(k) {
+            return;
+        }
+        if self.letters.is_some() && self.on_letters_key(k) {
             return;
         }
         if let Some(p) = self.pending.take() {
@@ -167,7 +193,18 @@ impl App {
         if self.picking() && self.on_pick_key(k) {
             return;
         }
-        if self.head.is_none() && self.current().is_some_and(|s| s.subagent.is_some()) && self.on_agent_row_key(k) {
+        if self.on_rail() && self.on_rail_key(k) {
+            return;
+        }
+        // A group's notes page has its own keys; picking a session to refer to stays among the sessions
+        if self.in_notes() && self.insert_to.is_none() && self.on_notes_key(k) {
+            return;
+        }
+        // So has its tasks page
+        if self.in_tasks() && self.insert_to.is_none() && self.on_tasks_key(k) {
+            return;
+        }
+        if !self.on_rail() && self.head.is_none() && self.current().is_some_and(|s| s.subagent.is_some()) && self.on_agent_row_key(k) {
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -207,9 +244,7 @@ impl App {
                     | KeyCode::End
                     | KeyCode::Esc
                     | KeyCode::Tab
-                    | KeyCode::BackTab
-                    | KeyCode::Char('j' | 'k' | 'h' | 'l' | 'J' | 'K' | 'g' | 'G' | '/' | ' ' | 'a' | 'W' | '{' | '}' | 'i' | 'q')
-                    | KeyCode::Char('!' | '@' | '#' | '%' | '&' | '^')
+                    | KeyCode::Char('j' | 'k' | 'h' | 'l' | 'J' | 'K' | 'g' | 'G' | '/' | ' ' | 'a' | 'w' | 'F' | 'W' | 'i' | 'q')
             );
             match k.code {
                 KeyCode::Enter => return self.enter(),
@@ -220,14 +255,20 @@ impl App {
             }
         }
         match k.code {
-            KeyCode::Char(' ') if !self.view.is_empty() => self.jump = Some(String::new()),
+            // Space jumps by letter; once something is selected it ticks instead (on_pick_key takes it first)
+            KeyCode::Char(' ') => self.start_jump(),
             KeyCode::Char('z') if ctrl => self.undo_last(),
             KeyCode::Char('z') => self.open_reader(),
             KeyCode::Char('x') => self.open_diff(),
             KeyCode::Char('Z') => self.open_trace(),
             KeyCode::Char('t') => self.open_term(),
             KeyCode::Char('s') if ctrl => self.open_settings(),
-            KeyCode::Char('s') => self.ask_send(),
+            KeyCode::Char('s') => self.ask_reply(),
+            // The router of the row's group: a group's own on its row, the one of a session's group on its row; on the rail's
+            // row for all groups the desk
+            KeyCode::Char('o') => self.open_router(),
+            // Onto the rail, a group's letter puts the cursor on its row
+            KeyCode::Char('`') => self.pick_row(),
             KeyCode::Char('T') => self.window_here(),
             KeyCode::Char('y') => self.open_yazi(),
             KeyCode::Esc if !self.filter.is_empty() => {
@@ -235,6 +276,11 @@ impl App {
                 self.rebuild();
             }
             KeyCode::Esc if let Some(p) = self.status => self.toggle_status(p),
+            // Inside a group Esc first steps out of it: onto the rail, or back to all groups on a screen with no rail
+            KeyCode::Esc if self.group.is_some() && !self.on_rail() => match rail_shown(self.screen) {
+                true => self.out_to_rail(),
+                false => self.set_group(None),
+            },
             // In a tmux popup or while following, Esc closes (following first goes back to where it was when opened; `follow_step` in the
             // run loop switches). In a standalone terminal Esc at the bottom doesn't quit: every popup and page closes with Esc, one press
             // too many shouldn't close the whole interface; quitting is q q
@@ -259,24 +305,18 @@ impl App {
             KeyCode::Enter if k.modifiers.contains(KeyModifiers::SHIFT) => self.enter_with_note(),
             KeyCode::Enter => self.enter(),
             KeyCode::Char('i') => self.jump_waiting(),
-            KeyCode::Char('/') => self.filtering = true,
-            KeyCode::Char('a') => self.toggle_all(),
-            KeyCode::Char('w') => self.toggle_open(),
-            KeyCode::Char('!') => self.toggle_status(Pick::Run),
-            KeyCode::Char('@') => self.toggle_status(Pick::Wait),
-            KeyCode::Char('#') => self.toggle_status(Pick::Idle),
-            KeyCode::Char('%') => self.toggle_status(Pick::Reaped),
-            KeyCode::Char('&') => self.toggle_status(Pick::Err),
-            KeyCode::Char('^') => self.toggle_status(Pick::Off),
-            KeyCode::Tab => self.open_group_menu(),
-            KeyCode::BackTab => self.back_group(),
-            KeyCode::Char('}') => self.cycle_group(1),
-            KeyCode::Char('{') => self.cycle_group(-1),
+            // What's typed lands the highlight on a match: the cursor is in the list from here on
+            KeyCode::Char('/') => {
+                self.rail = None;
+                self.filtering = true
+            }
+            KeyCode::Char('w') => self.cycle_scope(),
+            // Inside a group: its next page (its notes, then its tasks). All groups has one page
+            KeyCode::Tab if self.group.is_some() && self.insert_to.is_none() => self.flip_page(),
+            KeyCode::Char('a') => self.hop(),
             KeyCode::Char('l') if ctrl => self.ask_relaunch(),
             KeyCode::Left | KeyCode::Char('h') => self.step_out(),
             KeyCode::Right | KeyCode::Char('l') => self.step_in(),
-            KeyCode::Char('o') => self.toggle_fold(),
-            KeyCode::Char('O') => self.toggle_fold_all(),
             KeyCode::Char('N') => self.ask_new(),
             KeyCode::Char('n') if ctrl => self.ask_new_group(),
             KeyCode::Char('n') => self.open_tools(),
@@ -289,15 +329,10 @@ impl App {
             }
             KeyCode::Char('p') => self.toggle_pin(),
             KeyCode::Char('u') => self.toggle_read(),
-            KeyCode::Char('q') => self.pending = Some(Pending::Switch),
+            KeyCode::Char('q') => self.pending = Some(Pending::Quit),
             KeyCode::Char('Q') if self.current().is_some() => self.pending = Some(Pending::Send),
-            KeyCode::Char('[') => self.cycle_space(-1),
-            KeyCode::Char(']') => self.cycle_space(1),
-            KeyCode::Char('`') => self.back_space(),
             KeyCode::Char('S') => self.open_space_menu(),
-            KeyCode::Char('c') => self.ask_copy(true),
-            KeyCode::Char('B') => self.ask_copy(false),
-            KeyCode::Char('C') => self.open_copy_menu(),
+            KeyCode::Char('c') => self.start_copy(),
             KeyCode::Char(c @ ('v' | 'V')) => self.start_pick(c == 'V'),
             KeyCode::Char('L') => self.cycle_preview(),
             KeyCode::Char('r') if ctrl => self.refresh = true,
@@ -313,10 +348,8 @@ impl App {
             KeyCode::Char('A') => self.ask_adopt(),
             KeyCode::Char('M') => self.open_mcp(),
             KeyCode::Char('P') => self.open_plugins(),
-            KeyCode::Char(':') => self.open_caps(),
             KeyCode::Char('W') => self.toggle_own_group(),
-            KeyCode::Char('*') => self.cycle_days(),
-            KeyCode::Char('?') => self.open_help(),
+            KeyCode::Char('?') => self.open_main_sheet(),
             KeyCode::Char('$') => self.open_bill(),
             KeyCode::Char('e') => self.ask_note(),
             KeyCode::Char('E') => self.enter_with_note(),
@@ -324,15 +357,25 @@ impl App {
                 if self.digits_at.elapsed() > DIGIT_GAP {
                     self.digits.clear();
                 }
+                // No row is numbered 0: with no number being typed, 0 lists every session, and again goes back to the scope
+                if c == '0' && self.digits.is_empty() {
+                    return self.toggle_status(Pick::Every);
+                }
                 self.digits_at = Instant::now();
                 self.digits.push(c);
                 let n: usize = self.digits.parse().unwrap_or(0);
                 if self.numbered(n).is_none() {
+                    // No number 40 → the 0 is dropped: it starts no number, and this soon after a digit it isn't the key either
+                    if c == '0' {
+                        self.digits.pop();
+                        return;
+                    }
                     // No number 12 → treat it as pressing 2 afresh
                     self.digits = c.to_string();
                 }
                 let n: usize = self.digits.parse().unwrap_or(0);
                 if let Some(p) = self.numbered(n) {
+                    self.rail = None;
                     self.select(Some(p));
                 }
             }
@@ -341,7 +384,7 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
-        if self.term_on.is_some() || self.theme_menu.is_some() || self.settings.is_some() {
+        if self.term_on.is_some() || self.theme_menu.is_some() || self.settings.is_some() || self.sheet.is_some() {
             return;
         }
         if let Some(b) = self.bill.as_mut() {
@@ -380,8 +423,19 @@ impl App {
                 return;
             }
             let pos = ratatui::layout::Position::new(m.column, m.row);
-            if self.list_area.contains(pos) {
-                self.move_by(if m.kind == MouseEventKind::ScrollUp { -1 } else { 1 });
+            // Over the rail (one laid over a narrow screen lies on the list): the cursor moves along it while it's there
+            if self.rail_area.contains(pos) {
+                if self.on_rail() {
+                    self.rail_step(if m.kind == MouseEventKind::ScrollUp { -1 } else { 1 });
+                }
+            } else if self.list_area.contains(pos) {
+                self.rail = None;
+                let d = if m.kind == MouseEventKind::ScrollUp { -1 } else { 1 };
+                match self.page() {
+                    Page::Notes => self.note_step(d),
+                    Page::Tasks => self.task_step(d),
+                    Page::Sessions => self.move_by(d),
+                }
             } else if self.preview_area.contains(pos) && !self.on_group_row() && self.current().is_some_and(|s| s.subagent.is_none()) {
                 // The preview scrolls back through what doesn't fit on this screen;
                 // past the top, earlier stuff is in the full-screen reader
@@ -394,25 +448,36 @@ impl App {
             return;
         }
         match m.kind {
-            // Group list open: a click anywhere closes it
-            MouseEventKind::Down(MouseButton::Left) if self.group_menu.is_some() => self.group_menu = None,
+            // The tag at the top left (a screen with no rail): the rail comes out over the left, as h does
             MouseEventKind::Down(MouseButton::Left)
                 if self.chip_area.contains(ratatui::layout::Position::new(m.column, m.row)) && !self.modal_open() =>
             {
-                self.open_group_menu()
+                self.out_to_rail()
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if self.rail_area.contains(ratatui::layout::Position::new(m.column, m.row)) && !self.modal_open() =>
+            {
+                self.rail_click(m.row)
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let a = self.list_area;
                 if m.column < a.x || m.column >= a.x + a.width || m.row < a.y || m.row >= a.y + a.height {
                     return;
                 }
+                if self.on_notes() {
+                    return self.note_click(m.row);
+                }
+                if self.on_tasks() {
+                    return self.task_click(m.row);
+                }
                 // List items are one or two lines (two with a question), with section headers in between; add up heights from the current
                 // scroll position to find the clicked one
                 let mut y = a.y;
                 for &(pos, head, h) in self.drawn.iter().skip(self.disp.offset()) {
                     if m.row < y + h {
-                        let on = self.list.selected();
-                        // Clicking the already highlighted row = Enter (go in / fold); group headers are clickable too, blank rows and the
+                        // From the rail the first click only brings the cursor into the list: no row showed as highlighted
+                        let on = self.list.selected().filter(|_| self.rail.take().is_none());
+                        // Clicking the already highlighted row = Enter (go in); group headers are clickable too, blank rows and the
                         // pinned block's header aren't
                         match (pos, head) {
                             (Some(p), _) if on == Some(p) && self.head.is_none() => self.enter(),

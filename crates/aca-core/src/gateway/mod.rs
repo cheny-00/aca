@@ -192,16 +192,22 @@ pub fn catalog() -> Vec<Spec> {
 }
 
 /// Whether the gateway has anything for this session: only then is the relay mounted on it (by default nothing goes into the agent)
-pub fn offers(kind: &str, tool: &str, account: &str) -> bool {
+pub fn offers(kind: &str, tool: &str, account: &str, role: Option<crate::store::RouterRole>) -> bool {
+    !available(role, |w| w.reaches(tool, kind, account)).is_empty()
+}
+
+fn available(role: Option<crate::store::RouterRole>, matches_agent: impl Fn(&decl::Want) -> bool) -> Vec<Spec> {
+    let reg = plugin::registry();
     let wants = decl::wants().unwrap_or_default();
-    let reaches = |id: &str| wants.get(id).is_none_or(|w| w.reaches(tool, kind, account));
-    catalog().iter().any(|s| match (&s.plugin, s.tools) {
-        (Some(id), _) => reaches(id),
-        (None, true) => {
-            plugin::registry().iter().any(|e| e.enabled && !plugin::yours::agent_tools(e, wants.get(&e.id)).is_empty() && reaches(&e.id))
-        }
-        (None, false) => true,
-    })
+    let reaches = |e: &plugin::Entry| e.enabled && e.for_role(role) && wants.get(&e.id).is_none_or(&matches_agent);
+    catalog()
+        .into_iter()
+        .filter(|s| match (&s.plugin, s.tools) {
+            (Some(id), _) => reg.iter().any(|e| e.id == *id && reaches(e)),
+            (None, true) => reg.iter().any(|e| reaches(e) && !plugin::yours::agent_tools(e, wants.get(&e.id)).is_empty()),
+            (None, false) => role.is_none(),
+        })
+        .collect()
 }
 
 fn off_file(session: &str) -> PathBuf {
@@ -234,18 +240,10 @@ pub fn set_off(session: &str, names: &[String]) -> Res<()> {
 /// included): (server, switched off)
 pub fn seen_by(session: &str) -> Vec<(Spec, bool)> {
     let (tool, kind, account) = serve::facts(session);
-    let wants = decl::wants().unwrap_or_default();
-    let reaches = |id: &str| wants.get(id).is_none_or(|w| w.reaches(&tool, &kind, &account));
+    let Ok(role) = crate::store::Store::open().and_then(|st| st.router_role(session)) else { return vec![] };
     let off = off_for(session);
-    catalog()
+    available(role, |w| session.is_empty() || w.reaches(&tool, &kind, &account))
         .into_iter()
-        .filter(|s| match (&s.plugin, s.tools) {
-            (Some(id), _) => reaches(id),
-            (None, true) => plugin::registry()
-                .iter()
-                .any(|e| e.enabled && !plugin::yours::agent_tools(e, wants.get(&e.id)).is_empty() && reaches(&e.id)),
-            (None, false) => true,
-        })
         .map(|s| {
             let o = off.contains(&s.name);
             (s, o)

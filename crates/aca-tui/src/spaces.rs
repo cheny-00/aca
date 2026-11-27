@@ -1,10 +1,10 @@
 //! Workspaces: sessions are split across a few workspaces, each named by one key (a lowercase letter / digit), and you see one
 //! at a time: work and life kept apart.
-//! `q`+key switches there, `Q`+key sends the session there (on a fold row = the whole group), `[` `]` go back and forth,
-//! `` ` `` returns to the previous one, `S` lists them (`^R` renames).
-//! `h` is hidden: not listed in `S`, skipped by `[` `]`; you enter it with `q h` (after leaving, `` ` `` gets back too).
-//! Where a session is: its own assignment → a subsession follows its parent session → its group's (recorded by `Q` on a fold
-//! row) → `1` (see `ui::list::space_of`).
+//! `S` lists them and a workspace's key switches there (`^R` renames), `Q`+key sends the session there (on a group = the
+//! whole group).
+//! `h` is hidden: not listed in `S`; you enter it with `S h`.
+//! Where a session is: its own assignment → a subsession follows its parent session → its group's (recorded by `Q` on the
+//! group) → `1` (see `ui::list::space_of`).
 //! Groups are recorded too so that sessions opened later in that group (including ones opened by `aca new` in a terminal) land
 //! there directly, and a group hidden in h doesn't leak out.
 //! Keyed by `notes::key` (registered sessions by id, so renames and restarts follow along).

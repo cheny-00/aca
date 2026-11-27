@@ -589,6 +589,21 @@ pub struct Source {
     pub dir: PathBuf,
 }
 
+impl Source {
+    /// agy has a single Google login and only reports quotas from a running session.
+    pub fn agy(cfg: &Config, home: &str, installed: fn(&str) -> bool) -> Option<Self> {
+        let tool = aca_core::agent::tool(cfg, "agy")?;
+        let cmd = tool.cmd.first().map_or("agy", String::as_str);
+        installed(cmd).then(|| Source { agent: Agent::Agy, who: "agy".into(), dir: Path::new(home).join(".gemini") })
+    }
+}
+
+pub fn quota_sources(cfg: &Config, accounts: &[(Agent, String, String)], home: &str) -> Vec<Source> {
+    let mut srcs = sources(accounts, home);
+    srcs.extend(Source::agy(cfg, home, aca_core::agent::on_path));
+    srcs
+}
+
 /// Which account directories to read: accounts in config.toml that register a config directory (`accounts`: which agent, name,
 /// directory), plus both agents' default directories (~/.claude, ~/.codex). Each directory is read once, named after the first account
 /// registered for it. When two accounts' record directories (projects / sessions) link to the same place, there's no telling whose
@@ -721,6 +736,36 @@ impl Scanner {
         v.sort_by_key(|x| x.0);
         v
     }
+
+    /// Conversations found under more than one account with no record of the switch (switched before switches outlived their
+    /// session, or copied by hand): guess whose turns the shared ones were from where each copy stops. A switch stops the old
+    /// account's copy and the new one carries on, so the turns both copies have go to the copy that stops first. One switched
+    /// back and forth can be guessed wrong; a recorded switch (`Deck::homes`) always wins.
+    /// Conversation → [(from this second on, source index)], first entry from the very start
+    fn guessed_homes(&self, deck: &Deck) -> HashMap<String, Vec<(i64, usize)>> {
+        // (conversation, source) → its last turn; subagent files count too, they end inside the conversation they belong to
+        let mut last: HashMap<(&str, usize), i64> = HashMap::new();
+        for s in self.files.values().filter(|s| !s.conv.is_empty() && !deck.homes.contains_key(&s.conv)) {
+            if let Some(t) = s.recs.iter().map(|r| r.ts).max() {
+                let e = last.entry((s.conv.as_str(), s.src)).or_insert(t);
+                *e = (*e).max(t);
+            }
+        }
+        let mut copies: HashMap<&str, Vec<(i64, usize)>> = HashMap::new();
+        for ((conv, src), t) in last {
+            copies.entry(conv).or_default().push((t, src));
+        }
+        copies
+            .into_iter()
+            .filter(|(_, v)| v.len() > 1)
+            .map(|(conv, mut v)| {
+                v.sort();
+                let mut line = vec![(i64::MIN, v[0].1)];
+                line.extend(v.windows(2).map(|w| (w[0].0 + 1, w[1].1)));
+                (conv.to_string(), line)
+            })
+            .collect()
+    }
 }
 
 // ---------- Saved copy ----------
@@ -815,7 +860,7 @@ fn path_bytes(p: &Path) -> &[u8] {
     p.as_os_str().as_bytes()
 }
 
-const AGENTS: [Agent; 6] = [Agent::None, Agent::Claude, Agent::Codex, Agent::Other, Agent::Pi, Agent::Opencode];
+const AGENTS: [Agent; 7] = [Agent::None, Agent::Claude, Agent::Codex, Agent::Other, Agent::Pi, Agent::Opencode, Agent::Agy];
 
 impl Scanner {
     /// Read the saved copy; one not written by this aca, corrupt, or missing all count as none (read from the start)
@@ -1025,6 +1070,9 @@ pub const RANGES: [Tr; 4] =
 /// What an account is called in the panel: "Claude a", "Codex b" (anything that isn't Codex is read as a Claude directory,
 /// so it's called Claude too)
 pub fn account_name(agent: Agent, who: &str) -> String {
+    if agent == Agent::Agy {
+        return crate::words::agent_label(agent, who);
+    }
     format!("{} {}", if agent == Agent::Codex { "Codex" } else { "Claude" }, who.replace('·', " / "))
 }
 
@@ -1070,25 +1118,41 @@ fn real(p: &Path) -> PathBuf {
 }
 
 /// Read the sessions in the registry (archived ones too: their conversation records are still there). The current conversation is
-/// in the table; every one it has moved past is in the state the hook writes
+/// in the table; every one it has moved past is in the state the hook writes. Account switches come from the sessions' state, plus
+/// those kept from deleted sessions (`runtime::kept_moves`)
 pub fn deck() -> Deck {
     let mut d = Deck::default();
-    let Ok(store) = aca_core::store::Store::open() else { return d };
+    let mut moves = aca_core::runtime::kept_moves();
+    let Ok(store) = aca_core::store::Store::open() else {
+        d.homes = homes_of(moves);
+        return d;
+    };
     for s in store.sessions(true).unwrap_or_default() {
         let run = aca_core::runtime::load(&s.id);
         let title = aca_core::status::title(&s, &run);
         for c in std::iter::once(&s.conv).chain(&run.convs).chain(std::iter::once(&run.conv)).filter(|c| !c.is_empty()) {
             d.by_conv.entry(c.clone()).or_insert_with(|| (s.id.clone(), title.clone()));
         }
-        for m in &run.moves {
-            let line = d.homes.entry(m.conv.clone()).or_default();
-            if line.is_empty() {
-                line.push((i64::MIN, real(Path::new(&m.from))));
-            }
-            line.push((m.at as i64, real(Path::new(&m.to))));
-        }
+        moves.extend(run.moves);
     }
+    d.homes = homes_of(moves);
     d
+}
+
+/// Account switches → each conversation's line of homes (see `Deck::homes`), in time order whichever source each came from; the
+/// same switch recorded twice counts once
+fn homes_of(mut moves: Vec<aca_core::runtime::Move>) -> HashMap<String, Vec<(i64, PathBuf)>> {
+    moves.sort_by(|a, b| (&a.conv, a.at, &a.from, &a.to).cmp(&(&b.conv, b.at, &b.from, &b.to)));
+    moves.dedup();
+    let mut homes: HashMap<String, Vec<(i64, PathBuf)>> = HashMap::new();
+    for m in moves.iter().filter(|m| !m.conv.is_empty()) {
+        let line = homes.entry(m.conv.clone()).or_default();
+        if line.is_empty() {
+            line.push((i64::MIN, real(Path::new(&m.from))));
+        }
+        line.push((m.at as i64, real(Path::new(&m.to))));
+    }
+    homes
 }
 
 /// This Codex directory is logged in with an API key (pay as you go, no subscription quota)
@@ -1242,11 +1306,19 @@ impl Scanner {
         quotas.retain(|q| picked(only, q.agent, &q.who));
         // For duplicates keep the one with the most output; on a tie, the earlier file (a forked file is later, so it goes to the original
         // conversation). Conversations that switched accounts are the exception: the turns identical in both account directories go to
-        // the account in use at the time (see `Deck::homes`)
-        let mut files: Vec<&Seen> = self.files.values().filter(|s| !s.recs.is_empty()).collect();
-        files.sort_by_cached_key(|s| (s.first_ts(), s.conv.clone(), s.off));
+        // the account in use at the time (see `Deck::homes`), or failing a record of the switch, the one guessed (see `guessed_homes`).
+        // The path settles the order last, so identical copies come out the same on every run
+        let mut files: Vec<(&PathBuf, &Seen)> = self.files.iter().filter(|(_, s)| !s.recs.is_empty()).collect();
+        files.sort_by_cached_key(|(p, s)| (s.first_ts(), s.conv.clone(), s.off, *p));
+        let files: Vec<&Seen> = files.into_iter().map(|(_, s)| s).collect();
         let src_dirs: Vec<PathBuf> = if deck.homes.is_empty() { vec![] } else { self.srcs.iter().map(|s| real(&s.dir)).collect() };
-        let owns = |s: &Seen, ts: i64| deck.home_at(&s.conv, ts).is_some_and(|h| src_dirs.get(s.src).is_some_and(|d| d == h));
+        let guessed = self.guessed_homes(deck);
+        let owns = |s: &Seen, ts: i64| match deck.home_at(&s.conv, ts) {
+            Some(h) => src_dirs.get(s.src).is_some_and(|d| d == h),
+            None => {
+                guessed.get(&s.conv).and_then(|line| line.iter().take_while(|(since, _)| *since <= ts).last()).is_some_and(|l| l.1 == s.src)
+            }
+        };
         let mut best: HashMap<u64, (usize, usize), Fast> =
             HashMap::with_capacity_and_hasher(files.iter().map(|s| s.recs.len()).sum(), Fast::default());
         for (fi, s) in files.iter().enumerate() {
@@ -1258,7 +1330,9 @@ impl Scanner {
                     Entry::Occupied(mut e) => {
                         let (f0, r0) = *e.get();
                         let (had, got) = (files[f0].recs[r0].tok[4], r.tok[4]);
-                        if got > had || (got == had && !src_dirs.is_empty() && owns(s, r.ts) && !owns(files[f0], r.ts)) {
+                        if got > had
+                            || (got == had && (!src_dirs.is_empty() || !guessed.is_empty()) && owns(s, r.ts) && !owns(files[f0], r.ts))
+                        {
                             e.insert((fi, ri));
                         }
                     }
@@ -1585,15 +1659,17 @@ pub fn build_cached(only: &[String], palette: usize, quota_note: fn(&Config) -> 
 /// for accounts (see `slots`); `quota_note`: the line atop the quotas, written by the interface
 pub fn build(sc: &mut Scanner, only: &[String], palette: usize, quota_note: fn(&Config) -> String) -> Report {
     let home = std::env::var("HOME").unwrap_or_default();
-    let accounts = crate::agent::accounts(&aca_core::config::load());
-    let srcs = sources(&accounts, &home);
+    let cfg = aca_core::config::load();
+    let accounts = crate::agent::accounts(&cfg);
+    let mut srcs = sources(&accounts, &home);
     sc.scan(srcs.clone());
+    srcs.extend(Source::agy(&cfg, &home, aca_core::agent::on_path));
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     // Claude's quota is what the statusLine recorded (with the data's time, see limits)
     let quotas = crate::limits::dir().map(|d| crate::limits::quotas(&d, &srcs, now)).unwrap_or_default();
     let mut r = sc.report(now, local_offset(), &deck(), quotas, only);
     r.quotas = subscribed(std::mem::take(&mut r.quotas), &accounts, &home);
-    r.quota_note = quota_note(&aca_core::config::load());
+    r.quota_note = quota_note(&cfg);
     // Order for handing out slots the first time: biggest spenders over the last 30 days first (the first few, adjacent palette colors
     // are the easiest to tell apart), then those used earlier, then quota-only ones. Accounts that already have a slot aren't affected
     let mut names: Vec<String> = vec![];
@@ -2031,6 +2107,55 @@ mod tests {
         let by: Vec<(&str, f64)> = r.ranges[3].by_src.iter().map(|x| (x.name.as_str(), x.cost)).collect();
         assert_eq!(by, vec![("Claude a", 75.0), ("Claude b", 25.0)]);
         assert_eq!(r.ranges[3].calls, 4);
+    }
+
+    #[test]
+    fn with_no_record_of_the_switch_the_copy_that_stops_first_keeps_the_shared_turns() {
+        let t = parse_ts("2026-09-30T01:00:00Z");
+        let rec = |key: u64, ts: i64| Rec { key, ts, model: 0, tok: [0, 0, 0, 0, 1_000_000], ..Default::default() };
+        let seen = |src: usize, path: &str, recs: Vec<Rec>| {
+            let mut s = Seen::new(src, Agent::Claude, Path::new(path));
+            (s.conv, s.models, s.recs) = ("c1".into(), vec!["claude-opus-5".into()], recs);
+            s
+        };
+        // Ran 1, 2 and a subagent (10) on old, then switched to new and ran 3; the session was deleted before switches were kept.
+        // The subagent's file is byte for byte the same in both. Old's directory sorts after new's, so path order alone would
+        // hand the subagent to new
+        let files = || {
+            vec![
+                ("/z-old/projects/p/c1.jsonl", seen(0, "/z-old/projects/p/c1.jsonl", vec![rec(1, t), rec(2, t + 60)])),
+                ("/a-new/projects/p/c1.jsonl", seen(1, "/a-new/projects/p/c1.jsonl", vec![rec(1, t), rec(2, t + 60), rec(3, t + 3600)])),
+                (
+                    "/z-old/projects/p/c1/subagents/agent-x.jsonl",
+                    seen(0, "/z-old/projects/p/c1/subagents/agent-x.jsonl", vec![rec(10, t + 30)]),
+                ),
+                (
+                    "/a-new/projects/p/c1/subagents/agent-x.jsonl",
+                    seen(1, "/a-new/projects/p/c1/subagents/agent-x.jsonl", vec![rec(10, t + 30)]),
+                ),
+            ]
+        };
+        let srcs = vec![
+            Source { agent: Agent::Claude, who: "old".into(), dir: PathBuf::from("/z-old") },
+            Source { agent: Agent::Claude, who: "new".into(), dir: PathBuf::from("/a-new") },
+        ];
+        // Every new map walks its entries in another order: the split must not depend on it
+        for _ in 0..20 {
+            let files = files().into_iter().map(|(p, s)| (PathBuf::from(p), s)).collect();
+            let sc = Scanner { srcs: srcs.clone(), files, ..Default::default() };
+            let r = sc.report(t + 7200, 0, &Deck::default(), vec![], &[]);
+            let by: Vec<(&str, f64)> = r.ranges[3].by_src.iter().map(|x| (x.name.as_str(), x.cost)).collect();
+            assert_eq!(by, vec![("Claude old", 75.0), ("Claude new", 25.0)]);
+            assert_eq!(r.ranges[3].calls, 4);
+        }
+    }
+
+    #[test]
+    fn switches_kept_from_deleted_sessions_join_the_line_in_time_order() {
+        let m = |at: u64, from: &str, to: &str| aca_core::runtime::Move { at, conv: "c1".into(), from: from.into(), to: to.into() };
+        // The later switch comes from a live session, the earlier one was kept from a deleted one, and one is recorded twice
+        let homes = homes_of(vec![m(200, "/cb", "/ca"), m(100, "/ca", "/cb"), m(200, "/cb", "/ca")]);
+        assert_eq!(homes["c1"], vec![(i64::MIN, PathBuf::from("/ca")), (100, PathBuf::from("/cb")), (200, PathBuf::from("/ca"))]);
     }
 
     #[test]

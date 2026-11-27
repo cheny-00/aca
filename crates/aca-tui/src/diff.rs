@@ -50,6 +50,15 @@ pub struct Glance {
     pub repo: Option<Stat>,
     /// What's in the directory: read only for a group's preview (see `glance_dir`); None for a session's
     pub files: Option<Files>,
+    /// Its last turn: read only for a session with nothing on screen (see `last_turn`)
+    pub turn: Option<Turn>,
+}
+
+/// A session's last turn (see `last_turn`)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Turn {
+    pub prompt: String,
+    pub reply: String,
 }
 
 /// What's in a directory: subdirectories and files, each sorted by name (case-insensitive); dot entries are only counted
@@ -152,7 +161,7 @@ pub fn glance(w: &Where) -> Glance {
     let top = (!work.dir.is_empty() && std::path::Path::new(&work.dir).is_dir())
         .then(|| run(&work.dir, &["rev-parse", "--show-toplevel"]))
         .flatten();
-    let Some(top) = top else { return Glance { work, repo: None, files: None } };
+    let Some(top) = top else { return Glance { work, ..Default::default() } };
     let mut st = Stat { branch: branch_of(&top), ..Default::default() };
     let (_, base) = head_or_empty(&top);
     for l in run(&top, &["diff", "--numstat", "--no-ext-diff", "--no-textconv", "-M", &base]).unwrap_or_default().lines() {
@@ -170,7 +179,18 @@ pub fn glance(w: &Where) -> Glance {
             }
         }
     }
-    Glance { work, repo: Some(st), files: None }
+    Glance { work, repo: Some(st), ..Default::default() }
+}
+
+/// A session's last turn, from its run record (`id` is its aca id): what you said (the hook's copy, cut short) and its reply.
+/// The hook's copy of the reply is enough for the preview even when cut; only without one (adopted, not restarted, so no hooks)
+/// is it read from the conversation record. A missing record gives an empty turn
+pub fn last_turn(id: &str) -> Turn {
+    let r = aca_core::runtime::load(id);
+    let reply = if r.last.trim().is_empty() { aca_core::agent::reply(id) } else { r.last };
+    // A turn opened by a notice or a message aca typed in: that isn't what you said
+    let prompt = if crate::data::by_you(&r.prompt) { r.prompt } else { String::new() };
+    Turn { prompt, reply }
 }
 
 /// A group's preview: read the directory, branch and changes as for a session, then list what's in the directory

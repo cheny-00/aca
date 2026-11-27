@@ -1,7 +1,8 @@
-//! Reading a session at length: the reader (`z`) over its screen and scrollback, the diff (`x`) of what it changed, the help
-//! page, and the glance at a group's directory in the preview.
+//! Reading a session at length: the reader (`z`) over its screen and scrollback, the diff (`x`) of what it changed, and the
+//! glance at a group's directory in the preview.
 
 use super::*;
+use crate::sheet::{Key, key, more, named};
 
 /// What to copy (the run loop fetches the content and writes the clipboard)
 #[derive(Debug, PartialEq)]
@@ -28,14 +29,10 @@ pub(super) struct Reader {
     pub(super) wrapped: Vec<Styled>,
     pub(super) wrap_w: usize,
     pub(super) dirty: bool,
-    /// The key help opened by `?`, not a session
-    pub(super) help: bool,
-    /// Rows per screen when last drawn (the keys popup pages by this)
+    /// Rows per screen when last drawn
     pub(super) view_h: usize,
     /// `x`: showing changes (git diff), not output
     pub(super) diff: Option<DiffView>,
-    /// The key just pressed in the keys popup: lights up its description row
-    pub(super) hit: Option<crate::help::Hit>,
     /// Showing a plugin's output (a view, or a finished capability run): `r` reruns it
     pub(super) plugin: Option<crate::caps::Req>,
 }
@@ -81,19 +78,7 @@ impl App {
         let Some(s) = self.current() else { return };
         let (name, lines) = (s.name.clone(), preview_lines(s));
         self.trace = None;
-        self.reader = Some(Reader {
-            name,
-            lines,
-            scroll: 0,
-            wrapped: vec![],
-            wrap_w: 0,
-            dirty: true,
-            help: false,
-            view_h: 0,
-            diff: None,
-            hit: None,
-            plugin: None,
-        });
+        self.reader = Some(Reader { name, lines, scroll: 0, wrapped: vec![], wrap_w: 0, dirty: true, view_h: 0, diff: None, plugin: None });
         self.reader_load = true;
     }
 
@@ -126,10 +111,8 @@ impl App {
             wrapped: vec![],
             wrap_w: 0,
             dirty: true,
-            help: false,
             view_h: 0,
             diff: Some(diff),
-            hit: None,
             plugin: None,
         });
     }
@@ -167,8 +150,10 @@ impl App {
     /// Whether to read the diff stats at the top of the preview: the highlighted session changed; on a periodic refresh it has new
     /// activity (running: the pane has output; idle: a hook reported something, see `Session::active_at`), or GLANCE_EVERY passed.
     /// Counting on every refresh would mean five git processes every two seconds while sitting on a big repository.
-    /// Not read while the preview is off or a full-screen view is open
-    pub fn glance_request(&mut self, refreshed: bool) -> Option<(String, Where)> {
+    /// Not read while the preview is off or a full-screen view is open.
+    /// The third value: the aca id to read its last turn from too, for a stopped registered session with nothing on screen (see
+    /// `shows_turn`)
+    pub fn glance_request(&mut self, refreshed: bool) -> Option<(String, Where, Option<String>)> {
         if self.reader.is_some() || self.trace.is_some() || self.mode() == Preview::Off {
             return None;
         }
@@ -177,13 +162,20 @@ impl App {
         }
         // On a group: read the group's paths (key from group_key; by it the run loop also reads what's in the directories);
         // activity is the group's most recently active session
-        let (key, w, act) = if self.on_group_row() {
+        // On a rail row that is no group nothing is drawn beside; unless it's the row for all groups and there is a desk:
+        // then the group read is the desk's own
+        let beside = self.on_group_row() || self.row_router().is_some();
+        if self.on_rail() && !beside {
+            return None;
+        }
+        let (key, w, act, turn) = if beside {
             let sp = self.spot()?;
             let act = self.all.iter().filter(|s| s.group == sp.group && s.sub.is_none()).map(|s| s.active_at).max().unwrap_or(0);
-            (group_key(&sp.group), Where { dir: sp.dir, ..Where::default() }, act)
+            (group_key(&sp.group), Where { dir: sp.dir, ..Where::default() }, act, None)
         } else {
             let s = self.current().filter(|s| s.subagent.is_none())?;
-            (s.name.clone(), crate::data::where_of(s), s.active_at)
+            let turn = (s.sub.is_none() && !s.deck_id.is_empty() && shows_turn(s)).then(|| s.deck_id.clone());
+            (s.name.clone(), crate::data::where_of(s), s.active_at, turn)
         };
         let due = match &self.glance_for {
             Some((k, a, t)) if *k == key => refreshed && (*a != act || t.elapsed() >= GLANCE_EVERY),
@@ -193,7 +185,7 @@ impl App {
             return None;
         }
         self.glance_for = Some((key.clone(), act, Instant::now()));
-        Some((key, w))
+        Some((key, w, turn))
     }
 
     pub fn set_glance(&mut self, name: String, g: Glance) {
@@ -221,7 +213,7 @@ impl App {
         }
     }
 
-    /// l: open lazygit in this repository
+    /// y: open lazygit in this repository (y on the list opens yazi: an outside tool, here)
     fn diff_lazygit(&mut self) {
         let Some(v) = self.reader.as_ref().and_then(|r| r.diff.as_ref()) else { return };
         match () {
@@ -275,26 +267,10 @@ impl App {
         }
     }
 
-    pub(super) fn open_help(&mut self) {
-        self.reader = Some(Reader {
-            name: t!("aca 按键", "aca keys").into(),
-            lines: vec![],
-            scroll: usize::MAX,
-            wrapped: vec![],
-            wrap_w: 0,
-            dirty: true,
-            help: true,
-            view_h: 0,
-            diff: None,
-            hit: None,
-            plugin: None,
-        });
-    }
-
     /// The cell the full-screen reader is showing (the run loop fetches history from
     /// it): the pane id, or the session name for a stopped session without one
     pub fn reader_target(&self) -> Option<String> {
-        let r = self.reader.as_ref().filter(|r| !r.help && r.diff.is_none() && r.plugin.is_none())?;
+        let r = self.reader.as_ref().filter(|r| r.diff.is_none() && r.plugin.is_none())?;
         let pane = self.all.iter().find(|s| s.name == r.name).map(|s| s.pane.clone()).filter(|p| !p.is_empty());
         Some(pane.unwrap_or_else(|| format!("={}:", r.name)))
     }
@@ -308,34 +284,36 @@ impl App {
     }
 
     pub(super) fn on_reader_key(&mut self, k: KeyEvent) {
+        // c pressed: this key says what to copy (as on the list)
+        if let Some(p) = self.pending.take() {
+            return self.on_pending_key(p, k);
+        }
         let page = (self.screen.height.saturating_sub(3) as usize).max(1);
         let Some(r) = self.reader.as_mut() else { return };
-        let help = r.help;
         let diff = r.diff.is_some();
-        let page = if help && r.view_h > 0 { r.view_h } else { page };
-        if help {
-            // Keys popup: Esc / ? / q close, arrows and paging keys scroll; any other key
-            // "looks it up" — lights up the row explaining it and scrolls there
-            match k.code {
-                KeyCode::Esc | KeyCode::Char('?' | 'q') if !k.modifiers.contains(KeyModifiers::CONTROL) => self.reader = None,
-                KeyCode::Up => r.scroll = r.scroll.saturating_add(1),
-                KeyCode::Down => r.scroll = r.scroll.saturating_sub(1),
-                KeyCode::PageUp => r.scroll = r.scroll.saturating_add(page),
-                KeyCode::PageDown => r.scroll = r.scroll.saturating_sub(page),
-                KeyCode::Home => r.scroll = usize::MAX,
-                KeyCode::End => r.scroll = 0,
-                _ => r.hit = Some(crate::help::hit(k)),
-            }
-            return;
+        // ?: this page's keys (the same list the bottom bar names them from)
+        if k.code == KeyCode::Char('?') && !k.modifiers.contains(KeyModifiers::CONTROL) {
+            let keys = reader_keys(r.plugin.is_some(), r.diff.as_ref().map(|d| d.mode));
+            return self.open_sheet(&keys);
         }
-        if let Some(req) = r.plugin.clone() {
-            // Plugin output: can page, copy, r reruns; it's not a session, so you can't go in or switch to another session
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+letter is its own key here, never the bare letter: only ^D / ^U (half a page) and, on a plugin's output, ^R
+        if ctrl {
             match k.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | '?') => self.reader = None,
-                KeyCode::Char('r') => {
+                KeyCode::Char('u') => r.scroll = r.scroll.saturating_add(page / 2),
+                KeyCode::Char('d') => r.scroll = r.scroll.saturating_sub(page / 2),
+                KeyCode::Char('r') if let Some(req) = r.plugin.clone() => {
                     self.flash(&tr!("正在重新运行 {}…", "re-running {}…", req.title()));
                     self.plugin_q.push(req);
                 }
+                _ => {}
+            }
+            return;
+        }
+        if r.plugin.is_some() {
+            // Plugin output: can page, copy, ^R reruns; it's not a session, so you can't go in or switch to another session
+            match k.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.reader = None,
                 KeyCode::Char('c') => {
                     let text: Vec<String> = r.lines.iter().map(ansi::plain).collect();
                     self.clip = Some(Clip::Text(text.join("\n")));
@@ -344,8 +322,6 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => r.scroll = r.scroll.saturating_sub(1),
                 KeyCode::PageUp | KeyCode::Char('b') => r.scroll = r.scroll.saturating_add(page),
                 KeyCode::PageDown | KeyCode::Char(' ') => r.scroll = r.scroll.saturating_sub(page),
-                KeyCode::Char('u') => r.scroll = r.scroll.saturating_add(page / 2),
-                KeyCode::Char('d') => r.scroll = r.scroll.saturating_sub(page / 2),
                 KeyCode::Home | KeyCode::Char('g') => r.scroll = usize::MAX,
                 KeyCode::End | KeyCode::Char('G') => r.scroll = 0,
                 _ => {}
@@ -359,9 +335,9 @@ impl App {
             KeyCode::Tab if diff => self.open_trace(),
             KeyCode::Tab => self.open_diff(),
             KeyCode::Char('Z') => self.open_trace(),
-            KeyCode::Esc | KeyCode::Char('q' | 'z' | 'x' | '?') => self.reader = None,
+            KeyCode::Esc | KeyCode::Char('q' | 'z' | 'x') => self.reader = None,
             KeyCode::Char('n') if diff => self.diff_jump(1),
-            KeyCode::Char('l') if diff => self.diff_lazygit(),
+            KeyCode::Char('y') if diff => self.diff_lazygit(),
             KeyCode::Char('e') if diff => self.diff_edit(),
             KeyCode::Char('p') if diff => self.diff_jump(-1),
             KeyCode::Char('m') if diff => {
@@ -376,14 +352,11 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => r.scroll = r.scroll.saturating_sub(1),
             KeyCode::PageUp | KeyCode::Char('b') => r.scroll = r.scroll.saturating_add(page),
             KeyCode::PageDown | KeyCode::Char(' ') => r.scroll = r.scroll.saturating_sub(page),
-            KeyCode::Char('u') => r.scroll = r.scroll.saturating_add(page / 2),
-            KeyCode::Char('d') => r.scroll = r.scroll.saturating_sub(page / 2),
             KeyCode::Home | KeyCode::Char('g') => r.scroll = usize::MAX, // clamped to the top when drawn
             KeyCode::End | KeyCode::Char('G') => r.scroll = 0,
             KeyCode::Char('J') => self.reader_step(1),
             KeyCode::Char('K') => self.reader_step(-1),
-            KeyCode::Char('c') => self.ask_copy(true),
-            KeyCode::Char('B') => self.ask_copy(false),
+            KeyCode::Char('c') => self.start_copy(),
             _ => {}
         }
     }
@@ -391,11 +364,7 @@ impl App {
     /// J / K: switch to the next / previous session in the list and keep viewing
     fn reader_step(&mut self, d: isize) {
         let cur = self.list.selected().unwrap_or(0) as isize;
-        let mut next = cur + d;
-        // Fold rows aren't sessions, skip them
-        while next >= 0 && next < self.view.len() as isize && self.is_fold_row(next as usize) {
-            next += d;
-        }
+        let next = cur + d;
         if next < 0 || next >= self.view.len() as isize {
             return;
         }
@@ -408,51 +377,47 @@ impl App {
     }
 }
 
-/// `?`'s keys popup. On desktop centered, three columns in one screen; on a phone it rises from the bottom, one column scrolling down, a
-/// few list rows showing on top
-pub(super) fn draw_help(f: &mut Frame, app: &mut App) {
-    let full = f.area();
-    let float = floating(full);
-    let w = if float { full.width.saturating_sub(8).min(116) } else { full.width };
-    let (probe, _) = modal_area(full, w, full.height);
-    let inner_w = probe.width.saturating_sub(if float { 6 } else { 4 }) as usize;
-    let hit = app.reader.as_ref().and_then(|r| r.hit.clone());
-    let (lines, lit) = crate::help::lines(inner_w, hit.as_ref());
-    let total = lines.len();
-    // Title, blank line, (content), blank line, a line at the bottom
-    let room = full.height.saturating_sub(if float { 2 } else { 3 } + modal_chrome(full) + 4) as usize;
-    let body_h = total.min(room).max(1);
-    let Some(r) = app.reader.as_mut() else { return };
-    r.scroll = r.scroll.min(total - body_h);
-    // Just pressed a key: if the first lit row isn't on this screen, scroll to it (stop one row above it); after that, scroll freely
-    if let Some(h) = r.hit.as_mut().filter(|h| h.jump) {
-        h.jump = false;
-        let top = total - body_h - r.scroll;
-        if let Some(&y) = lit.first().filter(|&&y| y < top || y >= top + body_h) {
-            r.scroll = total - body_h - y.saturating_sub(1).min(total - body_h);
-        }
+/// The readers' keys (output, a plugin's output, the diff page; the diff's mode decides what m says), for `?`; the bottom bar
+/// names its keys from here
+pub(super) fn reader_keys(plugin: bool, diff: Option<Mode>) -> Vec<Key> {
+    let mut v = vec![
+        key("↑↓", t!("滚动", "scroll")),
+        key(t!("空格 b", "Space b"), t!("翻页", "page")),
+        more("^D ^U", t!("半页", "half a page")),
+        more("g G", t!("顶部 / 底部", "top / bottom")),
+    ];
+    if plugin {
+        v.extend([key("^R", t!("重新运行", "rerun")), key("c", t!("复制", "copy")), key("Esc", t!("返回", "back"))]);
+        return v;
     }
-    r.view_h = body_h;
-    let end = total - r.scroll;
-    let top = end - body_h;
-    let pages = total.div_ceil(body_h);
-    let page = if r.scroll == 0 { pages } else { top / body_h + 1 };
-    let pos = if pages > 1 { vec![Span::styled(format!("{page}/{pages}"), dim())] } else { esc_hint(t!("关闭", "close")) };
-    // Left of the bottom bar: say something only when the pressed key isn't a shortcut; for a shortcut, its rows light up by themselves
-    let said = match &hit {
-        Some(h) if lit.is_empty() => Span::styled(tr!("「{}」不是快捷键", "“{}” isn't a key", h.label), dim()),
-        _ => Span::raw(""),
-    };
-    let right =
-        if float && pages == 1 { vec![] } else { key_spans(&[("↑↓", t!("滚动", "scroll")), ("Esc", t!("关闭", "close"))], 30).0 };
-    let mut body = vec![modal_title(t!("快捷键", "Keys"), theme::accent(), pos, inner_w), Line::raw("")];
-    body.extend(lines[top..end].iter().cloned());
-    if !(said.content.is_empty() && right.is_empty()) {
-        body.push(Line::raw(""));
-        body.push(spread(vec![said], right, inner_w));
+    v.push(key("J K", t!("切换会话", "session")));
+    match diff {
+        Some(mode) => v.extend([
+            key("n p", t!("切换文件", "file")),
+            key("m", if mode == Mode::Uncommitted { t!("连同提交", "with commits") } else { t!("仅未提交", "uncommitted only") }),
+            key("⏎", t!("打开", "open")),
+            key("e", t!("编辑", "edit")),
+            key("y", "lazygit"),
+            key("Tab", t!("记录", "record")),
+            more("z", t!("输出", "output")),
+            more("c", t!("复制", "copy")),
+        ]),
+        None => v.extend([
+            key("⏎", t!("打开", "open")),
+            key("c", t!("复制", "copy")),
+            key("Tab", t!("改动", "diff")),
+            more("Z", t!("记录", "record")),
+        ]),
     }
-    let inner = modal_frame(f, w, body.len() as u16 + modal_chrome(full), theme::pal().accent);
-    f.render_widget(Paragraph::new(body), inner);
+    v.push(key("Esc", t!("返回", "back")));
+    v
+}
+
+/// A bottom bar laid out by hand (groups of key labels with their drop order), each key named as `keys` names it; the middle
+/// group is the main one. Ends with Esc and ? as every page's does
+fn bar(keys: &[Key], groups: &[&[(&str, u8)]], w: usize) -> Line<'static> {
+    let gs: Vec<Vec<MenuItem>> = groups.iter().map(|g| g.iter().map(|&(k, p)| (k, named(keys, k), p)).collect()).collect();
+    page_bar(&gs, Some(1), w)
 }
 
 /// Full-screen reader (`z`): an accent-colored line with the title on top (like the preview on a phone), the wrapped output, the bottom bar
@@ -529,54 +494,22 @@ pub(super) fn draw_reader(f: &mut Frame, app: &mut App) {
         ansi::paint_links(f.buffer_mut(), body, &rows);
     }
     let foot_line = match &app.msg {
+        _ if app.pending == Some(Pending::Copy) => super::screen::copy_bar(w),
         Some((m, t)) if t.elapsed() < app.msg_ttl => Line::styled(m.clone(), theme::warn()).centered(),
-        _ => match diff {
-            Some((mode, _)) => menu_bar(
-                &[
-                    // On a phone drop 「滚动」 ("scroll") first (everyone knows it), keep n p and m
-                    vec![
-                        ("↑↓", t!("滚动", "scroll"), 2),
-                        ("n p", t!("切换文件", "file"), 0),
-                        (
-                            "m",
-                            if mode == Mode::Uncommitted {
-                                t!("连同提交", "with commits")
-                            } else {
-                                t!("仅未提交", "uncommitted only")
-                            },
-                            1,
-                        ),
-                        ("J K", t!("切换会话", "session"), 5),
-                    ],
-                    vec![("⏎", t!("打开", "open"), 0), ("e", t!("编辑", "edit"), 4), ("l", "lazygit", 6), ("Tab", t!("记录", "record"), 3)],
-                    vec![("Esc", t!("返回", "back"), 0)],
-                ],
-                Some(1),
-                w,
-            ),
-            None if plugin => menu_bar(
-                &[
-                    vec![("↑↓", t!("滚动", "scroll"), 0), (t!("空格 b", "Space b"), t!("翻页", "page"), 2)],
-                    vec![("r", t!("重新运行", "rerun"), 0), ("c", t!("复制", "copy"), 1)],
-                    vec![("Esc", t!("返回", "back"), 0)],
-                ],
-                Some(1),
-                w,
-            ),
-            None => menu_bar(
-                &[
-                    vec![
-                        ("↑↓", t!("滚动", "scroll"), 0),
-                        (t!("空格 b", "Space b"), t!("翻页", "page"), 2),
-                        ("J K", t!("切换会话", "session"), 1),
-                    ],
-                    vec![("⏎", t!("打开", "open"), 0), ("c", t!("复制", "copy"), 3), ("Tab", t!("改动", "diff"), 4)],
-                    vec![("Esc", t!("返回", "back"), 0)],
-                ],
-                Some(1),
-                w,
-            ),
-        },
+        _ => {
+            let keys = reader_keys(plugin, diff.as_ref().map(|d| d.0));
+            let space = t!("空格 b", "Space b");
+            match diff {
+                // On a phone drop 「滚动」 ("scroll") first (everyone knows it), keep n p and m
+                Some(_) => bar(
+                    &keys,
+                    &[&[("↑↓", 2), ("n p", 0), ("m", 1), ("J K", 5)], &[("⏎", 0), ("e", 4), ("y", 6), ("Tab", 3)], &[("Esc", 0)]],
+                    w,
+                ),
+                None if plugin => bar(&keys, &[&[("↑↓", 0), (space, 2)], &[("^R", 0), ("c", 1)], &[("Esc", 0)]], w),
+                None => bar(&keys, &[&[("↑↓", 0), (space, 2), ("J K", 1)], &[("⏎", 0), ("c", 3), ("Tab", 4)], &[("Esc", 0)]], w),
+            }
+        }
     };
     f.render_widget(Paragraph::new(foot_line), foot);
 }
@@ -584,52 +517,83 @@ pub(super) fn draw_reader(f: &mut Frame, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::tests::{at, fixture, press, reader_rows, select, shows};
+    use crate::ui::tests::{at, caps, ctrl, fixture, keys, press, reader_rows, select, shows};
 
     #[test]
-    fn question_mark_shows_the_keys_from_the_top() {
-        let mut app = fixture();
-        press(&mut app, KeyCode::Char('?'));
-        assert!(app.reader_target().is_none()); // not a session, the run loop doesn't capture it from tmux
-        // On a phone it rises from the bottom, one column scrolling down from the top; a quick reference grouped by purpose,
-        // not the text of aca help keys
-        shows(&reader_rows(&mut app, 60, 12), &["快捷键", "1/", "导航"]);
-        // On a desktop a centered popup, three columns fitting on one screen
-        let rows = reader_rows(&mut app, 150, 40);
-        assert!(rows.iter().any(|r| r.contains("导航") && r.contains("新建时")), "{rows:#?}");
-        // Pressing a key inside = looking it up: lights up the rows describing it, doesn't actually do it
-        let lit = |app: &App| crate::help::lines(100, app.reader.as_ref().and_then(|r| r.hit.as_ref())).1.len();
-        press(&mut app, KeyCode::Char('T'));
-        assert!(app.split.is_none());
-        assert_eq!(lit(&app), 1);
-        press(&mut app, KeyCode::Char('t'));
-        assert!(app.term_req.is_none());
-        assert_eq!(lit(&app), 1);
-        press(&mut app, KeyCode::Char('y'));
-        assert!(app.external.is_none());
-        assert_eq!(lit(&app), 1);
-        press(&mut app, KeyCode::Char('J')); // doesn't switch sessions
-        press(&mut app, KeyCode::Enter); // doesn't enter the session
-        assert!(app.reader.is_some() && app.attach.is_none());
-        assert_eq!(lit(&app), 1);
-        // Only says so for something that isn't a key
-        assert!(!reader_rows(&mut app, 150, 40).iter().any(|r| r.contains("不是快捷键")));
-        press(&mut app, KeyCode::Char('U'));
-        shows(&reader_rows(&mut app, 150, 40), &["「U」不是快捷键"]);
-        // On a phone, one column scrolling down: if the lit row isn't on this screen, scroll to it
-        press(&mut app, KeyCode::Char('m'));
-        assert_eq!(lit(&app), 2);
-        shows(&reader_rows(&mut app, 46, 12), &["移到分组"]);
-        press(&mut app, KeyCode::Esc);
-        assert!(app.reader.is_none());
-        // The bottom bar can't fit every key: drop the least used first; ? and ⏎ always stay
-        assert_eq!(reader_rows(&mut app, 46, 12)[11], "n 新建 │ ⏎ 打开 • i 下一个 │ / 搜索 • ? 快捷键");
+    fn question_mark_lists_the_lists_keys_by_section_and_a_key_pressed_there_does_it() {
+        i18n::with(Lang::Zh, || {
+            let mut app = fixture();
+            select(&mut app, "跑");
+            press(&mut app, KeyCode::Char('?'));
+            assert!(app.sheet.is_some() && app.reader.is_none());
+            // The legend on top, then aca's keys by section; aimed at the highlighted session
+            let rows = reader_rows(&mut app, 100, 40);
+            shows(&rows, &["快捷键 · 对「跑」", "图例", "导航", "打开", "i       下一个待处理", "Esc 关闭"]);
+            // Moving keys move, they don't act
+            keys(&mut app, "jjkgG");
+            assert!(app.sheet.is_some() && app.reader.is_none() && app.attach.is_none());
+            // A row's key does it on the list: the sheet closes, z opens the output of the highlighted session
+            press(&mut app, KeyCode::Char('z'));
+            assert!(app.sheet.is_none() && app.reader.is_some());
+            press(&mut app, KeyCode::Esc);
+            // / filters, ⏎ does the highlighted one
+            press(&mut app, KeyCode::Char('?'));
+            keys(&mut app, "/改动");
+            press(&mut app, KeyCode::Enter);
+            assert!(app.sheet.is_none() && app.reader.as_ref().is_some_and(|r| r.diff.is_some()));
+            press(&mut app, KeyCode::Esc);
+            // : does nothing any more; ? q Esc close it
+            press(&mut app, KeyCode::Char(':'));
+            assert!(app.sheet.is_none() && !app.modal_open());
+            for k in [KeyCode::Char('?'), KeyCode::Char('q'), KeyCode::Esc] {
+                press(&mut app, KeyCode::Char('?'));
+                press(&mut app, k);
+                assert!(app.sheet.is_none() && !app.quit && app.pending.is_none(), "{k:?}");
+            }
+        });
     }
 
     #[test]
-    fn c_copies_last_response_and_shift_b_a_reference_to_the_session() {
+    fn question_mark_in_a_reader_lists_its_keys_and_leaves_the_reader_open() {
+        i18n::with(Lang::Zh, || {
+            let mut app = fixture();
+            select(&mut app, "跑");
+            press(&mut app, KeyCode::Char('z'));
+            press(&mut app, KeyCode::Char('?'));
+            assert!(app.reader.is_some() && app.sheet.is_some());
+            let rows = reader_rows(&mut app, 100, 30);
+            shows(&rows, &["快捷键", "J K", "切换会话", "^D ^U", "半页", "Tab", "改动"]);
+            // Its bottom bar calls them the same
+            press(&mut app, KeyCode::Esc);
+            shows(&reader_rows(&mut app, 100, 30), &["J K 切换会话", "Tab 改动"]);
+            // A key from it: Tab goes to the diff
+            press(&mut app, KeyCode::Char('?'));
+            press(&mut app, KeyCode::Tab);
+            assert!(app.sheet.is_none() && app.reader.as_ref().is_some_and(|r| r.diff.is_some()));
+            press(&mut app, KeyCode::Char('?'));
+            shows(&reader_rows(&mut app, 100, 30), &["n p", "切换文件", "y", "lazygit"]);
+        });
+    }
+
+    #[test]
+    fn c_then_a_key_copies_the_last_reply_a_reference_or_one_thing_about_the_session() {
         let mut app = fixture();
         select(&mut app, "跑");
+        // c alone copies nothing yet: the bottom bar says what each next key copies
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.clip.is_none());
+        // (the first cap's room before its key comes after the two spaces after 「复制」 (copy))
+        shows(
+            &reader_rows(&mut app, 120, 20),
+            &[&format!("复制   {}", caps("c 最后回复 • b 引用 • i aca id • s 对话 id • p 路径 • a 全部"))],
+        );
+        // Narrower, the later ones drop first; c, b and Esc stay
+        for w in [64, 46] {
+            let foot = reader_rows(&mut app, w, 20).pop().unwrap();
+            let kept = foot.contains(&caps("c 最后回复 • b 引用")) && foot.contains(&caps("Esc 取消"));
+            assert!(kept && foot.width() <= w as usize, "{w}: {foot}");
+        }
+        // c c: the last reply
         press(&mut app, KeyCode::Char('c'));
         match app.clip.take() {
             Some(Clip::Last { profile, id, title, .. }) => {
@@ -637,8 +601,8 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // B on a registered Claude: the reference another agent acts on
-        press(&mut app, KeyCode::Char('B'));
+        // c b on a registered Claude: the reference another agent acts on
+        keys(&mut app, "cb");
         match app.clip.take() {
             Some(Clip::Ref { title, text }) => {
                 assert_eq!(title, "跑");
@@ -649,10 +613,9 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // C's all: the lines B used to copy, ending with the config dir Claude uses (this machine's default / account): only
-        // that it's there
-        press(&mut app, KeyCode::Char('C'));
-        press(&mut app, KeyCode::Char('a'));
+        // c a, all: the lines together, ending with the config dir Claude uses (this machine's default / account): only that
+        // it's there
+        keys(&mut app, "ca");
         match app.clip.take() {
             Some(Clip::Text(text)) => {
                 let v: Vec<&str> = text.lines().collect();
@@ -661,16 +624,24 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // C: pick something to copy; this row has no conversation id, so s only says there is none
-        press(&mut app, KeyCode::Char('C'));
-        assert!(app.modal_open());
-        press(&mut app, KeyCode::Char('s'));
-        assert!(app.modal_open() && app.clip.is_none());
-        press(&mut app, KeyCode::Char('p'));
-        assert_eq!((app.modal_open(), app.clip.take()), (false, Some(Clip::Text("/p/work".into()))));
-        press(&mut app, KeyCode::Char('z')); // Copying works in full-screen reading too
+        // This row has no conversation id, so c s only says there is none; c p the path
+        keys(&mut app, "cs");
+        assert_eq!((app.clip.take(), app.msg.as_ref().map(|m| m.0.as_str())), (None, Some("对话 id:暂无对话")));
+        keys(&mut app, "cp");
+        assert_eq!(app.clip.take(), Some(Clip::Text("/p/work".into())));
+        // Any other key after c does nothing (x doesn't open the diff); B and C do nothing at all
+        keys(&mut app, "cx");
+        assert!(app.clip.is_none() && app.reader.is_none());
+        keys(&mut app, "BC");
+        assert!(app.clip.is_none() && !app.modal_open() && app.pending.is_none());
+        // The same in full-screen reading, with the same bar
+        press(&mut app, KeyCode::Char('z'));
         press(&mut app, KeyCode::Char('c'));
-        assert!(matches!(app.clip.take(), Some(Clip::Last { .. })));
+        shows(&reader_rows(&mut app, 120, 20), &[&format!("复制   {}", caps("c 最后回复 • b 引用"))]);
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.clip.take(), Some(Clip::Last { .. })) && app.reader.is_some());
+        keys(&mut app, "cb");
+        assert!(matches!(app.clip.take(), Some(Clip::Ref { .. })));
     }
 
     #[test]
@@ -689,7 +660,7 @@ mod tests {
             out
         };
         select(&mut app, "跑");
-        assert!(foot(&mut app).contains("⏎ 插入 • Esc 取消"), "{}", foot(&mut app));
+        assert!(foot(&mut app).contains(&caps("⏎ 插入 • Esc 取消")), "{}", foot(&mut app));
         assert!(!foot(&mut app).contains("新建"), "{}", foot(&mut app));
         press(&mut app, KeyCode::Enter);
         assert_eq!(
@@ -716,7 +687,7 @@ mod tests {
 
     #[test]
     fn z_reads_without_attaching_and_scrolls_history() {
-        let mut app = fixture(); // 1 day: 问 跑 闲
+        let mut app = fixture(); // 问 未读 跑 闲 错
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('z'));
         assert!(app.reader_load && app.attach.is_none());
@@ -728,7 +699,7 @@ mod tests {
         hist.extend([bar.clone(), "❯ ".into(), bar]);
         app.set_reader_lines(hist);
         let rows = reader_rows(&mut app, 30, 10); // Title + 8 lines + bottom bar
-        assert!(rows[0].contains("跑") && rows[0].contains("2/3 · 最新"), "{rows:?}");
+        assert!(rows[0].contains("跑") && rows[0].contains("3/5 · 最新"), "{rows:?}");
         assert_eq!(rows[8], "line 100"); // Input box stripped, the last line is content
         press(&mut app, KeyCode::Char('k'));
         press(&mut app, KeyCode::Char('b')); // 1 + one page (10 - 3 = 7)
@@ -745,25 +716,34 @@ mod tests {
         assert_eq!(reader_rows(&mut app, 30, 10)[1], "line 1");
         press(&mut app, KeyCode::Char('G'));
         assert_eq!(reader_rows(&mut app, 30, 10)[8], "line 105");
+        // Half a page is ^U / ^D only; a bare u / d does nothing, and ^L doesn't act as l
+        keys(&mut app, "ud");
+        assert_eq!(reader_rows(&mut app, 30, 10)[8], "line 105");
+        ctrl(&mut app, 'u');
+        assert_eq!(reader_rows(&mut app, 30, 10)[8], "line 102");
+        ctrl(&mut app, 'd');
+        assert_eq!(reader_rows(&mut app, 30, 10)[8], "line 105");
+        ctrl(&mut app, 'l');
+        assert!(app.reader.is_some() && app.external.is_none());
     }
 
     #[test]
     fn reader_j_k_switch_sessions_and_enter_attaches() {
-        let mut app = fixture();
+        let mut app = fixture(); // 问 未读 跑 闲 错
         press(&mut app, KeyCode::Char('z'));
         press(&mut app, KeyCode::Char('J'));
-        assert_eq!(app.reader_target().as_deref(), Some("=跑:")); // Fake sessions have no pane id, so capture by session name
-        press(&mut app, KeyCode::Char('J'));
-        press(&mut app, KeyCode::Char('J')); // At the end: a message, still viewing 闲
-        assert_eq!(app.reader_target().as_deref(), Some("=闲:"));
+        assert_eq!(app.reader_target().as_deref(), Some("=未读:")); // Fake sessions have no pane id, so capture by session name
+        keys(&mut app, "JJJ");
+        press(&mut app, KeyCode::Char('J')); // At the end: a message, still viewing 错
+        assert_eq!(app.reader_target().as_deref(), Some("=错:"));
         assert!(app.msg.is_none());
         press(&mut app, KeyCode::Char('q')); // q only leaves reading, doesn't quit aca
         assert!(app.reader.is_none() && !app.quit);
-        assert_eq!(at(&app), "闲"); // Back on the list, highlight on the last one viewed
+        assert_eq!(at(&app), "错"); // Back on the list, highlight on the last one viewed
         press(&mut app, KeyCode::Char('z'));
         press(&mut app, KeyCode::Enter);
         assert!(app.reader.is_none());
-        assert_eq!(app.attach.as_deref(), Some("闲"));
+        assert_eq!(app.attach.as_deref(), Some("错"));
     }
 
     #[test]
@@ -826,7 +806,7 @@ mod tests {
         assert_eq!(app.diff_request(false).map(|r| r.2), Some(Mode::Branch));
         app.set_diff("跑", Mode::Uncommitted, diff::render(&head, &patch(&["old"]), &[]));
         app.msg = None; // Keep the bottom bar free of messages
-        shows(&reader_rows(&mut app, 46, 12), &["连同提交 · 读取中…", "m 仅未提交"]);
+        shows(&reader_rows(&mut app, 80, 12), &["连同提交 · 读取中…", "m 仅未提交"]);
         // Tab cycles: diff → record → output → diff, the mode carried over
         press(&mut app, KeyCode::Tab);
         assert!(app.trace.is_some() && app.reader.is_none());
@@ -844,13 +824,13 @@ mod tests {
     }
 
     #[test]
-    fn diff_e_opens_the_editor_where_the_top_line_is_and_l_opens_lazygit() {
+    fn diff_e_opens_the_editor_where_the_top_line_is_and_y_opens_lazygit() {
         let tmp = std::env::temp_dir().join(format!("aca-ui-edit-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("f1"), "x\n".repeat(20)).unwrap();
         let mut app = fixture();
         press(&mut app, KeyCode::Char('x'));
-        press(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Char('y'));
         assert_eq!(app.msg.as_ref().unwrap().0, "正在读取 git,请稍候");
         let patch = "diff --git a/f1 b/f1\n--- a/f1\n+++ b/f1\n@@ -5,3 +5,4 @@\n a\n-b\n+B\n+C\n c\ndiff --git a/gone b/gone\ndeleted file mode 100644\n--- a/gone\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n";
         let mut d = diff::render(&diff::Head { dir: "~/p".into(), ..Default::default() }, patch, &[]);
@@ -876,7 +856,7 @@ mod tests {
         press(&mut app, KeyCode::Char('e'));
         assert!(app.external.is_none());
         assert_eq!(app.msg.as_ref().unwrap().0, "该文件已被删除");
-        press(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Char('y'));
         assert_eq!(app.external.take(), Some(External::Lazygit(tmp.to_string_lossy().into_owned())));
         // The diff is reread after coming back
         let _ = app.diff_request(false);

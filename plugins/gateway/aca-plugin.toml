@@ -12,11 +12,15 @@ description_en = "MCP registry: each MCP server runs once and every agent uses i
 # To check it: aca plugin gateway status; to change settings: [plugins."aca.gateway"] settings = { servers = ["web"] } in plugins.toml
 
 [settings.servers]
+label = "MCP 服务"
+label_en = "MCP servers"
 default = []
 desc = "通过 gateway 提供给 agent 的 MCP:config.toml 中 [mcps.<名字>] 的名字(scope = \"session\" 的每个会话一份)"
 desc_en = "MCP servers handed to agents through the gateway: names of [mcps.<name>] in config.toml (those with scope = \"session\" get one per session)."
 
 [settings.idle_minutes]
+label = "空闲退出(分钟)"
+label_en = "Idle exit (min)"
 default = 10
 desc = "没有 agent 连接多久后 gateway 自动退出"
 desc_en = "How long the gateway waits with no agent connected before it exits."

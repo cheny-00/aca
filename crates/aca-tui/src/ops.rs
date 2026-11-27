@@ -1,16 +1,17 @@
 //! Actions on the selected session: `R` restart, `X` carry on under another account, `r` rename, `m` move to another group,
 //! `⇧↑` `⇧↓` move within the group (on a group, reorder groups), `f` / `F` fork, `H` hand off, `M` attach MCP, `d` delete
 //! (on a group, delete the group), `A` adopt, plus `^Z` undoing a delete / stop and bringing back from / deleting for good in
-//! the trash; all are functions in aca-core (`session::*`, the registry). `s` sends the note through tmux.
+//! the trash; all are functions in aca-core (`session::*`, the registry). `s` sends a reply into its input box.
 //! Stop and delete wait for the processes to exit cleanly (a few seconds at most), so the run loop runs them on a background
 //! thread and the interface doesn't stall.
 
-use aca_core::session;
+use aca_core::answer::Unanswered;
+use aca_core::session::{self, Unsent};
 use aca_core::store::Store;
 use aca_core::{t, tr};
 use aca_records::agent::Agent;
 
-use crate::create::{NewReq, Removed, fzf};
+use crate::create::{NewReq, Removed, fzf_with};
 use crate::handoff::Source;
 
 /// The session to act on
@@ -31,16 +32,23 @@ pub enum Job {
     /// unlock: unlock the title afterwards (`^Z` back to a title that wasn't locked; renaming always locks)
     Rename { t: Target, to: String, unlock: bool },
     /// from: its current group (for `^Z` to move it back); groups: the existing groups (differing only in case counts as the
-    /// same one); the target group is created if missing
-    Move { t: Target, from: String, to: String, groups: Vec<String> },
+    /// same one); the target group is created if missing. home: the directory a group created here works in, made if missing
+    /// (empty = none recorded; nothing to do with a group that's already there)
+    Move { t: Target, from: String, to: String, groups: Vec<String>, home: String },
     /// D: stop the agent (the pane stays with its last screen), the registration stays
     Stop { t: Target },
     /// D on a window / pane opened inside a session: stop only that pane (see park.rs)
     Park { t: Target, p: crate::park::Pane },
     /// ⏎ on such a stopped pane, ^Z undoing the above: start that pane again in place
     Respawn { t: Target, p: crate::park::Pane },
-    /// s: send it the note (pasted into the pane's input box, then Enter); key is the note's key, deleted once sent
+    /// s: send it a reply (pasted into the pane's input box, then Enter); key is its note's key, which holds the reply while it's
+    /// written, deleted once sent. A registered one is looked at again right before (`session::say`); pane is for the others:
+    /// unregistered sessions, and a window / split pane inside a session (its id is empty, so it never lands in the session's
+    /// own pane)
     Send { t: Target, pane: String, text: String, key: String },
+    /// s on a row waiting for you: answer it (an option's number, yes, no) — only while it still asks what the box showed
+    /// (`answer::answer_for_you`)
+    Answer { t: Target, reply: String, shown: aca_core::answer::Asking },
     /// f / F: fork a new session carrying the conversation. Empty title = the default "<title> (fork)", unlocked (Claude can
     /// still name it later); a given one is locked
     Fork { t: Target, title: Option<String> },
@@ -72,10 +80,64 @@ pub enum Job {
     /// Remote tasks: test the server (see hooks.rs). Not aimed at any session
     /// The L page: install / update / remove / enable or disable a plugin (see plugins.rs). Not aimed at any session
     Plugins(crate::plugins::Act),
+    /// The tasks page: make a ticket, rewrite it, hand it over, mark it done, delete it. Not aimed at any session
+    Task(TaskAct),
     /// Done together after selecting several with v: the same job on several sessions (delete, stop, restart, move group; ^Z
     /// undoing them starts them again / moves them back), or on several trash entries (restore, delete for good), see `many`.
     /// Not aimed at any session
     Many(Vec<Job>),
+}
+
+/// What the tasks page does to a task ticket, all of it in your name (see `aca_core::task`)
+#[derive(Clone, Debug, PartialEq)]
+pub enum TaskAct {
+    /// n: a new one in this group, with nobody on it yet
+    Add { group: String, title: String, criteria: String },
+    /// e: its title and what counts as done, rewritten
+    Set { n: i64, title: String, criteria: String },
+    /// m: hand it to this session (`to` its id, `name` its title); an empty `to` takes it back
+    Give { n: i64, to: String, name: String },
+    /// c: mark it done
+    Done { n: i64 },
+    /// d: delete it
+    Remove { n: i64 },
+}
+
+impl TaskAct {
+    fn doing(&self) -> String {
+        match self {
+            TaskAct::Add { title, .. } => tr!("正在新建任务「{}」…", "making task “{}”…", short(title)),
+            TaskAct::Set { n, .. } => tr!("正在修改任务 #{n}…", "changing task #{n}…"),
+            TaskAct::Give { n, to, .. } if to.is_empty() => tr!("正在取回任务 #{n}…", "taking task #{n} back…"),
+            TaskAct::Give { n, name, .. } => tr!("正在将任务 #{n} 交给「{}」…", "handing task #{n} to “{}”…", short(name)),
+            TaskAct::Done { n } => tr!("正在完成任务 #{n}…", "marking task #{n} done…"),
+            TaskAct::Remove { n } => tr!("正在删除任务 #{n}…", "deleting task #{n}…"),
+        }
+    }
+
+    fn run(&self, store: &Store, cfg: &aca_core::config::Config) -> Outcome {
+        use aca_core::task;
+        let r = match self {
+            TaskAct::Add { group, title, criteria } => {
+                let new = task::New { group: group.clone(), title: title.clone(), criteria: criteria.clone(), ..Default::default() };
+                task::add(store, cfg, None, new).map(|t| tr!("已新建任务 #{}", "made task #{}", t.n))
+            }
+            TaskAct::Set { n, title, criteria } => {
+                task::set(store, cfg, None, *n, task::Changes { title: Some(title), criteria: Some(criteria), ..Default::default() })
+                    .map(|t| tr!("已修改任务 #{}", "changed task #{}", t.n))
+            }
+            TaskAct::Give { n, to, name } => task::give(store, cfg, None, *n, to, "", None).map(|t| match to.is_empty() {
+                true => tr!("已取回任务 #{}", "took task #{} back", t.n),
+                false => tr!("已将任务 #{} 交给「{}」", "handed task #{} to “{}”", t.n, short(name)),
+            }),
+            TaskAct::Done { n } => task::done(store, cfg, None, Some(*n), "").map(|t| tr!("任务 #{} 已完成", "task #{} is done", t.n)),
+            TaskAct::Remove { n } => task::remove(store, cfg, None, *n).map(|t| tr!("已删除任务 #{}", "deleted task #{}", t.n)),
+        };
+        match r {
+            Ok(msg) => Outcome::Done(msg),
+            Err(e) => Outcome::Failed(e),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -113,6 +175,7 @@ impl Job {
             | Job::Park { t, .. }
             | Job::Respawn { t, .. }
             | Job::Send { t, .. }
+            | Job::Answer { t, .. }
             | Job::Fork { t, .. }
             | Job::Mcp { t, .. }
             | Job::Remove { t, .. }
@@ -121,7 +184,13 @@ impl Job {
             | Job::Rehome { t, .. }
             | Job::Adopt { t, .. }
             | Job::Revive { t, .. } => t,
-            Job::GroupOrder { .. } | Job::Restore { .. } | Job::Purge { .. } | Job::Group(_) | Job::Plugins(_) | Job::Many(_) => {
+            Job::GroupOrder { .. }
+            | Job::Restore { .. }
+            | Job::Purge { .. }
+            | Job::Group(_)
+            | Job::Plugins(_)
+            | Job::Task(_)
+            | Job::Many(_) => {
                 return None;
             }
         })
@@ -137,6 +206,7 @@ impl Job {
             Job::Park { p, .. } => tr!("正在停止「{}」…", "stopping “{}”…", short(&p.label)),
             Job::Respawn { p, .. } => tr!("正在重启「{}」…", "restarting “{}”…", short(&p.label)),
             Job::Send { t, .. } => tr!("正在发送给「{}」…", "sending to “{}”…", short(&t.title)),
+            Job::Answer { t, .. } => tr!("正在回答「{}」…", "answering “{}”…", short(&t.title)),
             Job::Fork { t, .. } => tr!("正在分叉「{}」…", "forking “{}”…", short(&t.title)),
             Job::Mcp { t, .. } => tr!("正在修改「{}」的 MCP…", "changing the MCPs of “{}”…", short(&t.title)),
             Job::Remove { t, pane: Some(_) } => tr!("正在关闭「{}」…", "closing “{}”…", short(&t.title)),
@@ -151,9 +221,11 @@ impl Job {
             Job::Purge { item } => tr!("正在永久删除{}…", "deleting {} for good…", item.name()),
             Job::Group(a) => a.doing(),
             Job::Plugins(a) => a.doing(),
+            Job::Task(a) => a.doing(),
             Job::Many(jobs) => {
                 let n = jobs.len();
                 match jobs.first() {
+                    Some(Job::Plugins(a)) => a.doing(),
                     Some(Job::Remove { .. }) => tr!("正在删除 {n} 个…", "deleting {n}…"),
                     Some(Job::Stop { .. }) => tr!("正在停止 {n} 个…", "stopping {n}…"),
                     Some(Job::Restart { .. }) => tr!("正在重启 {n} 个…", "restarting {n}…"),
@@ -193,6 +265,8 @@ pub fn many_msg(jobs: &[Job], outs: &[Outcome]) -> String {
         };
     }
     let mut msg = match jobs.first() {
+        Some(Job::Plugins(crate::plugins::Act::Enable(_, on))) if n == 0 => return crate::channels::switched(*on),
+        Some(Job::Plugins(_)) => tr!("已修改 {ok} 个插件", "changed {ok} plugins"),
         Some(Job::Stop { .. }) => tr!("已停止 {ok} 个", "stopped {ok}"),
         Some(Job::Restart { .. }) => tr!("已重启 {ok} 个", "restarted {ok}"),
         Some(Job::Revive { .. }) => tr!("已撤销停止:{ok} 个已重新启动", "undid the stop: {ok} started again"),
@@ -207,6 +281,26 @@ pub fn many_msg(jobs: &[Job], outs: &[Outcome]) -> String {
         msg += &tr!(" · {n} 个失败:{e}", " · {n} failed: {e}");
     }
     msg
+}
+
+/// What the bottom bar says once answered: allowed / denied for a permission prompt, otherwise the option picked (`2 JSON 文件`
+/// (2 JSON file))
+pub fn answered_msg(title: &str, reply: &str, said: &str) -> String {
+    match reply {
+        "yes" => tr!("已允许「{}」", "allowed “{}”", short(title)),
+        "no" => tr!("已拒绝「{}」", "denied “{}”", short(title)),
+        _ => tr!("已回答「{}」:{said}", "answered “{}”: {said}", short(title)),
+    }
+}
+
+/// The answer box (or the answer it sent) no longer matches what the session asks: nothing was pressed
+pub fn changed_msg() -> String {
+    t!("问题变了,没回答", "the question changed; nothing answered").into()
+}
+
+/// A reply not sent because it started asking you something: what to press to answer it
+pub fn asking_msg() -> String {
+    tr!("未发送:{} · s 回答", "not sent: {} · s answers it", t!("正在等待回应", "it's waiting for your choice"))
 }
 
 fn short(s: &str) -> String {
@@ -236,12 +330,18 @@ pub fn run(job: &Job) -> Outcome {
             Ok(_) => Outcome::Done(tr!("已改名为「{}」", "renamed to “{}”", short(to))),
             Err(e) => Outcome::Failed(tr!("改名失败:{e}", "rename failed: {e}")),
         },
-        Job::Move { t, to, groups, .. } => {
+        Job::Move { t, to, groups, home, .. } => {
             // Differing only in case counts as the same: move into the existing one
             let (path, made) = match groups.iter().find(|g| g.eq_ignore_ascii_case(to)) {
                 Some(g) => (g.clone(), false),
                 None => (to.clone(), true),
             };
+            if made
+                && !home.is_empty()
+                && let Err(e) = group_at_home(&store, &path, home)
+            {
+                return Outcome::Failed(tr!("移动分组失败:{e}", "moving group failed: {e}"));
+            }
             match session::move_to(&store, &t.id, &path) {
                 Ok(_) => Outcome::Done(tr!(
                     "已将「{}」移到{} {path}",
@@ -264,9 +364,27 @@ pub fn run(job: &Job) -> Outcome {
             Ok(()) => Outcome::Done(tr!("已重启「{}」", "restarted “{}”", short(&p.label))),
             Err(e) => Outcome::Failed(tr!("重启失败:{e}", "restart failed: {e}")),
         },
-        Job::Send { t, pane, text, .. } => match crate::data::send_into(pane, text) {
-            Ok(()) => Outcome::Done(tr!("已发给「{}」", "sent to “{}”", short(&t.title))),
-            Err(e) => Outcome::Failed(tr!("发送失败:{e}", "not sent: {e}")),
+        Job::Send { t, pane, text, .. } => {
+            let sent = match t.id.as_str() {
+                "" => crate::data::send_into(pane, text).map_err(String::from),
+                id => match session::say(&store, &cfg, id, text) {
+                    Ok(()) => Ok(()),
+                    Err(Unsent::Asking) => return Outcome::Failed(asking_msg()),
+                    Err(Unsent::Stopped) => {
+                        return Outcome::Failed(tr!("未发送:{}", "not sent: {}", t!("未运行 · ⏎ 启动", "not running · ⏎ starts it")));
+                    }
+                    Err(Unsent::Failed(e)) => Err(e),
+                },
+            };
+            match sent {
+                Ok(()) => Outcome::Done(tr!("已发给「{}」", "sent to “{}”", short(&t.title))),
+                Err(e) => Outcome::Failed(tr!("发送失败:{e}", "not sent: {e}")),
+            }
+        }
+        Job::Answer { t, reply, shown } => match aca_core::answer::answer_for_you(&store, &cfg, &t.id, reply, shown) {
+            Ok(said) => Outcome::Done(answered_msg(&t.title, reply, &said)),
+            Err(Unanswered::Changed) => Outcome::Failed(changed_msg()),
+            Err(Unanswered::Failed(e)) => Outcome::Failed(tr!("未回答:{e}", "not answered: {e}")),
         },
         Job::Fork { t, title } => match session::fork(&store, &cfg, &t.id, title.as_deref().unwrap_or("")) {
             Ok(s) => Outcome::Made { msg: tr!("已分叉「{}」", "forked “{}”", short(&s.title)), id: s.id },
@@ -331,6 +449,7 @@ pub fn run(job: &Job) -> Outcome {
         }
         Job::Group(a) => crate::groups::job(a),
         Job::Plugins(a) => crate::plugins::job(a),
+        Job::Task(a) => a.run(&store, &cfg),
         Job::Many(jobs) => many(jobs),
     }
 }
@@ -343,7 +462,8 @@ fn many(jobs: &[Job]) -> Outcome {
     if !jobs.is_empty() && jobs.iter().all(|j| matches!(j, Job::Remove { pane: None, .. })) {
         return remove_many(jobs);
     }
-    if jobs.iter().any(|j| matches!(j, Job::Move { .. } | Job::Restore { .. } | Job::Purge { .. })) {
+    // Plugin switches share the registry and plugins.toml, so write them in order.
+    if jobs.iter().any(|j| matches!(j, Job::Move { .. } | Job::Restore { .. } | Job::Purge { .. } | Job::Plugins(_))) {
         return Outcome::Many(jobs.iter().map(run).collect());
     }
     Outcome::Many(std::thread::scope(|sc| {
@@ -392,6 +512,18 @@ fn remove_many(jobs: &[Job]) -> Outcome {
 /// deleted for good elsewhere meanwhile are skipped and reported
 fn restore(store: &Store, item: &crate::trash::Item, start: &[String]) -> Outcome {
     let had: Vec<String> = store.groups().unwrap_or_default().into_iter().map(|g| g.path).collect();
+    // A note deleted on its own: back in its notebook. Its group deleted meanwhile is recreated, as for a session (a note in a
+    // group that isn't there shows nowhere, until a group of that name is made again)
+    if let Some(n) = &item.note {
+        let what = item.name();
+        if store.note_unbin(&n.id).is_err() {
+            return Outcome::Done(tr!("{what}已被永久删除,无法恢复", "{what} is gone for good; can't restore"));
+        }
+        if !n.group.is_empty() && !had.contains(&n.group) {
+            let _ = store.group_create(&n.group, "");
+        }
+        return Outcome::Done(tr!("已恢复{what}", "restored {what}"));
+    }
     for g in &item.groups {
         if had.contains(&g.path) {
             continue;
@@ -403,6 +535,14 @@ fn restore(store: &Store, item: &crate::trash::Item, start: &[String]) -> Outcom
         // If the directory became another group's default meanwhile: don't take it
         if !g.dir.is_empty() {
             let _ = store.group_set_dir(&g.path, &g.dir);
+        }
+    }
+    // The notes deleted along with it are back in their notebooks, beside any written there meanwhile. An entry from before
+    // notebooks carries the group's one note as text: it becomes a note (once: bringing back may be tried again)
+    let _ = store.notes_unbin_with(&item.id);
+    for g in item.groups.iter().filter(|g| !g.note.trim().is_empty()) {
+        if !store.notes_in(&g.path).is_ok_and(|v| v.iter().any(|n| n.text == g.note)) {
+            let _ = store.note_add(&g.path, &g.note, "");
         }
     }
     let (mut back, mut lost, mut cold) = (0, 0, vec![]);
@@ -503,6 +643,46 @@ pub fn clean_group(name: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
+/// A group `m` creates, working in `dir`: the directory is made if it's missing, then the group with it as its default.
+/// A directory that can't be made, or that another group has, leaves no group behind
+fn group_at_home(store: &Store, group: &str, dir: &str) -> Result<(), String> {
+    let abs = aca_core::paths::expand(dir);
+    std::fs::create_dir_all(&abs)
+        .map_err(|e| tr!("无法创建目录 {}:{e}", "can't make directory {}: {e}", aca_records::words::tilde(&abs)))?;
+    store.group_create_in(group, &aca_core::paths::real(&abs))
+}
+
+/// What a name typed into `m`'s list means
+#[derive(Clone, Debug, PartialEq)]
+pub enum Typed {
+    /// A group that's already there, as it's written in the registry
+    Existing(String),
+    /// A group to create, and the directory it would work in (empty = none recorded)
+    New { group: String, dir: String },
+}
+
+/// A name typed into `m`'s list (or the row picked there) → the group it means. The name of a group that's there, in any
+/// case, is that group. Otherwise it's a new one: a bare name goes under the group being moved out of (`under`; empty when
+/// the ones moved aren't in one group), a name with a `/` in it is the whole path from the top, so `/x` is `x` at the top.
+/// A new group works in `<its parent's directory>/<its own name>`; no parent, or a parent with no directory = none.
+/// `groups`: every group with where it works. Nothing left of the name once tidied = None
+pub fn typed_group(typed: &str, under: &str, groups: &[(String, String)]) -> Option<Typed> {
+    let name = clean_group(typed)?;
+    let there = |path: &str| groups.iter().find(|(g, _)| g.eq_ignore_ascii_case(path)).map(|(g, _)| Typed::Existing(g.clone()));
+    if let Some(t) = there(&name) {
+        return Some(t);
+    }
+    let path = if typed.contains('/') || under.is_empty() { name } else { format!("{under}/{name}") };
+    if let Some(t) = there(&path) {
+        return Some(t);
+    }
+    let dir = path.rsplit_once('/').and_then(|(up, last)| {
+        let (_, d) = groups.iter().find(|(g, d)| g == up && !d.is_empty())?;
+        Some(format!("{}/{last}", d.trim_end_matches('/')))
+    });
+    Some(Typed::New { group: path, dir: dir.unwrap_or_default() })
+}
+
 /// A group in the `m` list
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupRow {
@@ -516,19 +696,25 @@ pub struct GroupRow {
 /// `m`: pick the group to move into with fzf. Moving changes only the group, the session keeps running in its directory, so
 /// each row carries that group's directory and a mismatch shows at a glance.
 /// Searches group names only (a typed new name won't get matched by another group's directory); when the typed name matches
-/// nothing, Enter = create a group with that name.
-/// what: what is being moved (see `named`); here: its directory (empty when the several being moved aren't in one directory)
-pub fn pick_group(rows: &[GroupRow], what: &str, here: &str) -> Result<Option<String>, String> {
-    let header = if here.is_empty() {
-        tr!("--header=移动{what}", "--header=move {what}")
+/// nothing, Enter = create the group it means (`typed_group`). What that would be, and the directory it would work in, is
+/// written above the header as the name is typed; Tab then asks for the directory before anything is created.
+/// what: what is being moved (see `named`); here: its directory (empty when the several being moved aren't in one directory);
+/// under, groups: as for `typed_group`.
+/// Returns the row picked or the name typed, and whether it was Tab that ended it
+pub fn pick_group(
+    rows: &[GroupRow],
+    what: &str,
+    here: &str,
+    under: &str,
+    groups: &[(String, String)],
+) -> Result<Option<(String, bool)>, String> {
+    let head = if here.is_empty() {
+        tr!("移动{what}", "move {what}")
     } else {
-        tr!(
-            "--header=移动{what} · 只换分组,目录不变:{}",
-            "--header=move {what} · only the group changes, it stays in {}",
-            aca_records::words::tilde(here)
-        )
+        tr!("移动{what} · 只换分组,目录不变:{}", "move {what} · only the group changes, it stays in {}", aca_records::words::tilde(here))
     };
-    let args = [
+    let header = format!("--header={head}");
+    let mut args = vec![
         "--ansi",
         "--delimiter=\t",
         "--with-nth=2..",
@@ -538,7 +724,60 @@ pub fn pick_group(rows: &[GroupRow], what: &str, here: &str) -> Result<Option<St
         &header,
         "--bind=enter:accept-or-print-query",
     ];
-    fzf(&group_lines(rows), &args)
+    // The two bindings ask this program (see `typed_says`): only it knows what a typed name would make. If it can't say where it
+    // is, the list works without them: nothing shown ahead, Tab steps through the candidates
+    let mut env = vec![];
+    if let Some(me) = std::env::current_exe().ok().and_then(|p| p.to_str().map(String::from)) {
+        args.extend([
+            r#"--bind=result:transform-header:"$ACA_SELF" ui --typed-group"#,
+            r#"--bind=tab:transform:"$ACA_SELF" ui --typed-group tab"#,
+        ]);
+        let all: Vec<String> = groups.iter().map(|(g, d)| format!("{g}\x1f{d}")).collect();
+        env = vec![("ACA_SELF", me), ("ACA_MOVE_HEAD", head), ("ACA_MOVE_UNDER", under.to_string()), ("ACA_MOVE_GROUPS", all.join("\x1e"))];
+    }
+    let got = fzf_with(&group_lines(rows), &args, &env)?;
+    Ok(got.map(|out| match out.split_once('\n') {
+        Some((TAB, name)) => (name.to_string(), true),
+        _ => (out, false),
+    }))
+}
+
+/// First line of what `m`'s fzf prints when Tab ended it; the typed name follows on the next line
+const TAB: &str = "tab";
+
+/// `aca ui --typed-group [tab]`: run by `m`'s fzf (see `pick_group`) each time its results change and when Tab is pressed, with
+/// its query and match count in the environment
+pub fn typed_says(tab: bool) -> String {
+    let var = |k: &str| std::env::var(k).unwrap_or_default();
+    let groups: Vec<(String, String)> =
+        var("ACA_MOVE_GROUPS").split('\x1e').filter_map(|l| l.split_once('\x1f')).map(|(g, d)| (g.to_string(), d.to_string())).collect();
+    let typed = if var("FZF_MATCH_COUNT") == "0" { typed_group(&var("FZF_QUERY"), &var("ACA_MOVE_UNDER"), &groups) } else { None };
+    // The header starts two columns in
+    let room = var("FZF_COLUMNS").parse::<usize>().map_or(usize::MAX, |c| c.saturating_sub(2));
+    typed_answer(tab, typed.as_ref(), &var("ACA_MOVE_HEAD"), room)
+}
+
+/// What fzf is told. Tab: the action to take — on a name that would make a new group, end with that name for its directory to
+/// be asked; otherwise step through the candidates as it always did. Not Tab: the header — on such a name, a line above the
+/// usual one saying which group it makes and where it would work; when that doesn't fit in `room` columns, the directory
+/// goes on a line of its own
+fn typed_answer(tab: bool, typed: Option<&Typed>, head: &str, room: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let Some(Typed::New { group, dir }) = typed else {
+        return if tab { "up".into() } else { head.into() };
+    };
+    if tab {
+        return format!("become:printf '{TAB}\\n%s' {{q}}");
+    }
+    let (b, d, off) = ("\x1b[1m", "\x1b[2m", "\x1b[0m");
+    let (what, key) = (t!("新分组", "new group"), t!("Tab 改目录", "Tab directory"));
+    let dir = aca_records::words::tilde(dir);
+    let width = format!("+ {group}  {what}  {dir}   {key}").width();
+    match (dir.is_empty(), width <= room) {
+        (true, _) => format!("+ {b}{group}{off}  {what}   {key}\n{head}"),
+        (false, true) => format!("+ {b}{group}{off}  {what}  {d}{dir}{off}   {key}\n{head}"),
+        (false, false) => format!("+ {b}{group}{off}  {what}   {key}\n  {d}{dir}{off}\n{head}"),
+    }
 }
 
 /// Three fields per line, Tab-separated: the group name (printed when selected), the displayed name (padded to one width so
@@ -566,6 +805,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_group_brought_back_has_its_notes_again_beside_any_written_meanwhile() {
+        use crate::trash::{GroupRec, Item};
+        let store = Store::memory();
+        store.group_create("fun/x", "").unwrap();
+        store.note_add("fun", "整体的想法", "").unwrap();
+        let rec = |path: &str, note: &str| GroupRec { path: path.into(), order: 1, dir: String::new(), space: None, note: note.into() };
+        // The entry of an older version carries the one note a group had as text (here: fun/x's)
+        let item =
+            Item { id: "x1".into(), group: "fun".into(), groups: vec![rec("fun", ""), rec("fun/x", "旧版的便签")], ..Item::default() };
+        store.notes_bin_group("fun", &item.id).unwrap();
+        store.group_drop("fun").unwrap();
+        // A fun made meanwhile got a note of its own
+        store.group_create("fun", "").unwrap();
+        store.note_add("fun", "新的", "").unwrap();
+        let texts = |g: &str| {
+            let mut v: Vec<String> = store.notes_in(g).unwrap().into_iter().map(|n| n.text).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(texts("fun"), ["新的"]);
+        assert!(matches!(restore(&store, &item, &[]), Outcome::Done(_)));
+        assert_eq!(texts("fun"), ["整体的想法", "新的"]);
+        assert_eq!(texts("fun/x"), ["旧版的便签"]);
+        // Brought back once more (the first try stopped halfway): not a second copy
+        restore(&store, &item, &[]);
+        assert_eq!((texts("fun").len(), texts("fun/x").len()), (2, 1));
+        // An entry deleted for good takes the notes deleted along with it, and no others
+        store.notes_bin_group("fun/x", "x2").unwrap();
+        crate::trash::drop_now(&store, &Item { id: "x2".into(), ..item.clone() });
+        assert_eq!(store.notes().unwrap().len(), 2);
+        assert_eq!(store.notes_unbin_with("x2").unwrap(), 0);
+    }
+
+    /// A note deleted on its own is an entry of the trash page too
+    #[test]
+    fn a_note_deleted_on_its_own_comes_back_and_its_group_too_if_that_went_meanwhile() {
+        use crate::trash::Item;
+        let store = Store::memory();
+        store.group_create("fun", "").unwrap();
+        let a = store.note_add("fun", "发版窗口\n周二", "").unwrap();
+        let b = store.note_add("fun", "另一条", "").unwrap();
+        store.note_bin(&a.id).unwrap();
+        // `aca group rm` deletes the group's notes each on its own
+        store.group_remove("fun").unwrap();
+        let gone = store.notes_gone().unwrap();
+        assert_eq!(gone.len(), 2);
+        let item = |id: &str| Item::note(gone.iter().find(|n| n.id == id).unwrap());
+        assert_eq!(item(&a.id).name(), "笔记「发版窗口」");
+        assert_eq!(restore(&store, &item(&a.id), &[]), Outcome::Done("已恢复笔记「发版窗口」".into()));
+        assert!(store.groups().unwrap().iter().any(|g| g.path == "fun"));
+        assert_eq!(store.notes_in("fun").unwrap().into_iter().map(|n| n.id).collect::<Vec<_>>(), std::slice::from_ref(&a.id));
+        // Deleted for good: only while it's still deleted
+        crate::trash::drop_now(&store, &item(&a.id));
+        assert_eq!(store.notes_in("fun").unwrap().len(), 1);
+        crate::trash::drop_now(&store, &item(&b.id));
+        assert!(store.notes_gone().unwrap().is_empty());
+        assert_eq!(restore(&store, &item(&b.id), &[]), Outcome::Done("笔记「另一条」已被永久删除,无法恢复".into()));
+    }
+
+    #[test]
     fn a_batch_says_how_many_worked_and_why_the_first_failed_one_did_not() {
         let t = |s: &str| Target { name: s.into(), title: s.into(), profile: "default".into(), id: format!("id-{s}") };
         let stops = [Job::Stop { t: t("a") }, Job::Stop { t: t("b") }, Job::Stop { t: t("c") }];
@@ -575,7 +874,7 @@ mod tests {
         assert_eq!(many_msg(&stops, &[ok(), bad("停止失败:x"), bad("停止失败:y")]), "已停止 1 个 · 2 个失败:停止失败:x");
         assert_eq!(many_msg(&stops, &[bad("停止失败:x"), bad("停止失败:y"), bad("z")]), "3 个均失败:停止失败:x");
         assert_eq!(many_msg(&stops[..1], &[bad("停止失败:x")]), "停止失败:x");
-        let mv = |s: &str, to: &str| Job::Move { t: t(s), from: "f".into(), to: to.into(), groups: vec![] };
+        let mv = |s: &str, to: &str| Job::Move { t: t(s), from: "f".into(), to: to.into(), groups: vec![], home: String::new() };
         assert_eq!(many_msg(&[mv("a", "g"), mv("b", "g")], &[ok(), ok()]), "已将 2 个移到 g");
         assert_eq!(many_msg(&[mv("a", "g"), mv("b", "h")], &[ok(), ok()]), "已移动 2 个");
         assert_eq!(Job::Many(stops.to_vec()).doing(), "正在停止 3 个…");
@@ -589,6 +888,79 @@ mod tests {
         assert_eq!(clean_group("/a//b/"), Some("a/b".into()));
         assert_eq!(clean_group("工作  台"), Some("工作-台".into()));
         assert_eq!(clean_group(" / "), None);
+    }
+
+    #[test]
+    fn a_typed_name_is_a_group_thats_there_or_a_new_one_under_the_one_moved_out_of() {
+        let groups: Vec<(String, String)> = [("fun", "/w/fun"), ("fun/manga", ""), ("Zeta", ""), ("home", "/h/")]
+            .iter()
+            .map(|(g, d)| (g.to_string(), d.to_string()))
+            .collect();
+        let new = |group: &str, dir: &str| Some(Typed::New { group: group.into(), dir: dir.into() });
+        let there = |g: &str| Some(Typed::Existing(g.into()));
+        let typed = |name: &str, under: &str| typed_group(name, under, &groups);
+        // Bare: under the group moved out of, in a directory of that name under its directory
+        assert_eq!(typed("rss", "home"), new("home/rss", "/h/rss"));
+        assert_eq!(typed(" new  thing ", "fun"), new("fun/new-thing", "/w/fun/new-thing"));
+        // Its parent has no directory, or there's nothing to go under: no directory
+        assert_eq!(typed("x", "Zeta"), new("Zeta/x", ""));
+        assert_eq!(typed("x", "fun/manga"), new("fun/manga/x", ""));
+        assert_eq!(typed("x", ""), new("x", ""));
+        // A / in it: the whole path from the top, wherever it's typed from
+        assert_eq!(typed("fun/x", "home"), new("fun/x", "/w/fun/x"));
+        assert_eq!(typed("/x", "home"), new("x", ""));
+        assert_eq!(typed("a/b", "home"), new("a/b", ""));
+        // A group that's there, written in any case, top level or under this one: that group, as the registry writes it
+        assert_eq!(typed("zeta", "fun"), there("Zeta"));
+        assert_eq!(typed("Manga", "fun"), there("fun/manga"));
+        assert_eq!(typed("FUN/manga", ""), there("fun/manga"));
+        assert_eq!(typed(" / ", "fun"), None);
+    }
+
+    #[test]
+    fn ms_list_is_told_what_a_new_name_makes_and_tab_asks_its_directory_only_then() {
+        let head = "移动「x」";
+        let new = Typed::New { group: "home/rss".into(), dir: "/h/rss".into() };
+        // The header: the new group's line above the usual one ("+ home/rss  新分组  /h/rss   Tab 改目录" is 39 columns)
+        assert_eq!(
+            typed_answer(false, Some(&new), head, 39),
+            "+ \x1b[1mhome/rss\x1b[0m  新分组  \x1b[2m/h/rss\x1b[0m   Tab 改目录\n移动「x」"
+        );
+        // Too narrow for that: the directory on its own line
+        assert_eq!(
+            typed_answer(false, Some(&new), head, 38),
+            "+ \x1b[1mhome/rss\x1b[0m  新分组   Tab 改目录\n  \x1b[2m/h/rss\x1b[0m\n移动「x」"
+        );
+        let bare = Typed::New { group: "rss".into(), dir: String::new() };
+        assert_eq!(typed_answer(false, Some(&bare), head, 10), "+ \x1b[1mrss\x1b[0m  新分组   Tab 改目录\n移动「x」");
+        // Tab: fzf ends with the mark and the name as typed
+        assert_eq!(typed_answer(true, Some(&new), head, 80), "become:printf 'tab\\n%s' {q}");
+        // Something matches, nothing typed, or the name is a group that's there: the usual header, and Tab steps as before
+        for typed in [None, Some(Typed::Existing("fun".into()))] {
+            assert_eq!(typed_answer(false, typed.as_ref(), head, 80), head);
+            assert_eq!(typed_answer(true, typed.as_ref(), head, 80), "up");
+        }
+    }
+
+    #[test]
+    fn a_group_m_creates_gets_its_directory_made_and_none_is_left_when_it_cant_be() {
+        let store = Store::memory();
+        let root = std::env::temp_dir().join(format!("aca-ops-home-{}-{}", std::process::id(), aca_core::paths::short_id()));
+        let dir = root.join("home/rss");
+        let at = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        group_at_home(&store, "home/rss", &at(&dir)).unwrap();
+        assert!(dir.is_dir());
+        let default = |g: &str| store.groups().unwrap().into_iter().find(|x| x.path == g).map(|x| x.default_path);
+        assert_eq!(default("home/rss"), Some(aca_core::paths::real(&at(&dir))));
+        assert_eq!(default("home"), Some(String::new()));
+        // The directory is another group's: no group
+        assert!(group_at_home(&store, "feeds", &at(&dir)).unwrap_err().contains("home/rss"));
+        assert_eq!(default("feeds"), None);
+        // It can't be made (a file is in the way): no group either
+        std::fs::write(root.join("file"), "").unwrap();
+        assert!(group_at_home(&store, "blocked", &at(&root.join("file/sub"))).unwrap_err().starts_with("无法创建目录"));
+        assert_eq!(default("blocked"), None);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

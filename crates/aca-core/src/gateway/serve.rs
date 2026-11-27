@@ -19,7 +19,6 @@ use serde_json::{Value, json};
 use super::down::{Down, State};
 use super::{Spec, catalog, dir, pid_path, settings, sock_path};
 use crate::paths::{self, Res};
-use crate::plugin::{decl, mount};
 use crate::tr;
 
 const KNOWN: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
@@ -253,19 +252,7 @@ impl Gw {
     fn list(self: &Arc<Self>, client: &Arc<Client>) -> Vec<Value> {
         self.refresh();
         *self.last.lock().unwrap() = Instant::now();
-        let (tool, kind, account) = facts(&client.session);
-        let wants = decl::wants().unwrap_or_default();
-        let reaches = |id: &str| client.session.is_empty() || wants.get(id).is_none_or(|w| w.reaches(&tool, &kind, &account));
-        // Ones switched off for this session on the M page aren't offered
-        let off = super::off_for(&client.session);
-        let specs: Vec<Spec> = self
-            .specs
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|s| s.plugin.as_deref().is_none_or(reaches) && !off.contains(&s.name))
-            .cloned()
-            .collect();
+        let specs: Vec<Spec> = super::seen_by(&client.session).into_iter().filter_map(|(s, off)| (!off).then_some(s)).collect();
         let downs: Vec<Arc<Down>> = specs.iter().map(|s| self.down(s, &client.session)).collect();
         std::thread::scope(|sc| {
             for d in &downs {
@@ -274,22 +261,13 @@ impl Gw {
                 });
             }
         });
-        let reg = crate::plugin::registry();
         let mut names = HashMap::new();
         let mut out = vec![];
         for d in downs.iter().filter(|d| d.state() == State::Ready) {
-            for t in d.tools() {
+            let tools = if d.spec.tools { crate::plugin::tools::schemas_for(&client.session) } else { d.tools() };
+            for t in tools {
                 let orig = t["name"].as_str().unwrap_or("").to_string();
-                let shown = if d.spec.tools {
-                    // The plugin-commands server's tool names are <plugin>__<command>: not offered if the plugin can't reach this session
-                    let owner = reg.iter().find(|e| orig.starts_with(&format!("{}__", mount::safe(&e.id))));
-                    if owner.is_some_and(|e| !reaches(&e.id)) {
-                        continue;
-                    }
-                    orig.clone()
-                } else {
-                    format!("{}__{orig}", d.spec.name)
-                };
+                let shown = if d.spec.tools { orig.clone() } else { format!("{}__{orig}", d.spec.name) };
                 let mut t = t.clone();
                 t["name"] = json!(shown);
                 names.insert(shown, (d.clone(), orig));
@@ -303,7 +281,13 @@ impl Gw {
     fn call(self: &Arc<Self>, client: &Arc<Client>, id: Value, params: &Value) {
         *self.last.lock().unwrap() = Instant::now();
         let name = params["name"].as_str().unwrap_or("").to_string();
-        let mut found = client.names.lock().unwrap().get(&name).cloned();
+        let mut found = client
+            .names
+            .lock()
+            .unwrap()
+            .get(&name)
+            .cloned()
+            .filter(|(down, _)| down.spec.tools || super::seen_by(&client.session).iter().any(|(s, off)| !off && *s == down.spec));
         if found.is_none() {
             // Not listed yet (or the list changed): list again, then look again
             self.list(client);

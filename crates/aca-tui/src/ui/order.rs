@@ -1,118 +1,77 @@
-//! Arranging the list: switching groups, the group menu and the only-these menu, pins, and moving rows and groups, written in
+//! Arranging the list: switching groups, the only-these menu, pins, and moving rows and groups, written in
 //! the background one at a time.
 
 use super::*;
 
 impl App {
-    /// Cycle: all groups → each group (in section order) → all groups
-    pub(super) fn cycle_group(&mut self, d: isize) {
-        let gs = self.groups();
-        let cur = self.group.as_ref().and_then(|g| gs.iter().position(|n| n == g)).map_or(0, |p| p as isize + 1);
-        let next = (cur + d).rem_euclid(gs.len() as isize + 1);
-        self.set_group(if next == 0 { None } else { Some(gs[next as usize - 1].clone()) });
-    }
-
-    /// ⇧Tab: switch back to the group just looked at (same as Tab ⏎); again switches back
-    pub(super) fn back_group(&mut self) {
-        match self.prev_group.clone() {
-            Some(Some(g)) if !self.groups().contains(&g) => {
-                self.flash(&tr!("「{}」中已没有会话", "no sessions left in {}", group_label(&g)))
-            }
-            Some(g) => self.set_group(g),
-            None => self.flash(t!("还没有切换过分组", "no group switched yet")),
-        }
-    }
-
-    /// Switch to showing only this group (None = all groups), remembering the one shown before
+    /// Switch to showing only this group (None = all groups). The highlight goes to the row it was on when that place was
+    /// left, the first row if it never was there (or that session is gone). With no rail on screen to show where the list is
+    /// now, the bottom bar says it
     pub(super) fn set_group(&mut self, to: Option<String>) {
         if to != self.group {
-            self.prev_group = Some(std::mem::replace(&mut self.group, to));
+            // All groups is left (or come back to): where `a` would have gone back to is forgotten; `hop` sets it after this
+            self.hop_back = None;
+            if let Some(n) = self.selected.clone() {
+                self.left_at.insert(self.group.clone(), n);
+            }
+            self.group = to;
+            // A group with tickets still to finish opens on its tasks, the cursor on the first of them. One with none
+            // opens on the page it was left on — unless that was its tasks: nothing there is waiting
+            if let Some(g) = self.group.clone() {
+                match self.tickets.open(&g) > 0 {
+                    true => self.show_page(&g, Page::Tasks),
+                    false if self.pages.get(&g) == Some(&Page::Tasks) => self.show_page(&g, Page::Sessions),
+                    false => {}
+                }
+                self.task_at = None;
+            }
+            self.selected = self.left_at.get(&self.group).cloned();
+            self.list.select(Some(0));
+            *self.disp.offset_mut() = 0;
         }
-        let m = match &self.group {
-            Some(g) => tr!("分组:{}", "group: {}", group_label(g)),
-            None => t!("全部分组", "all groups").into(),
-        };
-        self.flash(&m);
+        if !self.rail_on_screen() {
+            let m = match &self.group {
+                Some(g) => tr!("分组:{}", "group: {}", self.shown(g)),
+                None => t!("全部分组", "all groups").into(),
+            };
+            self.flash(&m);
+        }
         self.rebuild();
     }
 
-    /// Rows of the group list: (letter, group); row 0 is all groups (Space)
-    pub(super) fn group_rows(&self) -> Vec<(char, Option<String>)> {
-        let gs = self.groups();
-        let keys = group_keys(&gs);
-        std::iter::once((' ', None)).chain(keys.into_iter().zip(gs.into_iter().map(Some))).collect()
-    }
-
-    /// Tab: this workspace's group list, the highlight on the group last looked at (on the current one if never switched)
-    /// `F`: the small only-one-state list. The highlight is on the state picked now ("All" if none)
+    /// `F`: the small only-one-state list. The highlight is on the state picked now (on all, the top row, if none)
     pub(super) fn open_only_menu(&mut self) {
         self.digits.clear();
-        self.only_menu = Some(self.status.and_then(|p| PICKS.iter().position(|&x| x == p)).map_or(0, |i| i + 1));
+        self.only_menu = Some(self.status.and_then(|p| PICKS.iter().position(|&x| x == p)).unwrap_or(0));
     }
 
     /// In the only-state list: ↑↓ j k pick, ⏎ shows only it (on the one already picked = cancel), the key at the start of a row picks
-    /// directly, Space = all; Esc / F / q close
+    /// directly (the same one again = cancel); Esc / F / q close
     pub(super) fn on_only_menu_key(&mut self, k: KeyEvent) {
         let Some(sel) = self.only_menu else { return };
-        let n = PICKS.len() + 1;
-        let choose = |me: &mut Self, p: Option<Pick>| {
+        let n = PICKS.len();
+        let choose = |me: &mut Self, p: Pick| {
             me.only_menu = None;
-            match (p, me.status) {
-                (Some(p), _) => me.toggle_status(p),
-                (None, Some(cur)) => me.toggle_status(cur),
-                (None, None) => {}
-            }
+            me.toggle_status(p);
         };
         match k.code {
+            KeyCode::Char('?') if !k.modifiers.contains(KeyModifiers::CONTROL) => self.open_sheet(&super::screen::only_keys()),
             KeyCode::Down | KeyCode::Char('j') => self.only_menu = Some((sel + 1) % n),
             KeyCode::Up | KeyCode::Char('k') => self.only_menu = Some((sel + n - 1) % n),
-            KeyCode::Enter => choose(self, if sel == 0 { None } else { Some(PICKS[sel - 1]) }),
-            KeyCode::Char(' ') => choose(self, None),
+            KeyCode::Enter => choose(self, PICKS[sel]),
             KeyCode::Esc | KeyCode::Char('F' | 'q') => self.only_menu = None,
             KeyCode::Char(c) => {
                 if let Some(&p) = PICKS.iter().find(|p| p.label().0 == c) {
-                    choose(self, Some(p));
+                    choose(self, p);
                 }
             }
             _ => {}
         }
     }
 
-    /// How many in this workspace are in this state (not counting subagents or
-    /// placeholder empty rows; same as the count at the right of the top bar)
-    pub(super) fn pick_count(&self, p: Option<Pick>) -> usize {
-        self.all.iter().filter(|s| s.subagent.is_none() && !s.blank && s.space == self.space && p.is_none_or(|p| p.hit(s))).count()
-    }
-
-    pub(super) fn open_group_menu(&mut self) {
-        let rows = self.group_rows();
-        let at = |g: &Option<String>| rows.iter().position(|(_, x)| x == g);
-        self.group_menu = Some(self.prev_group.as_ref().and_then(at).or_else(|| at(&self.group)).unwrap_or(0));
-    }
-
-    /// In the group list: ↑↓ pick, ⏎ switches there, typing a letter switches too, Space = all groups; Esc / Tab / q close
-    pub(super) fn on_group_menu_key(&mut self, k: KeyEvent) {
-        let Some(sel) = self.group_menu else { return };
-        let rows = self.group_rows();
-        let n = rows.len();
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let pick = |me: &mut Self, g: Option<String>| {
-            me.group_menu = None;
-            me.set_group(g);
-        };
-        match k.code {
-            KeyCode::Down => self.group_menu = Some((sel + 1) % n),
-            KeyCode::Up => self.group_menu = Some((sel + n - 1) % n),
-            KeyCode::Enter => pick(self, rows[sel.min(n - 1)].1.clone()),
-            KeyCode::Char(' ') => pick(self, None),
-            KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q') => self.group_menu = None,
-            KeyCode::Char(c) if !ctrl => {
-                if let Some((_, g)) = rows.iter().skip(1).find(|(x, _)| *x == c) {
-                    pick(self, g.clone());
-                }
-            }
-            _ => {}
-        }
+    /// How many in this workspace are in this state (counted like the scopes' numbers in the top bar)
+    pub(super) fn pick_count(&self, p: Pick) -> usize {
+        self.all.iter().filter(|s| counted(s) && s.space == self.space && p.hit(s)).count()
     }
 
     /// Pinned ones go on top in pin order, the rest sort as usual. Everything is
@@ -130,11 +89,34 @@ impl App {
         for (s, c) in self.all.iter_mut().zip(space) {
             s.pinned = rank(&self.pins, s).is_some();
             s.noted = self.notes.get(&notes::key(s)).is_some();
-            s.group_noted = self.notes.get(&group_key(&s.group)).is_some();
+            s.group_noted = self.book.top(&s.group).is_some();
             s.space = c;
         }
-        let pins = &self.pins;
-        self.all.sort_by_key(|s| rank(pins, s).unwrap_or(usize::MAX));
+        // The scratch group's sessions (and those of the groups under it) come before the pinned ones, as its row does on the
+        // rail; an empty one's heading sinks to the bottom with the other empty groups'
+        let dir = (self.scratch_dir)();
+        self.scratch = if dir.is_empty() { None } else { groups::scratch_in(&(self.group_hints)().groups, &dir) };
+        // Its router is the desk; it and the groups under it are named by its mark
+        for s in &mut self.all {
+            s.desk = s.router && self.scratch.as_deref() == Some(s.group.as_str());
+            s.scratch = scratch_len(&s.group, self.scratch.as_deref());
+            // The ticket it's doing, else the one it finished last
+            s.ticket = match (self.tickets.doing(&s.deck_id), self.tickets.finished(&s.deck_id)) {
+                (Some(t), _) => format!("#{}", t.n),
+                (None, Some(t)) => format!("✓ #{}", t.n),
+                (None, None) => String::new(),
+            };
+        }
+        let (pins, scratch) = (&self.pins, self.scratch.as_deref());
+        // The desk (with its windows and what it started itself) leads the scratch group's rows: the group's other sessions
+        // are drawn under it (see `tree_marks`)
+        let desk = self.all.iter().find(|s| s.desk && s.sub.is_none()).map(|s| s.name.clone());
+        let of_desk = |s: &Session| desk.as_deref().is_some_and(|d| s.family() == d || s.ancestors(&hangs).any(|p| p == d));
+        self.all.sort_by_key(|s| match rank(pins, s) {
+            Some(r) => (1, r),
+            None if !s.blank && scratch.is_some_and(|g| groups::within(&s.group, g)) => (0, usize::from(!of_desk(s))),
+            None => (2, 0),
+        });
     }
 
     /// ⇧↑ ⇧↓ moves not yet written to the registry are applied to the list first: the whole family (windows, all levels of child
@@ -201,19 +183,22 @@ impl App {
                 Some(t!("普通 tmux 会话 · A 接管后才能移动", "an ordinary tmux session · A adopts it, then it can move").into())
             }
             _ if self.pins.rank(&s.name).is_some() => Some(t!("置顶会话不按分组排序", "pinned ones aren't ordered by group").into()),
+            // It leads its group's rows wherever the registry has it (see `apply_pins`)
+            _ if s.desk => Some(t!("总台固定在最前", "the desk always comes first").into()),
             _ => None,
         };
         if let Some(m) = m {
             return self.flash(&m);
         }
         // Swappable: same profile, same group, same level (top level with top
-        // level, child sessions under the same parent), not pinned itself
+        // level, child sessions under the same parent), not pinned itself. Not the desk: it stays first
         let peer = |o: &Session| {
             o.sub.is_none()
                 && !o.deck_id.is_empty()
                 && o.profile == s.profile
                 && o.group == s.group
                 && o.under() == s.under()
+                && !o.desk
                 && self.pins.rank(&o.name).is_none()
         };
         // Stop searching once out of this group (child sessions: out of the parent's family); child sessions at any level hanging
@@ -247,8 +232,17 @@ impl App {
         if g == "-" {
             return self.flash(t!("普通 tmux 会话区域不能移动", "the ordinary tmux sessions section can't be moved"));
         }
-        let secs: Vec<&str> =
-            self.section_starts().into_iter().map(|p| &self.all[self.view[p]]).filter(|s| !s.pinned).map(|s| s.group.as_str()).collect();
+        // The groups in order: the list's sections, or from the rail (the list shows one group then) its rows
+        let rail: Vec<String> = match self.on_rail() {
+            true => self.rail_rows().into_iter().filter_map(|r| if let RailKind::Group(g) = r.kind { Some(g) } else { None }).collect(),
+            false => vec![],
+        };
+        let secs: Vec<&str> = match self.on_rail() {
+            true => rail.iter().map(String::as_str).collect(),
+            false => {
+                self.section_starts().into_iter().map(|p| &self.all[self.view[p]]).filter(|s| !s.pinned).map(|s| s.group.as_str()).collect()
+            }
+        };
         let Some(cur) = secs.iter().position(|h| *h == g) else { return };
         let depth = g.split('/').count();
         let parent = |p: &str| p.rsplit_once('/').map(|x| x.0.to_string());
@@ -327,7 +321,8 @@ mod tests {
     use super::*;
     use crate::ui::screen::top_bar;
     use crate::ui::tests::{
-        fixture, keys, life_and_work, order, pin, press, reader_rows, said, select, sessions, shift, shows, target, titles,
+        caps, fixture, keys, life_and_work, mk, only, order, pin, press, reader_rows, said, select, sessions, shift, target, titles,
+        to_scope,
     };
 
     /// What's read back after the write: in-group order as given
@@ -346,7 +341,7 @@ mod tests {
     #[test]
     fn shift_arrows_swap_within_the_group_right_away_and_write_one_at_a_time() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "错"]);
         select(&mut app, "闲");
         shift(&mut app, KeyCode::Up);
@@ -381,12 +376,12 @@ mod tests {
     #[test]
     fn pin_moves_to_top_keeps_highlight_and_survives_refresh() {
         let mut app = fixture();
-        assert_eq!(order(&app), ["问", "跑", "闲"]);
+        assert_eq!(order(&app), ["问", "未读", "跑", "闲", "错"]);
         pin(&mut app, "闲");
-        assert_eq!(order(&app), ["闲", "问", "跑"]); // pinned ones above "needs you"
+        assert_eq!(order(&app), ["闲", "问", "未读", "跑", "错"]); // pinned ones above "needs you"
         assert_eq!(app.current().unwrap().title, "闲");
         app.set_sessions(sessions()); // 2-second refresh, pinned is false all over the new data
-        assert_eq!(order(&app), ["闲", "问", "跑"]);
+        assert_eq!(order(&app), ["闲", "问", "未读", "跑", "错"]);
     }
 
     #[test]
@@ -394,9 +389,9 @@ mod tests {
         let mut app = fixture();
         pin(&mut app, "跑");
         pin(&mut app, "闲");
-        assert_eq!(order(&app), ["跑", "闲", "问"]);
+        assert_eq!(order(&app), ["跑", "闲", "问", "未读", "错"]);
         pin(&mut app, "跑");
-        assert_eq!(order(&app), ["闲", "问", "跑"]);
+        assert_eq!(order(&app), ["闲", "问", "未读", "跑", "错"]);
     }
 
     #[test]
@@ -405,85 +400,151 @@ mod tests {
         let header = |app: &App| top_bar(app, 240).to_string();
         assert!(header(&app).contains("◆ 1 等待回应"));
         assert!(header(&app).contains("● 1 运行中"));
-        assert!(!header(&app).contains('◐') && !header(&app).contains('✕'));
+        assert!(header(&app).contains("◐ 1 未读") && header(&app).contains("✕ 1 出错"));
 
         app.set_group(Some("work".into()));
-        assert!(!header(&app).contains('◆'));
+        assert!(!header(&app).contains('◆') && !header(&app).contains('◐'));
         press(&mut app, KeyCode::Char('i'));
         assert!(app.attach.is_none());
         assert_eq!(said(&app), "暂无待处理会话");
 
         app.set_group(None);
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         assert!(header(&app).contains("◐ 1 未读") && header(&app).contains("✕ 1 出错"));
         keys(&mut app, "/未读⏎");
         assert!(header(&app).contains("◐ 1 未读"));
         assert!(!header(&app).contains('◆') && !header(&app).contains('●'));
         press(&mut app, KeyCode::Esc);
-        press(&mut app, KeyCode::Char('!'));
+        only(&mut app, '1');
         assert!(header(&app).contains("● 1 运行中"));
         assert!(!header(&app).contains('◆') && !header(&app).contains('◐'));
 
-        press(&mut app, KeyCode::Char('!'));
-        select(&mut app, "问");
-        press(&mut app, KeyCode::Char('o'));
-        assert!(!header(&app).contains('◆') && !header(&app).contains('◐'));
-        press(&mut app, KeyCode::Char('i'));
-        assert!(app.attach.is_none());
-        press(&mut app, KeyCode::Char('o'));
+        only(&mut app, '1');
         assert!(header(&app).contains("◆ 1 等待回应") && header(&app).contains("◐ 1 未读"));
     }
 
     #[test]
-    fn braces_cycle_groups_in_section_order_and_back() {
-        let mut app = fixture();
-        press(&mut app, KeyCode::Char('}')); // fun first like the sections, though work has more sessions
-        assert_eq!(titles(&app), ["问"]);
-        press(&mut app, KeyCode::Char('}'));
-        assert_eq!(titles(&app), ["跑", "闲"]);
-        press(&mut app, KeyCode::Char('}'));
-        assert_eq!(titles(&app), ["跑", "问", "闲"]); // back to all groups
-        press(&mut app, KeyCode::Char('{'));
-        assert_eq!(titles(&app), ["跑", "闲"]); // wraps back to the last group, work
+    fn a_rail_row_counts_what_going_there_would_list_in_the_current_scope() {
+        let mut v = sessions();
+        v.extend([mk("停", "work", State::Stopped, 10), mk("老停", "lab", State::Stopped, 9 * 86_400)]);
+        let mut app = App::new(String::new(), v);
+        assert_eq!(app.scope, Scope::Open);
+        // The row of a group: the number on its header in the list; all groups: the top bar's; a group with none here has none.
+        // Written as the name, the number, then how many are ◆ ● ◐ ✕
+        let row = |app: &App, name: &str| -> String {
+            let rows = app.rail_rows();
+            let r = rows.iter().find(|r| r.name == name).unwrap_or_else(|| panic!("{name}"));
+            let marks: Vec<String> =
+                ["◆", "●", "◐", "✕"].iter().zip(r.marks).filter(|m| m.1 > 0).map(|(ic, n)| format!("{ic}{n}")).collect();
+            [vec![name.to_string(), r.n.to_string()], marks].concat().join(" ")
+        };
+        let list = reader_rows(&mut app, 80, 24);
+        assert!(list.iter().any(|r| r.contains("▾ work  3")) && list[0].contains("未停止 5"), "{list:#?}");
+        assert_eq!(row(&app, "work"), "work 3 ●1 ✕1");
+        assert_eq!(row(&app, "全部"), "全部 5 ◆1 ●1 ◐1 ✕1");
+        assert_eq!(row(&app, "lab"), "lab 0");
+        // Going there lists that many
+        app.set_group(Some("work".into()));
+        assert_eq!(titles(&app).len(), 3);
+        app.set_group(None);
+        // 7 days: 「停」 too, not 「老停」 from nine days ago
+        to_scope(&mut app, Scope::Week);
+        assert_eq!(
+            (row(&app, "work"), row(&app, "全部"), row(&app, "lab")),
+            ("work 4 ●1 ✕1".into(), "全部 6 ◆1 ●1 ◐1 ✕1".into(), "lab 0".into())
+        );
+        // A state picked: only that state
+        only(&mut app, '1');
+        assert_eq!((row(&app, "work"), row(&app, "全部"), row(&app, "fun")), ("work 1 ●1".into(), "全部 1 ●1".into(), "fun 0".into()));
     }
 
     #[test]
-    fn tab_lists_the_groups_and_a_letter_or_enter_switches() {
+    fn on_a_narrow_screen_h_lays_the_rail_over_the_left_and_tab_opens_nothing() {
         let mut app = App::new(String::new(), life_and_work());
+        let shown = |app: &mut App| reader_rows(app, 80, 24);
+        // No rail of its own at this width
+        assert!(!shown(&mut app).iter().any(|r| r.contains("回收站")));
+        // h at the list's outermost level: the rail, over the left, the cursor on the row of where the list is
+        keys(&mut app, "h");
+        let rows = shown(&mut app);
+        assert!(app.on_rail() && rows[0].starts_with("▌   全部") && rows.iter().any(|r| r.contains("回收站")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains(&caps("⏎ 进入"))), "{rows:#?}");
+        // j: the next place, the list behind follows at once; ⏎ goes in, and the rail is put away
+        keys(&mut app, "j");
+        assert_eq!((app.group.as_deref(), app.on_rail()), (Some("fun"), true));
+        keys(&mut app, "j⏎");
+        assert_eq!((app.group.as_deref(), app.on_rail(), titles(&app)), (Some("work"), false, vec!["工作".to_string()]));
+        assert!(!shown(&mut app).iter().any(|r| r.contains("回收站")));
+        // Esc on the rail: put away, and the list back where it was when the rail was called out; h does the same
+        keys(&mut app, "hk");
+        assert_eq!((app.group.as_deref(), app.on_rail()), (Some("fun"), true));
+        keys(&mut app, "⎋");
+        assert_eq!((app.group.as_deref(), app.on_rail(), app.quit), (Some("work"), false, false));
+        keys(&mut app, "hkkh");
+        assert_eq!((app.group.as_deref(), app.on_rail()), (Some("work"), false));
+        // l and → go in as ⏎ does
+        keys(&mut app, "hkk");
+        press(&mut app, KeyCode::Right);
+        assert_eq!((app.group.as_deref(), app.on_rail()), (None, false));
+        // The rail takes the whole width where a list wouldn't fit beside it (a phone)
+        keys(&mut app, "h");
+        let phone = reader_rows(&mut app, 46, 24);
+        assert!(phone[0].starts_with("▌   全部") && phone[0].ends_with('│') && phone[0].width() == 46, "{phone:#?}");
+        keys(&mut app, "⎋");
+        // Tab opens nothing, here or in a group; { } ⇧Tab do nothing either
         keys(&mut app, "⇥");
-        assert_eq!(app.group_rows(), [(' ', None), ('f', Some("fun".into())), ('w', Some("work".into()))]);
-        assert_eq!(app.group_menu, Some(0)); // never switched: on the current one (all)
-        let rows = reader_rows(&mut app, 80, 24);
-        shows(&rows, &["分组", "␣  全部", "f  fun", "w  work", "⏎ 切换"]);
-        keys(&mut app, "w");
-        assert_eq!((app.group.as_deref(), app.group_menu, titles(&app)), (Some("work"), None, vec!["工作".to_string()]));
-        keys(&mut app, "⇥⏎"); // on the last one looked at (all): Tab ⏎ = switch back
-        assert_eq!(app.group, None);
-        keys(&mut app, "⇥⏎");
-        assert_eq!(app.group.as_deref(), Some("work"));
-        keys(&mut app, "⇥ "); // Space = all
-        assert_eq!(app.group, None);
-        keys(&mut app, "⇥↑⏎"); // on work, one up is fun
-        assert_eq!(app.group.as_deref(), Some("fun"));
-        keys(&mut app, "⇥z"); // a letter with no group: no change (highlight on the last one looked at: all)
-        assert_eq!((app.group_menu, app.group.as_deref()), (Some(0), Some("fun")));
-        keys(&mut app, "⇥"); // Tab again closes
-        keys(&mut app, "⇥q⇥⎋"); // q / Esc close too, don't quit
-        assert!(app.group_menu.is_none() && !app.quit && app.group.as_deref() == Some("fun"));
-        keys(&mut app, "}"); // { } still switch one step at a time
-        assert_eq!(app.group.as_deref(), Some("work"));
+        assert!(!app.on_rail() && !app.modal_open() && app.group.is_none());
+        keys(&mut app, "W");
+        let own = app.group.clone();
+        app.msg = None;
+        keys(&mut app, "⇥}{⇤");
+        assert!(own.is_some() && app.group == own && !app.on_rail() && !app.modal_open() && app.msg.is_none());
     }
 
     #[test]
-    fn shift_tab_goes_back_to_the_group_seen_before() {
-        let mut app = fixture();
-        press(&mut app, KeyCode::BackTab);
-        assert_eq!(app.msg.as_ref().unwrap().0, "还没有切换过分组");
-        press(&mut app, KeyCode::Char('{'));
-        assert_eq!(app.group.as_deref(), Some("work"));
-        press(&mut app, KeyCode::BackTab); // Back to the previous one (all), press again to come back
-        assert_eq!(app.group, None);
-        press(&mut app, KeyCode::BackTab);
-        assert_eq!(app.group.as_deref(), Some("work"));
+    fn a_rail_laid_over_the_list_shows_the_groups_letters_alone_keeps_the_wheel_and_goes_back_only_to_a_group_still_there() {
+        let mut app = App::new(String::new(), life_and_work());
+        reader_rows(&mut app, 80, 24);
+        app.set_group(Some("work".into()));
+        keys(&mut app, "h");
+        reader_rows(&mut app, 80, 24);
+        // Space: the sessions' letters would be written under the rail, so only the groups' own show, on it; a lowercase
+        // letter has nothing to open there and only puts them away
+        keys(&mut app, " ");
+        assert!(app.jump.is_some() && app.on_rail());
+        let rows = reader_rows(&mut app, 80, 24);
+        assert!(rows.iter().any(|r| r.contains("F fun")) && rows.iter().any(|r| r.contains("W work")), "{rows:#?}");
+        crate::ui::tests::shows(&rows, &[&caps("⇧字母 进分组"), &caps("空格 取消")]);
+        assert!(!rows.iter().any(|r| r.contains(&caps("字母 打开"))), "{rows:#?}");
+        keys(&mut app, "s");
+        assert!(app.jump.is_none() && app.on_rail() && app.attach.is_none());
+        // The wheel over the rail moves along it, and doesn't put it away
+        let wheel = |app: &mut App, kind: MouseEventKind| {
+            let (column, row) = (app.rail_area.x + 4, app.rail_area.y + 1);
+            app.on_mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE })
+        };
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!((app.group.as_deref(), app.on_rail()), (Some("fun"), true));
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!((app.group.as_deref(), app.on_rail()), (Some("work"), true));
+        // The group it was called out from was renamed meanwhile: Esc goes back to it under its new name
+        keys(&mut app, "k");
+        app.group_renamed("work", "job");
+        let mut v = life_and_work();
+        v.iter_mut().filter(|s| s.group == "work").for_each(|s| s.group = "job".into());
+        app.set_sessions(v);
+        keys(&mut app, "⎋");
+        assert_eq!((app.group.as_deref(), app.on_rail()), (Some("job"), false));
+        // Gone altogether: Esc puts the rail away and the list stays on what it shows
+        keys(&mut app, "hk");
+        let mut v = life_and_work();
+        v.retain(|s| s.group != "work");
+        app.set_sessions(v);
+        keys(&mut app, "⎋");
+        assert_eq!((app.group.as_deref(), app.on_rail()), (Some("fun"), false));
+        // Another workspace: nothing of this one to go back to
+        keys(&mut app, "hjSh");
+        keys(&mut app, "⎋");
+        assert!(!app.on_rail() && app.group.is_none());
     }
 }

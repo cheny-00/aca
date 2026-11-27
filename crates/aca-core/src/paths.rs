@@ -18,7 +18,20 @@ pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
 }
 
+/// Where [`keep_in`] said to keep everything
+static KEPT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// From here on this process keeps everything under `dir`, as with `ACA_HOME` (and ahead of it). For the unit tests of code
+/// that reads and writes aca's own files: a test run must not touch the real registry, events or settings. The first call
+/// decides
+pub fn keep_in(dir: PathBuf) {
+    let _ = KEPT.set(dir);
+}
+
 fn root(sub: &str, xdg: &str) -> PathBuf {
+    if let Some(dir) = KEPT.get() {
+        return dir.join(sub);
+    }
     match std::env::var_os("ACA_HOME").filter(|v| !v.is_empty()) {
         Some(h) => PathBuf::from(h).join(sub),
         None => home().join(xdg).join("aca"),

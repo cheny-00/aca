@@ -110,8 +110,8 @@ struct Env {
     /// The program written into statusLine
     aca: String,
     /// What each registered session uses (agent, account, title): `account rm` checks who uses it before deleting
-    sessions: fn() -> Vec<(Agent, String, String)>,
-    /// Ask the tool whether this account is logged in (`account status`)
+    sessions: fn() -> Vec<crate::acctpage::Use>,
+    /// Whether this account is logged in (`account status`; see [`accounts::login`])
     ask: fn(Agent, &str) -> accounts::Login,
     /// Whether this program is installed (`account status` lists only the installed tools' own defaults)
     installed: fn(&str) -> bool,
@@ -154,15 +154,16 @@ impl Env {
     }
 }
 
-/// What each registered session uses (agent, account, title; untitled ones get the directory name)
-pub(crate) fn session_accounts() -> Vec<(Agent, String, String)> {
+/// What each registered session uses (agent, account, title; untitled ones get the directory name), and whether it's running
+pub(crate) fn session_accounts() -> Vec<crate::acctpage::Use> {
     let cfg = aca_core::config::load();
     let all = aca_core::store::Store::open().and_then(|s| s.sessions(false)).unwrap_or_default();
     let name = |s: &aca_core::store::Session| match s.title.trim() {
         "" => s.dir.rsplit('/').find(|p| !p.is_empty()).unwrap_or(&s.id).to_string(),
         t => t.to_string(),
     };
-    all.into_iter().map(|s| (aca_records::agent::agent_of_tool(&cfg, &s.tool), s.account.clone(), name(&s))).collect()
+    let running = |s: &aca_core::store::Session| aca_core::runtime::load(&s.id).status == "running";
+    all.into_iter().map(|s| (aca_records::agent::agent_of_tool(&cfg, &s.tool), s.account.clone(), name(&s), running(&s))).collect()
 }
 
 /// Whose Claude status bar this config directory uses now (written in the right-hand column of the accounts page, named as in
@@ -365,7 +366,7 @@ fn family(tool: &str) -> Res<Agent> {
     }
 }
 
-/// The line for one account in `aca account status`: whether the directory is right, whether it's logged in (asks the tool itself)
+/// The line for one account in `aca account status`: whether the directory is right, whether it's logged in ([`accounts::login`])
 fn account_state(env: &Env, a: &accounts::Account, abs: &str) -> String {
     use accounts::Login;
     if let Some((other, why)) = (!abs.is_empty()).then(|| accounts::foreign(a.agent, abs, &env.home)).flatten() {
@@ -383,11 +384,13 @@ fn account_state(env: &Env, a: &accounts::Account, abs: &str) -> String {
     match (env.ask)(a.agent, &a.name) {
         Login::In(who) if who.is_empty() => t!("已登录", "logged in").into(),
         Login::In(who) => tr!("已登录:{who}", "logged in: {who}"),
+        Login::Out if a.agent == Agent::Agy => t!("未登录(登录:agy)", "not logged in (to log in: agy)").into(),
         Login::Out => {
             let how = if a.agent == Agent::Codex { "login" } else { "auth login" };
             tr!("未登录(登录:aca run {} -- {how})", "not logged in (to log in: aca run {} -- {how})", spec(a.agent, &a.name))
         }
         Login::Unknown(said) => tr!("无法确认登录状态:{said}", "can't tell whether it's logged in: {said}"),
+        Login::Unsafe(why) => why,
     }
 }
 
@@ -404,7 +407,8 @@ fn account_cmd(mut args: Vec<String>, env: &Env) -> Res<i32> {
     let mut args = args.into_iter();
     match args.next().as_deref() {
         None | Some("ls") => {
-            let all: Vec<accounts::Account> = accounts::listed(&env.text(), &env.home).into_iter().map(|(a, _)| a).collect();
+            let all: Vec<_> =
+                status_rows(env).into_iter().map(|(a, _)| a).filter(|a| !a.name.is_empty() || a.agent == Agent::Agy).collect();
             fn place(a: &accounts::Account) -> &str {
                 if a.dir.is_empty() { t!("(不更换配置目录)", "(same config directory)") } else { &a.dir }
             }
@@ -538,7 +542,7 @@ fn account_cmd(mut args: Vec<String>, env: &Env) -> Res<i32> {
                 ));
             };
             let agent = family(tool)?;
-            let used = (env.sessions)().into_iter().filter(|(g, n, _)| *g == agent && n == name).count();
+            let used = (env.sessions)().into_iter().filter(|(g, n, ..)| *g == agent && n == name).count();
             let mut why = vec![];
             if used > 0 {
                 why.push(tr!(
@@ -1346,6 +1350,23 @@ impl Page {
     }
 }
 
+impl Page {
+    /// Its keys, for the bottom bar (the most important first) and `?`
+    fn keys(&self) -> Vec<crate::sheet::Key> {
+        use crate::sheet::{key, more};
+        let mut keys = vec![key("⏎", t!("确定", "do it")), key("←→", t!("切换", "switch"))];
+        if self.rows.get(self.sel).is_some_and(|r| r.new.is_some()) {
+            keys.push(key("d", t!("去掉", "drop it")));
+        }
+        if self.can_add {
+            keys.push(key("+", t!("添加账号", "add")));
+        }
+        keys.push(key("a", t!("全部应用此项", "all like this")));
+        keys.extend([more("↑↓", t!("选择", "select")), more("Esc", t!("不保存", "change nothing"))]);
+        keys
+    }
+}
+
 impl Overlay for Page {
     fn width(&self) -> u16 {
         84
@@ -1397,22 +1418,21 @@ impl Overlay for Page {
             (n, c) => tr!("添加 {n} 个账号,修改 {c} 个状态栏", "add accounts: {n}, change status bars: {c}"),
         };
         // When it doesn't fit, the later keys are dropped first: the most important go first
-        let mut keys = vec![("⏎", t!("确定", "do it")), ("←→", t!("切换", "switch"))];
-        if self.rows.get(self.sel).is_some_and(|r| r.new.is_some()) {
-            keys.push(("x", t!("取消", "drop it")));
-        }
-        if self.can_add {
-            keys.push(("+", t!("添加账号", "add")));
-        }
-        keys.push(("a", t!("全部应用此项", "all like this")));
+        let keys = self.keys();
+        let keys = crate::sheet::foot(&keys);
         let todo = Span::styled(todo, theme::accent());
         // Narrow: what's to be done gets its own line (kept even when empty, so the table doesn't jump), keys on another line
         if w >= 60 {
-            out.push(kit::keys_line(&keys, vec![todo], w));
+            out.push(crate::kit::keys_line_help(&keys, vec![todo], w));
         } else {
-            out.extend([Line::from(todo), kit::keys_line(&keys, vec![], w)]);
+            out.extend([Line::from(todo), crate::kit::keys_line_help(&keys, vec![], w)]);
         }
         out
+    }
+
+    /// Filling in the form: ? is a character there
+    fn sheet(&self) -> Option<Vec<crate::sheet::Key>> {
+        self.form.is_none().then(|| self.keys())
     }
 
     fn on_key(&mut self, k: KeyEvent, fx: &mut Fx) -> Flow {
@@ -1429,8 +1449,9 @@ impl Overlay for Page {
             KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => self.cycle(false),
             KeyCode::Char('a') => self.all_like_this(),
             KeyCode::Char('+') if self.can_add => self.form = Some(Form::new()),
-            // The row registered this time: drop the registration (if it was ~/.claude, its original row comes back)
-            KeyCode::Char('x') | KeyCode::Delete if self.rows.get(self.sel).is_some_and(|r| r.new.is_some()) => {
+            // The row registered this time: drop the registration (if it was ~/.claude, its original row comes back). Nothing is
+            // saved yet, so it doesn't ask
+            KeyCode::Char('d') | KeyCode::Delete if self.rows.get(self.sel).is_some_and(|r| r.new.is_some()) => {
                 let gone = self.rows.remove(self.sel);
                 if gone.plain {
                     self.rows.insert(self.sel, Row { name: "claude".into(), shown: "~/.claude".into(), new: None, ..gone });
@@ -1707,7 +1728,12 @@ mod tests {
             home: root.to_string_lossy().into_owned(),
             record: root.join("state/statusline.json"),
             aca: ACA.into(),
-            sessions: || vec![(Agent::Claude, "busy".to_string(), "甲".to_string()), (Agent::Claude, "busy".to_string(), "乙".to_string())],
+            sessions: || {
+                vec![
+                    (Agent::Claude, "busy".to_string(), "甲".to_string(), false),
+                    (Agent::Claude, "busy".to_string(), "乙".to_string(), false),
+                ]
+            },
             ask: |a, name| match (a, name) {
                 (Agent::Codex, _) => accounts::Login::In("ChatGPT".into()),
                 (_, "work") => accounts::Login::In("max · me@example.com".into()),
@@ -1789,7 +1815,7 @@ mod tests {
         assert_eq!((p.rows[2].wire.as_ref().unwrap().pick, p.pending()), (Mode::Aca, (0, 2)));
         let text = shown(&p, 78);
         assert!(text.iter().any(|l| l.contains("plain") && l.contains("* ‹ aca 的 ›")), "{text:#?}");
-        assert!(text.last().unwrap().ends_with("修改 2 个状态栏"), "{text:#?}");
+        assert!(text.last().unwrap().ends_with("修改 2 个状态栏  ? 快捷键"), "{text:#?}");
         // The detail block: what it changes to, and a sample of aca's status bar (the second line is this account's quota)
         let said = text.iter().position(|l| l == "回车后 Claude 底部换成 aca 状态栏:").unwrap_or_else(|| panic!("{text:#?}"));
         assert!(text[said + 1].contains("42%") && text[said + 2].starts_with("plain 5h 23% · 7d 41%"), "{text:#?}");
@@ -1836,7 +1862,7 @@ mod tests {
         let mut p = Page::load(env.clone(), true);
         press(&mut p, &[KeyCode::Char('+')]);
         // Step one picks which tool: both laid out, not typing; Enter goes on to the name
-        assert!(!p.typing() && shown(&p, 78).iter().any(|l| l.starts_with("› Claude Code")), "{:#?}", shown(&p, 78));
+        assert!(!p.typing() && shown(&p, 78).iter().any(|l| l.starts_with("  Claude Code  默认目录")), "{:#?}", shown(&p, 78));
         press(&mut p, &[KeyCode::Enter]);
         assert!(p.typing());
         // Name: an invalid or duplicate one is reported right away
@@ -1937,8 +1963,10 @@ mod tests {
         press(&mut p, &[KeyCode::Enter]);
         // Still that row, with a new name, its chosen wiring carried along
         assert_eq!((picks(&p), p.pending()), (vec![("main", Some(Mode::Aca))], (1, 1)));
-        // x: drop the registration, its original row comes back
+        // d: drop the registration, its original row comes back (x no longer does)
         press(&mut p, &[KeyCode::Char('x')]);
+        assert_eq!(p.pending(), (1, 1));
+        press(&mut p, &[KeyCode::Char('d')]);
         assert_eq!((picks(&p), p.pending()), (vec![("claude", Some(Mode::Aca))], (0, 1)));
         press(&mut p, &[KeyCode::Char('+'), KeyCode::Enter]);
         type_in(&mut p, "main");

@@ -4,8 +4,8 @@
 //! Stored in ~/.local/state/aca/ui/notes (JSON).
 //! Keyed by the session's key (for registered ones their id, unchanged by renames and restarts; for plain tmux sessions the
 //! session name).
-//! A group can have one too (`e` on a group): thoughts on the group as a whole, not filled into any session; it follows the
-//! group's renames and goes to the trash along with the group when it's deleted.
+//! A group's notes aren't here: they're in its notebook, in the registry (book.rs). It used to have one note, kept in this
+//! file under `group:<path>`; ones still found here are moved over.
 //! Like pins, reread on every refresh and before every change, so an aca open on the phone and one on the desktop don't
 //! overwrite each other.
 
@@ -31,15 +31,37 @@ pub fn key(s: &Session) -> String {
 }
 
 const GROUP: &str = "group:";
+const NOTE: &str = "note:";
 
-/// The key a group is stored under (the interface's per-group terms / glances use it too). tmux session names never contain
-/// `:`, so it can't clash with a session's
+/// The key a group goes by (the interface's per-group terms / glances use it too). tmux session names never contain `:`, so
+/// it can't clash with a session's. As a note's key it's a note being started in that group's notebook (see book.rs); the one
+/// note a group used to have was stored under it in this file, and is moved into the notebook when found
 pub fn group_key(g: &str) -> String {
     format!("{GROUP}{g}")
 }
 
 pub fn is_group_key(k: &str) -> bool {
     k.starts_with(GROUP)
+}
+
+/// The key of one note in a group's notebook, by its id
+pub fn note_key(id: &str) -> String {
+    format!("{NOTE}{id}")
+}
+
+/// The group a [`group_key`] is of
+pub fn group_of(k: &str) -> Option<&str> {
+    k.strip_prefix(GROUP)
+}
+
+/// The note's id a [`note_key`] is of
+pub fn note_of(k: &str) -> Option<&str> {
+    k.strip_prefix(NOTE)
+}
+
+/// The key is of a note in a group's notebook (kept in the registry, see book.rs), not of a session's note in this file
+pub fn in_book(k: &str) -> bool {
+    k.starts_with(GROUP) || k.starts_with(NOTE)
 }
 
 impl Notes {
@@ -66,6 +88,16 @@ impl Notes {
 
     pub fn get(&self, key: &str) -> Option<&str> {
         self.map.get(key).map(String::as_str)
+    }
+
+    /// It reads and writes a file (not in memory only)
+    pub fn attached(&self) -> bool {
+        self.path.is_some()
+    }
+
+    /// The groups' notes still in this file: (group, text)
+    pub fn of_groups(&self) -> Vec<(String, String)> {
+        self.map.iter().filter_map(|(k, t)| Some((group_of(k)?.to_string(), t.clone()))).collect()
     }
 
     /// Save a note; nothing but whitespace = delete it
@@ -146,7 +178,7 @@ pub fn edit_in_editor(text: &str) -> Result<String, String> {
     let _ = std::fs::remove_file(&path);
     match st {
         Ok(s) if s.success() => got.map(|t| t.trim_matches('\n').to_string()).map_err(|e| e.to_string()),
-        Ok(_) => Err(tr!("{} 未正常退出,便签未修改", "{} didn't exit cleanly; note unchanged", editor_name())),
+        Ok(_) => Err(tr!("{} 未正常退出,未作修改", "{} didn't exit cleanly; nothing changed", editor_name())),
         Err(e) => Err(tr!("无法启动 {}:{e}", "can't start {}: {e}", editor_name())),
     }
 }

@@ -37,7 +37,7 @@ api = 1                          # 照着插件接口第几版写的(上面那�
 description = "一句话说它干什么"
 # needs = ["jq"]                 # 要用到的外面的程序:装的时候、aca plugin check、插件页说缺了哪个
 
-# 一条命令:插件菜单(会话列表上按 :)里有它,命令行 aca plugin run {id}.hello 也能跑
+# 一条命令:会话列表上按 ? 能看到它,命令行 aca plugin run {id}.hello 也能跑
 [[commands]]
 id = "hello"
 title = "打个招呼"
@@ -46,7 +46,7 @@ command = ["sh", "hello.sh"]
 # expose = ["menu", "cli", "agent"]   # 加上 agent:给 agent 当工具用(写好 desc,它才知道什么时候该调)
 # desc = "…"
 
-# 插件菜单里按 h 直接跑它
+# 会话列表的 ? 里按 h 直接跑它
 [[keys]]
 key = "h"
 run = "hello"
@@ -59,6 +59,7 @@ run = "hello"
 # 设置:值写在 plugins.toml(插件页里 ⏎ 进去改),交给命令时在环境里(ACA_SETTING_GREETING)
 [settings.greeting]
 default = "你好"
+label = "问候语"                  # 插件页里这一项叫什么(不写就显示 greeting)
 desc = "打招呼用的那句"
 "#
         ),
@@ -72,7 +73,7 @@ api = 1                          # the plugin API version it's written for ("The
 description = "One line on what it does"
 # needs = ["jq"]                 # outside programs it uses: install, aca plugin check and the plugins page say which are missing
 
-# A command: it's in the plugin menu (press : on the session list), and aca plugin run {id}.hello runs it too
+# A command: ? on the session list shows it, and aca plugin run {id}.hello runs it too
 [[commands]]
 id = "hello"
 title = "Say hello"
@@ -81,7 +82,7 @@ command = ["sh", "hello.sh"]
 # expose = ["menu", "cli", "agent"]   # add agent to give it to agents as a tool (write a desc so they know when to call it)
 # desc = "…"
 
-# h in the plugin menu runs it directly
+# h in the session list's ? runs it directly
 [[keys]]
 key = "h"
 run = "hello"
@@ -94,6 +95,7 @@ run = "hello"
 # A setting: its value lives in plugins.toml (⏎ on the plugins page to change it) and reaches the command as ACA_SETTING_GREETING
 [settings.greeting]
 default = "hello"
+label = "Greeting"               # what the plugins page calls it (greeting without one)
 desc = "What to greet with"
 "#
         ),

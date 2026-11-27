@@ -54,6 +54,9 @@ pub trait Overlay {
     fn typing(&self) -> bool {
         false
     }
+    /// This page's keys for its `?` sheet (its bottom bar shows the ones marked for it). None = `?` is an ordinary key here right
+    /// now: typing, asking y / n, waiting for a key to bind
+    fn sheet(&self) -> Option<Vec<crate::sheet::Key>>;
     /// A plugin's list view: whether this request (rereading itself, rereading after one of its keys finished) belongs to it
     fn takes(&self, _req: &crate::caps::Req) -> bool {
         false
@@ -89,7 +92,7 @@ pub struct Fx {
     pub copy: Option<String>,
     /// Run a plugin's command / view / pane (see caps.rs): runs in the background, doesn't take up `job`
     pub plugin: Option<crate::caps::Req>,
-    /// After this layer closes, act as if this key was pressed on the main list (an aca action picked in the `:` panel)
+    /// After this layer closes, act as if this key was pressed on what's below it (a row picked in a `?` sheet)
     pub key: Option<KeyEvent>,
 }
 
@@ -101,11 +104,10 @@ impl Fx {
 
 /// A feature's own row on the `^S` settings page: "key  name  current value  ›"
 pub trait Setting {
-    /// The key at the start of the row (mustn't clash with the settings page's own: t i a n g e; features' own: d Discord bridge,
-    /// h remote tasks, m Claude mod, f auto-trust folders)
+    /// The key at the start of the row (settings uses t u i a n p s e; features use m for Claude mod, f for trust and c for channels)
     fn key(&self) -> char;
     fn name(&self) -> &'static str;
-    /// The current value: asked once when the settings page opens and once per reread, not every frame
+    /// The current value: asked once when the settings page opens and once per reread. An empty vector hides the row and its key.
     fn value(&self) -> Vec<Span<'static>>;
     /// The mark at the end of the row: › = go in and pick, ↗ = open in the editor, empty = toggles in place
     fn mark(&self) -> &'static str {

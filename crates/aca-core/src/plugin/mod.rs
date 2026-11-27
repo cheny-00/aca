@@ -25,7 +25,7 @@
 //! (the plugin's own config and state stay); `install aca.<name>` installs a first-party plugin shipped with aca (see
 //! [`first_party`]); and `~/.config/aca/user/` is there as soon as it holds a manifest (see [`user`]).
 //!
-//! What plugins would like (tools for agents, keys in the `:` menu) you decide in plugins.toml, see [`yours`].
+//! What plugins would like (tools for agents, keys in the list's `?`) you decide in plugins.toml, see [`yours`].
 
 pub mod decl;
 pub mod dev;
@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub use manifest::{
-    AGENTS, ARG_TYPES, Action, AgentPart, AgentSpec, CONTEXTS, EXPOSE, Hook, INPUTS, Key, MANIFEST, MCP_AGENTS, MENU_KEYS_TAKEN, Manifest,
+    AGENTS, ARG_TYPES, Action, AgentPart, AgentSpec, CONTEXTS, Channel, EXPOSE, Hook, INPUTS, Key, MANIFEST, MCP_AGENTS, MENU_KEYS_TAKEN, Manifest,
     McpSpec, PaneDef, ROW_KEYS_TAKEN, RowKey, Setting, Timer, View, cond_matches, missing_note, parse, parse_user, read_manifest,
 };
 
@@ -60,6 +60,7 @@ const AGENTS_WITH_PLUGINS: &[&str] = &["claude"];
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Entry {
+    pub role: String,
     pub id: String,
     pub path: String,
     pub enabled: bool,
@@ -82,6 +83,14 @@ pub struct Entry {
 }
 
 impl Entry {
+    pub fn for_role(&self, role: Option<crate::store::RouterRole>) -> bool {
+        (self.role == "router") == role.is_some()
+    }
+
+    pub fn offers_action(&self, action: &str, role: Option<crate::store::RouterRole>) -> bool {
+        self.for_role(role) && (self.id != "aca.router" || action != "groups" || role == Some(crate::store::RouterRole::Desk))
+    }
+
     /// Installed from git (not linked, not built in)
     pub fn from_git(&self) -> bool {
         !self.source.is_empty() && self.source != first_party::SOURCE
@@ -184,6 +193,7 @@ fn register(dir: &Path, source: Option<String>) -> Res<(Manifest, Vec<String>)> 
     // Enabled or not: as plugins.toml says if written there; otherwise registered ones stay as they were and new ones are on
     let wanted = decl::wants().ok().and_then(|w| w.get(&m.id).map(decl::Want::on));
     let entry = Entry {
+        role: m.role.clone(),
         id: m.id.clone(),
         path: dir.to_string_lossy().into_owned(),
         enabled: wanted.unwrap_or(true),
@@ -369,6 +379,22 @@ fn install_bundled(id: &str) -> Res<(Manifest, Vec<String>)> {
     Ok((m, warn))
 }
 
+pub fn ensure_router() -> Res<()> {
+    const ID: &str = "aca.router";
+    let dir = paths::data_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let lock = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("router-install.lock")).map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| e.to_string())?;
+    let entry = registry().into_iter().find(|e| e.id == ID);
+    if !decl::want(ID).on() || entry.as_ref().is_some_and(|e| !e.enabled) {
+        return Err(t!("aca.router 已关闭,无法启动 router", "aca.router is disabled, so the router cannot start").into());
+    }
+    if entry.is_none() {
+        install_bundled(ID)?;
+    }
+    Ok(())
+}
+
 /// Installs the first-party plugins in the manifest's `requires` that aren't there yet; returns notes for people
 fn install_requires(m: &Manifest) -> Vec<String> {
     let have: Vec<String> = registry().into_iter().map(|e| e.id).collect();
@@ -546,6 +572,7 @@ pub fn sync() -> Res<Vec<String>> {
             Err(err) => said.push(format!("{id}:{err}")),
         }
     }
+    said.extend(timer::refresh_locales());
     // You changed hotkeys by hand in plugins.toml: the registry didn't change, but tmux has to follow too
     bind_hotkeys();
     Ok(said)
@@ -643,6 +670,8 @@ fn enable_quiet(id: &str, on: bool) -> Res<()> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SettingNow {
     pub name: String,
+    /// What the interface calls it (the manifest's `label` in this language); empty = use the name
+    pub label: String,
     /// The current value: the manifest's default, with what plugins.toml changed on top; neither = an empty string
     pub value: toml::Value,
     pub default: Option<toml::Value>,
@@ -675,6 +704,7 @@ pub fn settings_of(id: &str) -> Res<Vec<SettingNow>> {
         .iter()
         .map(|(k, s)| SettingNow {
             name: k.clone(),
+            label: s.label.clone(),
             value: all.get(k).cloned().unwrap_or_else(|| toml::Value::String(String::new())),
             default: s.default.clone(),
             desc: s.desc.clone(),
@@ -963,7 +993,7 @@ pub fn input_text(kind: &str, ctx: &Context) -> String {
         return String::new();
     }
     if kind == "reply" {
-        return reply(&ctx.session);
+        return crate::agent::reply(&ctx.session);
     }
     let pane = if ctx.pane.is_empty() { crate::tmux::find(&ctx.session).map(|p| p.pane).unwrap_or_default() } else { ctx.pane.clone() };
     if pane.is_empty() {
@@ -972,22 +1002,7 @@ pub fn input_text(kind: &str, ctx: &Context) -> String {
     crate::tmux::text(&pane, kind == "scrollback")
 }
 
-/// The session's last reply: the copy the hook recorded (at most 4000 characters). If none was recorded (an adopted
-/// session not restarted yet has no hooks) or it was cut short (ends with …), read the full one from its conversation
-/// record (see [`crate::agent::Agent::last_reply`])
-fn reply(session: &str) -> String {
-    let r = crate::runtime::load(session);
-    if !r.last.trim().is_empty() && !r.last.ends_with('…') {
-        return r.last;
-    }
-    let full = crate::store::Store::open().ok().and_then(|st| st.get(session).ok()).and_then(|s| {
-        let (agent, _) = crate::agent::of(&crate::config::load(), &s).ok()?;
-        agent.last_reply(&r)
-    });
-    full.unwrap_or(r.last)
-}
-
-/// An entry in the interface's `:` menu: a command exposed to the menu, a pane or a view
+/// An entry in the interface's `?` on the list: a command exposed to the menu, a pane or a view
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MenuItem {
     pub plugin: String,
@@ -995,7 +1010,7 @@ pub struct MenuItem {
     pub id: String,
     pub kind: ItemKind,
     pub title: String,
-    /// The key `[[keys]]` binds to it (pressed in the `:` menu)
+    /// The key `[[keys]]` binds to it (pressed in the list's `?`)
     pub key: Option<char>,
     pub contexts: Vec<String>,
     /// The command's arguments: (name, type, optional)
@@ -1399,8 +1414,8 @@ fn menu_and_notes() -> (Vec<MenuItem>, Vec<(String, String)>) {
             notes.push((
                 e.id.clone(),
                 tr!(
-                    "plugins.toml 中 {} 的 keys 写了 {t},但它没有这一项(只有 : 菜单中的能力、窗格、视图能设键)",
-                    "plugins.toml gives {} a key for {t}, which it doesn't have (only : menu commands, panes and views take keys)",
+                    "plugins.toml 中 {} 的 keys 写了 {t},但它没有这一项(只有 ? 中的能力、窗格、视图能设键)",
+                    "plugins.toml gives {} a key for {t}, which it doesn't have (only the commands, panes and views in ? take keys)",
                     e.id
                 ),
             ));
@@ -1461,7 +1476,7 @@ pub(crate) fn command_ids<'a>(id: &'a str, args: &'a str) -> [(&'static str, &'a
 }
 
 /// Writes a section to the plugin's log (hook output goes there too; see it with `aca plugin log`)
-fn log_line(id: &str, text: &str) {
+pub(crate) fn log_line(id: &str, text: &str) {
     use std::io::Write;
     let log = log_file(id);
     let _ = std::fs::create_dir_all(log.parent().unwrap());
@@ -1653,6 +1668,7 @@ mod tests {
         // Secret ones are masked
         let mut n = SettingNow {
             name: "url".into(),
+            label: String::new(),
             value: V::String("https://discord.com/api/webhooks/1/abcd".into()),
             default: None,
             desc: String::new(),

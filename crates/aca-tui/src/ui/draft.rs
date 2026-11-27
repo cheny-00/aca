@@ -76,7 +76,8 @@ impl App {
 
     /// Where N / n start filling from: on a session, another one like it; on a group, the group's path (see `group_dir`), into
     /// this group. Empty group: into this group (it stays even if the path changes), starting from the group's default directory,
-    /// or if none recorded, from the new group directory like ^N
+    /// or if none recorded, from the new group directory like ^N. With no project under the cursor (see `off_projects`) and a
+    /// scratch group set up: into that one, in its directory
     pub(super) fn draft(&self) -> Result<Draft, String> {
         if let Some(g) = self.blank_group() {
             let mut d = Draft::from(None, self.group_hints);
@@ -84,10 +85,20 @@ impl App {
             d.start_group(g.to_string(), &base);
             return Ok(d);
         }
-        match self.group_row().and_then(|g| Some((g, self.group_dir(g)?))) {
-            Some((g, (s, dir, _))) => Ok(Draft::in_group(s, g, &dir, self.group_hints)),
-            None => Ok(Draft::from(self.current(), self.group_hints)),
+        if let Some((g, (s, dir, _))) = self.group_row().and_then(|g| Some((g, self.group_dir(g)?))) {
+            return Ok(Draft::in_group(s, g, &dir, self.group_hints));
         }
+        // The tool and account still come from the row the list is on, when aca started it
+        let like = self.current().filter(|s| !s.profile.is_empty());
+        match &self.scratch {
+            Some(g) if self.off_projects() => Ok(Draft::in_scratch(like, g, &(self.scratch_dir)(), self.group_hints)),
+            _ => Ok(Draft::from(self.current(), self.group_hints)),
+        }
+    }
+
+    /// The cursor is on nothing that belongs to a project: the rail's row for all groups, a plain tmux session, or no row at all
+    fn off_projects(&self) -> bool {
+        self.on_all_row() || self.current().is_none_or(|s| s.profile.is_empty() || s.group == "-")
     }
 
     /// Typing (filter words / a new session's path): several keys arriving at once
@@ -98,10 +109,26 @@ impl App {
             || self.prompt.is_some()
             || self.term_on.is_some()
             || self.overlays.last().is_some_and(|o| o.typing())
+            || self.sheet.as_ref().is_some_and(|s| s.typing())
     }
 
     pub(super) fn on_draft_key(&mut self, k: KeyEvent) {
         let Some(d) = self.new_draft.as_mut() else { return };
+        if let Some((tools, i)) = &mut self.router_picker {
+            match k.code {
+                KeyCode::Up | KeyCode::Char('k') => *i = (*i + tools.len() - 1) % tools.len(),
+                KeyCode::Down | KeyCode::Char('j') => *i = (*i + 1) % tools.len(),
+                KeyCode::Enter if tools[*i].problem.is_none() => {
+                    let t = &tools[*i];
+                    (d.tool, d.account, d.label) = (t.tool.clone(), t.account.clone(), t.name.clone());
+                    d.hint.clear();
+                    self.router_picker = None;
+                }
+                KeyCode::Esc => self.router_picker = None,
+                _ => {}
+            }
+            return;
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Enter => match d.finish() {
@@ -115,16 +142,74 @@ impl App {
             KeyCode::Tab => d.complete(),
             KeyCode::BackTab => d.complete_back(),
             KeyCode::Right => d.accept(),
+            KeyCode::Up if d.router => match (self.tools_loader)() {
+                Ok(tools) => {
+                    let tools = router_choices(tools, &aca_core::config::load());
+                    if tools.is_empty() {
+                        d.hint = t!("没有可选的 router 工具", "No router tools available").into();
+                    } else {
+                        let i = tools.iter().position(|t| t.tool == d.tool && t.account == d.account).unwrap_or(0);
+                        self.router_picker = Some((tools, i));
+                    }
+                }
+                Err(e) => d.hint = e,
+            },
             KeyCode::Down => self.pick = true,
             KeyCode::Char('f') if ctrl => self.pick = true,
             KeyCode::Backspace => d.backspace(),
             KeyCode::Char('u') if ctrl => d.clear(),
             KeyCode::Char('w') if ctrl => d.kill_segment(),
-            KeyCode::Char('t') if ctrl => d.shell = !d.shell,
+            // A router is an agent, never a shell
+            KeyCode::Char('t') if ctrl && !d.router => d.shell = !d.shell,
+            KeyCode::Char('t') if ctrl => {}
             KeyCode::Char(c) if !ctrl => d.push(c),
             _ => {}
         }
     }
+}
+
+fn router_choices(tools: Vec<Tool>, cfg: &aca_core::config::Config) -> Vec<Tool> {
+    tools
+        .into_iter()
+        .filter(|t| matches!(t.agent, Agent::Claude | Agent::Codex))
+        .map(|mut t| {
+            if t.agent == Agent::Claude
+                && let Ok(p) = aca_core::agent::pick(cfg, &crate::tools::spec(&t.tool, &t.account))
+            {
+                t.problem = aca_core::router::check_account(cfg, p.agent.name(), &p.account).err().or(t.problem);
+            }
+            t
+        })
+        .collect()
+}
+
+pub(super) fn draw_router_choices(f: &mut Frame, tools: &[Tool], selected: usize) {
+    let visible = usize::from(f.area().height.saturating_sub(8) / 2).clamp(1, DRAFT_ROWS);
+    modal(f, 78, theme::pal().accent, |w| {
+        let mut out = vec![modal_title(t!("router 工具", "Router tools"), theme::accent(), esc_hint(t!("返回", "back")), w)];
+        for (i, t) in tools.iter().enumerate().skip((selected + 1).saturating_sub(visible)).take(visible) {
+            let mut name = clip(&t.name, w / 2).trim_end().to_string();
+            let kind = if t.agent == Agent::Claude { "Claude" } else { "Codex" };
+            if !name.eq_ignore_ascii_case(kind) {
+                name.push_str(&format!("  {kind}"));
+            }
+            if let Some(reason) = &t.problem {
+                name.push_str(&format!("  · {reason}"));
+            }
+            let style = if t.problem.is_some() { dim() } else { Style::default() };
+            let style = if i == selected { style.add_modifier(Modifier::REVERSED) } else { style };
+            out.extend(wrap_width(&name, w).into_iter().map(|l| Line::styled(l, style)));
+        }
+        out.push(Line::styled(
+            if tools[selected].problem.is_some() {
+                t!("↑↓ 换工具", "↑↓ choose another")
+            } else {
+                t!("↑↓ 选择  ⏎ 使用", "↑↓ select  ⏎ use")
+            },
+            dim(),
+        ));
+        out
+    });
 }
 
 /// Max rows of candidates listed for new
@@ -140,6 +225,7 @@ pub(super) fn draw_draft(f: &mut Frame, d: &Draft) {
             // A shell inside a sandbox, picked in n (^T switches to the plain one)
             _ if shell && !d.shell && !d.account.is_empty() => format!("shell:{}", d.account),
             _ if shell => "shell".to_string(),
+            _ if d.router && d.label.is_empty() => "Claude".into(),
             _ if d.label.is_empty() => t!("默认", "default").to_string(),
             _ => d.label.clone(),
         };
@@ -149,11 +235,13 @@ pub(super) fn draw_draft(f: &mut Frame, d: &Draft) {
             Some("Codex") => agent_style(Agent::Codex),
             Some("Pi") => agent_style(Agent::Pi),
             Some("OpenCode") => agent_style(Agent::Opencode),
+            Some("Antigravity") => agent_style(Agent::Agy),
             _ => Style::new(),
         };
         // ^T switches between the reused tool and a shell (no need if shell was picked in n)
         let swap = match () {
             _ if d.shell => t!("^T 换回", "^T back"),
+            _ if d.router => t!("↑ 选工具", "↑ choose tool"),
             _ if shell => "",
             _ => "^T shell",
         };
@@ -163,7 +251,8 @@ pub(super) fn draw_draft(f: &mut Frame, d: &Draft) {
             group_line.push(Span::styled(t!("默认", "default"), dim()));
         } else {
             group_line.push(Span::styled(clip(&group, 24).trim_end().to_string(), Style::new().add_modifier(Modifier::BOLD)));
-            if new {
+            // A router's group is the one it was asked for on, there already
+            if new && !d.router {
                 group_line.push(Span::styled(
                     if d.binds_dir() {
                         t!("  新分组 · 绑定目录", "  new group · bound to the directory")
@@ -175,8 +264,13 @@ pub(super) fn draw_draft(f: &mut Frame, d: &Draft) {
             }
         }
         let mark = if d.is_new_dir() { vec![Span::styled(t!("新目录", "new directory"), theme::warn())] } else { vec![] };
+        let title = match (d.router, d.desk) {
+            (_, true) => t!("新建总台", "New desk"),
+            (true, false) => t!("新建 router", "New router"),
+            (false, false) => t!("新建会话", "New session"),
+        };
         let mut out = vec![
-            modal_title(t!("新建会话", "New session"), theme::accent(), esc_hint(t!("取消", "cancel")), w),
+            modal_title(title, theme::accent(), esc_hint(t!("取消", "cancel")), w),
             Line::raw(""),
             spread(
                 vec![
@@ -230,8 +324,46 @@ pub(super) fn draw_draft(f: &mut Frame, d: &Draft) {
 mod tests {
     use super::*;
     use crate::ui::tests::{
-        ctrl, fixture, fun_in_h, keys, mk, pin, press, reader_rows, select, sessions, shows, target, tool, typ, with_windows,
+        ctrl, fixture, fun_in_h, jump_to_group, keys, mk, pin, press, reader_rows, select, sessions, shows, target, tool, typ, with_windows,
     };
+
+    #[test]
+    fn router_picker_preserves_the_draft_and_disables_only_ssh_claude() {
+        let cfg = aca_core::config::parse(
+            "[tools.cc]\nkind='claude'\naccount='remote'\n[tools.cx]\nkind='codex'\naccount='remote'\n\
+            [accounts.claude]\nremote={sandbox='cage'}\nlocal={sandbox='local'}\n[accounts.codex]\nremote={sandbox='cage'}\n\
+            [sandbox.cage]\nssh='host'\nworkspace='/cage'\n[sandbox.local]\nworkspace='/local'",
+        );
+        let menu = router_choices(
+            vec![
+                tool("remote Claude", "cc", "", Agent::Claude),
+                tool("local Claude", "claude", "local", Agent::Claude),
+                tool("remote Codex", "cx", "", Agent::Codex),
+                tool("pi", "pi", "", Agent::Pi),
+                tool("agy", "agy", "", Agent::Agy),
+                tool("oc", "opencode", "", Agent::Opencode),
+            ],
+            &cfg,
+        );
+        assert_eq!(menu.len(), 3);
+        let why = aca_core::router::check_account(&cfg, "claude", "remote").unwrap_err();
+        assert_eq!(menu[0].problem.as_deref(), Some(why.as_str()));
+        assert!(menu[1..].iter().all(|t| t.problem.is_none()));
+        let mut app = fixture();
+        keys(&mut app, "hjo");
+        let text = app.new_draft.as_ref().unwrap().text.clone();
+        app.router_picker = Some((menu, 0));
+        shows(&reader_rows(&mut app, 46, 30), &["SSH", "↑↓"]);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.router_picker.is_some() && app.create.is_none());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.router_picker.is_none());
+        let d = app.new_draft.as_ref().unwrap();
+        assert_eq!((&d.text, d.tool.as_str(), d.account.as_str()), (&text, "claude", "local"));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.create.is_some_and(|r| r.router && r.group == "fun"));
+    }
 
     #[test]
     fn new_defaults_to_the_selected_sessions_dir_and_group() {
@@ -268,8 +400,8 @@ mod tests {
     #[test]
     fn down_or_ctrl_f_in_new_asks_for_fzf_and_fills_the_path() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('j')); // select 「跑」
-        assert_eq!(app.dir_hints(), ["/p/work", "/p/fun"]); // the selected one first, same directories not repeated
+        keys(&mut app, "jj"); // select 「跑」
+        assert_eq!(app.dir_hints(), ["/p/work", "/p/fun", "/p/fun"]); // the selected one first, its directory not repeated
         press(&mut app, KeyCode::Down); // ↓ in the list moves down, doesn't open fzf
         assert!(!app.pick);
         press(&mut app, KeyCode::Char('N'));
@@ -414,10 +546,9 @@ mod tests {
         press(&mut app, KeyCode::Char('q'));
         press(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
-        // A fold row is a group: opens at the group's path (see t_on_a_group_opens_a_terminal_in_the_groups_dir)
+        // On a group: opens at the group's path (see t_on_a_group_opens_a_terminal_in_the_groups_dir)
         let mut app = fixture();
-        select(&mut app, "跑");
-        press(&mut app, KeyCode::Char('o'));
+        jump_to_group(&mut app, "work");
         press(&mut app, KeyCode::Char('t'));
         assert_eq!(app.term_req.take().map(|r| r.key).as_deref(), Some("group:work"));
     }
@@ -485,10 +616,10 @@ mod tests {
         let mut app = fun_in_h();
         assert!(app.matching("生活").is_empty());
         assert_eq!(app.matching("工作").len(), 1);
-        keys(&mut app, "qh");
+        keys(&mut app, "Sh");
         assert_eq!(app.matching("生活").iter().filter(|s| s.sub.is_none()).count(), 2);
         // N's fzf: sessions in h don't show their titles among 1's candidates
-        keys(&mut app, "q1");
+        keys(&mut app, "S1");
         let mut app = app.with_group_hints(|| crate::data::GroupHints { groups: vec![("work".into(), String::new())] });
         press(&mut app, KeyCode::Char('N'));
         let p = app.dir_pick_from(vec![("/p/fun".into(), Src::Known), ("/p/work".into(), Src::Known)], 40, 16).unwrap();

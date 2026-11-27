@@ -8,7 +8,7 @@
 //! settings = { max_continue = 3 }        # overrides the manifest's defaults
 //! tools = ["dispatch"]                   # which commands agents get as tools; not written = those marked agent in the manifest
 //!                                        # (agent? ones must be named)
-//! keys = { tasks = "T", run = "" }       # keys in the : menu: command / pane / view → key, "" = no key; the rest follow the manifest
+//! keys = { tasks = "T", run = "" }       # keys in the list's ?: command / pane / view → key, "" = no key; the rest follow the manifest
 //! hotkeys = { pad = "M-n" }              # hotkeys inside sessions: pane → tmux key name, "" = none; the rest follow the manifest
 //!
 //! [plugins."owner/gh-glance"]
@@ -45,7 +45,7 @@ pub struct Want {
     pub settings: toml::Table,
     /// Which commands agents get as tools (command ids); None = as the manifest says (`agent` ones yes, `agent?` ones no)
     pub tools: Option<Vec<String>>,
-    /// Keys in the `:` menu: command / pane / view id → one character; empty string = no key. The rest follow the manifest's
+    /// Keys in the list's `?`: command / pane / view id → one character; empty string = no key. The rest follow the manifest's
     /// `[[keys]]`
     pub keys: BTreeMap<String, String>,
     /// Hotkeys inside sessions: pane id → tmux key name; empty string = none. The rest follow the manifest's `[[hotkeys]]`

@@ -39,11 +39,35 @@ pub fn serve() -> Res<i32> {
             Err(_) => Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "parse error" } })),
         };
         if let Some(r) = reply {
-            let _ = writeln!(out, "{r}");
-            let _ = out.flush();
+            if writeln!(out, "{r}").and_then(|()| out.flush()).is_err() {
+                break;
+            }
+            if std::env::var_os("ACA_GATEWAY_TOOLS").is_none() {
+                note_listed(&r);
+            }
         }
     }
     Ok(0)
+}
+
+/// Called only after the list reply has been written to the agent, including through the gateway relay.
+pub(crate) fn note_listed(reply: &Value) -> bool {
+    if !reply["result"]["tools"]
+        .as_array()
+        .is_some_and(|ts| ts.iter().any(|t| t["name"].as_str().is_some_and(|n| n.starts_with("aca-router__"))))
+    {
+        return false;
+    }
+    let (Ok(id), Ok(shift)) = (std::env::var("ACA_SESSION_ID"), std::env::var("ACA_ROUTER_SHIFT")) else { return false };
+    if id.is_empty() || shift.is_empty() {
+        return false;
+    }
+    crate::runtime::update(&id, |r| {
+        if r.shift == shift {
+            r.tools_listed = true;
+        }
+    });
+    true
 }
 
 /// One message → the reply (notifications get none)
@@ -113,9 +137,13 @@ impl Offered {
 /// Which session is calling: requests forwarded by the gateway say so in `_meta` (`dev.aca/session`); a directly attached
 /// server looks at `ACA_SESSION_ID` in its environment
 pub(crate) fn caller(params: &Value) -> super::Context {
+    let direct = super::agent_context();
+    if !direct.session.is_empty() || std::env::var_os("ACA_GATEWAY_TOOLS").is_none() {
+        return direct;
+    }
     match params.pointer("/_meta/dev.aca~1session").and_then(Value::as_str) {
         Some(s) => super::agent_context_for(s),
-        None => super::agent_context(),
+        None => direct,
     }
 }
 
@@ -125,21 +153,29 @@ fn offered() -> Vec<Offered> {
     offered_for(&super::agent_context())
 }
 
+pub(crate) fn schemas_for(session: &str) -> Vec<Value> {
+    offered_for(&super::agent_context_for(session)).iter().map(Offered::schema).collect()
+}
+
 fn offered_for(ctx: &super::Context) -> Vec<Offered> {
+    let role = match crate::store::Store::open().and_then(|st| st.router_role(&ctx.session)) {
+        Ok(role) => role,
+        Err(_) => return vec![],
+    };
     let s = (!ctx.session.is_empty()).then(|| crate::store::Store::open().ok()?.get(&ctx.session).ok()).flatten();
     let cfg = crate::config::load();
     let (tool, account) = s.as_ref().map(|s| (s.tool.clone(), s.account.clone())).unwrap_or_default();
     let kind = crate::agent::tool(&cfg, &tool).map(|t| t.kind).unwrap_or_default();
     let wants = decl::wants().unwrap_or_default();
     let mut out = vec![];
-    for e in registry().into_iter().filter(|e| e.enabled) {
+    for e in registry().into_iter().filter(|e| e.enabled && e.for_role(role)) {
         // Which ones: what you set in plugins.toml (not written = those marked agent in the manifest), see yours
         let allowed = super::yours::agent_tools(&e, wants.get(&e.id));
         if allowed.is_empty() || (s.is_some() && !wants.get(&e.id).is_none_or(|w| w.reaches(&tool, &kind, &account))) {
             continue;
         }
         let Ok((m, _)) = read_manifest(Path::new(&e.path)) else { continue };
-        for a in m.actions.iter().filter(|a| allowed.contains(&a.id)) {
+        for a in m.actions.iter().filter(|a| allowed.contains(&a.id) && e.offers_action(&a.id, role)) {
             out.push(Offered { entry: e.clone(), manifest: m.clone(), action: a.clone() });
         }
     }
@@ -171,12 +207,52 @@ fn call(params: &Value) -> Value {
         Err(e) => return text(e, true),
     };
     let mut c = super::command(&o.entry, &o.manifest, &o.action.command, &ctx, &super::command_ids(&o.action.id, &args), &o.action.cwd);
+    if o.entry.id == "aca.router" {
+        match router_group(&ctx.session, &o.action.id, &params["arguments"]) {
+            Ok(group) => {
+                c.env("ACA_ROUTER_GROUP", group);
+            }
+            Err(err) => return text(err, true),
+        }
+        // A missing optional argument must not inherit the same variable from a parent plugin.
+        for key in o.action.args.keys().filter(|k| params["arguments"].get(k).is_none()) {
+            c.env_remove(super::manifest::var("ACA_ARG_", key));
+        }
+    }
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let fed = (!o.action.input.is_empty()).then(|| super::input_text(&o.action.input, &ctx));
     match run_fed(c, TIMEOUT, fed) {
         Ok(f) => text(f.text(), !f.ok),
         Err(e) => text(e, true),
     }
+}
+
+fn router_group(session: &str, action: &str, args: &Value) -> Res<String> {
+    let st = crate::store::Store::open()?;
+    let role = st.router_role(session)?.ok_or_else(|| tr!("会话不是 router", "session is not a router"))?;
+    let me = st.get(session)?;
+    let group = args["group"].as_str().unwrap_or(&me.group);
+    // Positional operands are ids or tool names, never command-line switches.
+    for key in ["id", "to", "ids", "tool"] {
+        if let Some(value) = args[key].as_str()
+            && value.split_whitespace().any(|s| s.starts_with('-') && !(action == "give" && key == "to" && s == "-"))
+        {
+            return Err(tr!("参数 {key} 无效", "invalid {key}"));
+        }
+    }
+    if role == crate::store::RouterRole::Project && group != me.group {
+        return Err(tr!("这个 router 只负责 {}", "this router only handles {}", me.group));
+    }
+    if let Some(n) = args["ticket"].as_i64() {
+        let t = st.task(n)?;
+        if (role == crate::store::RouterRole::Project || action == "start") && t.group != group {
+            return Err(tr!("任务 #{n} 不在项目 {group}", "ticket #{n} is outside project {group}"));
+        }
+    }
+    if !st.groups()?.iter().any(|g| g.path == group) {
+        return Err(tr!("没有分组 {group}", "no group {group}"));
+    }
+    Ok(group.to_string())
 }
 
 /// Checks the arguments MCP gave (already JSON) against the manifest's types: missing required ones, undeclared extras

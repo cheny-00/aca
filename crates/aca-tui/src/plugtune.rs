@@ -5,7 +5,7 @@
 //!   wraps the full description under the details (see [`Detail::hint`]).
 //!   ⏎ edits (space turns switches on / off), `-` goes back to the default; ones the manifest marks `secret` (webhook URLs,
 //!   keys) are masked, and editing starts from empty
-//! - **Tools for agents**: ✓ given ○ not given; ones the manifest writes as `agent?` (they touch things on your machine)
+//! - **Tools for agents**: [✓] given [ ] not given; ones the manifest writes as `agent?` (they touch things on your machine)
 //!   are marked "only if allowed". Space toggles
 //! - **Plugin menu** (the one `:` opens on the session list): its items in the menu and their keys. ⏎ then a key switches
 //!   to that key, ⌫ removes the key, `-` goes back to the manifest's; keys it didn't get (another plugin took them first)
@@ -36,6 +36,8 @@ const INPUT_MAX: usize = 2000;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Set {
     pub name: String,
+    /// What the interface calls it (the manifest's label); empty = the name
+    pub label: String,
     /// The value shown to people (masked if secret)
     pub shown: String,
     /// Pre-filled when editing (empty if secret)
@@ -45,6 +47,13 @@ pub struct Set {
     /// A switch: Some(whether it's on now)
     pub switch: Option<bool>,
     pub secret: bool,
+}
+
+impl Set {
+    /// What the page calls it: the label, or the name when there's none
+    pub fn title(&self) -> &str {
+        if self.label.is_empty() { &self.name } else { &self.label }
+    }
 }
 
 /// One command that can be given to agents
@@ -57,7 +66,7 @@ pub struct Tool {
     pub ask: bool,
 }
 
-/// One item in the `:` menu
+/// One item the plugin puts in the list's `?`
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Bind {
     pub id: String,
@@ -106,6 +115,7 @@ pub fn load(id: &str) -> Tune {
             raw: if s.secret { String::new() } else { plugin::plain(&s.value) },
             switch: s.value.as_bool(),
             name: s.name,
+            label: s.label,
             changed: s.changed,
             desc: s.desc,
             secret: s.secret,
@@ -193,7 +203,7 @@ pub struct Detail {
     sel: usize,
     /// Editing a setting's value
     input: Option<String>,
-    /// ⏎ on a plugin menu item: waiting for you to press its new key
+    /// ⏎ on one of its keys in ?: waiting for you to press its new key
     waiting: bool,
 }
 
@@ -214,10 +224,8 @@ fn heading(text: &str, note: &str, w: usize) -> Line<'static> {
 }
 
 /// A selectable row: when highlighted, an accent-colored bar at its start and the selected background
-fn pick(mut spans: Vec<Span<'static>>, w: usize, on: bool) -> Line<'static> {
-    if on {
-        spans[0] = Span::styled("▌ ", theme::accent());
-    }
+/// A row of the right pane: the highlighted one on the selected background
+fn pick(spans: Vec<Span<'static>>, w: usize, on: bool) -> Line<'static> {
     kit::picked(Line::from(spans), w, on)
 }
 
@@ -270,7 +278,7 @@ impl Detail {
     /// the row)
     pub fn hint(&self) -> Option<(&str, &str)> {
         match self.at() {
-            Some(At::Set(i)) => Some(&self.data.settings[i]).filter(|s| !s.desc.is_empty()).map(|s| (s.name.as_str(), s.desc.as_str())),
+            Some(At::Set(i)) => Some(&self.data.settings[i]).filter(|s| !s.desc.is_empty()).map(|s| (s.title(), s.desc.as_str())),
             _ => None,
         }
     }
@@ -278,14 +286,15 @@ impl Detail {
     /// The settings section: name and value aligned in two columns, changed ones marked (the description isn't in the row,
     /// see [`Detail::hint`])
     fn set_lines(&self, w: usize, focused: bool, out: &mut Vec<Line<'static>>, hl: &mut Option<usize>) {
-        let name_w = self.data.settings.iter().map(|s| s.name.width()).max().unwrap_or(0).min(16);
+        let name_w = self.data.settings.iter().map(|s| s.title().width()).max().unwrap_or(0).min(16);
         let val_w = self.data.settings.iter().map(|s| Self::value(s).width()).max().unwrap_or(0).clamp(4, 22);
         for (i, s) in self.data.settings.iter().enumerate() {
             let on = focused && self.at() == Some(At::Set(i));
             if on {
                 *hl = Some(out.len());
             }
-            let name = format!("{:<name_w$}", kit::clip(&s.name, name_w).trim_end());
+            // Padded by display width (a Chinese label takes two cells a character), so the values start in one column
+            let name = kit::clip(s.title(), name_w);
             let mut spans = vec![Span::raw("  "), Span::raw(name), Span::raw("  ")];
             match (&self.input, on) {
                 (Some(text), true) => {
@@ -328,7 +337,7 @@ impl Detail {
     }
 
     fn tool_line(t: &Tool, w: usize, on: bool) -> Line<'static> {
-        let (mark, st) = if t.on { ("✓", theme::accent().add_modifier(Modifier::BOLD)) } else { ("○", kit::dim()) };
+        let (mark, st) = if t.on { ("[✓]", theme::accent().add_modifier(Modifier::BOLD)) } else { ("[ ]", kit::dim()) };
         let right = if t.ask && !t.on { t!("需明确允许", "only if allowed") } else { "" };
         let room = w.saturating_sub(right.width() + 8);
         let title = kit::clip(&t.title, room).trim_end().to_string();
@@ -392,7 +401,7 @@ impl Detail {
         }
         if !d.binds.is_empty() {
             let note = if d.enabled { "" } else { t!("关闭时不在菜单中显示", "not in the menu while off") };
-            out.push(heading(t!(": 菜单中的按键", "Keys in the : menu"), note, w));
+            out.push(heading(t!("? 中的按键", "Keys in ?"), note, w));
             let s = d.settings.len() + d.tools.len();
             for (i, b) in d.binds.iter().enumerate() {
                 let on = focused && self.sel == s + i;
@@ -465,7 +474,7 @@ impl Detail {
                         let s = &self.data.settings[i];
                         // A secret starts empty: entering nothing means no change
                         if !(s.secret && v.is_empty()) {
-                            self.job(Act::Setting(id, s.name.clone(), Some(v)), fx);
+                            self.job(Act::Setting(id, s.name.clone(), Some(v), s.title().to_string()), fx);
                         }
                     }
                 }
@@ -485,15 +494,15 @@ impl Detail {
             (KeyCode::Enter | KeyCode::Char(' '), Some(At::Set(i))) if self.data.settings[i].switch.is_some() => {
                 let s = &self.data.settings[i];
                 let to = !s.switch.unwrap_or(false);
-                self.job(Act::Setting(id, s.name.clone(), Some(to.to_string())), fx);
+                self.job(Act::Setting(id, s.name.clone(), Some(to.to_string()), s.title().to_string()), fx);
             }
             (KeyCode::Enter, Some(At::Set(i))) => self.input = Some(self.data.settings[i].raw.clone()),
             (KeyCode::Char('-'), Some(At::Set(i))) => {
                 let s = &self.data.settings[i];
                 if s.changed {
-                    self.job(Act::Setting(id, s.name.clone(), None), fx);
+                    self.job(Act::Setting(id, s.name.clone(), None, s.title().to_string()), fx);
                 } else {
-                    fx.say(tr!("{} 已是默认值", "{} is already the default", s.name));
+                    fx.say(tr!("{} 已是默认值", "{} is already the default", s.title()));
                 }
             }
             (KeyCode::Char(' ') | KeyCode::Enter, Some(At::Tool(i))) => {
@@ -526,6 +535,7 @@ mod tests {
             settings: vec![
                 Set {
                     name: "url".into(),
+                    label: "webhook".into(),
                     shown: "••••abcd".into(),
                     changed: true,
                     desc: "webhook 地址".into(),
@@ -586,21 +596,30 @@ mod tests {
             let d = Detail::new(fake("aca.discord"));
             let t = text(&d, 84, true);
             // Settings: name and value aligned, changed ones marked, switches say on / off, secrets masked; the highlighted
-            // row starts with a bar. Descriptions aren't in the row
-            assert!(t.contains("▌ url       ••••abcd  已修改\n"), "{t}");
+            // row only on the selected background. Descriptions aren't in the row. One with a label goes by it, not by its key in
+            // the file
+            assert!(t.contains("  webhook   ••••abcd  已修改\n") && !t.contains(" url ") && !t.contains('▌'), "{t}");
+            let (lines, hl) = d.body(84, true);
+            assert!(hl.is_some_and(|i| lines[i].style.bg == Some(theme::pal().sel) && lines[i].to_string().contains("webhook")));
             assert!(t.contains("  workers   关\n") && !t.contains("worker 也发"), "{t}");
             // The highlighted setting: name and description go to the plugins page to write below
-            assert_eq!(d.hint(), Some(("url", "webhook 地址")));
+            assert_eq!(d.hint(), Some(("webhook", "webhook 地址")));
             // Tools for agents: title only, no id; whether a restart is needed isn't covered here
-            assert!(t.contains("提供给 agent 的工具 ─") && t.contains("✓ 列出挂载\n") && t.contains("需明确允许"), "{t}");
-            // Plugin menu: the heading says these are keys in the : menu
-            assert!(t.contains(": 菜单中的按键 ─"), "{t}");
+            assert!(
+                t.contains("提供给 agent 的工具 ─")
+                    && t.contains("[✓] 列出挂载\n")
+                    && t.contains("[ ] 挂一个端口")
+                    && t.contains("需明确允许"),
+                "{t}"
+            );
+            // Plugin menu: the heading says these are keys in the list's ?
+            assert!(t.contains("? 中的按键 ─"), "{t}");
             assert!(t.contains("m  挂载") && t.contains("已修改(原为 t)") && t.contains("e 已被其他插件占用"), "{t}");
             assert!(t.contains("⚠ 键 e 已分配给") && t.contains("给 agent  claude 的 skill / 斜杠命令"), "{t}");
             assert_eq!(d.keys()[0], ("⏎", "修改"));
             // Highlight not in this pane: no row marked
-            let (_, hl) = d.body(84, false);
-            assert!(hl.is_none() && !text(&d, 84, false).contains('▌'));
+            let (lines, hl) = d.body(84, false);
+            assert!(hl.is_none() && lines.iter().all(|l| l.style.bg.is_none()));
             // A narrow screen (phone) doesn't overflow
             assert!(d.body(40, true).0.iter().all(|l| l.width() <= 40), "{}", text(&d, 40, true));
             // Highlight on tools / menu keys: no setting description
@@ -609,6 +628,33 @@ mod tests {
                 press(&mut d, KeyCode::Char('j'));
             }
             assert_eq!(d.hint(), None);
+        });
+    }
+
+    #[test]
+    fn setting_values_start_in_one_column_whatever_the_labels_are_written_in() {
+        i18n::with(Lang::Zh, || {
+            let mut t = fake("aca.delegate");
+            let set = |label: &str, shown: &str| Set {
+                name: "x".into(),
+                label: label.into(),
+                shown: shown.into(),
+                raw: shown.into(),
+                ..Default::default()
+            };
+            t.settings =
+                vec![set("最多代发次数", "3"), set("派给谁", "codex"), set("url", "https://x"), set("一个特别特别长的中文设置名", "on")];
+            let d = Detail::new(t);
+            let lines = d.body(84, false).0;
+            let col = |v: &str| {
+                let l =
+                    lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).find(|l| l.contains(v)).unwrap();
+                l[..l.find(v).unwrap()].width()
+            };
+            assert_eq!([col("3"), col("codex"), col("https://x"), col("on")], [20; 4]);
+            // Over 16 cells a name is still cut
+            let text = text(&d, 84, false);
+            assert!(text.contains("一个特别特别长…") && !text.contains("长的中文设置名"), "{text}");
         });
     }
 
@@ -626,14 +672,17 @@ mod tests {
             }
             assert_eq!(
                 job(press(&mut d, KeyCode::Enter)),
-                Some(Act::Setting("aca.discord".into(), "url".into(), Some("https://x/y".into())))
+                Some(Act::Setting("aca.discord".into(), "url".into(), Some("https://x/y".into()), "webhook".into()))
             );
-            assert_eq!(job(press(&mut d, KeyCode::Char('-'))), Some(Act::Setting("aca.discord".into(), "url".into(), None)));
+            assert_eq!(
+                job(press(&mut d, KeyCode::Char('-'))),
+                Some(Act::Setting("aca.discord".into(), "url".into(), None, "webhook".into()))
+            );
             // A switch: space toggles; - on an unchanged one says it's already the default
             press(&mut d, KeyCode::Char('j'));
             assert_eq!(
                 job(press(&mut d, KeyCode::Char(' '))),
-                Some(Act::Setting("aca.discord".into(), "workers".into(), Some("true".into())))
+                Some(Act::Setting("aca.discord".into(), "workers".into(), Some("true".into()), "workers".into()))
             );
             let fx = press(&mut d, KeyCode::Char('-'));
             assert!(fx.job.is_none() && fx.flash.unwrap().contains("已是默认值"));
@@ -645,7 +694,7 @@ mod tests {
             assert_eq!(d.on_key(KeyEvent::from(KeyCode::Char('q')), &mut Fx::default()), Back::Stay);
             assert_eq!(
                 job(press(&mut d, KeyCode::Enter)),
-                Some(Act::Setting("aca.discord".into(), "username".into(), Some("acaq".into())))
+                Some(Act::Setting("aca.discord".into(), "username".into(), Some("acaq".into()), "username".into()))
             );
             press(&mut d, KeyCode::Enter);
             assert!(press(&mut d, KeyCode::Esc).job.is_none() && !d.typing());

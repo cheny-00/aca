@@ -11,7 +11,7 @@
 设计参考了 [herdr](https://github.com/herdrdev/herdr) 的插件,区别见最后一节。
 
 插件声明它想要什么,最终由你决定(像 kitty:kitten 不自己绑定键,远程控制的每个口令能用哪些命令由你列出):给 agent 哪些工具、
-`:` 菜单里用哪些键,都在 `plugins.toml` 里修改(见「由你决定」)。不想建插件的话,写一份 `~/.config/aca/user/aca-plugin.toml`
+列表的 `?` 里用哪些键,都在 `plugins.toml` 里修改(见「由你决定」)。不想建插件的话,写一份 `~/.config/aca/user/aca-plugin.toml`
 即可生效(见「你自己的插件」)。
 
 ## 写第一个插件
@@ -48,6 +48,7 @@ requires = ["aca.core"]          # 可选:依赖的插件,只能是 aca 自带�
 
 [settings.max_lines]             # 设置:默认值和说明;值保存在 plugins.toml,运行命令时通过环境变量传入(ACA_SETTING_MAX_LINES)
 default = 20                     # 值按默认值的类型读取:在界面或 aca plugin setting 里填 "20x" 会提示应为整数
+label = "统计行数"               # 可选:插件页里这一项叫什么;不写就显示设置的名字(max_lines)
 desc = "改动统计最多显示几行"
 # secret = true                  # webhook 地址、key 这类:界面和 aca plugin setting 列出时打码
                                  # (值仍以明文保存在 plugins.toml 中,所以 aca 把这个文件的权限设为仅你可读的 0600)
@@ -119,10 +120,10 @@ key = "x"
 title = "关闭"
 run = "close"                    # 带着这一行运行这个插件的一个能力(是否提供给菜单都可以)
 args = { number = "{id}" }       # 参数从这一行填入;能力需要的其他参数先弹出表单询问
-confirm = true                   # 需要按两次
+confirm = true                   # 先问,只认 y
 # row = false                    # 不需要选中某一行(比如新建一条);模板读取列表的 fields
 
-[[keys]]                         # 界面 : 菜单里按这个键直接运行(能力 / 窗格 / 视图的 id)
+[[keys]]                         # 列表的 ? 里按这个键直接运行(能力 / 窗格 / 视图的 id)
 key = "c"
 run = "ci"
 
@@ -141,12 +142,20 @@ via = "auto"                     # auto:gateway 开启时登记到 gateway,否�
 scope = "shared"                 # 在 gateway 中:shared 所有会话共用一份 / session 每个会话一份(有状态的服务)
 ```
 
+清单顶层写 `role = "router"` 时,插件的 agent 目录、MCP 服务和工具只给登记为分组 router 或总台的会话。
+这些会话只拿带这个角色的插件,经过 gateway 时也一样。给普通会话用的插件省略 `role`。
+
+把外面消息接进 aca 的插件可以声明 `[channel]` 表。`name` 填脚本传给 `aca msg --via` 的名字,1–16 个字符,不含空白,
+`claude` 是保留名。可选的 `settings` 列出必填的 `[settings.*]` 项。Discord 写
+`settings = ["token", "channel", "user|mention"]`,最后一项填 `user` 或 `mention` 均可。
+设置页会列出还缺哪些项,显示它们的 label。
+
 `command` 是参数数组,不经过 shell,工作目录是插件目录。
 
 清单里无法识别的字段不会阻止链接,但会被指出来(链接时、`aca plugin check`、插件页):多半是拼错了,或者写到了别的表下面
 —— TOML 中写在 `[[keys]]` 这类表头之后的字段都属于那一条。
 
-**两种语言**:`name`、`description`,以及各处的 `title`、`desc`,都可以按语言另写一份:`description_en = "…"`、
+**两种语言**:`name`、`description`,以及各处的 `title`、`desc`、`label`,都可以按语言另写一份:`description_en = "…"`、
 `title_zh = "…"`。界面是对应语言时用带后缀的那份,其他情况用不带后缀的那份(所以不带后缀的必须写)。旧版 aca 不识别后缀,
 仍然使用不带后缀的那份。aca 自带的插件都把中文写在不带后缀的字段里、英文写在 `_en` 里。
 
@@ -197,7 +206,7 @@ scope = "shared"                 # 在 gateway 中:shared 所有会话共用一�
 
 ### 热键
 
-`[[keys]]` 是界面里 `:` 菜单的键;`[[hotkeys]]` 是你在会话里面(面对 agent)时按的键。aca 把它绑定在 tmux 上,
+`[[keys]]` 是列表的 `?` 里的键;`[[hotkeys]]` 是你在会话里面(面对 agent)时按的键。aca 把它绑定在 tmux 上,
 和进入会话后用 Ctrl+Q 返回是同一种机制:
 
 - **只在 aca 的会话里拦截**。在其他 tmux 会话里,这个键照常发给里面的程序。
@@ -220,7 +229,7 @@ scope = "shared"                 # 在 gateway 中:shared 所有会话共用一�
 ```toml
 [plugins."aca.tailnet"]
 tools = ["list", "add"]            # 哪些能力作为工具提供给 agent。不写 = 清单里标了 agent 的那些;标了 agent? 的要在这里明确列出
-keys = { mounts = "M", run = "" }  # : 菜单里的键:能力 / 窗格 / 视图 → 一个字符,"" = 不分配键;没写的按清单的 [[keys]]
+keys = { mounts = "M", run = "" }  # 列表的 ? 里的键:能力 / 窗格 / 视图 → 一个字符,"" = 不分配键;没写的按清单的 [[keys]]
 hotkeys = { mounts = "M-m" }       # 会话里面的热键:窗格 → tmux 的键名,"" = 不要;没写的按清单的 [[hotkeys]]
 ```
 
@@ -228,20 +237,20 @@ hotkeys = { mounts = "M-m" }       # 会话里面的热键:窗格 → tmux 的�
   (开放端口、删除文件这类会改动机器的)默认不提供。修改后正在运行的会话要重启才生效(Codex 只在启动时读取工具;gateway 开启时
   Claude 立即更新)。这是给 agent 的工具清单,**不是沙箱**:agent 有 shell 的话照样能直接运行 `aca` 命令。
 - **键**:两个插件要同一个键时,你写的优先;都来自清单时,先登记的优先。没分配到键的不会悄悄消失 ——
-  `aca plugin ls`、`aca plugin key`、插件页里会指出来,并告诉你在哪里修改。`/` 是 `:` 菜单自己的(筛选),不能分配。
+  `aca plugin ls`、`aca plugin key`、插件页里会指出来,并告诉你在哪里修改。`/` 是 `?` 自己的(筛选),不能分配。
 - **热键**:分配规则相同(你写的优先)。清单没给热键的窗格,你也可以给它一个 —— 任何插件的任何窗格都可以。
 
 ```sh
 aca plugin allow aca.tailnet             # 列出可提供给 agent 的工具:✓ 已提供 ○ 未提供(需明确允许的会标出)
 aca plugin allow aca.tailnet add         # 提供;deny 撤回;--reset 恢复清单的设置
-aca plugin key                           # : 菜单里的全部键,未分配到键的会标出
+aca plugin key                           # 列表的 ? 里的全部键,未分配到键的会标出
 aca plugin key aca.tailnet mounts M      # 改成 M;--none 不分配键;--reset 恢复清单的设置
 aca plugin hotkey                        # 会话里面的全部热键,未绑定的会标出
 aca plugin hotkey aca.copy pick M-y      # 改成 Alt+y(tmux 上立即生效);--none 不要;--reset 恢复清单的设置
 ```
 
 界面中:插件页(`P`)右边是高亮插件的详情,按 ⏎ 进入修改 —— 设置(⏎ 修改,开关类用 ⏎ 或空格切换,`-` 恢复默认)、
-给 agent 的工具(空格切换)、插件菜单(在会话列表按 `:` 弹出的那个)里的键(按 ⏎ 后再按一个键改成它,⌫ 不分配键,
+给 agent 的工具(空格切换)、列表的 `?` 里的键(按 ⏎ 后再按一个键改成它,⌫ 不分配键,
 `-` 恢复清单的设置),Esc 返回列表。
 
 ## 你自己的插件
@@ -275,16 +284,16 @@ plugins.toml 里不用写它(sync 不会安装它,也不会删除它);要关闭�
 
 ## 界面中
 
-- **`:` 插件菜单**:在列表上按 `:`,列出已开启插件提供给 `menu` 的能力、窗格、视图,并按高亮行筛选 `contexts` 相符的
+- **列表的 `?`**:在列表上按 `?`,最前面列出已开启插件提供给 `menu` 的能力、窗格、视图,并按高亮行筛选 `contexts` 相符的
   (会话上是 `session`,分组标题上是 `group`,其他位置是 `global`;不写 `contexts` = 任何位置都可用)。↑↓ 选择、⏎ 运行,
-  `[[keys]]` 分配了键的直接按那个键,`/` 筛选。作用于高亮的会话:`ACA_SESSION_ID` 就是它。
+  `[[keys]]` 分配了键的直接按那个键,`/` 筛选。`j` `k` `g` `G` 在那里只移动、`q` `?` 只关闭:分到这几个键的用 ⏎ 运行。作用于高亮的会话:`ACA_SESSION_ID` 就是它。
 - **参数表单**:能力有 `args` 时先弹出一张表单,一个参数一栏(`bool` 用空格切换,带 `?` 的可以不填),按类型检查通过后才运行。
-- **输出**:能力运行完,只有一行的输出显示在底栏,较长的放进全屏阅读页;视图总是放进阅读页,`r` 重新运行、`c` 复制、`Esc` 返回。
+- **输出**:能力运行完,只有一行的输出显示在底栏,较长的放进全屏阅读页;视图总是放进阅读页,`Ctrl+R` 重新运行、`c` 复制、`Esc` 返回。
   都在后台运行(最多 120 秒),不影响其他操作。
 - **窗格**:在 tmux 弹窗 / 分屏 / 新窗口中打开;界面不在 tmux 里时(比如手机直接 ssh 进来)就让出终端,在前台运行。
 - **列表视图**(`rows = true`):打开为一页,每条一行,下方是高亮行的详情,最底下列出这一行可以按的键。模板里用到的字段
-  这一行没有(或为空)时,这个键在这一行上不列出,按下会提示「此行不支持」。需要按两次的会先提示。键运行完,输出显示在列表下方
-  (比如撤掉之后怎样加回去),列表重新读取;`r` 重新读取(插件没有占用 `r` 时)。
+  这一行没有(或为空)时,这个键在这一行上不列出,按下会提示「此行不支持」。标了 `confirm` 的会先问,只认 `y`。键运行完,输出显示在列表下方
+  (比如撤掉之后怎样加回去),列表重新读取;`Ctrl+R` 重新读取。
 - **会话行上的文字**:`aca meta set` 设置的文字在列表里跟在标题后面,显示为灰色的 `[名字 值]`;名字以 `_` 开头的只显示值(适合图标、数字这类一看就懂的)。
 
 ### 列表视图的输出
@@ -338,27 +347,39 @@ plugins.toml 里不用写它(sync 不会安装它,也不会删除它);要关闭�
 
 | 事件 | 自己的字段 | 什么时候发出 |
 |---|---|---|
-| `session.created` | `title` `tool` `account` `dir` `group` `parent` | 新建(分叉出来的多 `fork` 和来源会话 `fork_of`,`parent` 为空:没有派出它的会话;`aca adopt` 接管的多 `adopted` 和当前的会话名 `tmux`) |
+| `session.created` | `title` `tool` `account` `dir` `group` `parent` `by` | 新建。`by` 是在哪个会话里运行的命令建出来的(null = 你建的),不管它是不是 `parent`:在会话里用 `aca new --parent -` 建的没有 parent,`by` 仍然是那个会话(分叉出来的多 `fork` 和来源会话 `fork_of`,`parent` 为空:没有派出它的会话;`aca adopt` 接管的多 `adopted` 和当前的会话名 `tmux`;这两种没有 `by`) |
 | `session.started` | `how`:fresh / resume / fork | agent 已启动 |
-| `session.stopped` | `idle`(因空闲被 aca 停止时:停止前空闲了几秒,见 config.toml 的 `[idle] stop_after`) | `aca stop`、界面里按 D;因空闲被 aca 停止 |
+| `session.stopped` | `idle`(因空闲停止前的空闲秒数,包括投递时发现 Claude router 已闲满时限而换班) | `aca stop`、界面里按 D;因空闲被 aca 停止 |
 | `session.renamed` | `title` `tmux` | 用户重命名 |
 | `session.titled` | `title` `tmux` | agent 自己设置或更换了标题 |
-| `session.moved` | `group` | 移到别的分组 |
-| `session.rehomed` | `tool` `account` `from`(原来的「工具:账号」) | 切换账号继续(`aca restart --as`、界面的 `X`):对话复制到新账号,在原地重启 |
+| `session.moved` | `group` `from`(原来的分组)`by`(在哪个会话里跑的 `aca move`;你自己移的为 null) | 移到别的分组 |
+| `session.rehomed` | `tool` `account` `from`(原来的「工具:账号」) | 切换账号(`aca restart --as`、界面的 `X`)。普通会话按需把对话记录复制到新账号,在原地继续。Claude router 在新账号上开新一班,不复制上一班的对话记录 |
 | `session.archived` / `session.removed` | 删除的带 `title`;`aca release` 移出 aca 的多一个 `released`(tmux 会话保留) | |
 | `turn.started` | `prompt` | 你发送了一句话。别的 Claude 会话发来的消息、后台任务的通知也会让 Claude 开始一轮,这时也发这一条,`prompt` 是那段话:谁开的这一轮要等这一轮结束才在对话记录里查得到(到时会话的 `prompt` 改回你上一次说的) |
-| `turn.done` | `last`(最后一条回复)`bg`(仍在运行的后台任务数)`secs` | 一轮结束 |
-| `turn.failed` | `error` `kind`(transient = 限流、过载、连接中断,过一会儿继续多半就好;account = 额度、登录、欠费;fatal = 重试也无效) | 一轮失败(Codex 不报这个 hook:aca 查看状态时从它的对话记录中读出来补上) |
+| `turn.done` | `last`(最后一条回复)`bg`(仍在运行的后台任务数)`secs` `routers`(往来里显示这条结果的 router id 列表,有时才有) `via`（本轮开头的用户消息来自外部渠道时才有） | 一轮结束 |
+| `turn.failed` | `error` `kind`(transient = 限流、过载、连接中断,过一会儿继续多半就好;account = 额度、登录、欠费;fatal = 重试也无效) `routers`(往来里显示这条结果的 router id 列表,有时才有) `via`（本轮开头的用户消息来自外部渠道时才有） | 一轮失败(Codex 不报这个 hook:aca 查看状态时从它的对话记录中读出来补上) |
 | `turn.interrupted` | `by`(`aca interrupt` 中止 Claude 时:谁按的) | 你按 Esc 中断了它(Codex 自己报);或者 `aca interrupt` 中止了它 |
-| `agent.waiting` | `ask` `kind`(choice / permission / 空 = 无法识别)`options`(选择题的选项) | 等待你确认或回答 |
+| `agent.waiting` | `ask` `kind`(choice / permission / 空 = 无法识别)`options`(选择题的选项) `routers`(往来里显示这条结果的 router id 列表,有时才有) `via`（本轮开头的用户消息来自外部渠道时才有） | 等待你确认或回答 |
 | `agent.status` | `state`(idle / working / done / blocked / error / 空 = 它清掉了自己的状态)`kind`(blocked 时:permission / question / auth / 空)`msg`(它自己写的一行说明) | agent 自己报告了状态(OSC 7501;只有支持这个协议、经 aca 中转启动的 agent 才有),变了才发 |
 | `agent.exited` | `reason` | agent 进程退出 |
 | `conversation.changed` | `conv` `from` | 对话 id 变了(/clear) |
-| `message.sent` | `id`(这条消息的)`from` `kind`(msg / notice)`what`(通知所说的事;不是通知时为 null)`wake` `text` `at`(定时的到点时刻,秒;不是定时的为 null)`via`(`claude` = 用 Claude 自带的 SendMessage 发来的;其余为 null)| 往这个会话的收件箱放了一条消息(`aca msg`,或者它派出去的 worker 自动发的通知)。别的 Claude 会话用 SendMessage 发来的,在一轮结束时从对话记录里记下,随即算作已送达(`how` = native)。定时的(`aca msg --in`)放进去时就发这一条,送达的那条要等到点 |
-| `message.delivered` | `id` `how`(bell / queue / type / wait / native:Claude 自己送到的) | 那条消息已送达 |
+| `message.sent` | `id`(这条消息的)`from` `kind`(msg / notice)`what`(工作会话的事件或任务单消息,见表下说明,其余为 null)`wake` `text` `at`(定时的到点时刻,秒;不是定时的为 null)`via`(`claude` = 用 Claude 自带的 SendMessage 发来的;别的名字 = 用户这句话是从 aca 外面哪个渠道来的,就是 `aca msg --via` 给的那个;其余为 null)| 往这个会话的收件箱放了一条消息(`aca msg`,或者它派出去的 worker 自动发的通知)。别的 Claude 会话用 SendMessage 发来的,在一轮结束时从对话记录里记下,随即算作已送达(`how` = native)。定时的(`aca msg --in`)放进去时就发这一条,送达的那条要等到点 |
+| `message.delivered` | `id` `how`(bell / queue / type / wait / native / handoff)。native 表示 Claude 自己送达,handoff 表示 Claude router 已确认收到交接首句中的消息 | 那条消息已送达 |
 | `message.throttled` | `from` `count` `secs` | 同一个会话发送过于频繁,之后的只保存、不唤醒 |
-| `ask.answered` | `by`(谁代为回答;`you` = 在外部回答)`answer` `ask` `kind`(choice / permission;启动时的确认框是 `gate`) | `aca answer` 代为回答了确认框 |
+| `ask.answered` | `by`(谁代为回答;`you` = 在外部回答,包括在列表里按 `s`)`answer` `ask` `kind`(choice / permission;启动时的确认框是 `gate`) | `aca answer` 或列表里的 `s` 代为回答了确认框 |
 | `limits.changed` | `tool`(claude / codex)`name`(登记的账号名,未登记的是目录名去掉点)`dir`(账号目录)`wins`(这个账号的每个窗口:`label` 5h / 7d / Fable …、已用百分比 `used`、`resets` 和这份数据的时间 `at`,都以秒计) | 一个账号的订阅额度有变化:刷新时数值没变的不发出。Claude 的来自状态栏,Codex 的在它一轮结束时读取。`session` 是报告它的会话,不是 aca 启动的则为空;一次获取全部账号用 `aca limits --json` |
+| `task.added` | `n`(单号)`group` `title` `by`(谁新建的:会话 id;空 = 你) | 新建了一张任务单。`session` 是做它的会话,还没人做时为空(下面几个同) |
+| `task.given` | `n` `group` `title` `by`(谁交的)`say`(交的时候说的话) | 任务单交给了 `session`;`session` 为空 = 取回了,它又在等人做 |
+| `task.done` | `n` `group` `title` `by`(谁标的)`result`(说的结果) `routers`(往来里显示这条结果的 router id 列表,有时才有) | 任务单标成了完成 |
+| `task.changed` | `n` `group` `title` `by` | 改了任务单的名字、完成标准、那一行字或盯单设置 |
+| `task.removed` | `n` `group` `title` `by` | 删除了任务单 |
+
+任务结果的 `routers` 记的是事件发生时单子所在分组的 router 和交这张单的 router,与盯没盯无关。一轮可能涉及做活会话手上的多张未完成单。
+只要一轮由用户的渠道来话开头,任何会话的轮次事件都可能带 `via`。
+
+`message.sent` 的 `what` 在发给 router 的任务单消息上可以是 `task`,完成消息是 `task.done`。
+工作会话给 parent 的通知用 `turn.done`、`agent.waiting`、`turn.failed`、`agent.exited`。
+盯单通知在对应的事件名前加 `task.`,比如 `task.agent.waiting`。
 
 全部事件记录在 `~/.local/state/aca/events.jsonl`;`aca events -f` 持续读取。
 
@@ -374,7 +395,9 @@ LaunchAgent(`~/Library/LaunchAgents/com.aca.timer.<插件>.<能力>.plist`),到�
 - **运行时**:环境和从命令行运行这个能力相同,另有 `ACA_INVOKED_BY=timer`、`ACA_PLUGIN_TIMER=<插件.能力>`,没有会话(`ACA_SESSION_ID` 为空),
   标准输入为空。输出写进插件的日志(`aca plugin log`),最多运行 10 分钟(超时先向它的进程组发 TERM,3 秒内不退出再发 KILL);上一次还没结束时,下一次不启动。
 - **在运行中开关它自己**(比如完成后 `off`):aca 等这一次运行结束再改动 launchd,不会中途把自己卸掉。
-- PATH 在开启的那一刻复制进 plist(launchd 自己的 PATH 里没有 Homebrew 的路径)。
+- 开启时把 PATH 和当前环境里有的 LANG、LC_ALL、LC_CTYPE 复制进 plist。打开界面、运行 `aca plugin sync`
+  或 `aca plugin timer on` 时,会把当前环境里有、但 plist 缺的语言设置补上并重新加载。已有的值保留。
+  定时任务自己运行时跳过这项检查。
 - 测试、基准测试(设置了 `ACA_HOME` 或 `ACA_TMUX_SOCKET`)不改动 launchd:plist 写在 aca 状态目录的 `timers/` 里,视为已安装。
 
 ```sh
@@ -468,7 +491,7 @@ aca 会指出是哪个插件:
 
 ## 第一方插件
 
-在仓库的 [`plugins/`](../plugins) 里,编译进 aca 一起发布,默认都不安装。`aca plugin install aca.<名字>` 不用写路径;
+在仓库的 [`plugins/`](../plugins) 里,编译进 aca 一起发布。首次启动 router 时会自动登记 `aca.router`。`aca plugin install aca.<名字>` 不用写路径;
 plugins.toml 里只写一个 `[plugins."aca.core"]` 表头(不写 source),换台机器 `sync` 也能装上。
 安装 = aca 把编译进来的文件写到 `~/.local/share/aca/first-party/<名字>/` 再登记;这份文件由 aca 管理,升级 aca 后内容有变化时,
 下次启动 agent、`sync`、打开插件页时按新版本重写(插件页里标「自带」,`aca plugin ls` 里标「aca 自带」)。
@@ -476,14 +499,24 @@ plugins.toml 里只写一个 `[plugins."aca.core"]` 表头(不写 source),换台
 | 插件 | 提供什么 |
 |---|---|
 | `aca.delegate` | `/aca:delegate`(Claude 中是斜杠命令,输入 `/dele` 补全出来的就是它;Codex 中是一个 skill):主会话规划、经 aca 派出 worker、验收、汇报;worker 遇到临时错误时自动继续。还带一个 `/aca:spec`:一个变更从提案到归档(`openspec/changes/<slug>/`),每条任务交给 `/aca:delegate` 完成,在真实环境中验收通过才算完成。设置:`worker`(派给谁,默认 `codex`)、`language`(用哪种语言回复你,空 = 跟随你)、`say`(代为发送的那句话)、`max_continue`、`delay` |
+| `aca.router` | 项目 router 有 12 个分发工具,总台另有 `groups`。插件也提供 Claude 的角色文件。关闭插件后 router 无法启动,用 `aca plugin enable aca.router` 可重新启用。 |
 | `aca.core` | 把 aca 的核心能力作为工具提供给 agent(Claude、Codex 都支持):`sessions` 查看会话、`dispatch` 派出 worker(挂在调用者下面,可以带 worktree 分支)、`message` 发送消息、`wait` 等待(每次最多 240 秒)、`answer` 代为回答、`interrupt` 中止、`wakeup` 过会儿叫醒自己(定时消息发给自己,`aca msg --in`)。代为回答、中止的对象只能是调用者自己派出的会话。Codex 另外带一个 `wakeup` skill:要等好几分钟的活不在这一轮里干等,结束这一轮,让 aca 过会儿叫醒它回来看 |
 | `aca.gateway` | MCP gateway,见下一节 |
-| `aca.remote` | 远端任务,全部实现在插件脚本里(sh + jq + curl + ssh):把长任务派到别的机器上后台运行,结束时结果作为一条消息放进派出它的会话的收件箱。`:` 菜单里 `r` 派出、`t` 列表(⏎ 复制查看日志的命令、`x` 撤销、`r` 立即获取)、「测试 server」;agent 有 `run`、`list` 两个工具。回调先发到一台始终在线的 server 上([jobhook](https://github.com/cheny-00/jobhook)),设置:`url`、`token`。有等待中的任务时才开启每 5 分钟拉取一次的定时任务 |
-| `aca.tailnet` | tailnet 挂载,全部实现在插件脚本里(sh + jq,需要 `jq`):`:` 菜单里 `m` 是列表,每条 `tailscale serve` 一行(显示目标端口是否在监听),⏎ 复制地址、`x` 撤销(并写出如何加回去)、`a` 把本机端口挂载出去、`p` 开启 / 关闭发布(需安装 tpub)。agent 可以列出;挂端口是 `agent?`,需你明确允许(`aca plugin allow aca.tailnet add`) |
+| `aca.remote` | 远端任务,全部实现在插件脚本里(sh + jq + curl + ssh):把长任务派到别的机器上后台运行,结束时结果作为一条消息放进派出它的会话的收件箱。列表的 `?` 里 `r` 派出、`t` 列表(⏎ 复制查看日志的命令、`x` 撤销、`r` 立即获取)、「测试 server」;agent 有 `run`、`list` 两个工具。回调先发到一台始终在线的 server 上([jobhook](https://github.com/cheny-00/jobhook)),设置:`url`、`token`。有等待中的任务时才开启每 5 分钟拉取一次的定时任务 |
+| `aca.tailnet` | tailnet 挂载,全部实现在插件脚本里(sh + jq,需要 `jq`):列表的 `?` 里 `m` 是列表,每条 `tailscale serve` 一行(显示目标端口是否在监听),⏎ 复制地址、`x` 撤销(并写出如何加回去)、`a` 把本机端口挂载出去、`p` 开启 / 关闭发布(需安装 tpub)。agent 可以列出;挂端口是 `agent?`,需你明确允许(`aca plugin allow aca.tailnet add`) |
 | `aca.bark` | 一轮结束、等待你确认、出错时通过 Bark 推送到手机(有人正连着那个会话时不推送)。设置:`url`(推送地址)、`workers`(派出去的 worker 也推送)、`group`;发送一条测试推送:`aca plugin run aca.bark.test` |
-| `aca.discord` | 同样这三种情况发到 Discord 频道(webhook;有人正连着那个会话时不发)。设置:`url`(webhook 地址)、`mention`(等待确认时 @ 的用户 id)、`workers`、`username`。只往外发;在 Discord 里回复并发送到会话尚未实现 |
+| `aca.discord` | 在频道主线和总台对话,在每个会话自己的串里和它对话。`Ctrl+S` 后按 `c` 可一起开关插件和定时任务。见 [Discord 设置](#discord-设置)。 |
 | `aca.notify` | 同样这三种情况在本机弹出桌面通知(你正连着那个会话时不弹)。设置:`command`(换一个弹通知的命令,标题、正文是它的两个参数;为空或它发送失败时,macOS 用 `osascript`、Linux 用 `notify-send`)、`workers`、`attached`(正连着时也弹);显示一条测试通知:`aca plugin run aca.notify.test` |
-| `aca.copy` | 复制回复里的命令,全部实现在插件脚本里(sh,需要 `fzf`):在会话里按 Ctrl+Alt+Y(热键;`:` 菜单里是 `y`),从最后一条回复的原文中识别代码块和行内命令 —— 只有一条时直接复制,多条时弹出列表按数字键选择;shell 代码块里的每一条也单独列出。复制到 tmux 缓冲区、外层终端(OSC 52)和本机剪贴板。设置:`inline`(行内的 `…` 要哪些)、`lines`、`copy`(换一个复制命令) |
+| `aca.copy` | 复制回复里的命令,全部实现在插件脚本里(sh,需要 `fzf`):在会话里按 Ctrl+Alt+Y(热键;列表的 `?` 里是 `y`),从最后一条回复的原文中识别代码块和行内命令 —— 只有一条时直接复制,多条时弹出列表按数字键选择;shell 代码块里的每一条也单独列出。复制到 tmux 缓冲区、外层终端(OSC 52)和本机剪贴板。设置:`inline`(行内的 `…` 要哪些)、`lines`、`copy`(换一个复制命令) |
+
+## Discord 设置
+
+填好 `token` 和 `channel` 就能用 bot 的名字发话。bot 模式需要 curl 和 Python 3.8 或更新版本(`python3`)。邀请 bot 加入服务器,在这个频道给它**查看频道**、**发送消息**、**读取消息历史**、**创建公开串**、**在串里发消息**、**管理串**权限。在加锁的私人频道里,公开串也只对能看该频道的人可见。
+
+- **回到哪里。** 主线发的话交给总台,串里发的话交给那个会话。从 Discord 发起的一轮,即使有人正连着,也整段回复(最多 4000 字,每条最多 2000 字)。普通通知在有人正连着时跳过,派出的 worker 要打开 `workers` 才通知。串里用 ✓ 表示完成、? 表示在等你、✕ 表示出错。填了 `mention`,提问的第一条会 @ 那个人。
+- **串的创建和收起。** 会话第一次有通知时建同名公开串,主线用 Discord 自带的开串提示作目录。会话改名时串跟着改名,归档或删除会话时收起它的串。串空闲 24 小时后自动收起,有新发言时展开。串被人删了,下次要通知时会重建。
+- **收话。** 打开 Message Content Intent,把自己的 Discord 用户 ID 填进 `user`(留空用 `mention`)。bot 每分钟只收这个用户的文字,从旧到新用 `aca msg … --via Discord` 转交。开头 @ bot 的部分(bot 本身,或 Discord 为它管理的角色)会先去掉,只有这个 @ 的消息不转交。主线和各串从启用或建串时起各记各的进度。每轮查一次活跃串列表,只读有记录且有新消息的串。还没有总台时,主线消息算作已读。如果串对应的会话已经不存在,bot 会说一声,随即删掉记录。运行 `aca plugin run aca.discord.check` 可检查频道、消息正文和活跃串列表是否可读。
+- **只用 webhook。** 只填 `url` 时沿用原来的 webhook 通知和摘要(需要 jq)。`username` 只设置 webhook 显示的名字。`token` 和 `channel` 都填好时用 bot 自己的名字。运行 `aca plugin run aca.discord.test` 可发一条测试消息。
 
 ## MCP gateway
 
@@ -516,7 +549,7 @@ aca plugin gateway import [--apply]  # 列出各账号里单独配置的 MCP;--a
 ```
 
 - **界面**:在插件页(`P`)的 gateway 那一行按 `m` 进入,每个服务一行(运行中 / 空闲 / 已崩溃、工具数、每天调用次数、使用它的会话数),
-  空格把 `[mcps.*]` 加入 / 移出,`r` 重启、`l` 查看日志、`s` 停止。`M` 页最上面是这个会话从 gateway 能看到的服务,
+  空格把 `[mcps.*]` 加入 / 移出,`r` 重启、`z` 查看日志、`s` 停止。`M` 页最上面是这个会话从 gateway 能看到的服务,
   按空格只对这个会话关闭 / 开启(Claude 立即生效,Codex 重启后生效);已加入 gateway 的 `[mcps.*]` 不再在「项目」里重复列出。
 - **把账号里的 MCP 加入 gateway**:`import` 读取 Claude 账号目录里 `.claude.json` 顶层的 `mcpServers` 和 Codex 账号目录里
   `config.toml` 的 `[mcp_servers]`,同名且写法相同的合并成一个;HTTP 的(gateway 目前只支持 stdio)、几处写法不同的会标出来,不加入。
@@ -535,7 +568,7 @@ source = "~/src/aca/plugins/delegate"   # 本地目录 = 链接;git 地址 / own
 agents = ["claude:*", "codex:work"]    # 给哪几个「工具[:账号]」带入内容;不写 = 清单里列出的几种 agent 全给
 settings = { max_continue = 3 }        # 覆盖清单里的默认值
 tools = ["dispatch"]                   # 给 agent 哪些工具(见「由你决定」)
-keys = { tasks = "T" }                 # : 菜单里的键
+keys = { tasks = "T" }                 # 列表的 ? 里的键
 
 [plugins."owner/gh-glance"]
 source = "owner/gh-glance"
@@ -568,7 +601,7 @@ aca plugin run example.git-glance.refresh top=5 --session 3f2a   # 参数写成 
 aca plugin view aca.remote.tasks     # 运行一个视图,输出结果
 aca plugin setting aca.delegate [worker [codex:work]]   # 列出全部设置 / 读取一个 / 修改一个(写进 plugins.toml);--reset 恢复默认
 aca plugin allow | deny <id> [能力…]    # 给 agent 哪些工具(见「由你决定」)
-aca plugin key [<id> <目标> <键>]       # : 菜单里的键
+aca plugin key [<id> <目标> <键>]       # 列表的 ? 里的键
 aca plugin pane example.git-glance diff --session 3f2a [--placement window]
 aca plugin log example.git-glance    # 事件钩子的输出;列表视图的标准错误也记在这里
 aca plugin emit turn.failed kind=transient [--session id] [--plugin id]   # 模拟一个事件,钩子在前台运行
@@ -604,7 +637,7 @@ aca 会把启动 agent 时插件提供的内容记在会话的运行时状态里
 | `pane.report_metadata` 的令牌 | `aca meta set` |
 | 窗格 placement:overlay / popup / split / tab / zoomed | popup / split / window(都是 tmux 自己的) |
 | `[[startup]]` | 没有:没有 server 需要等待。需要定期运行的写 `[[timers]]`(aca 代为安装 launchd 任务) |
-| `[[keybindings]]` | `[[keys]]`:绑定在界面的 `:` 菜单里(按 `:` 再按那个键),不和 aca 自己的键冲突;只是默认值,你可以在 plugins.toml 里修改 |
+| `[[keybindings]]` | `[[keys]]`:绑定在列表的 `?` 里(按 `?` 再按那个键),不和 aca 自己的键冲突;只是默认值,你可以在 plugins.toml 里修改 |
 | | `[[views]]`:命令的输出显示在 aca 的全屏阅读页,插件不用自己写界面 |
 | `plugin install <GitHub>` | `aca plugin install owner/repo`(任何 git 地址都可以,`--ref` 固定版本),`update`、`remove` |
 | | `[agent]`:给 aca 启动的 agent 带一个插件目录(skill、斜杠命令)和一个 MCP 服务 |

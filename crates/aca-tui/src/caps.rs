@@ -1,15 +1,12 @@
-//! The `:` command panel: aca's own actions (the table in acts.rs; picking one = pressing that key on the main list) and the
-//! commands enabled plugins expose to the interface (the manifest's `[[commands]]`, called commands in the interface; the
-//! ones for agents are called "tools for agents"), panes and views (see `aca_core::plugin::menu`), narrowed by the
-//! highlighted row to the ones that make sense here. Diagnostic ones (try it, test connectivity) don't go here; the manifest
+//! Running what enabled plugins expose to the interface: commands (the manifest's `[[commands]]`, called commands in the
+//! interface; the ones for agents are called "tools for agents"), panes and views (see `aca_core::plugin::menu`). They're listed
+//! first in the main list's `?` sheet (sheet.rs), narrowed by the highlighted row to the ones that make sense here; keys the
+//! manifest's `[[keys]]` binds work only there. Diagnostic ones (try it, test connectivity) don't go there; the manifest
 //! exposes them to the cli only.
 //!
-//! - ↑↓ to pick, ⏎ to run; or press the key at the start of a row directly (aca's is the same key as on the main list; keys
-//!   the manifest's `[[keys]]` binds for a plugin work only here, and a clash with aca's goes to the plugin); `/` to type a
-//!   filter
 //! - A command with parameters first pops up a form (`Form`); once it has run, short output goes to the bottom bar, long
 //!   output into the full-screen reading page
-//! - Views: output goes into the full-screen reading page, `r` reruns. A list view (`rows = true`) opens as a [`List`]
+//! - Views: output goes into the full-screen reading page, `^R` reruns. A list view (`rows = true`) opens as a [`List`]
 //!   page: one item per row, the keys from the manifest's `[[views.keys]]` act on the highlighted row (copy a field, run one
 //!   of this plugin's commands with that row), the result is written below and the list reloads
 //! - Panes: tmux popup / split / new window (when the interface isn't in tmux, it gives up the terminal and runs in the
@@ -29,8 +26,6 @@ use aca_core::{t, tr};
 use crate::overlay::{Flow, Fx, Overlay, kit};
 use crate::theme;
 
-/// At most this many per page; beyond that, the list scrolls with the highlight
-const SHOWN: usize = 14;
 /// The longest input for one parameter
 const INPUT_MAX: usize = 2000;
 
@@ -94,209 +89,13 @@ pub fn run(req: &Req) -> (bool, String) {
 }
 
 /// Start it: a pane while the interface isn't in tmux has to give up the terminal; everything else goes to the background
-fn start(req: Req, fx: &mut Fx) {
+pub(crate) fn start(req: Req, fx: &mut Fx) {
     if req.item.kind == ItemKind::Pane && std::env::var_os("TMUX").is_none() {
         fx.external = Some(crate::view::External::Plugin(req));
         return;
     }
     fx.say(tr!("正在运行 {}…", "running {}…", req.title()));
     fx.plugin = Some(req);
-}
-
-/// One row of the panel: an aca action (acts.rs), or one a plugin provides. When a key a plugin binds in `:` clashes with
-/// aca's, the key goes to the plugin and the aca row shows no key (shadowed)
-enum Entry {
-    Act(&'static crate::acts::Act, bool),
-    Plugin(MenuItem),
-}
-
-impl Entry {
-    /// The key at the start of the row; blank if none
-    fn key(&self) -> String {
-        match self {
-            Entry::Act(a, false) => a.key.to_string(),
-            Entry::Act(_, true) => String::new(),
-            Entry::Plugin(it) => it.key.map_or(String::new(), |k| k.to_string()),
-        }
-    }
-
-    /// Its name (a plugin one with parameters gets …)
-    fn title(&self) -> String {
-        match self {
-            Entry::Act(a, _) => a.name().to_string(),
-            Entry::Plugin(it) => format!("{}{}", it.title, if it.args.is_empty() { "" } else { "…" }),
-        }
-    }
-
-    /// Right side: whose it is
-    fn from(&self) -> String {
-        match self {
-            Entry::Act(..) => "aca".to_string(),
-            Entry::Plugin(it) => it.plugin_name.clone(),
-        }
-    }
-
-    fn matches(&self, f: &str) -> bool {
-        match self {
-            Entry::Act(a, _) => [a.key, a.name()].iter().any(|s| s.to_lowercase().contains(f)),
-            Entry::Plugin(it) => [&it.title, &it.plugin_name, &it.id, &it.plugin].iter().any(|s| s.to_lowercase().contains(f)),
-        }
-    }
-
-    /// The key pressed is its direct key
-    fn hit(&self, k: KeyEvent) -> bool {
-        match self {
-            Entry::Act(a, shadowed) => !shadowed && a.hit(k),
-            Entry::Plugin(it) => !k.modifiers.contains(KeyModifiers::CONTROL) && it.key.is_some_and(|c| k.code == KeyCode::Char(c)),
-        }
-    }
-}
-
-/// The `:` layer
-pub struct Menu {
-    items: Vec<Entry>,
-    target: Target,
-    sel: usize,
-    /// The filter text being typed after `/`
-    filter: Option<String>,
-}
-
-impl Menu {
-    /// `all` = everything enabled plugins give the menu; keep only what makes sense on this kind of row, followed by what
-    /// aca itself can do on it
-    pub fn new(all: Vec<MenuItem>, target: Target) -> Menu {
-        let mut items: Vec<Entry> = all.into_iter().filter(|i| i.fits(target.on)).map(Entry::Plugin).collect();
-        let bound: Vec<char> = items.iter().filter_map(|e| if let Entry::Plugin(it) = e { it.key } else { None }).collect();
-        items.extend(
-            crate::acts::ACTS
-                .iter()
-                .filter(|a| a.fits(target.on))
-                .map(|a| Entry::Act(a, a.key.chars().count() == 1 && a.key.chars().any(|c| bound.contains(&c)))),
-        );
-        Menu { items, target, sel: 0, filter: None }
-    }
-
-    #[cfg(test)]
-    fn plugin_ids(&self) -> Vec<&str> {
-        self.items.iter().filter_map(|e| if let Entry::Plugin(it) = e { Some(it.id.as_str()) } else { None }).collect()
-    }
-
-    /// The filtered ones (indices)
-    fn shown(&self) -> Vec<usize> {
-        let f = self.filter.as_deref().unwrap_or("").to_lowercase();
-        (0..self.items.len()).filter(|&i| f.is_empty() || self.items[i].matches(&f)).collect()
-    }
-
-    fn pick(&self, i: usize, fx: &mut Fx) -> Flow {
-        match &self.items[i] {
-            Entry::Act(a, _) => fx.key = a.event(),
-            Entry::Plugin(it) if it.kind == ItemKind::Command && !it.args.is_empty() => {
-                fx.open = Some(Box::new(Form::new(it.clone(), self.target.clone())));
-            }
-            Entry::Plugin(it) => start(Req { item: it.clone(), session: self.target.session.clone(), ..Default::default() }, fx),
-        }
-        Flow::Close
-    }
-
-    fn row(&self, it: &Entry, w: usize) -> Line<'static> {
-        let key = format!("{:<3}", it.key());
-        // The right side only says whose it is: aca's own, or which plugin's (pane / view / command is an implementation
-        // split; pressing any of them just "runs it")
-        let right = it.from();
-        let right_w = right.width();
-        let title = kit::clip(&it.title(), w.saturating_sub(right_w + 7)).trim_end().to_string();
-        kit::spread(
-            vec![Span::raw(" "), Span::styled(key, kit::key_style()), Span::styled(title, Style::new().add_modifier(Modifier::BOLD))],
-            vec![Span::styled(right, kit::dim())],
-            w,
-        )
-    }
-}
-
-impl Overlay for Menu {
-    fn width(&self) -> u16 {
-        72
-    }
-
-    fn lines(&self, w: usize) -> Vec<Line<'static>> {
-        let wrap =
-            |text: &str, st: Style| crate::kit::wrap_width(text, w).into_iter().map(move |l| Line::styled(l, st)).collect::<Vec<_>>();
-        let on = match self.target.on {
-            "session" => tr!("命令 · 对「{}」", "Commands · for “{}”", self.target.label),
-            "group" => tr!("命令 · 对分组 {}", "Commands · for group {}", self.target.label),
-            _ => t!("命令", "Commands").to_string(),
-        };
-        let mut out = vec![kit::modal_title(&on, theme::accent(), kit::esc_hint(t!("关闭", "close")), w), Line::raw("")];
-        let shown = self.shown();
-        if shown.is_empty() {
-            out.extend(wrap(t!("无匹配项", "nothing matches"), kit::dim()));
-        }
-        let at = shown.iter().position(|&i| i == self.sel).unwrap_or(0);
-        let from = at.saturating_sub(SHOWN / 2).min(shown.len().saturating_sub(SHOWN));
-        for &i in shown.iter().skip(from).take(SHOWN) {
-            out.push(kit::picked(self.row(&self.items[i], w), w, i == self.sel));
-        }
-        out.push(Line::raw(""));
-        if let Some(f) = &self.filter {
-            out.push(Line::from(vec![Span::styled(t!("筛选 > ", "filter > "), theme::accent()), Span::raw(f.clone()), Span::raw("▏")]));
-            out.push(kit::keys_line(&[("⏎", t!("执行", "run")), ("Esc", t!("清除筛选", "stop filtering"))], vec![], w));
-        } else {
-            out.push(kit::keys_line(&[("↑↓", t!("选择", "pick")), ("⏎", t!("执行", "run")), ("/", t!("筛选", "filter"))], vec![], w));
-        }
-        out
-    }
-
-    fn on_key(&mut self, k: KeyEvent, fx: &mut Fx) -> Flow {
-        let shown = self.shown();
-        let at = shown.iter().position(|&i| i == self.sel);
-        let step = |d: isize| -> Option<usize> {
-            let n = shown.len() as isize;
-            (n > 0).then(|| shown[((at.map_or(-1, |a| a as isize) + d).rem_euclid(n)) as usize])
-        };
-        if let Some(f) = &mut self.filter {
-            match k.code {
-                KeyCode::Esc => self.filter = None,
-                KeyCode::Enter => return at.map_or(Flow::Stay, |_| self.pick(self.sel, fx)),
-                KeyCode::Up => self.sel = step(-1).unwrap_or(0),
-                KeyCode::Down => self.sel = step(1).unwrap_or(0),
-                KeyCode::Backspace => {
-                    f.pop();
-                }
-                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => f.push(c),
-                _ => {}
-            }
-            // After filtering, the highlight lands on the first match
-            let shown = self.shown();
-            if !shown.contains(&self.sel) {
-                self.sel = shown.first().copied().unwrap_or(0);
-            }
-            return Flow::Stay;
-        }
-        match k.code {
-            KeyCode::Esc => return Flow::Close,
-            KeyCode::Char('q') if !self.items.iter().any(|i| i.hit(k)) => return Flow::Close,
-            KeyCode::Enter => return at.map_or(Flow::Stay, |_| self.pick(self.sel, fx)),
-            KeyCode::Up => self.sel = step(-1).unwrap_or(0),
-            KeyCode::Down => self.sel = step(1).unwrap_or(0),
-            KeyCode::Char('/') if !k.modifiers.contains(KeyModifiers::CONTROL) => self.filter = Some(String::new()),
-            _ => {
-                // Direct keys: plugin-bound ones, aca's; j k, when nobody takes them, move the highlight
-                if let Some(i) = self.items.iter().position(|i| i.hit(k)) {
-                    return self.pick(i, fx);
-                }
-                match k.code {
-                    KeyCode::Char('j') => self.sel = step(1).unwrap_or(0),
-                    KeyCode::Char('k') => self.sel = step(-1).unwrap_or(0),
-                    _ => {}
-                }
-            }
-        }
-        Flow::Stay
-    }
-
-    fn typing(&self) -> bool {
-        self.filter.is_some()
-    }
 }
 
 /// A command with parameters: one field per parameter, runs once filled in
@@ -355,6 +154,11 @@ impl Form {
 }
 
 impl Overlay for Form {
+    /// Always typing: ? is a character here
+    fn sheet(&self) -> Option<Vec<crate::sheet::Key>> {
+        None
+    }
+
     fn width(&self) -> u16 {
         72
     }
@@ -484,6 +288,49 @@ impl List {
         self.list.rows.get(self.sel)
     }
 
+    /// Its keys: the plugin's that work on this row, then ^R; for the bottom bar and `?`
+    fn keys(&self) -> Vec<crate::sheet::Key> {
+        use crate::sheet::{key, more};
+        let mut keys: Vec<crate::sheet::Key> = self
+            .req
+            .item
+            .acts
+            .iter()
+            .filter(|a| self.usable(a).is_some())
+            .map(|a| key(if a.key == "enter" { "⏎" } else { a.key.as_str() }, a.title.as_str()))
+            .collect();
+        keys.push(key("^R", t!("重新读取", "reload")));
+        keys.extend([more("↑↓", t!("选择", "select")), more("Esc", t!("返回", "back"))]);
+        keys
+    }
+
+    /// Run one of its keys on the highlighted row (copy, or the plugin's command; one missing an argument opens the form first)
+    fn run(&mut self, a: &plugin::RowAct, fx: &mut Fx) -> Flow {
+        let Some(given) = self.usable(a) else { return Flow::Stay };
+        let row = if a.row { self.cur() } else { None };
+        match &a.run {
+            None => {
+                fx.copy = plugin::fill(&a.copy, &self.list, row);
+            }
+            Some(item) => {
+                let then = self.reload_req();
+                if item.args.iter().any(|(n, _, opt)| !opt && !given.iter().any(|(g, _)| g == n)) {
+                    fx.open = Some(Box::new(Form::from_list(item.clone(), &self.req.session, &given, then)));
+                } else {
+                    let req = Req {
+                        item: item.clone(),
+                        session: self.req.session.clone(),
+                        args: given,
+                        then: Some(Box::new(then)),
+                        refresh: false,
+                    };
+                    start(req, fx);
+                }
+            }
+        }
+        Flow::Stay
+    }
+
     fn act(&self, name: &str) -> Option<&plugin::RowAct> {
         self.req.item.acts.iter().find(|a| a.key == name)
     }
@@ -563,8 +410,11 @@ impl Overlay for List {
             }
         }
         if let Some(a) = self.armed.as_deref().and_then(|k| self.act(k)) {
-            let key = if a.key == "enter" { "⏎" } else { &a.key };
-            out.extend(wrap(&tr!("再按 {key}:{}", "press {key} again: {}", a.title), theme::warn()));
+            out.push(Line::raw(""));
+            out.extend(wrap(&tr!("{}?", "{}?", a.title), theme::warn()));
+            out.push(Line::raw(""));
+            out.push(kit::keys_line(&[("y", t!("确定", "do it")), ("Esc", t!("取消", "keep"))], vec![], w));
+            return out;
         }
         if !self.said.is_empty() {
             out.push(Line::raw(""));
@@ -573,29 +423,36 @@ impl Overlay for List {
             }
         }
         out.push(Line::raw(""));
-        let mut keys: Vec<(String, String)> = self
-            .req
-            .item
-            .acts
-            .iter()
-            .filter(|a| self.usable(a).is_some())
-            .map(|a| (if a.key == "enter" { "⏎".to_string() } else { a.key.clone() }, a.title.clone()))
-            .collect();
-        if self.act("r").is_none() {
-            keys.push(("r".into(), t!("重新读取", "reload").into()));
-        }
-        let keys: Vec<(&str, &str)> = keys.iter().map(|(k, t)| (k.as_str(), t.as_str())).collect();
-        out.push(kit::keys_line(&keys, vec![], w));
+        out.push(crate::kit::keys_line_help(&crate::sheet::foot(&self.keys()), vec![], w));
         out
     }
 
+    fn sheet(&self) -> Option<Vec<crate::sheet::Key>> {
+        self.armed.is_none().then(|| self.keys())
+    }
+
     fn on_key(&mut self, k: KeyEvent, fx: &mut Fx) -> Flow {
-        let armed = self.armed.take();
+        // Asked about a key the plugin marked confirm: only y goes ahead; Esc says nothing, any other key (the same key again
+        // included) says it wasn't done
+        if let Some(name) = self.armed.take() {
+            let Some(a) = self.act(&name).cloned() else { return Flow::Stay };
+            match k.code {
+                KeyCode::Char('y') if !k.modifiers.contains(KeyModifiers::CONTROL) => return self.run(&a, fx),
+                KeyCode::Esc => {}
+                _ => fx.say(tr!("未执行:{}", "not done: {}", a.title)),
+            }
+            return Flow::Stay;
+        }
         let n = self.list.rows.len();
         match k.code {
             KeyCode::Esc => return Flow::Close,
             KeyCode::Down if n > 0 => return self.step(1),
             KeyCode::Up if n > 0 => return self.step(n - 1),
+            KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                fx.say(tr!("正在重新读取 {}…", "reloading {}…", self.req.title()));
+                fx.plugin = Some(self.reload_req());
+                return Flow::Stay;
+            }
             _ => {}
         }
         let Some(name) = key_name(&k) else { return Flow::Stay };
@@ -605,45 +462,18 @@ impl Overlay for List {
             "k" if n > 0 => return self.step(n - 1),
             _ => {}
         }
-        let Some(a) = self.act(&name).cloned() else {
-            if name == "r" {
-                fx.say(tr!("正在重新读取 {}…", "reloading {}…", self.req.title()));
-                fx.plugin = Some(self.reload_req());
-            }
-            return Flow::Stay;
-        };
-        let Some(given) = self.usable(&a) else {
+        let Some(a) = self.act(&name).cloned() else { return Flow::Stay };
+        if self.usable(&a).is_none() {
             if self.cur().is_some() || !a.row {
                 fx.say(tr!("此行不支持:{}", "not on this row: {}", a.title));
             }
             return Flow::Stay;
-        };
-        if a.confirm && armed.as_deref() != Some(name.as_str()) {
+        }
+        if a.confirm {
             self.armed = Some(name);
             return Flow::Stay;
         }
-        let row = if a.row { self.cur() } else { None };
-        match &a.run {
-            None => {
-                fx.copy = plugin::fill(&a.copy, &self.list, row);
-            }
-            Some(item) => {
-                let then = self.reload_req();
-                if item.args.iter().any(|(n, _, opt)| !opt && !given.iter().any(|(g, _)| g == n)) {
-                    fx.open = Some(Box::new(Form::from_list(item.clone(), &self.req.session, &given, then)));
-                } else {
-                    let req = Req {
-                        item: item.clone(),
-                        session: self.req.session.clone(),
-                        args: given,
-                        then: Some(Box::new(then)),
-                        refresh: false,
-                    };
-                    start(req, fx);
-                }
-            }
-        }
-        Flow::Stay
+        self.run(&a, fx)
     }
 
     fn takes(&self, req: &Req) -> bool {
@@ -702,50 +532,8 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_keeps_what_fits_the_row_and_a_bound_key_runs_at_once() {
-        let all = vec![
-            item("stat", ItemKind::Command, None, &["session"], &[]),
-            item("tidy", ItemKind::Command, None, &["group"], &[]),
-            item("ci", ItemKind::View, Some('c'), &[], &[]),
-        ];
-        let mut m = Menu::new(all, on_session());
-        assert_eq!(m.plugin_ids(), ["stat", "ci"]);
-        // aca's own actions follow; the plugin binds c, so aca's 「复制回复」 (copy the reply) row shows no key, c goes to the
-        // plugin
-        let t = text(&m, 70);
-        assert!(t.contains("n  新建") && t.contains("aca"), "{t}");
-        let shadowed = m.items.iter().find(|e| matches!(e, Entry::Act(a, _) if a.key == "c")).unwrap();
-        assert!(shadowed.key().is_empty() && shadowed.title() == "复制回复" && !shadowed.hit(key(KeyCode::Char('c'))));
-        let mut fx = Fx::default();
-        assert_eq!(m.on_key(key(KeyCode::Char('f')), &mut fx), Flow::Close);
-        assert_eq!(fx.key, Some(key(KeyCode::Char('f'))));
-        let mut fx = Fx::default();
-        assert_eq!(m.on_key(key(KeyCode::Char('c')), &mut fx), Flow::Close);
-        let req = fx.plugin.expect("跑起来了");
-        assert_eq!((req.item.id.as_str(), req.session.as_str()), ("ci", "s1"));
-    }
-
-    #[test]
-    fn filtering_narrows_the_list_and_enter_runs_the_one_left() {
-        let all = vec![item("stat", ItemKind::Command, None, &[], &[]), item("deploy", ItemKind::Command, None, &[], &[])];
-        let mut m = Menu::new(all, on_session());
-        let mut fx = Fx::default();
-        m.on_key(key(KeyCode::Char('/')), &mut fx);
-        for c in "dep".chars() {
-            m.on_key(key(KeyCode::Char(c)), &mut fx);
-        }
-        assert_eq!(m.shown(), vec![1]);
-        assert_eq!(m.on_key(key(KeyCode::Enter), &mut fx), Flow::Close);
-        assert_eq!(fx.plugin.unwrap().item.id, "deploy");
-    }
-
-    #[test]
     fn a_command_with_arguments_asks_in_a_form_and_checks_them() {
         let it = item("run", ItemKind::Command, None, &[], &[("host", "string", false), ("n", "int", true), ("dry", "bool", true)]);
-        let m = Menu::new(vec![it.clone()], on_session());
-        let mut fx = Fx::default();
-        assert_eq!(m.pick(0, &mut fx), Flow::Close);
-        assert!(fx.open.is_some() && fx.plugin.is_none());
         let mut f = Form::new(it, on_session());
         // Types in plain words, none for strings; bool says on / off
         let t = text(&f, 70);
@@ -773,25 +561,6 @@ mod tests {
         let req = fx.plugin.unwrap();
         assert_eq!(req.args, vec![("host".into(), "nas".into()), ("n".into(), "3".into()), ("dry".into(), "false".into())]);
         assert!(text(&f, 70).contains("   关"), "{}", text(&f, 70));
-    }
-
-    #[test]
-    fn without_plugins_the_panel_still_lists_acas_own_actions_for_the_row() {
-        let t = text(&Menu::new(vec![], on_session()), 70);
-        assert!(t.contains("命令 · 对「主线」") && t.contains("n  新建") && t.contains("⏎ 执行"), "{t}");
-        // A group row keeps only what can be done on a group: delete is there, fork isn't
-        let t = text(&Menu::new(vec![], Target { on: "group", session: String::new(), label: "组".into() }), 70);
-        assert!(t.contains("命令 · 对分组 组") && t.contains("d  删除") && !t.contains("分叉"), "{t}");
-        // / filter: typing the key finds it too; picking it = pressing that key on the main list
-        let mut m = Menu::new(vec![], on_session());
-        let mut fx = Fx::default();
-        m.on_key(key(KeyCode::Char('/')), &mut fx);
-        for c in "^n".chars() {
-            m.on_key(key(KeyCode::Char(c)), &mut fx);
-        }
-        assert_eq!(m.shown().len(), 1);
-        assert_eq!(m.on_key(key(KeyCode::Enter), &mut fx), Flow::Close);
-        assert_eq!(fx.key, Some(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)));
     }
 
     /// A list view like the mounts one: ⏎ copies the URL, x takes one down (press twice), a mounts a port (needs input), p
@@ -840,7 +609,7 @@ mod tests {
         assert!(t.starts_with("PX · mounts 标题") && t.contains("mac.ts.net\n发布 关着\n"), "{t}");
         assert!(t.contains("✕ :443 / → 127.0.0.1:8420") && t.contains("没在听") && t.contains("https://mac.ts.net/"), "{t}");
         assert!(t.contains("⏎ 复制地址") && t.contains("x 撤掉") && t.contains("a 挂一个本机端口") && t.contains("p 开关发布"), "{t}");
-        assert!(t.contains("r 重新读取"), "{t}");
+        assert!(t.contains("^R 重新读取"), "{t}");
         // The foreground row: no drop, so x isn't listed; phone width doesn't overflow
         let mut l = l;
         press(&mut l, KeyCode::Char('j'));
@@ -859,24 +628,29 @@ mod tests {
     }
 
     #[test]
-    fn row_keys_copy_run_with_the_row_ask_twice_and_hand_the_result_back_to_the_list() {
+    fn row_keys_copy_run_with_the_row_ask_first_and_hand_the_result_back_to_the_list() {
         let mut l = List::new(mounts(), true, OUT);
         assert_eq!(press(&mut l, KeyCode::Enter).0.copy.as_deref(), Some("https://mac.ts.net/"));
-        // x: the first press only warns, the second runs drop with this row; the result goes back to this list (reload
+        // x (marked confirm): asks first, only y runs drop with this row; the result goes back to this list (reload
         // only, no new page)
         let (fx, _) = press(&mut l, KeyCode::Char('x'));
-        assert!(fx.plugin.is_none() && text(&l, 80).contains("再按 x:撤掉"));
-        let req = press(&mut l, KeyCode::Char('x')).0.plugin.expect("跑了");
+        let t = text(&l, 80);
+        assert!(fx.plugin.is_none() && t.contains("撤掉?") && t.contains("y 确定 • Esc 取消"), "{t}");
+        let req = press(&mut l, KeyCode::Char('y')).0.plugin.expect("跑了");
         assert_eq!(
             (req.item.id.as_str(), req.args.clone(), req.session.as_str()),
             ("drop", vec![("target".into(), "https:443/".into())], "s1")
         );
         let then = req.then.expect("交回列表");
         assert!(then.refresh && l.takes(&then) && then.item.id == "mounts");
-        // Pressing something else in between doesn't count
+        // The same key again, or anything else, keeps it and says so (and does nothing else); Esc only cancels, the page stays
         press(&mut l, KeyCode::Char('x'));
-        press(&mut l, KeyCode::Char('k'));
-        assert!(press(&mut l, KeyCode::Char('x')).0.plugin.is_none());
+        let (fx, _) = press(&mut l, KeyCode::Char('x'));
+        assert_eq!((fx.plugin.is_none(), fx.flash.as_deref()), (true, Some("未执行:撤掉")));
+        press(&mut l, KeyCode::Char('x'));
+        let (fx, flow) = press(&mut l, KeyCode::Esc);
+        assert_eq!((fx.plugin.is_none(), fx.flash, flow), (true, None, Flow::Stay));
+        assert!(press(&mut l, KeyCode::Char('y')).0.plugin.is_none());
         // p: reads the list-level field, no row needed
         let req = press(&mut l, KeyCode::Char('p')).0.plugin.unwrap();
         assert_eq!(req.args, vec![("to".into(), "on".into())]);
@@ -890,8 +664,11 @@ mod tests {
         let req = press(form.as_mut(), KeyCode::Enter).0.plugin.unwrap();
         assert_eq!((req.item.id.as_str(), req.args.clone()), ("add", vec![("port".into(), "3000".into())]));
         assert!(req.then.is_some_and(|t| l.takes(&t)));
-        // r (not bound by the plugin): reloads this list
-        let req = press(&mut l, KeyCode::Char('r')).0.plugin.unwrap();
+        // ^R reloads this list; a bare r is the plugin's to bind
+        assert!(press(&mut l, KeyCode::Char('r')).0.plugin.is_none());
+        let mut fx = Fx::default();
+        l.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut fx);
+        let req = fx.plugin.unwrap();
         assert!(req.refresh && l.takes(&req));
         assert_eq!(press(&mut l, KeyCode::Char('q')).1, Flow::Close);
     }

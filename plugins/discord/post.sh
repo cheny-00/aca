@@ -1,6 +1,12 @@
 #!/bin/sh
-# aca.discord: post one message to the channel per event. The address is the url setting (ACA_SETTING_URL); nothing is posted
-# while someone is attached to the session; for workers that were sent out, see the workers setting.
+# With token and channel set the bot posts (discord.py, which keeps the thread records pull.sh reads); otherwise the webhook.
+if [ -n "$ACA_SETTING_TOKEN" ] && [ -n "$ACA_SETTING_CHANNEL" ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "aca.discord: needs python3"; exit 0; }
+  exec python3 "$(dirname "$0")/discord.py" post "$@"
+fi
+# Webhook: Discord-originated turns return their full reply through the configured webhook. Other events use the ordinary
+# preview; the session lifetime events (for the bot's threads) are nothing to it.
+case "$ACA_PLUGIN_EVENT" in session.*) exit 0 ;; esac
 url="$ACA_SETTING_URL"
 [ -n "$url" ] || { echo "aca.discord: no url set (aca plugin setting aca.discord url <webhook>)"; exit 0; }
 for c in curl jq; do
@@ -20,13 +26,33 @@ if [ "$1" = "test" ]; then
   post "aca" "Discord works" && echo "posted"
   exit
 fi
+ev="$ACA_PLUGIN_EVENT_JSON"
+if [ "$(printf '%s' "$ev" | jq -r '.via // empty')" = Discord ]; then
+  # Split after adding the mention so it counts toward the first message's limit.
+  mention=
+  case "$ACA_PLUGIN_EVENT" in
+    turn.done) field=last ;;
+    agent.waiting) field=ask; mention=$ACA_SETTING_MENTION ;;
+    turn.failed) field=error ;;
+    *) exit 0 ;;
+  esac
+  payloads=$(printf '%s' "$ev" | jq -c --arg field "$field" --arg u "${ACA_SETTING_USERNAME:-aca}" --arg m "$mention" '
+    ((if $m == "" then "" else "<@\($m)> " end) + (.[$field] // "")[:4000]) as $text |
+    range(0; $text | length; 2000) as $i |
+    {username: $u, content: $text[$i:$i+2000],
+     allowed_mentions: (if $i == 0 and $m != "" then {parse: [], users: [$m]} else {parse: []} end)}') || exit 1
+  [ -n "$payloads" ] || exit 0
+  printf '%s\n' "$payloads" | while IFS= read -r body; do
+    curl -fsS --max-time 10 -X POST "$url" -H 'Content-Type: application/json' -d "$body" >/dev/null || exit 1
+  done
+  exit $?
+fi
 row=$("$ACA_BIN" show "$ACA_SESSION_ID" --json) || exit 0
 [ "$(printf '%s' "$row" | jq -r '.attached // 0')" = "0" ] || exit 0
 if [ "$ACA_SETTING_WORKERS" != "true" ] && [ -n "$(printf '%s' "$row" | jq -r '.parent // empty')" ]; then
   exit 0
 fi
 title=$(printf '%s' "$row" | jq -r .title)
-ev="$ACA_PLUGIN_EVENT_JSON"
 case "$ACA_PLUGIN_EVENT" in
   turn.done) post "✓ $title" "$(printf '%s' "$ev" | jq -r '(.last // "") | .[0:300]')" ;;
   agent.waiting) post "? $title" "$(printf '%s' "$ev" | jq -r '.ask // ""')" "$ACA_SETTING_MENTION" ;;

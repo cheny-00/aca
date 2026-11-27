@@ -426,9 +426,6 @@ impl TraceView {
 impl App {
     /// `Z`: the highlighted session's record (see `trace`)
     pub(super) fn open_trace(&mut self) {
-        if self.on_fold_row() {
-            return self.flash(t!("先按回车展开", "press Enter to unfold first"));
-        }
         let Some(s) = self.current().filter(|s| !s.blank) else { return };
         // Subagent row: open its session's record, and once read go straight into its level (Esc goes back to the turn that started it)
         let (name, goto) = match &s.subagent {
@@ -501,6 +498,13 @@ impl App {
     }
 
     pub(super) fn on_trace_key(&mut self, k: KeyEvent) {
+        if k.code == KeyCode::Char('?')
+            && !k.modifiers.contains(KeyModifiers::CONTROL)
+            && let Some(v) = self.trace.as_ref()
+        {
+            let keys = trace_keys(v);
+            return self.open_sheet(&keys);
+        }
         // Ctrl combos aren't letters (^Z isn't z for output): ^L restarts in place (same as the list and billing panel), others are ignored
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             if k.code == KeyCode::Char('l') {
@@ -642,10 +646,7 @@ impl App {
     /// J / K: switch to the next / previous session in the list and keep viewing records
     fn trace_step(&mut self, d: isize) {
         let cur = self.list.selected().unwrap_or(0) as isize;
-        let mut next = cur + d;
-        while next >= 0 && next < self.view.len() as isize && self.is_fold_row(next as usize) {
-            next += d;
-        }
+        let next = cur + d;
         if next < 0 || next >= self.view.len() as isize {
             return;
         }
@@ -715,7 +716,7 @@ pub(super) fn draw_trace(f: &mut Frame, app: &mut App) {
     v.wide = w >= TRACE_SPLIT;
     let foot_line = |groups: &[Vec<MenuItem>], action: Option<usize>| match &msg {
         Some(m) => Line::styled(m.clone(), theme::warn()).centered(),
-        None => menu_bar(groups, action, w),
+        None => page_bar(groups, action, w),
     };
     // One step full screen
     if let (Some(d), Some(t)) = (v.detail.as_mut(), v.t.as_ref().map(|t| t.at(&v.path))) {
@@ -742,15 +743,7 @@ pub(super) fn draw_trace(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(title_rule(dic, &crate::trace::where_of(t, d.node), vec![Span::styled(pos, dim())], w)), head);
         let rows: Vec<Line> = d.wrapped.iter().skip(d.scroll).take(h).map(|l| pad_line(l, "  ")).collect();
         f.render_widget(Paragraph::new(rows), body);
-        let keys = vec![
-            vec![
-                ("↑↓", t!("滚动", "scroll"), 2),
-                (t!("空格 b", "Space b"), t!("翻页", "page"), 3),
-                ("n p", t!("上 / 下一项", "prev / next"), 1),
-            ],
-            vec![("Esc", t!("返回", "back"), 0)],
-        ];
-        f.render_widget(Paragraph::new(foot_line(&keys, None)), foot);
+        f.render_widget(Paragraph::new(foot_line(&trace_bar(v), None)), foot);
         return;
     }
     // Viewing steps on a phone: the top says which turn
@@ -804,7 +797,23 @@ pub(super) fn draw_trace(f: &mut Frame, app: &mut App) {
             }
         }
     }
-    let keys = match (v.wide, v.in_steps) {
+    f.render_widget(Paragraph::new(foot_line(&trace_bar(v), Some(0))), foot);
+}
+
+/// The trace page's bottom bar for where it is: one step full screen, the two panes (the conversation or its steps), or on a phone
+/// the conversation or the steps
+fn trace_bar(v: &TraceView) -> Vec<Vec<MenuItem<'static>>> {
+    if v.detail.is_some() {
+        return vec![
+            vec![
+                ("↑↓", t!("滚动", "scroll"), 2),
+                (t!("空格 b", "Space b"), t!("翻页", "page"), 3),
+                ("n p", t!("上 / 下一项", "prev / next"), 1),
+            ],
+            vec![("Esc", t!("返回", "back"), 0)],
+        ];
+    }
+    match (v.wide, v.in_steps) {
         (true, false) => vec![
             vec![("↑↓", t!("移动", "move"), 3), ("→", t!("查看过程", "steps"), 0), ("o", t!("全文", "full text"), 4)],
             vec![("n p", t!("切换轮次", "turn"), 2), ("J K", t!("切换会话", "session"), 5), ("Tab", t!("输出", "output"), 6)],
@@ -812,24 +821,43 @@ pub(super) fn draw_trace(f: &mut Frame, app: &mut App) {
         ],
         (true, true) => vec![
             vec![("↑↓", t!("移动", "move"), 3), ("o", t!("展开", "unfold"), 0), ("⏎", t!("全屏查看", "full screen"), 1)],
-            vec![("← Esc", t!("返回对话", "conversation"), 2), ("n p", t!("切换轮次", "turn"), 4), ("J K", t!("切换会话", "session"), 5)],
+            vec![("←", t!("返回对话", "conversation"), 2), ("n p", t!("切换轮次", "turn"), 4), ("J K", t!("切换会话", "session"), 5)],
+            vec![("Esc", t!("返回", "back"), 0)],
         ],
-        (false, false) => {
-            vec![
-                vec![("⏎", t!("查看过程", "steps"), 0), ("o", t!("全文", "full text"), 3)],
-                vec![("n p", t!("切换轮次", "turn"), 1), (t!("空格 b", "Space b"), t!("翻页", "page"), 2)],
-                vec![("Esc", t!("返回", "back"), 0)],
-            ]
+        (false, false) => vec![
+            vec![("⏎", t!("查看过程", "steps"), 0), ("o", t!("全文", "full text"), 3)],
+            vec![("n p", t!("切换轮次", "turn"), 1), (t!("空格 b", "Space b"), t!("翻页", "page"), 2)],
+            vec![("Esc", t!("返回", "back"), 0)],
+        ],
+        (false, true) => vec![
+            vec![("o", t!("展开", "unfold"), 0), ("⏎", t!("详情", "details"), 1)],
+            vec![("n p", t!("切换轮次", "turn"), 2), (t!("空格 b", "Space b"), t!("翻页", "page"), 3)],
+            vec![("Esc", t!("返回", "back"), 0)],
+        ],
+    }
+}
+
+/// `?` on the trace page: the bottom bar's keys, then the ones it has no room for
+fn trace_keys(v: &TraceView) -> Vec<crate::sheet::Key> {
+    use crate::sheet::{key, more};
+    let mut keys: Vec<crate::sheet::Key> = trace_bar(v).into_iter().flatten().map(|(k, w, _)| key(k, w)).collect();
+    let has = |keys: &[crate::sheet::Key], k: &str| keys.iter().any(|x| x.key == k);
+    let all = if v.in_steps { t!("全部展开", "unfold all") } else { t!("全部全文", "full text, all") };
+    let extra = [
+        ("O", all),
+        (t!("空格 b", "Space b"), t!("翻页", "page")),
+        ("e", t!("编辑器", "editor")),
+        ("J K", t!("切换会话", "session")),
+        ("z", t!("输出", "output")),
+        ("x", t!("改动", "diff")),
+        ("g G", t!("顶部 / 底部", "top / bottom")),
+    ];
+    for (k, w) in extra {
+        if !has(&keys, k) && (v.detail.is_none() || k == "e" || k == "g G") {
+            keys.push(more(k, w));
         }
-        (false, true) => {
-            vec![
-                vec![("o", t!("展开", "unfold"), 0), ("⏎", t!("详情", "details"), 1)],
-                vec![("n p", t!("切换轮次", "turn"), 2), (t!("空格 b", "Space b"), t!("翻页", "page"), 3)],
-                vec![("Esc", t!("返回对话", "conversation"), 0)],
-            ]
-        }
-    };
-    f.render_widget(Paragraph::new(foot_line(&keys, Some(0))), foot);
+    }
+    keys
 }
 
 /// How many cells to indent a wrapped line
@@ -1074,7 +1102,7 @@ fn draw_steps(f: &mut Frame, v: &mut TraceView, area: Rect, live: bool, now: i64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::tests::{fixture, press, reader_rows, select, shows, with_agents};
+    use crate::ui::tests::{fixture, press, reader_rows, select, shows, to_scope, with_agents};
 
     /// Open the record of 「跑」 and feed it the test transcript (no background thread)
     fn trace_app(name: &str) -> (App, std::path::PathBuf) {
@@ -1175,7 +1203,7 @@ mod tests {
     #[test]
     fn enter_on_a_subagent_row_opens_the_record_at_that_subagent() {
         let mut app = App::new(String::new(), with_agents());
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('l'));
         press(&mut app, KeyCode::Char('l'));
@@ -1313,7 +1341,7 @@ mod tests {
         // → into the right pane, step by step; ⏎ shows this step full screen
         press(&mut app, KeyCode::Right);
         assert!(app.trace.as_ref().unwrap().in_steps);
-        shows(&reader_rows(&mut app, 120, 20), &["← Esc 返回对话"]);
+        shows(&reader_rows(&mut app, 120, 20), &["← 返回对话", "Esc 返回 • ? 快捷键"]);
         press(&mut app, KeyCode::Down);
         assert_eq!(trace_sel(&app), "先看 bill.rs 的列宽");
         press(&mut app, KeyCode::Down);
@@ -1602,7 +1630,7 @@ mod tests {
         // ⏎ shows this turn's steps full screen, with the turn number on top
         press(&mut app, KeyCode::Enter);
         let rows = reader_rows(&mut app, 46, 30);
-        shows(&rows, &["第 1 轮", "── 4.0s", "▸ Grep  width(", "▸ Edit  src/bill.rs", "o 展开", "Esc 返回对话"]);
+        shows(&rows, &["第 1 轮", "── 4.0s", "▸ Grep  width(", "▸ Edit  src/bill.rs", "o 展开", "Esc 返回 • ? 快捷键"]);
         assert!(!rows.iter().any(|r| r.contains("你  看看两栏")));
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);

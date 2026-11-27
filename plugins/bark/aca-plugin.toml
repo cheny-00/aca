@@ -9,17 +9,23 @@ description_en = "Pushes to your phone (Bark) when a session finishes, waits or 
 # The address goes in plugins.toml: [plugins."aca.bark"] settings = { url = "https://api.day.app/<your key>" }
 
 [settings.url]
+label = "推送地址"
+label_en = "Push URL"
 default = ""
 secret = true
 desc = "Bark 的推送地址:https://api.day.app/<你的 key>(也可以用自建的 Bark server)。留空则不推送"
 desc_en = "Bark push URL: https://api.day.app/<your key> (a self-hosted Bark server works too). Empty: push nothing."
 
 [settings.workers]
+label = "worker 也推送"
+label_en = "Workers too"
 default = false
 desc = "派出的 worker(有 parent 的会话)也推送。默认不推送:worker 完成后会通知派出它的会话"
 desc_en = "Also push for dispatched workers (sessions with a parent). Off by default: a finished worker reports to the session that dispatched it."
 
 [settings.group]
+label = "推送分组"
+label_en = "Group"
 default = "aca"
 desc = "推送在手机上归入的分组"
 desc_en = "The group the notifications are filed under on the phone."

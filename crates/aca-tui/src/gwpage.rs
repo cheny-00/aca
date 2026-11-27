@@ -160,11 +160,12 @@ impl Page {
     }
 
     fn row(&self, r: &Srv, w: usize) -> Line<'static> {
+        // In the gateway or not is what space switches: [✓] / [ ]; a served one that crashed or hasn't started says so instead
         let (mark, st) = match (r.served, r.state.as_str()) {
-            (false, _) => ("○", kit::dim()),
-            (true, "ready") => ("●", theme::accent()),
-            (true, "failed") => ("✕", theme::warn()),
-            (true, _) => ("◌", Style::new()),
+            (false, _) => ("[ ]", kit::dim()),
+            (true, "ready") => ("[✓]", theme::accent()),
+            (true, "failed") => (" ✕ ", theme::warn()),
+            (true, _) => (" ◌ ", Style::new()),
         };
         let mut facts = vec![];
         if !r.served {
@@ -183,7 +184,7 @@ impl Page {
             facts.push(t!("每个会话独立", "per session").to_string());
         }
         let right = facts.join(" · ");
-        let room = w.saturating_sub(right.width() + 6);
+        let room = w.saturating_sub(right.width() + 8);
         let name_st = if r.served { Style::new().add_modifier(Modifier::BOLD) } else { kit::dim() };
         kit::spread(
             vec![
@@ -195,6 +196,22 @@ impl Page {
             vec![Span::styled(right, kit::dim())],
             w,
         )
+    }
+}
+
+impl Page {
+    /// Its keys, for the bottom bar and `?`
+    fn keys(&self) -> Vec<crate::sheet::Key> {
+        use crate::sheet::{key, more};
+        vec![
+            key("o", if self.info.on { t!("关闭", "turn off") } else { t!("开启", "turn on") }),
+            key(t!("空格", "space"), t!("加入/移出", "serve/unserve")),
+            key("r R", t!("重启/全部", "restart/all")),
+            key("z", t!("日志", "log")),
+            key("s", t!("停止进程", "stop process")),
+            more("↑↓", t!("选择", "select")),
+            more("Esc", t!("返回插件页", "back to the plugins page")),
+        ]
     }
 }
 
@@ -241,18 +258,12 @@ impl Overlay for Page {
             }
         }
         out.push(Line::raw(""));
-        out.push(kit::keys_line(
-            &[
-                ("o", if self.info.on { t!("关闭", "turn off") } else { t!("开启", "turn on") }),
-                (t!("空格", "space"), t!("加入/移出", "serve/unserve")),
-                ("r R", t!("重启/全部", "restart/all")),
-                ("l", t!("日志", "log")),
-                ("s", t!("停止进程", "stop process")),
-            ],
-            vec![],
-            w,
-        ));
+        out.push(crate::kit::keys_line_help(&crate::sheet::foot(&self.keys()), vec![], w));
         out
+    }
+
+    fn sheet(&self) -> Option<Vec<crate::sheet::Key>> {
+        Some(self.keys())
     }
 
     fn on_key(&mut self, k: KeyEvent, fx: &mut Fx) -> Flow {
@@ -282,7 +293,7 @@ impl Overlay for Page {
                 }
                 self.reload();
             }
-            KeyCode::Char('l') => {
+            KeyCode::Char('z') => {
                 if let Some(r) = self.cur() {
                     let log = gateway::log_of(&aca_core::plugin::mount::safe(&r.name));
                     if log.exists() {
@@ -365,12 +376,12 @@ mod tests {
             let t: String = p.lines(100).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect();
             assert!(
                 t.contains("已开启 · 运行中 · 2 个连接\n")
-                    && t.contains("● web")
+                    && t.contains("[✓] web")
                     && t.contains("运行中 · 3 个工具 · 每天 7 次 · 2 个会话 · 每个会话独立"),
                 "{t}"
             );
             // What space does is in the key bar, not repeated in the body
-            assert!(t.contains("✕ aca-delegate") && t.contains("○ github") && t.contains("未加入") && !t.contains("空格:"), "{t}");
+            assert!(t.contains(" ✕  aca-delegate") && t.contains("[ ] github") && t.contains("未加入") && !t.contains("空格:"), "{t}");
             // A plugin's own doesn't show the plugin id; the server of plugin tools for agents is called just that
             assert_eq!((info_what(&p, 0), info_what(&p, 1)), ("来自插件", "插件提供给 agent 的工具"));
         });

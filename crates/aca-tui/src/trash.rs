@@ -13,6 +13,8 @@
 //!
 //! Stored in ~/.local/state/aca/ui/deleted, one entry per line (JSON). Like pins, it's reread on every refresh and before every
 //! change, so an interface open on the phone and one on the desktop agree.
+//! A note deleted on its own isn't in that file: it stays in the registry, marked deleted (`Store::note_bin`), and the page
+//! lists it from there, an entry like the others (see [`Item::note`]).
 //! Older versions kept it in trash in the same directory (`<pid of the interface that deleted it>\t<profile>\t<session id>`,
 //! deleted for good when the interface exited): entries whose interface has exited are moved over and kept for 1 day from the
 //! move; those of an old interface still open are left to it.
@@ -25,7 +27,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde::{Deserialize, Serialize};
 
-use aca_core::store::Store;
+use aca_core::store::{Note, Store};
 use aca_core::{t, tr};
 use aca_records::paths::{state_file, write_atomic};
 
@@ -56,6 +58,19 @@ pub struct Item {
     /// Sessions deleted with it
     #[serde(default)]
     pub sessions: Vec<Gone>,
+    /// The entry is a note deleted on its own. Read from the registry each time, never written to the file
+    #[serde(skip)]
+    pub note: Option<GoneNote>,
+}
+
+/// A note deleted on its own
+#[derive(Clone, Debug, PartialEq)]
+pub struct GoneNote {
+    pub id: String,
+    /// Its first line
+    pub name: String,
+    /// Whose notebook it was in
+    pub group: String,
 }
 
 /// A deleted group as it was in the registry
@@ -70,7 +85,8 @@ pub struct GroupRec {
     /// Which workspace it's in (the interface's, see spaces.rs)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space: Option<char>,
-    /// Its note (the interface's, see notes.rs)
+    /// The one note it had, in entries made before groups had notebooks (brought back, it becomes a note in the notebook). Since
+    /// then a group's notes stay in the registry, deleted along with the entry (see `Store::notes_bin_group`)
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
 }
@@ -96,21 +112,36 @@ impl Item {
 
     /// Several sessions deleted together with v select: one entry, restored together
     pub fn sessions(profile: &str, v: Vec<Gone>) -> Item {
-        Item { id: new_id(), at: aca_core::paths::now(), profile: profile.into(), group: String::new(), groups: vec![], sessions: v }
+        Item { id: new_id(), at: aca_core::paths::now(), profile: profile.into(), sessions: v, ..Item::default() }
     }
 
-    /// What the trash page and messages call it: a group by its name, a session by its title
+    /// The entry for a note deleted on its own, as the registry has it: its key is the note's (`notes::note_key`), so it's the
+    /// same entry every time it's read
+    pub fn note(n: &Note) -> Item {
+        Item {
+            id: crate::notes::note_key(&n.id),
+            at: n.gone,
+            profile: crate::data::REGISTERED.into(),
+            note: Some(GoneNote { id: n.id.clone(), name: n.name().to_string(), group: n.group.clone() }),
+            ..Item::default()
+        }
+    }
+
+    /// What the trash page and messages call it: a group by its name, a session by its title, a note by its first line
     pub fn label(&self) -> &str {
-        match self.sessions.first() {
-            Some(s) if self.group.is_empty() => &s.title,
+        match (&self.note, self.sessions.first()) {
+            (Some(n), _) => &n.name,
+            (None, Some(s)) if self.group.is_empty() => &s.title,
             _ => &self.group,
         }
     }
 
     /// What messages call it: a session is "<title>" (long ones cut), several deleted together are "<first>" and n-1 more, a
-    /// group is "group <name>". No leading space (as in 「已恢复{}」 (restored …))
+    /// group is "group <name>", a note is "note <its first line>". No leading space (as in 「已恢复{}」 (restored …))
     pub fn name(&self) -> String {
-        if self.group.is_empty() {
+        if let Some(n) = &self.note {
+            tr!("笔记{}", "note {}", crate::ops::named(&n.name, 1))
+        } else if self.group.is_empty() {
             crate::ops::named(self.label(), self.sessions.len())
         } else {
             let short: String = self.group.chars().take(16).collect();
@@ -226,8 +257,17 @@ fn alive(pid: u32) -> bool {
     Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
-/// Delete for good, right now, the sessions in this entry that are still archived. Returns how many were deleted
+/// Delete for good, right now, the sessions in this entry that are still archived, and the notes deleted along with it. An
+/// entry that is a note: that note, if it's still deleted (one brought back meanwhile is wanted again, so it stays).
+/// Returns how many sessions were deleted
 pub fn drop_now(store: &Store, item: &Item) -> usize {
+    if let Some(n) = &item.note {
+        if store.notes_gone().is_ok_and(|v| v.iter().any(|x| x.id == n.id)) {
+            let _ = store.note_remove(&n.id);
+        }
+        return 0;
+    }
+    let _ = store.notes_drop_with(&item.id);
     let still = |id: &str| store.get(id).is_ok_and(|s| s.id == id && s.archived > 0);
     item.sessions.iter().filter(|s| still(&s.id) && aca_core::session::remove(store, &s.id).is_ok()).count()
 }
@@ -239,7 +279,10 @@ pub fn purge() {
     if let Some(old) = state_file("trash") {
         let _ = legacy(&old, &mut bin, &store, alive);
     }
-    let Ok(due) = bin.take_due(aca_core::paths::now()) else { return };
+    let now = aca_core::paths::now();
+    // Deleted notes are kept as long (in the registry): the ones deleted on their own, and any whose entry is no longer here
+    let _ = store.notes_purge(now.saturating_sub(KEEP));
+    let Ok(due) = bin.take_due(now) else { return };
     for i in due {
         drop_now(&store, &i);
     }
@@ -288,6 +331,8 @@ pub fn purge_detached() {
 /// the selected ones together
 pub struct Page {
     trash: Trash,
+    /// The notes deleted on their own, as the registry has them now (see `Book::gone`)
+    notes: Option<Box<dyn Fn() -> Vec<Note>>>,
     now: fn() -> u64,
     rows: Vec<Item>,
     sel: usize,
@@ -301,13 +346,42 @@ pub struct Page {
     anchor: Option<String>,
     /// This range is a V range that unchecks
     unpick: bool,
+    /// The scratch group, for naming the groups under it as the list does
+    scratch: Option<String>,
 }
 
 impl Page {
     pub fn new(trash: Trash, now: fn() -> u64) -> Page {
-        let mut p = Page { trash, now, rows: vec![], sel: 0, armed: false, dropped: vec![], marked: vec![], anchor: None, unpick: false };
+        let mut p = Page {
+            trash,
+            notes: None,
+            scratch: None,
+            now,
+            rows: vec![],
+            sel: 0,
+            armed: false,
+            dropped: vec![],
+            marked: vec![],
+            anchor: None,
+            unpick: false,
+        };
         p.reload();
         p
+    }
+
+    /// Also list the notes deleted on their own: `gone` reads them
+    pub fn with_notes(mut self, gone: impl Fn() -> Vec<Note> + 'static) -> Page {
+        self.notes = Some(Box::new(gone));
+        self.reload();
+        // Just opened: the highlight starts on the newest, note or not
+        self.sel = 0;
+        self
+    }
+
+    /// Which group is the scratch group (None = there is none)
+    pub fn with_scratch(mut self, scratch: Option<String>) -> Page {
+        self.scratch = scratch;
+        self
     }
 
     fn cur(&self) -> Option<&Item> {
@@ -356,18 +430,22 @@ impl Page {
         let right = vec![Span::styled(ago, kit::dim())];
         let right_w: usize = right.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
         let room = w.saturating_sub(right_w + 3);
-        // Group: name + how many sessions; session: title + which group it's in; several deleted together: a string of titles + how many
-        let (name, what) = if i.group.is_empty() && i.sessions.len() > 1 {
+        // Group: name + how many sessions; session: title + which group it's in; several deleted together: a string of titles +
+        // how many; note: its mark and first line + whose notebook it was in
+        let shown = |g: &str| crate::kit::group_shown(g, crate::kit::scratch_len(g, self.scratch.as_deref())).into_owned();
+        let in_group = |g: &str| if g.is_empty() { String::new() } else { shown(g) };
+        let (name, what) = if let Some(n) = &i.note {
+            (format!("✎ {}", n.name), in_group(&n.group))
+        } else if i.group.is_empty() && i.sessions.len() > 1 {
             let titles: Vec<&str> = i.sessions.iter().map(|s| s.title.as_str()).collect();
             let what = tr!("{} 个会话", "{} sess.", i.sessions.len());
             let room = room.saturating_sub(unicode_width::UnicodeWidthStr::width(what.as_str()) + 2);
             (kit::clip(&titles.join(t!("、", ", ")), room).trim_end().to_string(), what)
         } else if i.group.is_empty() {
-            let g = i.sessions.first().map(|s| s.group.as_str()).unwrap_or_default();
-            (i.label().to_string(), if g.is_empty() { String::new() } else { crate::kit::group_label(g).to_string() })
+            (i.label().to_string(), in_group(i.sessions.first().map(|s| s.group.as_str()).unwrap_or_default()))
         } else {
             let n = i.taken();
-            (format!("▾ {}", i.group), if n > 0 { tr!("{n} 个会话", "{n} sess.") } else { String::new() })
+            (format!("▾ {}", shown(&i.group)), if n > 0 { tr!("{n} 个会话", "{n} sess.") } else { String::new() })
         };
         let name = kit::clip(&name, room).trim_end().to_string();
         let what = kit::clip(&what, room.saturating_sub(unicode_width::UnicodeWidthStr::width(name.as_str()) + 2)).trim_end().to_string();
@@ -379,14 +457,32 @@ impl Page {
     }
 
     /// What's written below once d is pressed
+    /// Its keys as they are now (selecting or not), for the bottom bar and `?`
+    fn keys(&self) -> Vec<crate::sheet::Key> {
+        use crate::sheet::{key, more};
+        let ranging = self.anchor.is_some();
+        let picking = ranging || !self.marked.is_empty();
+        let tick = if self.on_marked() { t!("取消选中", "unselect") } else { t!("选中", "select") };
+        let mut v = vec![key("⏎", t!("恢复", "restore")), key("d", t!("删除", "delete"))];
+        match () {
+            _ if ranging => {}
+            _ if picking => {
+                v.extend([key("v", t!("连选", "range")), key("V", t!("连续取消", "range unselect")), key(t!("空格", "Space"), tick)])
+            }
+            _ => v.extend([key("v", t!("多选", "select")), more("V", t!("连续取消", "range unselect")), more(t!("空格", "Space"), tick)]),
+        }
+        v.extend([more("↑↓", t!("选择", "pick")), more("Esc", if picking { t!("清空选择", "unselect all") } else { t!("关闭", "close") })]);
+        v
+    }
+
     fn warning(&self, items: &[Item]) -> String {
         let n = items.len();
         let m: usize = items.iter().map(Item::taken).sum();
         match items {
             [i] if i.group.is_empty() || m == 0 => tr!("立即永久删除{}？", "Delete {} for good now?", i.name()),
             [i] => tr!("立即永久删除{}及其中 {m} 个会话？", "Delete {} and its {m} sessions for good now?", i.name()),
-            // Every entry is one session: no need to also say how many sessions
-            _ if items.iter().all(|i| i.group.is_empty() && i.sessions.len() == 1) => {
+            // Every entry is one session or one note: no need to also say how many sessions
+            _ if items.iter().all(|i| i.group.is_empty() && i.sessions.len() <= 1) => {
                 tr!("立即永久删除这 {n} 条？", "Delete these {n} for good now?")
             }
             _ => tr!("立即永久删除这 {n} 条(共 {m} 个会话)？", "Delete these {n} for good now, {m} sessions in all?"),
@@ -414,7 +510,7 @@ impl Overlay for Page {
         let at = if n > SHOWN { vec![Span::styled(format!("{}/{n}  ", self.sel + 1), kit::dim())] } else { vec![] };
         let esc = match () {
             _ if self.armed => t!("取消", "keep"),
-            _ if ranging => t!("确定", "keep"),
+            _ if ranging => t!("结束", "end"),
             _ if !self.marked.is_empty() => t!("清空选择", "clear"),
             _ => t!("关闭", "close"),
         };
@@ -442,9 +538,9 @@ impl Overlay for Page {
             out.push(kit::keys_line(&[("y", t!("永久删除", "delete")), ("Esc", t!("取消", "keep"))], vec![], w));
             return out;
         }
-        let acts = [("⏎", t!("恢复", "restore")), ("d", t!("删除", "delete"))];
+        let keys = self.keys();
         if !ranging && self.marked.is_empty() {
-            out.push(kit::keys_line(&[acts[0], acts[1], ("v", t!("多选", "select"))], vec![], w));
+            out.push(crate::kit::keys_line_help(&crate::sheet::foot(&keys), vec![], w));
             return out;
         }
         // While selecting: a green block up front says how many are selected (as in the main list's bottom bar)
@@ -455,22 +551,17 @@ impl Overlay for Page {
             false => kit::button(&count, theme::pal().green),
         };
         // If it doesn't fit, drop from the end: Space first, then V (as in the main list's bottom bar)
-        let on = self.on_marked();
-        let keys = match ranging {
-            true => vec![acts[0], acts[1]],
-            false => vec![
-                acts[0],
-                acts[1],
-                ("v", t!("连选", "range")),
-                ("V", t!("连续取消", "range unselect")),
-                (t!("空格", "Space"), if on { t!("取消选中", "unselect") } else { t!("选中", "select") }),
-            ],
-        };
+        let keys = crate::sheet::foot(&keys);
         let used = unicode_width::UnicodeWidthStr::width(badge.content.as_ref()) + 1;
-        let mut l = kit::keys_line(&keys, vec![], w.saturating_sub(used));
+        let mut l = crate::kit::keys_line_help(&keys, vec![], w.saturating_sub(used));
         l.spans.splice(0..0, [badge, Span::raw(" ")]);
         out.push(l);
         out
+    }
+
+    /// Asking whether to delete: ? is "any other key" there
+    fn sheet(&self) -> Option<Vec<crate::sheet::Key>> {
+        (!self.armed).then(|| self.keys())
     }
 
     /// v select as in the main list (after yazi): v / V start a new range from this entry, Esc fixes a range in progress; when
@@ -497,6 +588,8 @@ impl Overlay for Page {
         }
         let ranging = self.anchor.is_some();
         match k.code {
+            // b opened it: pressing it again closes, whatever is selected
+            KeyCode::Char('b') => return Flow::Close,
             KeyCode::Esc if ranging => {
                 self.marked = self.chosen().iter().map(|r| r.id.clone()).collect();
                 self.anchor = None;
@@ -524,7 +617,7 @@ impl Overlay for Page {
                     return Flow::Close;
                 }
             }
-            KeyCode::Char('d' | 'x') if n > 0 => self.armed = true,
+            KeyCode::Char('d') if n > 0 => self.armed = true,
             _ => {}
         }
         Flow::Stay
@@ -533,7 +626,12 @@ impl Overlay for Page {
     fn reload(&mut self) {
         let was = self.cur().map(|i| i.id.clone());
         self.trash.reload();
-        self.rows = self.trash.items((self.now)());
+        let now = (self.now)();
+        self.rows = self.trash.items(now);
+        if let Some(gone) = &self.notes {
+            self.rows.extend(gone().iter().map(Item::note).filter(|i| !i.expired(now)));
+            self.rows.sort_by_key(|i| std::cmp::Reverse(i.at));
+        }
         // Ones just deleted for good and still being deleted in the background aren't read back
         self.rows.retain(|r| !self.dropped.contains(&r.id));
         self.sel = was.and_then(|id| self.rows.iter().position(|r| r.id == id)).unwrap_or(self.sel).min(self.rows.len().saturating_sub(1));
@@ -553,7 +651,7 @@ mod tests {
     }
 
     fn item(id: &str, at: u64, group: &str, sessions: Vec<Gone>) -> Item {
-        Item { id: id.into(), at, profile: "default".into(), group: group.into(), groups: vec![], sessions }
+        Item { id: id.into(), at, profile: "default".into(), group: group.into(), groups: vec![], sessions, note: None }
     }
 
     fn temp(name: &str) -> PathBuf {
@@ -632,6 +730,8 @@ mod tests {
 
     #[test]
     fn dropping_now_leaves_what_came_back_meanwhile() {
+        // Deleting a session for good is an event: written to the events log and handed to the plugins
+        crate::test_home();
         let store = Store::memory();
         let mk = |id: &str, archived: u64| aca_core::store::Session {
             id: id.into(),
@@ -684,6 +784,17 @@ mod tests {
         assert!(text(&p, 36).iter().all(|r| unicode_width::UnicodeWidthStr::width(r.as_str()) <= 36));
         let empty = Page::new(Trash::default(), now);
         assert!(text(&empty, 60).iter().any(|r| r == "回收站为空"));
+        // A group under the scratch group is named as the list names it: the scratch mark for that part of its path
+        let mut t = Trash::default();
+        t.add(item("1", now() - 60, "", vec![gone("a", "fun/x", false)])).unwrap();
+        t.add(item("2", now() - 30, "fun/y", vec![gone("b", "fun/y", false)])).unwrap();
+        let rows = text(&Page::new(t, now).with_scratch(Some("fun".into())), 60);
+        assert!(rows[at_in(&rows, "标题a")].contains("  ⌂/x") && rows.iter().any(|r| r.contains("▾ ⌂/y")), "{rows:#?}");
+        assert!(!rows.iter().any(|r| r.contains("fun/")), "{rows:#?}");
+    }
+
+    fn at_in(rows: &[String], want: &str) -> usize {
+        rows.iter().position(|r| r.contains(want)).unwrap_or_else(|| panic!("缺「{want}」:{rows:#?}"))
     }
 
     #[test]
@@ -730,7 +841,52 @@ mod tests {
         let (flow, fx) = press(&mut p, KeyCode::Esc);
         assert_eq!((flow, fx.flash), (Flow::Stay, None));
         assert!(!p.armed);
-        assert_eq!(press(&mut p, KeyCode::Esc).0, Flow::Close);
+        // d twice doesn't delete (the second d is "any other key"); x doesn't ask at all
+        press(&mut p, KeyCode::Char('d'));
+        let (_, fx) = press(&mut p, KeyCode::Char('d'));
+        assert_eq!((fx.job.is_none(), fx.flash.as_deref()), (true, Some("未删除")));
+        press(&mut p, KeyCode::Char('x'));
+        assert!(!p.armed);
+        // b opened it: b closes it
+        assert_eq!(press(&mut p, KeyCode::Char('b')).0, Flow::Close);
+    }
+
+    #[test]
+    fn notes_deleted_on_their_own_are_entries_like_the_rest() {
+        let mut t = Trash::default();
+        t.add(item("1", now() - 7200, "", vec![gone("a", "fun", false)])).unwrap();
+        let note = |id: &str, text: &str, ago: u64| Note {
+            id: id.into(),
+            group: "fun/aca".into(),
+            text: text.into(),
+            gone: now() - ago,
+            ..Note::default()
+        };
+        let notes = vec![note("n1", "发版窗口\n周二、周四", 60), note("n2", "太旧的", KEEP)];
+        let mut p = Page::new(t, now).with_notes(move || notes.clone());
+        let rows = text(&p, 60);
+        let at = |want: &str| rows.iter().position(|r| r.contains(want)).unwrap_or_else(|| panic!("缺「{want}」:{rows:#?}"));
+        // Its mark and first line, whose notebook it was in, how long ago; newest first; expired ones aren't listed
+        assert!(rows[at("✎ 发版窗口")].contains("aca") && rows[at("✎ 发版窗口")].ends_with("1 分钟前"), "{rows:#?}");
+        assert!(!rows[at("✎ 发版窗口")].contains("周二") && at("✎ 发版窗口") < at("标题a"), "{rows:#?}");
+        assert!(!rows.iter().any(|r| r.contains("太旧的")), "{rows:#?}");
+        assert!(text(&p, 36).iter().all(|r| unicode_width::UnicodeWidthStr::width(r.as_str()) <= 36));
+        // d asks by its name; with a session selected too there's no count of sessions to give
+        press(&mut p, KeyCode::Char('d'));
+        has(&p, &["立即永久删除笔记「发版窗口」？"]);
+        press(&mut p, KeyCode::Esc);
+        keys(&mut p, "vjd");
+        has(&p, &["立即永久删除这 2 条？"]);
+        let (_, fx) = press(&mut p, KeyCode::Char('y'));
+        let Some(Job::Many(v)) = fx.job else { panic!() };
+        assert!(matches!(&v[..], [Job::Purge { item: a }, Job::Purge { item: b }] if a.note.is_some() && b.id == "1"));
+        // ⏎ brings it back: the same job as any entry, carrying which note
+        let mut p = Page::new(Trash::default(), now).with_notes(move || vec![note("n1", "发版窗口", 60)]);
+        let (flow, fx) = press(&mut p, KeyCode::Enter);
+        assert_eq!(flow, Flow::Close);
+        let Some(Job::Restore { item, .. }) = fx.job else { panic!() };
+        assert_eq!((item.id.as_str(), item.note.as_ref().map(|n| (n.id.as_str(), n.group.as_str()))), ("note:n1", Some(("n1", "fun/aca"))));
+        assert_eq!(Job::Restore { item, start: vec![] }.doing(), "正在恢复笔记「发版窗口」…");
     }
 
     /// Four entries, one deleted session each: 1 is the newest, at the top
@@ -765,7 +921,7 @@ mod tests {
         // v drags a range: selected rows start with "▌"; v again mid-range: the unfixed range is dropped and a new one starts here
         keys(&mut p, "vj");
         assert_eq!(chosen(&p), ["1", "2"]);
-        has(&p, &["连选 · 已选 2", "Esc 确定"]);
+        has(&p, &["连选 · 已选 2", "Esc 结束"]);
         assert_eq!(text(&p, 60).iter().filter(|r| r.starts_with('▌')).count(), 2);
         keys(&mut p, "v");
         assert_eq!(chosen(&p), ["2"]);

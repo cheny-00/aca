@@ -69,14 +69,7 @@ fn bold() -> Style {
 }
 
 /// How long: 12s / 3m / 5h / 2d
-pub fn age(sec: u64) -> String {
-    match sec {
-        0..60 => tr!("{sec}秒", "{sec}s"),
-        60..3600 => tr!("{}分", "{}m", sec / 60),
-        3600..86400 => tr!("{}时", "{}h", sec / 3600),
-        _ => tr!("{}天", "{}d", sec / 86400),
-    }
-}
+pub use aca_core::router::age;
 
 /// A state icon's color (same as the interface's list, see `kit::icon`) and its name
 fn state(s: State) -> (Style, &'static str) {
@@ -463,16 +456,21 @@ pub fn names(cfg: &Config, names: &[String]) -> bool {
 /// `aca group ls`: order, path, default directory
 fn group_lines(groups: &[Group]) -> Vec<Styled> {
     let pathw = groups.iter().map(|g| g.path.width()).max().unwrap_or(0);
+    let dirs: Vec<String> = groups.iter().map(|g| aca_records::words::tilde(&g.default_path)).collect();
+    let dirw = dirs.iter().map(|d| d.width()).max().unwrap_or(0);
     groups
         .iter()
-        .map(|g| {
+        .zip(dirs)
+        .map(|(g, dir)| {
             let pad = pathw - g.path.width() + 2;
-            vec![
-                seg(format!("{:>3}  ", g.order), theme::minor()),
-                seg(g.path.as_str(), bold()),
-                spaces(pad),
-                seg(aca_records::words::tilde(&g.default_path), theme::minor()),
-            ]
+            let mut l = vec![seg(format!("{:>3}  ", g.order), theme::minor()), seg(g.path.as_str(), bold()), spaces(pad)];
+            // The session it names as its router, in a column of its own
+            if !g.router.is_empty() {
+                l.extend([seg(dir.as_str(), theme::minor()), spaces(dirw - dir.width() + 2), seg(format!("@{}", g.router), theme::minor())]);
+            } else {
+                l.push(seg(dir, theme::minor()));
+            }
+            l
         })
         .collect()
 }
@@ -771,10 +769,16 @@ mod tests {
     fn small_lists_line_up_too() {
         let cfg = Config::default();
         let names = group_lines(&[
-            Group { path: "work/app".into(), order: 1, default_path: "/srv/app".into() },
-            Group { path: "杂".into(), order: 12, default_path: String::new() },
+            Group { path: "work/app".into(), order: 1, default_path: "/srv/app".into(), router: String::new() },
+            Group { path: "杂".into(), order: 12, ..Default::default() },
+            Group { path: "probe".into(), order: 13, default_path: "/srv/probe".into(), router: "ab12cd34".into() },
+            Group { path: "nuc".into(), order: 14, router: "ef56ab78".into(), ..Default::default() },
         ]);
-        assert_eq!(page(&names), "  1  work/app  /srv/app\n 12  杂");
+        // A group that names a router ends with it, after its directory's column
+        assert_eq!(
+            page(&names),
+            "  1  work/app  /srv/app\n 12  杂\n 13  probe     /srv/probe  @ab12cd34\n 14  nuc                   @ef56ab78"
+        );
         let accounts = account_lines(&[("claude", "sub", "~/.claude-sub"), ("codex", "labs", "~/.labs")]);
         assert_eq!(page(&accounts), "claude:sub  ~/.claude-sub\ncodex:labs  ~/.labs");
         assert_eq!(style_of(&accounts[1], "labs").fg, Some(theme::pal().codex));

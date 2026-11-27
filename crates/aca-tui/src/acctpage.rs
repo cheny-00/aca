@@ -1,4 +1,5 @@
-//! Accounts page: `^S` → `a`; `+` in the `n` menu also lands here (straight into adding an account).
+//! Accounts page: `a` on the list (on the highlighted session's account) or in any menu listing accounts, `^S` → `a`; `+` in
+//! the `n` menu also lands here (straight into adding an account).
 //!
 //! Like the plugins page it's a big fixed-size popup: the left column lists the registered accounts in two sections, Claude Code
 //! and Codex, one row each: "name  logged in or not" (asked of the tool itself, see `login` in accounts.rs); the right column is
@@ -153,7 +154,7 @@ impl Form {
                 name.content = format!("{:name_w$}", name.content).into();
                 let room = w.saturating_sub(2 + name_w + 2);
                 let line = Line::from(vec![
-                    Span::styled(if on { "› " } else { "  " }, theme::accent()),
+                    Span::raw("  "),
                     name,
                     Span::raw("  "),
                     Span::styled(kit::clip(&note, room).trim_end().to_string(), kit::dim()),
@@ -211,7 +212,7 @@ pub struct Env {
 }
 
 /// A registered session: which tool, the account it uses, its title
-pub(crate) type Use = (Agent, String, String);
+pub(crate) type Use = (Agent, String, String, bool);
 
 struct Row {
     a: Account,
@@ -219,8 +220,10 @@ struct Row {
     there: bool,
     /// The directory belongs to the other tool: which one, and why we think so
     foreign: Option<(Agent, String)>,
-    /// Titles of the sessions using it
-    used: Vec<String>,
+    /// How many sessions use it, and how many of those are running
+    used: (usize, usize),
+    /// The special environment it's bound to (`[sandbox.<name>]`), empty on this Mac
+    env: String,
     /// Tools that use it when no account is given
     default_of: Vec<String>,
     /// Listed in the `n` menu (hidden ones in `[ui] hide` don't count)
@@ -234,6 +237,8 @@ struct Row {
 /// A tool listed with a section header
 struct Fam {
     agent: Agent,
+    /// First account in menu order, or the family's own tool name when unregistered.
+    first: String,
     /// Launch args every account of this tool gets (`[tools.<tool>] args`); at launch they go before the account's own
     args: Vec<String>,
 }
@@ -246,8 +251,12 @@ enum Item {
 }
 
 impl Row {
+    fn name(&self) -> &str {
+        if self.a.agent == Agent::Agy { "agy" } else { &self.a.name }
+    }
+
     fn spec(&self) -> String {
-        format!("{}:{}", accounts::fam(self.a.agent).unwrap_or("claude"), self.a.name)
+        crate::tools::spec(accounts::fam(self.a.agent).unwrap_or("claude"), &self.a.name)
     }
 
     /// Login can be asked: the directory exists and belongs to its own tool (asking about a missing directory would create it; it
@@ -272,39 +281,109 @@ fn own_spec(a: Agent) -> String {
     accounts::fam(a).unwrap_or("claude").to_string()
 }
 
-/// A terminal at the bottom running an account's login (`run`; ⏎ here, `l` among `^E`'s). Login doesn't let the tool open the
-/// default browser itself: the link goes to the UI (a file in `links`), which pops up a choice of what to open it with (see
+/// A terminal at the bottom running an account's login (`run`; `i` here and wherever accounts are listed). Login doesn't let the
+/// tool open the default browser itself: the link goes to the UI (a file in `links`), which pops up a choice of what to open it
+/// with (see
 /// browser.rs). Codex doesn't hand it over, nor does Claude when remote (it gives the paste-a-code one), so the UI reads it off
 /// the screen; a file left from last time is deleted first so the old link doesn't pop up right away
 pub fn login_term(links: &std::path::Path, home: &str, remote: bool, name: &str, a: Agent, run: String) -> TermReq {
-    let tool = if a == Agent::Codex { "codex" } else { "claude" };
+    let tool = accounts::fam(a).unwrap_or("claude");
     let file = links.join(format!("login-{tool}-{name}.url"));
     let _ = std::fs::create_dir_all(links);
     let _ = std::fs::remove_file(&file);
+    // The remembered answer is about to be wrong
+    accounts::logging_in(a, name);
     TermReq {
-        key: format!("account:{name}"),
+        key: if name.is_empty() { format!("account:{tool}:") } else { format!("account:{name}") },
         family: String::new(),
-        title: tr!("登录 {} · {name}", "log in {} · {name}", accounts::who(a)),
+        title: if name.is_empty() {
+            tr!("登录 {}", "log in {}", accounts::who(a))
+        } else {
+            tr!("登录 {} · {name}", "log in {} · {name}", accounts::who(a))
+        },
         w: aca_records::workdir::Where { dir: home.to_string(), ..Default::default() },
         env: vec![(aca_core::agent::LOGIN_LINK.to_string(), file.to_string_lossy().into_owned())],
         run: Some(run),
-        link: Some(crate::term::Catch { file, screen: a == Agent::Codex || remote }),
+        link: Some(crate::term::Catch { file, screen: matches!(a, Agent::Codex | Agent::Agy) || remote }),
     }
+}
+
+pub(crate) fn agy_login_term(links: &Path, cfg: &aca_core::config::Config) -> Result<TermReq, String> {
+    let dir = links.join("agy-login");
+    let dir = std::fs::create_dir_all(&dir)
+        .and_then(|()| {
+            if std::fs::symlink_metadata(&dir)?.is_symlink() {
+                return Err(std::io::Error::other(t!("登录目录是符号链接", "the login directory is a symbolic link")));
+            }
+            dir.canonicalize()
+        })
+        .map_err(|e| tr!("无法打开登录目录:{e}", "can't open the login directory: {e}"))?;
+    let dir = dir.to_str().ok_or(t!("登录目录不是 UTF-8 路径", "the login directory is not a UTF-8 path"))?;
+    let mut cmd = aca_core::agent::tool(cfg, "agy").map(|t| t.cmd).unwrap_or_default();
+    if let Some(program) = cmd.first_mut() {
+        *program = aca_core::paths::expand(program);
+    } else {
+        cmd.push("agy".into());
+    }
+    cmd.extend(["--settings".into(), serde_json::json!({"trustedWorkspaces": [dir]}).to_string()]);
+    let run = cmd.iter().map(|s| aca_core::agent::sh_quote(s)).collect::<Vec<_>>().join(" ");
+    Ok(login_term(links, dir, false, "", Agent::Agy, run))
 }
 
 /// How a login answer is shown: mark, a phrase, color. None = still asking
+/// Before logging in an account that's logged in (or not asked about yet): what it is now, what logging in again loses, and
+/// that only y goes ahead. Every place `i` logs in asks with these, since the tool's login starts by dropping the current one
+pub fn relogin_lines(a: Agent, name: &str, login: Option<&Login>, w: usize) -> Vec<Line<'static>> {
+    let me = accounts::who(a);
+    // Not asked yet: say nothing about it; ask as if it's logged in
+    let now = match login {
+        Some(Login::In(who)) if !who.is_empty() => tr!("当前已登录:{who}。", "It is logged in now: {who}."),
+        Some(Login::In(_)) => t!("当前已登录。", "It is logged in now.").to_string(),
+        Some(Login::Unknown(said)) => tr!("无法确认登录状态:{said}", "can't tell whether it's logged in: {said}"),
+        _ => String::new(),
+    };
+    let lost = if a == Agent::Codex {
+        t!(
+            "Codex 开始登录时会清除当前登录,中途退出将变为未登录。",
+            "Codex's login deletes the current one as it starts: if you don't finish, this account is left logged out."
+        )
+    } else {
+        t!("重新登录将替换当前登录。", "Logging in again replaces the current login.")
+    };
+    let title = tr!("重新登录 {me} 账号 {name}?", "Log the {me} account {name} in again?");
+    let mut out = vec![Line::styled(title, theme::warn().add_modifier(Modifier::BOLD)), Line::raw("")];
+    if !now.is_empty() {
+        out.extend(fold(&now, w).into_iter().map(Line::raw));
+    }
+    out.extend(fold(lost, w).into_iter().map(|l| Line::styled(l, theme::warn())));
+    out.push(Line::raw(""));
+    let keys = [("y", t!("重新登录", "log in again")), (t!("其他键", "any other key"), t!("取消", "leave it"))];
+    out.push(kit::keys_line(&keys, vec![], w));
+    out
+}
+
+/// Where the accounts page opens
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Opening {
+    /// On the first account
+    First,
+    /// Straight into adding one (`+`)
+    Adding,
+    /// On this account (`a` on a session, or on an account in a menu)
+    At(Agent, String),
+}
+
 fn login_said(l: Option<Login>) -> (&'static str, String, Style) {
     match l {
         None => ("…", t!("查询中", "asking").into(), kit::dim()),
-        Some(Login::In(who)) if who.is_empty() => ("●", t!("已登录", "logged in").into(), Style::new().fg(theme::pal().green)),
-        Some(Login::In(who)) => ("●", who, Style::new().fg(theme::pal().green)),
-        Some(Login::Out) => ("○", t!("未登录", "not logged in").into(), theme::warn()),
+        Some(Login::In(who)) if who.is_empty() => ("✓", t!("已登录", "logged in").into(), Style::new().fg(theme::pal().green)),
+        Some(Login::In(who)) => ("✓", who, Style::new().fg(theme::pal().green)),
+        Some(Login::Out) => ("", t!("未登录", "not logged in").into(), theme::warn()),
         Some(Login::Unknown(said)) => ("?", said, kit::dim()),
+        Some(Login::Unsafe(why)) => ("⚠", why, theme::warn()),
     }
 }
 
-/// At most this many session titles in the right column
-const TITLES: usize = 5;
 /// Max rows of the add-account form (when the hint wraps to two lines)
 const FORM_ROWS: usize = 7;
 /// Max length of the launch args line
@@ -428,8 +507,7 @@ pub struct Page {
 }
 
 impl Page {
-    /// `adding`: open straight into adding an account (`+` in the `n` menu)
-    pub fn real(adding: bool) -> Page {
+    pub fn real(o: Opening) -> Page {
         let env = Env {
             config: crate::config::path(),
             home: std::env::var("HOME").unwrap_or_default(),
@@ -438,9 +516,13 @@ impl Page {
             links: aca_core::paths::state_dir(),
             remote: aca_core::agent::remote(&aca_core::config::load()),
             installed: accounts::on_path,
-            quotas: || [Agent::Claude, Agent::Codex].into_iter().flat_map(crate::rehome::quotas).collect(),
+            quotas: || [Agent::Claude, Agent::Codex, Agent::Agy].into_iter().flat_map(crate::rehome::quotas).collect(),
         };
-        Page::load(env, crate::setup::session_accounts(), adding)
+        let mut p = Page::load(env, crate::setup::session_accounts(), o == Opening::Adding);
+        if let Opening::At(a, name) = &o {
+            p.at(*a, name);
+        }
+        p
     }
 
     /// `uses`: what each registered session uses (tool, account name, title)
@@ -491,6 +573,14 @@ impl Page {
         }
     }
 
+    /// The single Google login shares its detail page and launch arguments with the heading.
+    fn settings_item(&self) -> Option<Item> {
+        match self.item() {
+            Some(Item::Acct(i)) if self.rows[i].a.agent == Agent::Agy => Some(Item::Head(Agent::Agy)),
+            item => item,
+        }
+    }
+
     /// Launch args every account of this tool gets
     fn common(&self, a: Agent) -> &[String] {
         self.fams.iter().find(|f| f.agent == a).map_or(&[], |f| &f.args)
@@ -506,17 +596,23 @@ impl Page {
         let cfg = aca_core::config::parse(&text);
         let lay =
             crate::tools::Layout { menu: crate::config::list_in(&text, "ui", "menu"), hide: crate::config::list_in(&text, "ui", "hide") };
-        let menu = crate::tools::menu(&cfg, &lay);
+        let menu = crate::tools::menu_with(&cfg, &lay, self.env.installed);
         let (home, uses) = (&self.env.home, &self.uses);
+        self.own = accounts::defaults(&text, home, self.env.installed);
         self.rows = accounts::listed(&text, home)
             .into_iter()
+            .chain(self.own.iter().filter(|a| a.agent == Agent::Agy).cloned().map(|a| (a, String::new())))
             .map(|(a, abs)| {
                 let fam = accounts::fam(a.agent).unwrap_or_default();
                 let there = abs.is_empty() || Path::new(&abs).is_dir();
                 let foreign = if abs.is_empty() { None } else { accounts::foreign(a.agent, &abs, home) };
                 let wired = a.agent == Agent::Claude && !abs.is_empty() && there && foreign.is_none();
                 Row {
-                    used: uses.iter().filter(|(g, n, _)| *g == a.agent && *n == a.name).map(|(_, _, title)| title.clone()).collect(),
+                    used: uses
+                        .iter()
+                        .filter(|(g, n, ..)| *g == a.agent && *n == a.name)
+                        .fold((0, 0), |(n, run), (.., on)| (n + 1, run + usize::from(*on))),
+                    env: aca_core::sandbox::of(&cfg, fam, &a.name).map(|(n, _)| n.to_string()).unwrap_or_default(),
                     default_of: accounts::default_of(&cfg, a.agent, &a.name),
                     in_menu: menu.iter().any(|t| t.tool == fam && t.account == a.name),
                     bar: wired.then(|| crate::setup::bar_of(Path::new(&abs))),
@@ -528,16 +624,18 @@ impl Page {
             })
             .collect();
         self.mods = aca_core::agent::tool(&cfg, "claude").is_some_and(|t| t.mods);
-        self.own = accounts::defaults(&text, home, self.env.installed);
         let (rows, own) = (&self.rows, &self.own);
-        self.fams = [Agent::Claude, Agent::Codex]
+        self.fams = [Agent::Claude, Agent::Codex, Agent::Agy]
             .into_iter()
             .filter_map(|a| {
                 let args = aca_core::agent::tool(&cfg, accounts::fam(a)?).map(|t| t.args).unwrap_or_default();
-                let shown = rows.iter().any(|r| r.a.agent == a) || own.iter().any(|o| o.agent == a) || !args.is_empty();
-                shown.then_some(Fam { agent: a, args })
+                let shown =
+                    rows.iter().any(|r| r.a.agent == a) || own.iter().any(|o| o.agent == a) || (a != Agent::Agy && !args.is_empty());
+                let first = rows.iter().find(|r| r.a.agent == a).map_or_else(|| own_spec(a), |r| r.name().to_string());
+                shown.then_some(Fam { agent: a, first, args })
             })
             .collect();
+        self.fams.sort_by_key(|f| lay.menu.iter().position(|n| n == &f.first).unwrap_or(usize::MAX));
         let items = self.items();
         let at = keep.and_then(|(g, n)| {
             items.iter().position(|i| match (i, &n) {
@@ -550,15 +648,27 @@ impl Page {
         self.ask(false);
     }
 
-    /// Width of each column (w inside in all): the left fits the longest name, the right gets the rest
+    /// An account's name in the left column, with the special environment it's bound to: "team  @work"
+    fn name_of(r: &Row) -> String {
+        if r.env.is_empty() { r.name().into() } else { format!("{}  @{}", r.name(), r.env) }
+    }
+
+    fn name_w(&self) -> usize {
+        self.rows.iter().map(|r| Self::name_of(r).width()).max().unwrap_or(0).min(22)
+    }
+
+    /// Width of each column (w inside in all): the left fits the longest name, the login and a quota line, at most a little under
+    /// half; the right gets the rest
     fn split(&self, w: usize) -> (usize, usize) {
-        let names = self.rows.iter().map(|r| r.a.name.width()).max().unwrap_or(0).min(14);
-        let lw = (2 + names + 2 + 2 + 16).clamp(26, 38);
+        let lw = (2 + self.name_w() + 2 + crate::rehome::login_w() + 32).clamp(26, (w * 45 / 100).max(26));
         (lw, w.saturating_sub(lw + DIVIDER.width()))
     }
 
     fn at(&mut self, a: Agent, name: &str) {
-        let hit = |i: &Item| matches!(i, Item::Acct(i) if self.rows[*i].a.agent == a && self.rows[*i].a.name == name);
+        let hit = |i: &Item| match i {
+            Item::Acct(i) => self.rows[*i].a.agent == a && self.rows[*i].a.name == name,
+            Item::Head(_) => false,
+        };
         if let Some(i) = self.items().iter().position(hit) {
             self.sel = i;
         }
@@ -611,7 +721,7 @@ impl Page {
 
     fn quota_of(&self, r: &Row) -> Option<Quota> {
         let got = self.quotas.lock().unwrap_or_else(|e| e.into_inner());
-        got.as_deref().and_then(|qs| crate::rehome::quota_of(qs, r.a.agent, &r.a.name))
+        got.as_deref().and_then(|qs| crate::rehome::quota_of(qs, r.a.agent, r.name()))
     }
 
     fn login_of(&self, r: &Row) -> Option<Login> {
@@ -629,12 +739,16 @@ impl Page {
         login_said(self.login_of(r))
     }
 
-    /// Left column: two sections (Claude Code, Codex), each header on its own line, one account per line "name  mark first-part".
-    /// Plus which line the highlight is on
+    /// Left column: two sections (Claude Code, Codex), each header on its own line, one account per line drawn as everywhere
+    /// accounts are listed (name, login, quota; the section header says the tool), or what's wrong with its directory. Plus which
+    /// line the highlight is on
     fn list(&self, w: usize) -> (Vec<Line<'static>>, Option<usize>) {
-        let name_w = self.rows.iter().map(|r| r.a.name.width()).max().unwrap_or(0).min(14);
+        let name_w = self.name_w();
         let (mut out, mut at) = (vec![], None);
         let items = self.items();
+        // Both sections are one table: each quota window in its own column
+        let qs: Vec<Quota> = self.rows.iter().filter(|r| self.state(r).0 != "⚠").filter_map(|r| self.quota_of(r)).collect();
+        let cols = crate::rehome::Cols::of(&qs, self.at);
         for (n, item) in items.iter().enumerate() {
             let on = n == self.sel;
             let i = match *item {
@@ -646,7 +760,7 @@ impl Page {
                         at = Some(out.len());
                     }
                     out.push(kit::picked(Line::from(who_span(a)), w, on && self.form.is_none()));
-                    if !matches!(items.get(n + 1), Some(Item::Acct(_))) {
+                    if a != Agent::Agy && !matches!(items.get(n + 1), Some(Item::Acct(_))) {
                         out.push(Line::styled(t!("  暂无账号", "  no accounts yet"), kit::dim()));
                     }
                     continue;
@@ -654,16 +768,23 @@ impl Page {
                 Item::Acct(i) => i,
             };
             let r = &self.rows[i];
-            let (mark, said, st) = self.state(r);
-            let short = said.split(" · ").next().unwrap_or_default();
-            let room = w.saturating_sub(2 + name_w + 2 + 2);
-            let line = Line::from(vec![
-                Span::styled(if on { "› " } else { "  " }, theme::accent()),
-                Span::styled(kit::clip(&r.a.name, name_w), agent_style(r.a.agent)),
+            let name = kit::clip(&Self::name_of(r), name_w);
+            let tag = name.find("  @").unwrap_or(name.len());
+            let mut spans = vec![
                 Span::raw("  "),
-                Span::styled(format!("{mark} "), st),
-                Span::styled(kit::clip(short, room).trim_end().to_string(), if mark == "●" { Style::new() } else { st }),
-            ]);
+                Span::styled(name[..tag].to_string(), agent_style(r.a.agent)),
+                Span::styled(name[tag..].to_string(), kit::dim()),
+                Span::raw(" ".repeat(name_w.saturating_sub(name.width()) + 2)),
+            ];
+            match self.state(r) {
+                ("⚠", said, st) => spans.push(Span::styled(format!("⚠ {said}"), st)),
+                _ => {
+                    let room = w.saturating_sub(spans.iter().map(|s| s.content.width()).sum());
+                    let (login, q) = (self.login_of(r), self.quota_of(r));
+                    spans.extend(crate::rehome::account_row(&cols, None, Some(login.as_ref()), q.as_ref(), (self.at, self.off), room))
+                }
+            }
+            let line = Line::from(spans);
             if on {
                 at = Some(out.len());
             }
@@ -681,7 +802,7 @@ impl Page {
         if let Some(f) = &self.form {
             return f.lines(w, t!("添加", "add"));
         }
-        match self.item() {
+        match self.settings_item() {
             // No tool installed or registered (the key bar has +)
             None => {
                 let none = t!(
@@ -708,29 +829,62 @@ impl Page {
         let (labels, lw) = (labels(), label_w());
         let mut out = vec![Line::from(who_span(a)), Line::raw("")];
         let bare = !self.rows.iter().any(|r| r.a.agent == a);
-        if let Some(own) = self.own.iter().find(|o| o.agent == a).filter(|_| bare) {
-            let none = tr!(
-                "默认使用 {} · + 添加账号",
-                "Without accounts, {} is used; for another subscription or key: + adds an account",
-                own.dir
-            );
-            out.extend(fold(&none, w).into_iter().map(|l| Line::styled(l, kit::dim())));
-            out.push(Line::raw(""));
+        if let Some(own) = self.own.iter().find(|o| o.agent == a).filter(|_| bare || a == Agent::Agy) {
+            if a != Agent::Agy {
+                let none = tr!(
+                    "默认使用 {} · + 添加账号",
+                    "Without accounts, {} is used; for another subscription or key: + adds an account",
+                    own.dir
+                );
+                out.extend(fold(&none, w).into_iter().map(|l| Line::styled(l, kit::dim())));
+                out.push(Line::raw(""));
+            }
             let login = self.logins.lock().unwrap_or_else(|e| e.into_inner()).get(&own_spec(a)).cloned();
             let out_now = login == Some(Login::Out);
-            let (mark, said, st) = login_said(login);
-            field(&mut out, w, lw, labels[1], Some((mark, st)), &said, if mark == "●" { Style::new() } else { st });
-            if out_now {
+            let (mark, mut said, st) = login_said(login);
+            if a == Agent::Agy && mark == "✓" {
+                said = tr!("已登录:{said}", "logged in: {said}");
+            }
+            field(&mut out, w, lw, labels[1], (!mark.is_empty()).then_some((mark, st)), &said, if mark == "✓" { Style::new() } else { st });
+            if a == Agent::Agy {
+                if mark == "✓" {
+                    field(&mut out, w, lw, "", None, t!("换号先在 agy 里 /logout", "To switch, /logout in agy first"), kit::dim());
+                }
+                let got = self.quotas.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(q) = got.iter().flatten().find(|q| q.agent == a) {
+                    self.quota_field(&mut out, w, q);
+                } else {
+                    let status = if got.is_none() { t!("查询中", "loading") } else { t!("暂无记录", "no record yet") };
+                    field(&mut out, w, lw, labels[2], None, status, kit::dim());
+                }
+            } else if out_now {
                 let how = if a == Agent::Codex { "login" } else { "auth login" };
                 let go = tr!("登录:aca run {} -- {how}", "to log in: aca run {} -- {how}", own_spec(a));
                 field(&mut out, w, lw, "", None, &go, kit::dim());
             }
         }
-        self.args_field(&mut out, w, &join(self.common(a)));
+        if a == Agent::Agy && self.common(a).is_empty() && self.editing.is_none() {
+            field(&mut out, w, lw, labels[4], None, t!("无", "none"), kit::dim());
+        } else {
+            self.args_field(&mut out, w, &join(self.common(a)));
+        }
         if self.editing.is_some() {
             self.args_keys(&mut out, w);
         }
         out
+    }
+
+    fn quota_field(&self, out: &mut Vec<Line<'static>>, w: usize, q: &Quota) {
+        let lw = label_w();
+        let mut spans = crate::rehome::quota_spans(Some(q), self.at, self.off);
+        if !q.note.is_empty() {
+            spans.push(Span::styled(format!("  {}", q.note), kit::dim()));
+        }
+        for (i, mut line) in crate::rehome::wrap_quota(spans, w.saturating_sub(lw)).into_iter().enumerate() {
+            let label = if i == 0 { labels()[2] } else { "" };
+            line.spans.insert(0, Span::styled(kit::clip(label, lw), kit::dim()));
+            out.push(line);
+        }
     }
 
     /// The launch args field (`now` is the current value, omitted when empty); an input box while editing
@@ -792,21 +946,18 @@ impl Page {
             let (mark, said, st) = self.state(r);
             let said = match (r.there, mark) {
                 (false, _) => t!("目录不存在 · d 删除", "directory missing · d removes it").to_string(),
-                (_, "○") => t!("未登录 · ⏎ 登录", "not logged in · ⏎ logs in").to_string(),
+                (_, "") => t!("未登录 · i 登录", "not logged in · i logs in").to_string(),
                 (_, "?") => tr!("无法确认登录状态:{said}", "can't tell whether it's logged in: {said}"),
                 _ => said,
             };
-            put(&mut out, labels[1], Some((mark, st)), &said, if mark == "●" { plain } else { st });
+            // Logged out: only the words, no mark before them
+            let lead = (!mark.is_empty()).then_some((mark, st));
+            put(&mut out, labels[1], lead, &said, if mark == "✓" { plain } else { st });
         }
         // Quota only once recorded; a Claude account with no status bar wired up (and no mod) can't record it, which the status bar
         // field says
         if let Some(q) = self.quota_of(r) {
-            let mut spans = vec![Span::styled(kit::clip(labels[2], lw), kit::dim())];
-            spans.extend(crate::rehome::quota_spans(Some(&q), self.at, self.off));
-            if !q.note.is_empty() {
-                spans.push(Span::styled(format!("  {}", q.note), kit::dim()));
-            }
-            out.push(Line::from(spans));
+            self.quota_field(&mut out, w, &q);
         }
         if let Some((bar, feeds)) = r.bar {
             let said = if feeds || self.mods { bar.to_string() } else { tr!("{bar} · 无额度信息", "{bar} · no quotas") };
@@ -826,17 +977,14 @@ impl Page {
             return out;
         }
         // Fields shown only when non-empty, a blank line above them
-        let (mut more, n) = (vec![], r.used.len());
-        if n > 0 {
-            put(&mut more, labels[5], None, &tr!("{n} 个正在使用", "{n} using it"), plain);
-            let room = w.saturating_sub(lw + 2);
-            for title in r.used.iter().take(if n > TITLES { TITLES - 1 } else { TITLES }) {
-                more.push(Line::styled(format!("{}· {}", " ".repeat(lw), kit::clip(title, room).trim_end()), kit::dim()));
-            }
-            if n > TITLES {
-                let rest = tr!("…还有 {} 个", "…and {} more", n + 1 - TITLES);
-                more.push(Line::styled(format!("{}· {rest}", " ".repeat(lw)), kit::dim()));
-            }
+        let mut more = vec![];
+        let said = match r.used {
+            (0, _) => String::new(),
+            (n, 0) => tr!("{n} 个", "{n}"),
+            (n, run) => tr!("{n} 个 · {run} 个运行中", "{n} · {run} running"),
+        };
+        if !said.is_empty() {
+            put(&mut more, labels[5], None, &said, plain);
         }
         if !r.in_menu {
             put(&mut more, labels[6], None, t!("不显示", "not shown"), kit::dim());
@@ -857,11 +1005,11 @@ impl Page {
             t!("仅从 aca 中移除,目录和登录信息保留。", "It's only taken out of aca; the directory and its login stay.")
         };
         let mut said = vec![kept.to_string()];
-        if !r.used.is_empty() {
+        if r.used.0 > 0 {
             said.push(tr!(
                 "{} 个会话正在使用它,删除后这些会话将无法重启。",
                 "{} sessions use it; once removed they can't restart.",
-                r.used.len()
+                r.used.0
             ));
         }
         for tool in &r.default_of {
@@ -884,38 +1032,21 @@ impl Page {
         !r.there || self.login_of(r) == Some(Login::Out)
     }
 
-    /// ⏎ on a logged-in account: what logging in again loses; only y goes ahead
+    /// i on a logged-in account: what logging in again loses; only y goes ahead
     fn relogin(&self, r: &Row, w: usize) -> Vec<Line<'static>> {
-        let me = accounts::who(r.a.agent);
-        // Not asked yet: say nothing about it; ask as if it's logged in
-        let now = match self.login_of(r) {
-            Some(Login::In(who)) if !who.is_empty() => tr!("当前已登录:{who}。", "It is logged in now: {who}."),
-            Some(Login::In(_)) => t!("当前已登录。", "It is logged in now.").to_string(),
-            Some(Login::Unknown(said)) => tr!("无法确认登录状态:{said}", "can't tell whether it's logged in: {said}"),
-            _ => String::new(),
-        };
-        let lost = if r.a.agent == Agent::Codex {
-            t!(
-                "Codex 开始登录时会清除当前登录,中途退出将变为未登录。",
-                "Codex's login deletes the current one as it starts: if you don't finish, this account is left logged out."
-            )
-        } else {
-            t!("重新登录将替换当前登录。", "Logging in again replaces the current login.")
-        };
-        let title = tr!("重新登录 {me} 账号 {}?", "Log the {me} account {} in again?", r.a.name);
-        let mut out = vec![Line::styled(title, theme::warn().add_modifier(Modifier::BOLD)), Line::raw("")];
-        if !now.is_empty() {
-            out.extend(fold(&now, w).into_iter().map(Line::raw));
-        }
-        out.extend(fold(lost, w).into_iter().map(|l| Line::styled(l, theme::warn())));
-        out.push(Line::raw(""));
-        let keys = [("y", t!("重新登录", "log in again")), (t!("其他键", "any other key"), t!("取消", "leave it"))];
-        out.push(kit::keys_line(&keys, vec![], w));
-        out
+        relogin_lines(r.a.agent, &r.a.name, self.login_of(r).as_ref(), w)
     }
 
-    /// ⏎ on the highlighted row: logged out goes straight to login; logged in asks first (see [`Asking::Relogin`])
+    /// i on the highlighted row: logged out goes straight to login; logged in asks first (see [`Asking::Relogin`])
     fn login(&mut self, fx: &mut Fx) {
+        if self.settings_item() == Some(Item::Head(Agent::Agy)) {
+            let cfg = aca_core::config::parse(&std::fs::read_to_string(&self.env.config).unwrap_or_default());
+            match agy_login_term(&self.env.links, &cfg) {
+                Ok(req) => fx.term = Some(req),
+                Err(e) => fx.say(e),
+            }
+            return;
+        }
         let Some(r) = self.cur() else { return };
         if let Some((other, _)) = &r.foreign {
             return fx.say(tr!("是 {} 的目录,不能在此登录", "a {} directory, not logging in here", accounts::who(*other)));
@@ -955,7 +1086,7 @@ impl Page {
     /// Save the highlighted account's launch args (section header: those every account of the tool gets); if that fails, why goes
     /// under the input box and editing continues
     fn save_args(&mut self, fx: &mut Fx) {
-        let (Some(text), Some(item)) = (&self.editing, self.item()) else { return };
+        let (Some(text), Some(item)) = (&self.editing, self.settings_item()) else { return };
         let args = match split(text) {
             Ok(args) => args,
             Err(e) => {
@@ -999,7 +1130,14 @@ impl Page {
     fn shift(&mut self, up: bool, fx: &mut Fx) {
         let Some(r) = self.cur() else { return };
         let (a, name) = (r.a.agent, r.a.name.clone());
-        match accounts::shift_in(&self.env.config, &self.env.home, a, &name, up) {
+        let moved = if a == Agent::Agy {
+            let Some(i) = self.fams.iter().position(|f| f.agent == a) else { return };
+            let Some(next) = self.fams.get(if up { i.wrapping_sub(1) } else { i + 1 }) else { return };
+            accounts::move_next_to(&self.env.config, r.name(), &next.first, up, self.env.installed)
+        } else {
+            accounts::shift_in(&self.env.config, &self.env.home, a, &name, up)
+        };
+        match moved {
             Ok(true) => {
                 self.read();
                 self.at(a, &name);
@@ -1007,6 +1145,36 @@ impl Page {
             Ok(false) => {}
             Err(e) => fx.say(e),
         }
+    }
+}
+
+impl Page {
+    /// The keys for the highlighted row, for the bottom bar (when they don't fit, later ones drop first: the most important go
+    /// first) and `?`
+    fn keys(&self) -> Vec<crate::sheet::Key> {
+        use crate::sheet::{key, more};
+        let all = [
+            key("i", t!("登录", "log in")),
+            key("+", t!("添加账号", "add")),
+            key("d", t!("删除", "remove")),
+            key("⇧↑↓", t!("移动", "move")),
+            key("p", t!("启动参数", "launch args")),
+            key("s", t!("状态栏", "status bar")),
+            key("^R", t!("刷新", "recheck")),
+        ];
+        // A section header lacks the keys that act on one account; the status bar table is empty when there are no accounts
+        let on_head = |k: &str| ["+", "p", "^R"].contains(&k) || (k == "s" && !self.rows.is_empty());
+        let mut keys: Vec<crate::sheet::Key> = match self.item() {
+            None => all[1..2].to_vec(),
+            Some(Item::Head(Agent::Agy)) => vec![all[0].clone(), all[4].clone(), all[1].clone(), all[6].clone()],
+            Some(Item::Acct(i)) if self.rows[i].a.agent == Agent::Agy => {
+                vec![all[0].clone(), all[4].clone(), all[3].clone(), all[1].clone(), all[6].clone()]
+            }
+            Some(Item::Head(_)) => all.into_iter().filter(|k| on_head(&k.key)).collect(),
+            Some(Item::Acct(_)) => all.to_vec(),
+        };
+        keys.extend([more("↑↓", t!("选择", "select")), more("Esc", t!("关闭", "close"))]);
+        keys
     }
 }
 
@@ -1041,27 +1209,11 @@ impl Overlay for Page {
         let busy = self.form.is_some() || self.asking.is_some() || self.editing.is_some();
         let esc = kit::esc_hint(if busy { t!("返回", "back") } else { t!("关闭", "close") });
         let mut out = vec![kit::modal_title(t!("账号", "Accounts"), theme::accent(), esc, w), Line::raw("")];
-        // When they don't fit, later keys are dropped first: the most important go first. While filling the form or asking whether to
-        // remove, the keys go in the right column
-        let out_now = self.cur().is_none_or(|r| r.foreign.is_some() || self.logged_out(r));
-        let all = [
-            ("⏎", if out_now { t!("登录", "log in") } else { t!("重新登录", "log in again") }),
-            ("+", t!("添加账号", "add")),
-            ("d", t!("删除", "remove")),
-            ("⇧↑↓", t!("移动", "move")),
-            ("p", t!("启动参数", "launch args")),
-            ("s", t!("状态栏", "status bar")),
-            ("r", t!("刷新", "recheck")),
-        ];
-        // A section header lacks the keys that act on one account; the status bar table is empty when there are no accounts
-        let on_head = |k: &str| ["+", "p", "r"].contains(&k) || (k == "s" && !self.rows.is_empty());
-        let keys: Vec<(&str, &str)> = match self.item() {
-            _ if busy => vec![],
-            None => all[1..2].to_vec(),
-            Some(Item::Head(_)) => all.into_iter().filter(|(k, _)| on_head(k)).collect(),
-            Some(Item::Acct(_)) => all.to_vec(),
-        };
-        let foot = [Line::styled("─".repeat(w), theme::faint()), kit::keys_line(&keys, vec![], w)];
+        // While filling the form or asking whether to remove, the keys go in the right column
+        let keys = if busy { vec![] } else { self.keys() };
+        let keys_line =
+            if busy { kit::keys_line(&[], vec![], w) } else { crate::kit::keys_line_help(&crate::sheet::foot(&keys), vec![], w) };
+        let foot = [Line::styled("─".repeat(w), theme::faint()), keys_line];
         let bh = h.saturating_sub(out.len() + foot.len());
         if w >= SPLIT_W {
             let (lw, rw) = self.split(w);
@@ -1089,6 +1241,12 @@ impl Overlay for Page {
         out.extend(foot);
         out.truncate(h);
         out
+    }
+
+    /// Filling the form, editing launch args, asking y / n: ? is a character or "any other key" there
+    fn sheet(&self) -> Option<Vec<crate::sheet::Key>> {
+        let busy = self.form.is_some() || self.asking.is_some() || self.editing.is_some();
+        (!busy).then(|| self.keys())
     }
 
     fn on_key(&mut self, k: KeyEvent, fx: &mut Fx) -> Flow {
@@ -1120,6 +1278,8 @@ impl Overlay for Page {
         if let Some(what) = self.asking.take() {
             match (what, k.code) {
                 (Asking::Remove, KeyCode::Char('y')) => self.remove(fx),
+                (Asking::Remove, KeyCode::Esc) => {}
+                (Asking::Remove, _) => fx.say(t!("未删除", "not removed")),
                 (Asking::Relogin, KeyCode::Char('y')) => self.open_login(fx),
                 _ => {}
             }
@@ -1128,19 +1288,20 @@ impl Overlay for Page {
         let n = self.items().len();
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
-            KeyCode::Esc | KeyCode::Char('q') => return Flow::Close,
+            // a opens it (on the list and in the menus that list accounts): pressing it again closes
+            KeyCode::Esc | KeyCode::Char('q' | 'a') => return Flow::Close,
             KeyCode::Up if shift => self.shift(true, fx),
             KeyCode::Down if shift => self.shift(false, fx),
-            KeyCode::Char('K') => self.shift(true, fx),
-            KeyCode::Char('J') => self.shift(false, fx),
             KeyCode::Down | KeyCode::Char('j') if n > 0 => self.sel = (self.sel + 1) % n,
             KeyCode::Up | KeyCode::Char('k') if n > 0 => self.sel = (self.sel + n - 1) % n,
-            KeyCode::Enter => self.login(fx),
+            KeyCode::Char('i') => self.login(fx),
             KeyCode::Char('+') => self.form = Some(Form::new()),
-            KeyCode::Char('d') | KeyCode::Delete if self.cur().is_some() => self.asking = Some(Asking::Remove),
+            KeyCode::Char('d') | KeyCode::Delete if matches!(self.settings_item(), Some(Item::Acct(_))) => {
+                self.asking = Some(Asking::Remove)
+            }
             // On an account, edit its own; on a section header, those every account of the tool gets
             KeyCode::Char('p') => {
-                self.editing = match self.item() {
+                self.editing = match self.settings_item() {
                     Some(Item::Head(a)) => Some(join(self.common(a))),
                     Some(Item::Acct(i)) => Some(join(&self.rows[i].args)),
                     None => None,
@@ -1149,7 +1310,8 @@ impl Overlay for Page {
             // Whether each account's status bar is wired up (`aca setup` opens the same table; accounts are added on this page, not in
             // the table)
             KeyCode::Char('s') => fx.open = Some(Box::new(crate::setup::Page::real(false))),
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                accounts::forget_all();
                 self.read();
                 self.ask(true);
                 self.fetch_quotas();
@@ -1170,8 +1332,85 @@ impl Overlay for Page {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) const MENU_CONFIG: &str = r#"[accounts.claude]
+sub = {}
+ding = {}
+[accounts.codex]
+codex = {}
+acme = {}
+zeta = {}
+[tools.official]
+[tools.toys]
+[ui]
+menu = ["sub", "ding", "codex", "acme", "zeta", "official", "toys"]  # my order
+hide = ["official", "toys"]  # hidden tools
+"#;
+
+    pub(crate) fn installed(p: &str) -> bool {
+        matches!(p, "agy" | "pi")
+    }
+
+    // Fields from the 1.5.16 title capture, with the quota set to the reported 2% / 0%.
+    fn title() -> serde_json::Value {
+        serde_json::json!({"email":"user@example.com","plan_tier":"Google AI Pro","quota":{
+            "gemini-5h":{"remaining_fraction":0.98,"reset_time":"2026-11-25T08:25:21Z"},
+            "gemini-weekly":{"remaining_fraction":1,"reset_time":"2026-12-02T03:25:21Z"}
+        }})
+    }
+
+    pub(crate) fn login(a: Agent, name: &str) -> Login {
+        if a == Agent::Agy {
+            assert!(name.is_empty());
+            let v = title();
+            return Login::In(format!("{} · {}", v["plan_tier"].as_str().unwrap(), v["email"].as_str().unwrap()));
+        }
+        Login::In(String::new())
+    }
+
+    pub(crate) fn quotas(a: Agent) -> Vec<Quota> {
+        use aca_records::usage::Win;
+        let win = |label: &str, used| Win { label: label.into(), used, resets: None };
+        let q = |who: &str, wins| Quota { agent: a, who: who.into(), plan: String::new(), wins, updated: 0, note: String::new() };
+        if a == Agent::Claude {
+            return vec![
+                q("sub", vec![win("7d", 63.0), win("Fable", 83.0)]),
+                q("ding", vec![win("5h", 0.0), win("7d", 53.0), win("Fable", 88.0)]),
+            ];
+        }
+        if a == Agent::Codex {
+            return vec![q("codex", vec![win("7d", 39.0)]), q("zeta", vec![Win { resets: Some(1), ..win("7d", 0.0) }])];
+        }
+        let report = aca_core::agent::AgyLimits::from_title(&title()).unwrap();
+        let wins = report.windows.into_iter().map(|(label, used, _)| win(label, used)).collect();
+        vec![Quota { agent: a, who: "agy".into(), plan: report.plan, wins, updated: 0, note: String::new() }]
+    }
+
+    fn check_agy_login(req: TermReq, state: &Path, prefix: &[&str]) {
+        let dir = state.join("agy-login");
+        assert_eq!(Path::new(&req.w.dir), dir);
+        assert!(dir.read_dir().unwrap().next().is_none());
+        let argv = split(req.run.as_deref().unwrap()).unwrap();
+        let (settings, args) = argv.split_last().unwrap();
+        assert_eq!(args, prefix);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(settings).unwrap(), serde_json::json!({"trustedWorkspaces":[dir]}));
+        println!("cwd = {}\nargv = {argv:?}", req.w.dir);
+    }
+
+    #[test]
+    fn agy_native_login_command_trusts_only_its_aca_directory() {
+        let (root, env) = home("agy-command", "");
+        let links = env.links.join("user's state");
+        let cfg = aca_core::config::parse("[tools.agy]\ncmd = ['/wrapper with spaces', 'agy']");
+        check_agy_login(agy_login_term(&links, &cfg).unwrap(), &links, &["/wrapper with spaces", "agy", "--settings"]);
+        let dir = links.join("agy-login");
+        std::fs::remove_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&env.home, &dir).unwrap();
+        assert!(agy_login_term(&links, &cfg).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn home(name: &str, config: &str) -> (PathBuf, Env) {
         let root = std::env::temp_dir().join(format!("aca-acctpage-{}-{name}", std::process::id()));
@@ -1236,6 +1475,74 @@ mod tests {
         p.rows.iter().map(|r| r.a.name.as_str()).collect()
     }
 
+    #[test]
+    fn agy_account_header_on_desktop_and_phone() {
+        let config = format!("{MENU_CONFIG}[tools.agy]\nargs = ['--model', 'Gemini']\n[accounts.agy]\napi = {{ args = ['--other'] }}\n");
+        let (root, mut env) = home("agy", &config);
+        env.installed = installed;
+        env.ask = login;
+        env.quotas = || [Agent::Claude, Agent::Codex, Agent::Agy].into_iter().flat_map(quotas).collect();
+        let mut page = Page::load(env, vec![], false);
+        let items = page.items();
+        let [.., Item::Head(Agent::Agy), Item::Acct(google)] = items.as_slice() else { panic!("{items:?}") };
+        page.at(Agent::Agy, "");
+        assert_eq!(page.item(), Some(Item::Acct(*google)));
+        for width in [110, 40] {
+            let text = shown(&page, width);
+            let agy = row(&text, "agy");
+            shows(&[agy.into()], &["✓", "5h 2% · 7d", "0%"]);
+            let column = |line: &str| line.split_once("7d").unwrap().0.width();
+            assert_eq!(column(agy), column(row(&text, "codex")));
+            shows(
+                &text,
+                &[
+                    "Antigravity",
+                    "已登录",
+                    "Google AI Pro",
+                    "user@example.com",
+                    "额度      5h 2% · 7d 0%",
+                    "--model Gemini",
+                    "/logout",
+                    "i 登录",
+                    "p 启动参数",
+                    "⇧↑↓ 移动",
+                ],
+            );
+            assert!(!text.iter().any(|line| line.contains("剩余") || line.contains("d 删除")));
+            println!(
+                "accounts {width}\n{}",
+                text.iter().filter(|s| !s.trim_matches([' ', '│']).is_empty()).cloned().collect::<Vec<_>>().join("\n")
+            );
+        }
+        let req = key(&mut page, KeyCode::Char('i')).1.term.unwrap();
+        check_agy_login(req, &page.env.links, &["agy", "--settings"]);
+        key(&mut page, KeyCode::Char('d'));
+        assert!(page.asking.is_none());
+        key(&mut page, KeyCode::Char('p'));
+        retype(&mut page, "--mode plan");
+        key(&mut page, KeyCode::Enter);
+        assert_eq!(page.common(Agent::Agy), ["--mode", "plan"]);
+        for (k, first) in [(KeyCode::Up, "sub"), (KeyCode::Up, "agy"), (KeyCode::Down, "sub")] {
+            let mut fx = Fx::default();
+            page.on_key(KeyEvent::new(k, KeyModifiers::SHIFT), &mut fx);
+            assert!(fx.flash.is_none());
+            assert_eq!(page.cur().unwrap().name(), "agy");
+            assert_eq!(page.fams[0].first, first);
+            let saved = std::fs::read_to_string(&page.env.config).unwrap();
+            assert_eq!(crate::config::list_in(&saved, "ui", "menu")[0], first);
+        }
+        page.env.ask = |_, _| Login::Out;
+        page.ask(true);
+        assert!(row(&shown(&page, 110), "agy").contains("未登录"));
+        key(&mut page, KeyCode::Char('+'));
+        assert!(page.right(40).iter().all(|line| !line.to_string().contains("Antigravity")));
+        page.env.installed = |_| false;
+        page.read();
+        assert!(!page.items().contains(&Item::Head(Agent::Agy)));
+        assert!(page.rows.iter().all(|r| r.a.agent != Agent::Agy));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// The highlighted item: an account's name, or a section header's tool
     fn on(p: &Page) -> &str {
         match p.item() {
@@ -1245,9 +1552,9 @@ mod tests {
         }
     }
 
-    /// This account's row in the left column (the highlighted one starts with ›)
+    /// This account's row in the left column
     fn row<'a>(text: &'a [String], name: &str) -> &'a str {
-        let found = text.iter().find(|l| l.starts_with(&format!("  {name} ")) || l.starts_with(&format!("› {name} ")));
+        let found = text.iter().find(|l| l.starts_with(&format!("  {name} ")));
         found.unwrap_or_else(|| panic!("左边没有 {name}:{text:#?}"))
     }
 
@@ -1264,7 +1571,7 @@ mod tests {
         // A Codex directory registered as Claude's and launched once: it gained a .claude.json
         dir(&root, ".codex", &["auth.json", "config.toml", "version.json", ".claude.json"]);
         dir(&root, ".codex-cx", &["auth.json"]);
-        let used = |a, account: &str, title: &str| (a, account.to_string(), title.to_string());
+        let used = |a, account: &str, title: &str| (a, account.to_string(), title.to_string(), title == "查额度");
         let uses = vec![used(Agent::Claude, "sub", "写账号页"), used(Agent::Claude, "sub", "查额度"), used(Agent::Codex, "cx", "跑测试")];
         (root, Page::load(env, uses, false))
     }
@@ -1324,6 +1631,25 @@ mod tests {
     }
 
     #[test]
+    fn the_left_column_keeps_each_quota_window_in_one_column_across_both_tools() {
+        use aca_records::usage::Win;
+        let (root, mut p) = page("cols");
+        p.env.quotas = || {
+            let win = |label: &str, used| Win { label: label.into(), used, resets: None };
+            let quota =
+                |agent, who: &str, wins| Quota { agent, who: who.into(), plan: String::new(), wins, updated: 0, note: String::new() };
+            vec![quota(Agent::Claude, "sub", vec![win("5h", 12.0), win("7d", 61.0)]), quota(Agent::Codex, "cx", vec![win("7d", 8.0)])]
+        };
+        p.fetch_quotas();
+        let text = shown(&p, 120);
+        let at = |name: &str, t: &str| row(&text, name).find(t).map(|i| row(&text, name)[..i].width());
+        // cx has no 5h: that column is left blank, its 7d under sub's, the numbers right-aligned
+        assert!(at("sub", "7d").is_some() && at("sub", "7d") == at("cx", "7d"), "{text:#?}");
+        assert_eq!((at("cx", "5h"), at("sub", "61%").map(|c| c + 1)), (None, at("cx", "8%")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn p_on_a_tools_heading_changes_what_every_account_of_it_gets() {
         let config = CONFIG.replace("account = \"sub\"\n", "account = \"sub\"\nargs = [\"--x\"]\n");
         let (root, mut p) = page_with("common", &config);
@@ -1334,7 +1660,8 @@ mod tests {
         assert!(text.iter().any(|l| l.starts_with("Claude Code") && l.contains("│  Claude Code")), "{text:#?}");
         shows(&text, &["启动参数  --x"]);
         // A section header has no keys that act on one account
-        assert_eq!(text.last().unwrap(), "+ 添加账号 • p 启动参数 • s 状态栏 • r 刷新");
+        let last = text.last().unwrap();
+        assert!(last.starts_with("+ 添加账号 • p 启动参数 • s 状态栏 • ^R 刷新  ") && last.ends_with("? 快捷键"), "{last}");
         assert!(press(&mut p, &[KeyCode::Enter]).term.is_none() && p.asking.is_none());
         press(&mut p, &[KeyCode::Char('d')]);
         assert!(p.asking.is_none());
@@ -1402,8 +1729,15 @@ mod tests {
         // it's logged in
         let at = |want: &str| text.iter().position(|l| l.starts_with(want)).unwrap_or_else(|| panic!("没有「{want}」开头的行:{text:#?}"));
         assert!(at("Claude Code") < at("  sub ") && at("  gone ") < at("Codex") && at("Codex") < at("  cx "), "{text:#?}");
-        assert!(row(&text, "sub").contains("● max") && !row(&text, "sub").contains("me@example.com"), "{text:#?}");
-        assert!(row(&text, "firm").contains("○ 未登录") && row(&text, "cx").contains("● ChatGPT"), "{text:#?}");
+        // The plan (max, ChatGPT) moved to the right; the left says only whether it's logged in
+        assert!(row(&text, "sub").contains("✓") && !row(&text, "sub").contains("max"), "{text:#?}");
+        assert!(
+            row(&text, "firm").contains("未登录")
+                && !row(&text, "firm").contains('○')
+                && row(&text, "cx").contains("✓")
+                && !row(&text, "cx").contains("ChatGPT"),
+            "{text:#?}"
+        );
         // The other tool's directory, a missing directory: marked, and not asked about login (asking would write into them)
         assert!(row(&text, "codex").contains("⚠ 是 Codex 的目录") && row(&text, "gone").contains("⚠ 目录不存在"), "{text:#?}");
         assert!(!p.logins.lock().unwrap().keys().any(|k| k == "claude:codex" || k == "claude:gone"));
@@ -1421,36 +1755,34 @@ mod tests {
             &[
                 "sub  默认",
                 "目录      ~/.claude-sub",
-                "登录      ● max · me@example.com",
+                "登录      ✓ max · me@example.com",
                 "状态栏    不接入 · 无额度信息",
-                "会话      2 个正在使用",
-                "        · 写账号页",
-                "        · 查额度",
+                "会话      2 个 · 1 个运行中",
             ],
         );
         assert!(!text.iter().any(|l| l.contains("n 菜单") || l.contains("aca ")), "{text:#?}");
         // No sessions using it and not default: not mentioned; hidden from the n menu: one line says so
         press(&mut p, &[KeyCode::Up, KeyCode::Up]);
         let text = shown(&p, 110);
-        shows(&text, &["登录      ○ 未登录 · ⏎ 登录", "n 菜单    不显示"]);
+        shows(&text, &["登录      未登录 · i 登录", "n 菜单    不显示"]);
         assert!(!text.iter().any(|l| l.contains(" 会话    ") || l.contains("默认")), "{text:#?}");
         // Up wraps past the section header to the last one
         press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Up]);
         assert_eq!(on(&p), "cx");
-        shows(&shown(&p, 110), &["cx", "登录      ● ChatGPT"]);
+        shows(&shown(&p, 110), &["cx", "登录      ✓ ChatGPT"]);
         // Codex's quota doesn't depend on the status bar: no such field
         assert!(!shown(&p, 110).iter().any(|l| l.contains(" 状态栏  ")));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn a_long_list_of_sessions_is_cut_short() {
+    fn the_sessions_using_it_are_one_line_however_many() {
         let (root, env) = home("many", "[accounts.claude]\nsub = \"~/.claude-sub\"\n");
         dir(&root, ".claude-sub", &[]);
-        let uses = (1..=9).map(|i| (Agent::Claude, "sub".to_string(), format!("会话 {i}"))).collect();
+        let uses = (1..=9).map(|i| (Agent::Claude, "sub".to_string(), format!("会话 {i}"), i <= 2)).collect();
         let text = shown(&Page::load(env, uses, false), 110);
-        shows(&text, &["会话      9 个正在使用", "· 会话 4", "· …还有 5 个"]);
-        assert!(!text.iter().any(|l| l.contains("会话 5")), "{text:#?}");
+        shows(&text, &["会话      9 个 · 2 个运行中"]);
+        assert!(!text.iter().any(|l| l.contains("会话 1")), "{text:#?}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1497,10 +1829,14 @@ mod tests {
         // Moved: the list reorders on the spot, no extra message in the bottom bar
         let fx = shift(&mut p, KeyCode::Up);
         assert!(fx.flash.is_none() && names(&p)[2] == "sub");
-        press(&mut p, &[KeyCode::Char('K'), KeyCode::Char('K')]);
+        // J / K don't move accounts (⇧↑ ⇧↓ do, as on the list)
+        press(&mut p, &[KeyCode::Char('K')]);
+        assert_eq!(names(&p)[2], "sub");
+        shift(&mut p, KeyCode::Up);
+        shift(&mut p, KeyCode::Up);
         // The highlight follows it; Codex's are unaffected
         assert_eq!((names(&p), on(&p)), (vec!["sub", "codex", "firm", "gone", "cx"], "sub"));
-        press(&mut p, &[KeyCode::Char('K')]);
+        shift(&mut p, KeyCode::Up);
         assert_eq!(names(&p)[0], "sub");
         // Kept in [ui] menu, other lines (comments, hide) untouched; the n menu reads this same order
         let text = std::fs::read_to_string(&p.env.config).unwrap();
@@ -1522,8 +1858,17 @@ mod tests {
         // still there
         assert!(!p.typing());
         let text = shown(&p, 110);
-        shows(&text, &["添加账号 · 选择工具", "› Claude Code  默认目录 ~/.claude-<名字>", "  Codex        默认目录 ~/.codex-<名字>"]);
-        assert!(row(&text, "sub").contains("● max"), "{text:#?}");
+        shows(&text, &["添加账号 · 选择工具", "  Claude Code  默认目录 ~/.claude-<名字>", "  Codex        默认目录 ~/.codex-<名字>"]);
+        assert!(row(&text, "sub").contains("✓"), "{text:#?}");
+        // The tool picked is on the selected background, with no mark before it
+        let lit: Vec<String> = p
+            .lines(110)
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.bg == Some(theme::pal().sel) && !s.content.trim().is_empty())
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(lit.contains(&"Claude Code".to_string()) && !lit.iter().any(|s| s.contains("Codex")), "{lit:#?}");
         press(&mut p, &[KeyCode::Enter]);
         assert!(p.typing());
         shows(&shown(&p, 110), &["添加 Claude Code 账号 · 名字", "字母、数字、- 和 _"]);
@@ -1558,7 +1903,7 @@ mod tests {
         assert!(p.form.is_none() && fx.term.is_none());
         assert_eq!(fx.flash.as_deref(), Some("已添加 Codex 账号 mine"));
         assert_eq!((names(&p), on(&p)), (vec!["firm", "gone", "sub", "cx", "mine"], "mine"));
-        shows(&shown(&p, 110), &["目录      ~/.elsewhere", "登录      ● ChatGPT"]);
+        shows(&shown(&p, 110), &["目录      ~/.elsewhere", "登录      ✓ ChatGPT"]);
         // A newly created directory: once added, a terminal opens in the bottom half running the tool's own login for this account
         press(&mut p, &[KeyCode::Char('+'), KeyCode::Enter]);
         type_in(&mut p, "work");
@@ -1576,17 +1921,25 @@ mod tests {
         assert_eq!(key(&mut p, KeyCode::Char('+')).0, Flow::Stay);
         assert_eq!(key(&mut p, KeyCode::Esc).0, Flow::Stay);
         assert!(p.form.is_none());
-        assert_eq!(key(&mut p, KeyCode::Esc).0, Flow::Close);
+        // a opened it: a closes it, while typing in the form it's a letter
+        key(&mut p, KeyCode::Char('+'));
+        assert_eq!(key(&mut p, KeyCode::Char('a')).0, Flow::Stay);
+        key(&mut p, KeyCode::Esc);
+        key(&mut p, KeyCode::Esc);
+        assert_eq!(key(&mut p, KeyCode::Char('a')).0, Flow::Close);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn enter_logs_in_with_the_tools_own_command_and_r_asks_again() {
+    fn i_logs_in_with_the_tools_own_command_and_r_asks_again() {
         let (root, mut p) = page("login");
+        // ⏎ does nothing here (it used to log in)
+        let fx = press(&mut p, &[KeyCode::Down, KeyCode::Enter, KeyCode::Up]);
+        assert!(fx.term.is_none() && fx.flash.is_none() && p.asking.is_none());
         // The other tool's directory: no login in it
-        let fx = press(&mut p, &[KeyCode::Enter]);
+        let fx = press(&mut p, &[KeyCode::Char('i')]);
         assert_eq!((fx.term.is_none(), fx.flash.as_deref()), (true, Some("是 Codex 的目录,不能在此登录")));
-        let fx = press(&mut p, &[KeyCode::Down, KeyCode::Enter]);
+        let fx = press(&mut p, &[KeyCode::Down, KeyCode::Char('i')]);
         let term = fx.term.unwrap();
         assert_eq!(term.title, "登录 Claude Code · firm");
         assert!(term.run.as_deref().is_some_and(|c| c.ends_with("' run claude:firm -- auth login")));
@@ -1595,9 +1948,9 @@ mod tests {
         let file = root.join("state/login-claude-firm.url");
         assert_eq!(term.env, [("ACA_LOGIN_LINK".to_string(), file.to_string_lossy().into_owned())]);
         assert_eq!(term.link, Some(crate::term::Catch { file, screen: false }));
-        // Logged in (up wraps past the section header to the last row, Codex's): ⏎ doesn't go straight to login — Codex's login
+        // Logged in (up wraps past the section header to the last row, Codex's): i doesn't go straight to login — Codex's login
         // deletes the old one the moment it starts, so ask first
-        let fx = press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Up, KeyCode::Enter]);
+        let fx = press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Up, KeyCode::Char('i')]);
         assert!(fx.term.is_none() && p.asking == Some(Asking::Relogin));
         let text = shown(&p, 110);
         shows(&text, &["重新登录 Codex 账号 cx?", "当前已登录:ChatGPT。", "Codex 开始登录时会清除当前登录", "y 重新登录 • 其他键 取消"]);
@@ -1605,33 +1958,35 @@ mod tests {
         // Any other key: no login, back to the page, and the key isn't passed on
         let fx = press(&mut p, &[KeyCode::Enter]);
         assert!(fx.term.is_none() && p.asking.is_none() && on(&p) == "cx");
-        shows(&shown(&p, 110), &["登录      ● ChatGPT"]);
-        assert!(shown(&p, 110).last().unwrap().starts_with("⏎ 重新登录 • + 添加账号"));
-        let fx = press(&mut p, &[KeyCode::Enter, KeyCode::Char('y')]);
+        shows(&shown(&p, 110), &["登录      ✓ ChatGPT"]);
+        assert!(shown(&p, 110).last().unwrap().starts_with("i 登录 • + 添加账号"));
+        let fx = press(&mut p, &[KeyCode::Char('i'), KeyCode::Char('y')]);
         let term = fx.term.unwrap();
         assert!(term.run.as_deref().is_some_and(|c| c.ends_with("' run codex:cx -- login")));
         assert!(term.link.is_some_and(|c| c.screen && c.file.ends_with("login-codex-cx.url")));
         // A logged-in Claude account asks first too; not asked yet or can't tell is treated as logged in (not asked yet doesn't say
         // whether it's logged in now)
-        let fx = press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Enter]);
+        let fx = press(&mut p, &[KeyCode::Up, KeyCode::Up, KeyCode::Char('i')]);
         assert!(fx.term.is_none() && on(&p) == "sub");
         shows(&shown(&p, 110), &["重新登录 Claude Code 账号 sub?", "当前已登录:max · me@example.com。", "重新登录将替换当前登录。"]);
         let fx = press(&mut p, &[KeyCode::Char('y')]);
         assert!(fx.term.unwrap().run.as_deref().is_some_and(|c| c.ends_with("' run claude:sub -- auth login")));
         p.logins.lock().unwrap().remove("claude:sub");
-        assert!(press(&mut p, &[KeyCode::Enter]).term.is_none() && p.asking == Some(Asking::Relogin));
+        assert!(press(&mut p, &[KeyCode::Char('i')]).term.is_none() && p.asking == Some(Asking::Relogin));
         let text = shown(&p, 110);
         shows(&text, &["重新登录 Claude Code 账号 sub?", "重新登录将替换当前登录。"]);
         assert!(!text.iter().any(|l| l.contains("已登录")), "{text:#?}");
         press(&mut p, &[KeyCode::Esc]);
-        // The logged-out row says 「登录」 (log in); ⏎ goes straight there
+        // The logged-out row says 「登录」 (log in); i goes straight there
         press(&mut p, &[KeyCode::Up, KeyCode::Up]);
         assert_eq!(on(&p), "firm");
-        shows(&shown(&p, 110), &["登录      ○ 未登录 · ⏎ 登录"]);
-        assert!(shown(&p, 110).last().unwrap().starts_with("⏎ 登录 • + 添加账号"));
-        // r: drop every answer and ask again (press it after coming back from logging in)
+        shows(&shown(&p, 110), &["登录      未登录 · i 登录"]);
+        assert!(shown(&p, 110).last().unwrap().starts_with("i 登录 • + 添加账号"));
+        // ^R: drop every answer and ask again (press it after coming back from logging in); a bare r does nothing
         p.logins.lock().unwrap().insert("claude:firm".into(), Login::Unknown("旧的".into()));
         press(&mut p, &[KeyCode::Char('r')]);
+        assert_eq!(p.logins.lock().unwrap().get("claude:firm"), Some(&Login::Unknown("旧的".into())));
+        p.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut Fx::default());
         assert_eq!(p.logins.lock().unwrap().get("claude:firm"), Some(&Login::Out));
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1641,7 +1996,7 @@ mod tests {
         let (root, mut p) = page("draw");
         assert!(p.fill());
         for w in [30, 44, 60, 80, 116] {
-            for keys in [&[][..], &[KeyCode::Char('d')][..], &[KeyCode::Esc, KeyCode::Char('+')][..], &[KeyCode::Enter][..]] {
+            for keys in [&[][..], &[KeyCode::Char('d')][..], &[KeyCode::Esc, KeyCode::Char('+')][..], &[KeyCode::Char('i')][..]] {
                 press(&mut p, keys);
                 for h in [14, 24, 40] {
                     let lines: Vec<String> =
@@ -1662,14 +2017,18 @@ mod tests {
             press(&mut p, keys);
             assert_eq!(p.fill_rows(), tall);
         }
-        // ⏎ on cx (logged in): asking whether to log in again, the frame is just as tall
-        press(&mut p, &[KeyCode::Esc, KeyCode::Enter]);
+        // i on cx (logged in): asking whether to log in again, the frame is just as tall
+        press(&mut p, &[KeyCode::Esc, KeyCode::Char('i')]);
         assert_eq!((on(&p), p.asking, p.fill_rows()), ("cx", Some(Asking::Relogin), tall));
         press(&mut p, &[KeyCode::Esc, KeyCode::Down, KeyCode::Down]);
         assert_eq!((on(&p), tall), ("codex", Some(22)));
         // Wide: rule and keys at the bottom; while filling the form the keys go in the right column and the bottom line is empty
         let wide = shown(&p, 116);
-        assert_eq!(wide[wide.len() - 1], "⏎ 登录 • + 添加账号 • d 删除 • ⇧↑↓ 移动 • p 启动参数 • s 状态栏 • r 刷新");
+        let last = &wide[wide.len() - 1];
+        assert!(
+            last.starts_with("i 登录 • + 添加账号 • d 删除 • ⇧↑↓ 移动 • p 启动参数 • s 状态栏 • ^R 刷新  ") && last.ends_with("? 快捷键"),
+            "{last}"
+        );
         assert!(wide[wide.len() - 2].starts_with("────"), "{wide:#?}");
         press(&mut p, &[KeyCode::Char('+')]);
         let form = shown(&p, 116);
@@ -1678,9 +2037,9 @@ mod tests {
         // Phone width: stacked, list on top, the highlighted one's page below
         press(&mut p, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
         let narrow = shown(&p, 42);
-        let list = narrow.iter().position(|l| l.starts_with("› sub ") && l.contains("● max")).unwrap_or_else(|| panic!("{narrow:#?}"));
+        let list = narrow.iter().position(|l| l.starts_with("  sub ") && l.contains('✓')).unwrap_or_else(|| panic!("{narrow:#?}"));
         let rule = narrow.iter().position(|l| l.starts_with("┄┄")).unwrap();
-        let full = narrow.iter().position(|l| l.contains("登录      ● max · me@example.com")).unwrap_or_else(|| panic!("{narrow:#?}"));
+        let full = narrow.iter().position(|l| l.contains("登录      ✓ max · me@example.com")).unwrap_or_else(|| panic!("{narrow:#?}"));
         assert!(list < rule && rule < full, "{narrow:#?}");
         let (root2, env) = home("empty", "");
         let none = Page::load(env, vec![], false);
@@ -1689,17 +2048,19 @@ mod tests {
         // in and how to log in; launch args can be edited on the header; Codex, not installed, isn't mentioned
         assert_eq!(on(&none), "Claude Code");
         assert!(text.iter().any(|l| l.starts_with("Claude Code") && l.contains("│  Claude Code")), "{text:#?}");
-        shows(&text, &["  暂无账号", "默认使用 ~/.claude · + 添加账号", "登录      ○ 未登录"]);
+        shows(&text, &["  暂无账号", "默认使用 ~/.claude · + 添加账号", "登录      未登录"]);
         shows(&text, &["          登录:aca run claude -- auth login"]);
         assert!(!text.iter().any(|l| l.contains("Codex") || l.contains("aca run codex")), "{text:#?}");
-        assert_eq!(text.last().unwrap(), "+ 添加账号 • p 启动参数 • r 刷新");
+        let last = text.last().unwrap();
+        assert!(last.starts_with("+ 添加账号 • p 启动参数 • ^R 刷新  ") && last.ends_with("? 快捷键"), "{last}");
         // No tool installed: only adding is possible
         let (root3, mut env) = home("bare", "");
         env.installed = |_| false;
         let bare = Page::load(env, vec![], false);
         let text = shown(&bare, 110);
         shows(&text, &["暂无账号", "默认使用 ~/.claude、~/.codex"]);
-        assert_eq!(text.last().unwrap(), "+ 添加账号");
+        let last = text.last().unwrap();
+        assert!(last.starts_with("+ 添加账号  ") && last.ends_with("? 快捷键"), "{last}");
         assert!(bare.item().is_none());
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&root2).unwrap();

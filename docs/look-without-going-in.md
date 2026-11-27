@@ -28,9 +28,9 @@ diff, `Enter` goes into the session.
 |---|---|
 | `↑` `↓` or `j` `k` | Scroll |
 | `Space` / `b` | Page down / up |
-| `u` / `d` | Half a page up / down |
+| `Ctrl+U` / `Ctrl+D` | Half a page up / down |
 | `g` / `G` | Top / bottom |
-| `c` | Copy its last reply |
+| `c` `c` | Copy its last reply (`c` then another key copies something else; the bottom bar lists them) |
 
 The mouse wheel over the preview scrolls back too; `z` takes you further.
 
@@ -47,7 +47,7 @@ file list is on top.
 | `n` / `p` | Next / previous file |
 | `m` | Include its commits: the diff against where the branch left the main branch. `m` again: uncommitted changes only (the default, new files included) |
 | `e` | Open the file at the top of the screen in `$EDITOR`, at that line |
-| `l` | Open [lazygit](https://github.com/jesseduffield/lazygit) in that repository. aca reads the diff again when you quit it |
+| `y` | Open [lazygit](https://github.com/jesseduffield/lazygit) in that repository. aca reads the diff again when you quit it |
 
 The page refreshes every 2 seconds and only reads: it never stages anything. It needs `git`.
 

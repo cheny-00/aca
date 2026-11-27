@@ -12,7 +12,8 @@
 //!   `plugin` use each other, as do `gateway` and `plugin`
 //! - sessions: `launch` (putting a session's command together), `session` (operations shared by the interface and the
 //!   CLI), `adopt` (sessions aca didn't start), `hook` `relay` `status` (where the state comes from; `relay`: what the
-//!   agent reports itself, OSC 7501), `inbox` `answer` (messages between sessions, answering confirmations). These call
+//!   agent reports itself, OSC 7501), `inbox` `answer` (messages between sessions, answering confirmations), `router`
+//!   `thread` (a group's router: what a new one is told, and its exchanges read off the event stream). These call
 //!   each other: there's no resident process, so looking at a session's state fills in the hook event the agent didn't
 //!   report, which goes through the inbox, which looks at the state again
 //!
@@ -35,6 +36,7 @@ pub mod paths;
 pub mod plugin;
 pub mod proc;
 pub mod relay;
+pub mod router;
 pub mod runtime;
 pub mod sandbox;
 pub mod schedule;
@@ -42,6 +44,8 @@ pub mod screen;
 pub mod session;
 pub mod status;
 pub mod store;
+pub mod task;
+pub mod thread;
 pub mod tmux;
 pub mod trust;
 pub mod worktree;

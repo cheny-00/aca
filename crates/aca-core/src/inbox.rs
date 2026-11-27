@@ -5,8 +5,10 @@
 //! exits or waits for a confirmation, it leaves a notice for the session that delegated it (`parent`) ([`notify`]).
 //! Notices only go up: delegation forms a tree, so two agents can't keep waking each other up forever.
 //!
-//! How it's delivered depends on the receiving tool ([`Delivery`]); the first two never touch the input box:
-//! - **Doorbell** (Claude): touch `inbox/<id>.bell`. When Claude starts, `aca inbox watch` has it watch this file; on a
+//! How it's delivered depends on the receiving tool ([`Delivery`]):
+//! - **Doorbell** (Claude): when Claude is idle, its input box is empty and you aren't typing, paste your messages and
+//!   router messages quoting you into the input box. Other messages in that batch wait for the end of the turn.
+//!   Otherwise touch `inbox/<id>.bell`. When Claude starts, `aca inbox watch` has it watch this file; on a
 //!   change it runs `aca inbox take` in the background, which takes the undelivered messages, writes them to stderr and
 //!   exits 2, and Claude hands that to the model as a system message (idle: starts a turn; running: added to this turn;
 //!   needs you: waits until you've answered). If nobody takes it 10 seconds after ringing, this one didn't connect, so
@@ -41,7 +43,7 @@ use crate::agent::{self, Agent, Delivery};
 use crate::config::Config;
 use crate::i18n::Tr;
 use crate::paths::{self, Res};
-use crate::runtime::{self, Run, clip};
+use crate::runtime::{self, Run, UserWords, clip};
 use crate::schedule::Due;
 use crate::status::{self, State};
 use crate::store::{Session, Store};
@@ -67,10 +69,28 @@ pub struct Msg {
     /// Scheduled (`aca msg --in`): delivered only at this moment; 0 = right away
     pub at: u64,
     /// How it came: empty = through aca; `claude` = Claude passed it straight from another Claude session (SendMessage), taken
-    /// in from the receiver's conversation record afterwards ([`native`])
+    /// in from the receiver's conversation record afterwards ([`native`]); any other name = a channel outside aca your words
+    /// came in through, as whatever relays them calls it (`aca msg --via`)
     #[serde(skip_serializing_if = "String::is_empty")]
     pub via: String,
+    /// The router prefixed this message with the user's words for this recipient.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quoted: bool,
 }
+
+impl Msg {
+    fn carries_user_words(&self) -> bool {
+        (self.from == "you" || self.quoted) && self.kind == "msg" && self.at == 0 && self.what.is_empty() && self.via != NATIVE
+    }
+
+    fn prepend_quote(&mut self, prefix: &str) {
+        self.quoted = !prefix.is_empty();
+        self.text.insert_str(0, prefix);
+    }
+}
+
+/// What `via` says of a message Claude passed along by itself: not a name a channel can take
+pub const NATIVE: &str = crate::plugin::Channel::NATIVE;
 
 /// Which ones were delivered: `got` reached the other side; `queued` went into Codex's queue, but it hasn't been seen
 /// starting a turn for them yet
@@ -108,6 +128,7 @@ impl Stage {
 pub enum Sent {
     /// Nothing to wake it for
     Nothing,
+    Starting,
     Bell,
     Queued,
     Typed,
@@ -121,6 +142,7 @@ impl Sent {
     pub fn said(&self) -> String {
         match self {
             Sent::Nothing => t!("无需唤醒", "no need to wake it").into(),
+            Sent::Starting => t!("已启动新一班", "started a new shift").into(),
             Sent::Bell => t!("已按门铃", "rang the doorbell").into(),
             Sent::Queued => t!("已排入它的队列,空闲后会自动开始一轮", "queued; it starts a turn on its own once idle").into(),
             Sent::Typed => t!("已输入并发送", "typed in and sent").into(),
@@ -298,7 +320,7 @@ pub fn native(to: &str, got: Vec<agent::Native>) {
             who: from.map_or_else(|| format!("「{}」claude", n.name), |(s, r)| who(s, r)),
             to: to.to_string(),
             kind: "msg".into(),
-            via: "claude".into(),
+            via: NATIVE.into(),
             text: n.text,
             ..Default::default()
         });
@@ -376,6 +398,9 @@ pub fn mark(id: &str, ids: &[String], how: &str) {
 /// there are only non-waking ones, leave them to be carried along next time
 pub fn take(id: &str) -> Vec<Msg> {
     let _l = lock(id);
+    if runtime::load(id).opening_mail.is_some() {
+        return vec![];
+    }
     let p = pending(id);
     if !p.iter().any(|m| m.wake) {
         return vec![];
@@ -394,7 +419,7 @@ fn mark_queued(id: &str, ids: &[String]) {
 }
 
 pub fn remove(id: &str) {
-    for ext in ["jsonl", "state", "bell", "lock"] {
+    for ext in ["jsonl", "state", "bell", "lock", "shift"] {
         let _ = std::fs::remove_file(paths::inbox_dir().join(format!("{id}.{ext}")));
     }
 }
@@ -409,7 +434,7 @@ fn ago(secs: u64) -> String {
 }
 
 fn what_said(what: &str) -> &'static str {
-    match what {
+    match what.strip_prefix("task.").unwrap_or(what) {
         "turn.done" => "跑完一轮",
         "turn.failed" => "出错了",
         "agent.exited" => "退出了",
@@ -425,8 +450,15 @@ fn what_said(what: &str) -> &'static str {
 /// (tested on 2.1.295). `hears_done` = the parent gets a notice when this turn finishes: answering in place sends it
 /// back, no need for another `aca msg`
 pub fn render(msgs: &[Msg], now: u64, parent: &str, hears_done: bool) -> String {
+    render_bell(msgs, now, parent, hears_done, false)
+}
+
+fn render_bell(msgs: &[Msg], now: u64, parent: &str, hears_done: bool, router: bool) -> String {
     let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
-    let mut out = format!("{} 条新消息({})· 全部:aca inbox", msgs.len(), ids.join(" "));
+    let mut out = format!("{} 条新消息({})", msgs.len(), ids.join(" "));
+    if !router {
+        out.push_str("· 全部:aca inbox");
+    }
     for (i, m) in msgs.iter().enumerate() {
         let when = ago(now.saturating_sub(m.ts));
         let who = if m.from == "you" { "用户(在会话外面)".to_string() } else { m.who.clone() };
@@ -438,6 +470,8 @@ pub fn render(msgs: &[Msg], now: u64, parent: &str, hears_done: bool) -> String 
             let back = match m.from.as_str() {
                 "you" => String::new(),
                 f if f == parent && hears_done => "  派你干活的会话交代的:直接在这里做、在这里回答,这一轮跑完它会收到你最后一句".into(),
+                f if f == parent && router => "  派你干活的会话交代的:直接在这里做".into(),
+                _ if router => String::new(),
                 f if f == parent => format!("  派你干活的会话交代的:直接在这里做;要回它用 aca msg {f} \"…\""),
                 f => format!("  回话:aca msg {f} \"…\""),
             };
@@ -588,39 +622,134 @@ fn notice_text(id: &str, ev: &str, r: &Run) -> String {
     }
 }
 
-/// The worker side, in its own hook: whether to tell the session that delegated it about this; if so, put a message in
-/// that session's inbox and start a detached delivery process. Returns the message put in
-pub fn notify(id: &str, ev: &str, cfg: &Config) -> Option<Msg> {
+/// A hook's notices, one per watched ticket and at most one ordinary parent notice.
+fn notices(store: &Store, s: &Session, r: &Run, ev: &str, short: &str, cfg: &Config) -> Vec<Msg> {
+    let notice = |to: String, what: &str, text| Msg {
+        from: s.id.clone(),
+        who: who(s, r),
+        to,
+        kind: "notice".into(),
+        what: what.into(),
+        wake: true,
+        text,
+        ..Default::default()
+    };
+    let mut out = vec![];
+    for t in store.watched_by_worker(&s.id).unwrap_or_default() {
+        let Some(to) = crate::task::recipient(store, &t) else { continue };
+        if to == s.id || store.get(&to).is_ok_and(|p| crate::sandbox::cage_of_session(cfg, &p).is_some()) {
+            continue;
+        }
+        let state = match ev {
+            "turn.done" => t!("跑完一轮", "finished a turn").into(),
+            "turn.failed" => tr!("出错:{}", "failed: {}", r.error),
+            "agent.waiting" => tr!("在问:{}", "asks: {}", r.ask),
+            _ => t!("进程退出", "process exited").into(),
+        };
+        let mut text = format!("#{} · {state}", t.n);
+        if !r.last.trim().is_empty() {
+            text.push_str(&tr!("\n最后一句:{}", "\nLast reply: {}", clip(&r.last, 300)));
+        }
+        text.push_str(&tr!("\n全文:look {}", "\nFull reply: look {}", s.id));
+        out.push(notice(to, &format!("task.{ev}"), text));
+    }
+    if wanted(&r.notify, &cfg.inbox.notify, short)
+        && let Ok(parent) = store.get(&s.parent)
+        && parent.id != s.id
+        && !out.iter().any(|m| m.to == parent.id)
+        && (ev == "agent.exited" || !store.task_routers(&s.id, None).is_ok_and(|routers| routers.contains(&parent.id)))
+        && crate::sandbox::cage_of_session(cfg, &parent).is_none()
+    {
+        out.push(notice(parent.id, ev, notice_text(&s.id, ev, r)));
+    }
+    out
+}
+
+pub fn notify(id: &str, ev: &str, cfg: &Config) {
     let short = match ev {
         "turn.done" => "done",
         "turn.failed" => "failed",
         "agent.exited" => "exited",
         "agent.waiting" => "waiting",
-        _ => return None,
+        _ => return,
     };
-    let r = runtime::load(id);
-    if !wanted(&r.notify, &cfg.inbox.notify, short) {
-        return None;
+    let Ok(store) = Store::open() else { return };
+    let Ok(s) = store.get(id) else { return };
+    for msg in notices(&store, &s, &runtime::load(id), ev, short, cfg) {
+        let m = post(msg);
+        if m.wake {
+            later(&m.to, 0, &[]);
+        }
     }
-    let store = Store::open().ok()?;
-    let s = store.get(id).ok()?;
-    let parent = store.get(&s.parent).ok().filter(|p| p.id != s.id)?;
-    // Nothing goes into a cage from another session (see crate::sandbox)
-    if crate::sandbox::cage_of_session(cfg, &parent).is_some() {
-        return None;
+}
+
+fn user_words(text: &str, via: &str, ts: u64) -> UserWords {
+    UserWords { text: text.chars().take(4000).collect(), chars: text.chars().count(), via: via.into(), ts, sent_to: vec![] }
+}
+
+pub(crate) fn opening_words(msgs: &[Msg]) -> Option<UserWords> {
+    let first = msgs.iter().find(|m| m.wake)?;
+    (first.from == "you" && first.carries_user_words()).then(|| user_words(&first.text, &first.via, first.ts))
+}
+
+/// Claude can escape '<' inside a paste and use its final newline as the wrapper's separator.
+pub(crate) fn input_hash(text: &str) -> u64 {
+    exact_input_hash(text.replace(r"<\", "<").trim_end())
+}
+
+fn exact_input_hash(text: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+fn pasted_input_hash(r: &Run, text: &str) -> u64 {
+    if r.shift.is_empty() { exact_input_hash(text) } else { input_hash(text) }
+}
+
+fn typed_words(r: &mut Run, prompt: &str, now: u64) -> Option<UserWords> {
+    let (submitted, words) = if r.shift.is_empty() { (prompt, prompt.into()) } else { agent::paste_text(prompt, false) };
+    if let Some((hash, origin)) = r.router_input.take()
+        && hash == pasted_input_hash(r, submitted)
+    {
+        return origin;
     }
-    let m = post(Msg {
-        from: s.id.clone(),
-        who: who(&s, &r),
-        to: parent.id.clone(),
-        kind: "notice".into(),
-        what: ev.into(),
-        wake: true,
-        text: notice_text(&s.id, ev, &r),
-        ..Default::default()
+    // A different submit leaves the opening batch for the doorbell.
+    r.opening_mail = None;
+    (!words.trim().is_empty() && !crate::thread::not_typed(&words)).then(|| user_words(&words, "", now))
+}
+
+/// A recipient gets the original once in this turn, even if two tool calls run concurrently.
+pub(crate) fn forward(store: &Store, me: Option<&Session>, to: &str, text: &str) -> String {
+    router_quote(store, me, to) + text
+}
+
+fn router_quote(store: &Store, me: Option<&Session>, to: &str) -> String {
+    let Some(router) = me.filter(|s| s.id != to && crate::task::is_router(store, s)) else { return String::new() };
+    let mut prefix = String::new();
+    runtime::update(&router.id, |r| {
+        if let Some(words) = &mut r.user_words {
+            prefix = quote(words, &router.title, to);
+        }
     });
-    later(&parent.id, 0, &[]);
-    Some(m)
+    prefix
+}
+
+fn quote(words: &mut UserWords, title: &str, to: &str) -> String {
+    if words.sent_to.iter().any(|id| id == to) {
+        return String::new();
+    }
+    words.sent_to.push(to.into());
+    let via = if words.via.is_empty() { t!("界面", "interface") } else { &words.via };
+    let clock = crate::schedule::clock(words.ts, words.ts);
+    let text: String = words.text.chars().take(1500).collect();
+    let n = words.chars;
+    let cut = if n > 1500 { tr!("(共 {n} 字,已截)", " ({n} characters total, truncated)") } else { String::new() };
+    tr!(
+        "用户对「{title}」说({via},{clock}):\n「{text}」{cut}\n{title}:",
+        "The user said to “{title}” ({via}, {clock}):\n“{text}”{cut}\n{title}: "
+    )
 }
 
 /// The receiving side, in its own hook (waits for nothing):
@@ -630,9 +759,51 @@ pub fn notify(id: &str, ev: &str, cfg: &Config) -> Option<Msg> {
 pub fn on_hook(id: &str, ev: &str, prompt: &str, bell_agent: bool) {
     if ev == "UserPromptSubmit" {
         let ids = queued_in(id, prompt);
+        let router = Store::open().is_ok_and(|st| st.router_role(id).ok().flatten().is_some());
+        if router || !ids.is_empty() || runtime::load(id).router_input.is_some() {
+            let _mail = lock(id);
+            let queued: Vec<_> = all(id).into_iter().filter(|m| ids.contains(&m.id)).collect();
+            let mut confirmed = vec![];
+            runtime::update(id, |r| {
+                if !r.current_shift() {
+                    return;
+                }
+                if prompt.starts_with("<task-notification>")
+                    && prompt.contains(&format!("<summary>{}</summary>", agent::BELL_SUMMARY))
+                    && let Some(via) = r.bell_via.take()
+                {
+                    r.turn_via = via;
+                    return;
+                }
+                let words = if queued.is_empty() {
+                    let words = typed_words(r, prompt, paths::now());
+                    confirmed = r.opening_mail.take().unwrap_or_default();
+                    words
+                } else {
+                    r.opening_mail = None;
+                    opening_words(&queued)
+                };
+                r.turn_via = words.as_ref().map(|w| w.via.clone()).unwrap_or_default();
+                if router {
+                    r.user_words = words;
+                }
+            });
+            mark_locked(id, &confirmed, "handoff");
+        }
         if !ids.is_empty() {
             mark(id, &ids, "queue");
         }
+    }
+    if matches!(ev, "Stop" | "StopFailure" | "Interrupt" | "SessionEnd") {
+        runtime::update(id, |r| {
+            if r.current_shift() && !matches!(r.status.as_str(), "running" | "waiting") {
+                // Without a matching submit, release the batch for redelivery after the turn.
+                r.opening_mail = None;
+                r.turn_via.clear();
+                r.bell_via = None;
+                r.user_words = None;
+            }
+        });
     }
     let again = matches!(ev, "Stop" | "StopFailure") || (ev == "SessionStart" && !bell_agent);
     if again && wants_wake(id) {
@@ -648,6 +819,10 @@ pub fn launched(cfg: &Config, s: &Session) {
     if !bell && wants_wake(&s.id) {
         later(&s.id, 5, &[]);
     }
+}
+
+pub(crate) fn connected_bell(cfg: &Config, s: &Session) -> bool {
+    runtime::load(&s.id).bell && agent::of(cfg, s).is_ok_and(|(a, _)| a.delivery() == Delivery::Bell)
 }
 
 /// Running / waiting for a confirmation: don't deliver yet, usually wait for its own end-of-turn hook. If the screen looks
@@ -691,22 +866,50 @@ const NOT_RUNNING: Tr = Tr::new("它未运行:启动后再送达", "it isn't run
 /// it's doing now, and picks a way to deliver. `retry` = this is already a retry after a while
 pub fn deliver(store: &Store, cfg: &Config, id: &str, retry: bool) -> Res<Sent> {
     let s = store.get(id)?;
-    let msgs = pending(&s.id);
+    let shift = crate::router::shift_lock(store, cfg, &s)?;
+    let slot = tmux::find(&s.id);
+    let pane = slot.as_ref().filter(|p| !p.dead);
+    let mut msgs = pending(&s.id);
     if !msgs.iter().any(|m| m.wake) {
         return Ok(Sent::Nothing);
     }
     let (agent, _) = agent::of(cfg, &s)?;
+    if shift.is_some() {
+        if crate::session::wake_shift(cfg, &s, slot.as_ref())? {
+            return Ok(Sent::Starting);
+        }
+        // The hook may have acknowledged the opening while we checked the pane. Take a consistent new batch.
+        let _mail = lock(&s.id);
+        if runtime::load(&s.id).opening_mail.is_some() {
+            return Ok(Sent::Held(t!("等新一班接收交接", "waiting for the new shift to receive its handoff").into()));
+        }
+        msgs = pending(&s.id);
+        if !msgs.iter().any(|m| m.wake) {
+            return Ok(Sent::Nothing);
+        }
+    }
     let r = runtime::load(&s.id);
-    let pane = tmux::find(&s.id).filter(|p| !p.dead);
     let held = |why: &str| Ok(Sent::Held(why.to_string()));
-    match agent.delivery() {
+    let sent = match agent.delivery() {
         Delivery::Keep => {
             held(t!("它是 shell,不会输入到其中;可在 aca inbox 中查看", "it's a shell, nothing is typed into it; see aca inbox"))
         }
         Delivery::Bell if pane.is_none() => held(NOT_RUNNING.get()),
         Delivery::Bell if r.bell => {
-            ring(&s.id);
+            // A concurrent sender or FileChanged hook may have taken the first snapshot.
+            let _mail = lock(&s.id);
+            let mut msgs = pending(&s.id);
             let ids: Vec<String> = msgs.iter().filter(|m| m.wake).map(|m| m.id.clone()).collect();
+            if ids.is_empty() {
+                return Ok(Sent::Nothing);
+            }
+            msgs.retain(Msg::carries_user_words);
+            // A connected bell takes over immediately if typing is held or fails.
+            if !msgs.is_empty() && matches!(type_in(cfg, &s, &*agent, pane.unwrap(), &msgs, true), Ok(Sent::Typed)) {
+                mark_locked(&s.id, &msgs.into_iter().map(|m| m.id).collect::<Vec<_>>(), "type");
+                return Ok(Sent::Typed);
+            }
+            ring(&s.id);
             later(&s.id, BELL_CHECK_SECS, &["--check", &ids.join(",")]);
             Ok(Sent::Bell)
         }
@@ -748,14 +951,18 @@ pub fn deliver(store: &Store, cfg: &Config, id: &str, retry: bool) -> Res<Sent> 
                     "无法排入它的队列({e}),且它未运行:启动后再送达",
                     "can't queue it ({e}) and it isn't running: delivered when it starts"
                 )),
-                Err(_) => type_in(cfg, &s, &*agent, &pane.unwrap(), &msgs, retry),
+                Err(_) => type_in(cfg, &s, &*agent, pane.unwrap(), &msgs, retry),
             }
         }
-        _ => match &pane {
+        _ => match pane {
             None => held(NOT_RUNNING.get()),
             Some(p) => type_in(cfg, &s, &*agent, p, &msgs, retry),
         },
+    }?;
+    if sent == Sent::Typed {
+        mark(&s.id, &msgs.into_iter().map(|m| m.id).collect::<Vec<_>>(), "type");
     }
+    Ok(sent)
 }
 
 /// Queue for Codex: first write with `-c` in our own process (without bringing up the background service); if this
@@ -821,18 +1028,41 @@ fn type_in(cfg: &Config, s: &Session, agent: &dyn Agent, pane: &tmux::Pane, msgs
         }
         return Ok(Sent::Held(why.into()));
     }
-    tmux::paste(&pane.pane, &render_as_input(msgs, paths::now(), &s.parent))?;
+    let input = render_as_input(msgs, paths::now(), &s.parent);
+    tmux::paste(&pane.pane, &input)?;
+    let words = opening_words(msgs);
+    if words.as_ref().is_some_and(|w| !w.via.is_empty()) || Store::open().is_ok_and(|st| crate::task::is_router(&st, s)) {
+        runtime::update(&s.id, |r| r.router_input = Some((pasted_input_hash(r, &input), words)));
+    }
     std::thread::sleep(Duration::from_millis(150));
     tmux::keys(&pane.pane, &["Enter"])?;
-    mark(&s.id, &msgs.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), "type");
     Ok(Sent::Typed)
 }
 
 /// `aca msg`: puts a message in the other side's inbox and tries delivering it at once. Called from inside a session, the
 /// sender is that session; `parent` = the session that delegated it. A nonzero `at` makes it scheduled: delivered at that
-/// moment, and it may be sent to yourself (to wake yourself up later)
-pub fn send(store: &Store, cfg: &Config, to: &str, text: &str, at: u64) -> Res<(Msg, Sent)> {
+/// moment, and it may be sent to yourself (to wake yourself up later). `via`: the channel your words came in through,
+/// named by whatever relays them (empty = none); only what is sent from outside a session can name one
+pub fn send(store: &Store, cfg: &Config, to: &str, text: &str, at: u64, via: &str) -> Res<(Msg, Sent)> {
     let me = std::env::var("ACA_SESSION_ID").ok().filter(|x| !x.is_empty()).and_then(|x| store.get(&x).ok());
+    send_as(store, cfg, me, to, text, at, via)
+}
+
+/// [`send`] from the sender named (None = you) instead of the session this process runs in: for what aca passes on in
+/// someone's name, wherever it happens to run
+pub fn send_as(store: &Store, cfg: &Config, me: Option<Session>, to: &str, text: &str, at: u64, via: &str) -> Res<(Msg, Sent)> {
+    send_message(store, cfg, me, to, Msg { text: text.into(), at, via: via.into(), ..Default::default() })
+}
+
+pub(crate) fn send_message(store: &Store, cfg: &Config, me: Option<Session>, to: &str, mut msg: Msg) -> Res<(Msg, Sent)> {
+    let (via, at) = (msg.via.as_str(), msg.at);
+    if !via.is_empty() {
+        // A session's own messages say who sent them already; a channel is where the user's words came from
+        if me.is_some() {
+            return Err(t!("--via 只能在会话外使用", "--via only works from outside a session").into());
+        }
+        crate::plugin::Channel::check_name(via)?;
+    }
     let to = match to {
         "parent" => {
             let me = me.as_ref().ok_or(t!(
@@ -862,8 +1092,16 @@ pub fn send(store: &Store, cfg: &Config, to: &str, text: &str, at: u64) -> Res<(
         Some(m) => (m.id.clone(), who(m, &runtime::load(&m.id))),
         None => ("you".to_string(), "你".to_string()),
     };
-    let m =
-        post(Msg { from, who, to: to.id.clone(), kind: "msg".into(), wake: true, text: clip(text.trim(), 4000), at, ..Default::default() });
+    // Preserve whitespace and long pastes in the input box and the router's handoff.
+    let keep_words = me.is_none() && msg.what.is_empty() && (crate::task::is_router(store, &to) || (at == 0 && connected_bell(cfg, &to)));
+    if !keep_words {
+        msg.text = clip(crate::task::said(store, me.as_ref(), &msg.text), 4000);
+        if at == 0 && msg.what.is_empty() {
+            msg.prepend_quote(&router_quote(store, me.as_ref(), &to.id));
+        }
+    }
+    let what = if !msg.what.is_empty() && crate::task::is_router(store, &to) { msg.what } else { String::new() };
+    let m = post(Msg { from, who, to: to.id.clone(), kind: "msg".into(), wake: true, what, ..msg });
     if m.wake && at > paths::now() {
         later_at(&to.id, at);
         return Ok((m, Sent::Scheduled(at)));
@@ -876,7 +1114,14 @@ pub fn send(store: &Store, cfg: &Config, to: &str, text: &str, at: u64) -> Res<(
             ),
         ));
     }
-    let sent = deliver(store, cfg, &to.id, false)?;
+    // The message is in the inbox now: a failed attempt (a router's new shift that didn't come up, a paste tmux refused…)
+    // doesn't undo that. Saying it failed would have the sender send it again and the inbox hold it twice; instead it's
+    // held, tried once more in a while, and otherwise waits for the receiver's own hooks like any held message
+    let sent = deliver(store, cfg, &to.id, false).unwrap_or_else(|e| {
+        later(&to.id, RETRY_SECS, &["--retry"]);
+        let e = clip(e.trim(), 300);
+        Sent::Held(tr!("无法送达({e}),{RETRY_SECS} 秒后重试一次", "couldn't deliver it ({e}); trying once more in {RETRY_SECS} seconds"))
+    });
     Ok((m, sent))
 }
 
@@ -890,13 +1135,39 @@ pub fn take_cmd() -> i32 {
     if std::env::var_os("CLAUDE_JOB_DIR").is_some() {
         return 0;
     }
-    let got = take(&id);
-    if got.is_empty() {
-        return 0;
-    }
-    let me = Store::open().ok().and_then(|st| st.get(&id).ok()).unwrap_or_default();
-    eprint!("{}", render(&got, paths::now(), &me.parent, hears_done(&crate::config::load(), &me)));
+    let Some(text) = take_bell(&id) else { return 0 };
+    eprint!("{text}");
     2
+}
+
+fn take_bell(id: &str) -> Option<String> {
+    let store = Store::open().ok();
+    let session = store.as_ref().and_then(|st| st.get(id).ok());
+    let _shift = match (store.as_ref(), session.as_ref()) {
+        (Some(st), Some(s)) => crate::router::shift_lock(st, &crate::config::load(), s).ok()?,
+        _ => None,
+    };
+    if !runtime::load(id).current_shift() {
+        return None;
+    }
+    let got = take(id);
+    if got.is_empty() {
+        return None;
+    }
+    let me = session.unwrap_or_default();
+    let router = store.as_ref().is_some_and(|st| crate::task::is_router(st, &me));
+    let words = opening_words(&got);
+    runtime::update(id, |r| {
+        if !matches!(r.status.as_str(), "running" | "waiting") {
+            r.turn_via = words.as_ref().map(|w| w.via.clone()).unwrap_or_default();
+        }
+        if router {
+            r.router_input = None;
+            r.user_words = words;
+            r.bell_via = Some(r.turn_via.clone());
+        }
+    });
+    Some(render_bell(&got, paths::now(), &me.parent, hears_done(&crate::config::load(), &me), router))
 }
 
 /// `aca inbox watch`: the extra one run on Claude's SessionStart and CwdChanged. Replies with `watchPaths` so it watches
@@ -918,6 +1189,9 @@ pub fn watch_cmd() -> i32 {
         .and_then(|v| v["hook_event_name"].as_str().map(str::to_string))
         .filter(|e| e == "CwdChanged")
         .unwrap_or_else(|| "SessionStart".into());
+    if !runtime::load(&id).current_shift() {
+        return 0;
+    }
     let b = bell(&id);
     if !b.exists() {
         ring(&id);
@@ -981,9 +1255,9 @@ impl Outcome {
 /// finish has to come after waiting started (a prompt just sent hasn't become "running" yet, so it still looks like the
 /// last turn's "finished"); with messages still undelivered, it hasn't started yet
 fn outcome(cfg: &Config, s: &Session, since: u64, now: u64) -> Option<Outcome> {
-    let r = runtime::load(&s.id);
     // Read the screen: Claude sends no hook when interrupted with Esc, so going by hooks alone it would be "running" forever
-    let state = status::one(cfg, s, true).state;
+    let (pane, r, seen) = status::observe(cfg, s, true);
+    let (state, _, _) = status::merge(pane.as_ref(), &r, seen.as_ref(), now);
     match state {
         State::Running => None,
         // Asking at startup whether to trust the folder, with the setting on: the follow-up left when starting it is about to
@@ -993,6 +1267,9 @@ fn outcome(cfg: &Config, s: &Session, since: u64, now: u64) -> Option<Outcome> {
         State::Error => Some(Outcome::Failed),
         State::Exited | State::Stopped => Some(Outcome::Exited),
         State::Idle | State::Unread => {
+            if pane.and_then(|p| r.codex_turn(p.pid)).is_some_and(|t| t != runtime::CodexTurn::Done) {
+                return None;
+            }
             let busy = list(&s.id).iter().any(|(m, st)| m.wake && *st != Stage::Got);
             let never = r.turn == 0 && r.done == 0;
             let early = now.saturating_sub(since) < 3 && r.done < since;
@@ -1055,6 +1332,47 @@ pub fn wait(store: &Store, cfg: &Config, keys: &[String], any: bool, timeout: Op
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_immediate_user_messages_and_router_quotes_carry_user_words() {
+        // The interface and the external CLI both post as "you"; a relay also names its channel.
+        let user = Msg { from: "you".into(), ..msg("m1", "msg", "可以") };
+        let peer = msg("m2", "msg", "用户对「router」说(界面,10:00):\n「可以」");
+        let mut words = user_words("可以", "Discord", 100);
+        let mut from_router = || {
+            let mut m = peer.clone();
+            m.prepend_quote(&quote(&mut words, "router", &peer.to));
+            m
+        };
+        let quoted = from_router();
+        for m in [&user, &Msg { via: "Discord".into(), ..user.clone() }, &quoted] {
+            assert!(m.carries_user_words(), "{m:?}");
+        }
+        assert!(opening_words(&[quoted]).is_none());
+        for m in [
+            from_router(),
+            peer.clone(),
+            Msg { kind: "notice".into(), ..user.clone() },
+            Msg { what: "task.created".into(), ..user.clone() },
+            Msg { at: 1, ..user.clone() },
+            Msg { from: peer.to.clone(), at: 1, ..peer },
+            Msg { via: NATIVE.into(), ..user },
+        ] {
+            assert!(!m.carries_user_words(), "{m:?}");
+        }
+    }
+
+    #[test]
+    fn old_inbox_lines_default_to_no_quote_and_only_quotes_write_the_flag() {
+        let line = r#"{"id":"m1","from":"router","kind":"msg","wake":true,"text":"可以"}"#;
+        let mut m: Msg = serde_json::from_str(line).unwrap();
+        assert!(!m.quoted);
+        assert!(serde_json::to_value(&m).unwrap().get("quoted").is_none());
+        m.quoted = true;
+        let record = serde_json::to_value(&m).unwrap();
+        assert_eq!(record["quoted"], true);
+        assert_eq!(serde_json::from_value::<Msg>(record).unwrap(), m);
+    }
+
     fn msg(id: &str, kind: &str, text: &str) -> Msg {
         Msg {
             id: id.into(),
@@ -1068,7 +1386,272 @@ mod tests {
             text: text.into(),
             at: 0,
             via: String::new(),
+            quoted: false,
         }
+    }
+
+    #[test]
+    fn watched_worker_events_go_to_the_project_or_its_dispatcher_only_while_assigned() {
+        use crate::store::Task;
+        let store = Store::memory();
+        let worker = Session { id: "worker".into(), group: "project".into(), ..Default::default() };
+        for id in ["project-router", "desk", "worker"] {
+            store.insert(&Session { id: id.into(), ..worker.clone() }).unwrap();
+        }
+        let r =
+            Run {
+                last: "最后一句".into(), ask: "选哪项？".into(), error: "连接失败".into(), notify: "none".into(), ..Default::default()
+            };
+        let events = [("turn.done", "done"), ("agent.waiting", "waiting"), ("turn.failed", "failed"), ("agent.exited", "exited")];
+        let check = |expected: Option<&str>| {
+            for (ev, short) in events {
+                let got = notices(&store, &worker, &r, ev, short, &Config::default());
+                assert_eq!(got.len(), usize::from(expected.is_some()), "{ev}: {got:?}");
+                if let Some(to) = expected {
+                    let m = &got[0];
+                    assert_eq!(m.to, to);
+                    assert_eq!(m.what, format!("task.{ev}"));
+                    assert!(m.wake && m.text.contains("#1") && m.text.contains(&r.last) && m.text.contains("look worker"));
+                    if short == "waiting" {
+                        assert!(m.text.contains(&r.ask));
+                    }
+                    if short == "failed" {
+                        assert!(m.text.contains(&r.error));
+                    }
+                }
+            }
+        };
+        let task = Task { group: worker.group.clone(), given_by: "desk".into(), session: worker.id.clone(), ..Task::default() };
+        let t = store.task_add(&task).unwrap();
+        check(None);
+        store.with_watch(t.n, Some(true), || Ok(())).unwrap();
+        check(Some("desk"));
+        store.group_set_router("project", "project-router").unwrap();
+        check(Some("project-router"));
+        store.task_done(t.n, "好了").unwrap();
+        check(None);
+    }
+
+    #[test]
+    fn a_router_parent_gets_one_exit_notice_for_a_worker_with_a_ticket() {
+        let store = Store::memory();
+        let parent = Session { id: "router".into(), group: "project".into(), ..Default::default() };
+        let worker = Session { id: "worker".into(), group: parent.group.clone(), parent: parent.id.clone(), ..Default::default() };
+        store.insert(&parent).unwrap();
+        store.insert(&worker).unwrap();
+        store.group_set_router(&parent.group, &parent.id).unwrap();
+        let task = crate::store::Task { group: parent.group.clone(), session: worker.id.clone(), ..Default::default() };
+        let t = store.task_add(&task).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.inbox.notify = vec!["exited".into(), "done".into(), "waiting".into(), "failed".into()];
+        let run = Run::default();
+        for (ev, short) in [("turn.done", "done"), ("agent.waiting", "waiting"), ("turn.failed", "failed")] {
+            assert!(notices(&store, &worker, &run, ev, short, &cfg).is_empty(), "{ev}");
+        }
+        let check_exit = |what: &str| {
+            let msgs = notices(&store, &worker, &run, "agent.exited", "exited", &cfg);
+            assert_eq!(msgs.len(), 1, "{msgs:?}");
+            assert_eq!(msgs[0].to, parent.id);
+            assert_eq!(msgs[0].what, what);
+            assert!(msgs[0].wake);
+        };
+        check_exit("agent.exited");
+        store.with_watch(t.n, Some(true), || Ok(())).unwrap();
+        check_exit("task.agent.exited");
+    }
+
+    #[test]
+    fn doorbell_submit_preserves_the_taken_words_and_channel_for_forwarding() {
+        // Exercise the real inbox, registry and hook in an isolated process.
+        let name = "inbox::tests::doorbell_submit_preserves_the_taken_words_and_channel_for_forwarding";
+        if std::env::var_os("ACA_TEST_BELL").is_none() {
+            let dir = std::env::temp_dir().join(format!("aca-unit-bell-{}", paths::short_id()));
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name])
+                .env("ACA_TEST_BELL", "1")
+                .env("HOME", &dir)
+                .env("ACA_HOME", &dir)
+                .env("ACA_TMUX_SOCKET", dir.file_name().unwrap())
+                .env_remove("ACA_ROUTER_SHIFT")
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+            return;
+        }
+        let store = Store::open().unwrap();
+        let s = Session { id: "ab12".into(), title: "aps".into(), tool: "claude".into(), group: "probe".into(), ..Default::default() };
+        store.insert(&s).unwrap();
+        store.group_set_router(&s.group, &s.id).unwrap();
+        let cfg = crate::config::load();
+        let (agent, _) = agent::of(&cfg, &s).unwrap();
+        let words = "怎么还失败了,派个 agent 看看。…";
+        for via in ["", "Discord"] {
+            let m = post(Msg { via: via.into(), from: "you".into(), ..msg("", "msg", words) });
+            let text = take_bell(&s.id).unwrap();
+            let prompt = format!(
+                "<task-notification>\n<summary>aca: 收件箱有新消息</summary>\n</task-notification>\n<system-reminder>\n[aca] {text}\n</system-reminder>"
+            );
+            crate::hook::feed(&cfg, &s.id, &*agent, &json!({"hook_event_name":"UserPromptSubmit", "prompt":prompt}));
+            let source = if via.is_empty() { "界面" } else { via };
+            let clock = crate::schedule::clock(m.ts, m.ts);
+            assert_eq!(
+                forward(&store, Some(&s), "worker", "查一下"),
+                format!("用户对「aps」说({source},{clock}):\n「{words}」\naps:查一下")
+            );
+            assert_eq!(forward(&store, Some(&s), "worker", "补一句"), "补一句");
+            assert_eq!(runtime::load(&s.id).turn_via, via);
+            crate::hook::feed(&cfg, &s.id, &*agent, &json!({"hook_event_name":"Stop","last_assistant_message":"好"}));
+        }
+    }
+
+    #[test]
+    fn only_the_user_who_opened_this_turn_is_quoted_once_per_recipient() {
+        let mut r = Run::default();
+        let now = 1234;
+        let clock = crate::schedule::clock(now, now);
+        let mut words = typed_words(&mut r, "  可以,,你定吧\n ", now).unwrap();
+        assert_eq!(quote(&mut words, "aps", "w1"), format!("用户对「aps」说(界面,{clock}):\n「  可以,,你定吧\n 」\naps:"));
+        assert!(quote(&mut words, "aps", "w1").is_empty());
+        assert!(!quote(&mut words, "aps", "w2").is_empty());
+        let mut m = Msg { from: "you".into(), text: "界".repeat(4501), ts: now, ..msg("m1", "msg", "") };
+        for via in ["", "Discord"] {
+            m.via = via.into();
+            let mut w = opening_words(std::slice::from_ref(&m)).unwrap();
+            assert_eq!((w.text.chars().count(), w.chars, w.via.as_str()), (4000, 4501, via));
+            let source = if via.is_empty() { "界面" } else { via };
+            assert_eq!(
+                quote(&mut w, "aps", "w1"),
+                format!("用户对「aps」说({source},{clock}):\n「{}」(共 4501 字,已截)\naps:", "界".repeat(1500))
+            );
+        }
+        r.router_input = Some((input_hash(&m.text), opening_words(std::slice::from_ref(&m))));
+        assert_eq!(typed_words(&mut r, &m.text, 9999).unwrap().ts, now);
+        assert_eq!(typed_words(&mut r, &m.text, 9999).unwrap().ts, 9999);
+        for input in ["[aca] 来自会话 w1:消息", "<task-notification>ok", "<cross-session-message/>"] {
+            assert!(typed_words(&mut r, input, now).is_none());
+        }
+        m.at = now;
+        assert!(opening_words(std::slice::from_ref(&m)).is_none());
+        m.from = "w1".into();
+        m.at = 0;
+        assert!(opening_words(&[m]).is_none());
+    }
+
+    #[test]
+    fn only_a_single_claude_paste_confirms_the_expected_router_input() {
+        let body = "  [aca] 项目交接\n「保留原话」\n`echo literal`  \n";
+        let wrapped = format!("\n\n<pasted_content id=\"402f\">\n{body}\n</pasted_content id=\"402f\">\n");
+        let matched = |expected: &str, prompt: &str| {
+            let mut r = Run {
+                shift: "current".into(),
+                router_input: Some((input_hash(expected), Some(user_words("原信", "Discord", 1)))),
+                opening_mail: Some(vec!["mail".into()]),
+                ..Default::default()
+            };
+            let origin = typed_words(&mut r, prompt, 2);
+            assert!(r.router_input.is_none());
+            let confirmed = r.opening_mail.is_some();
+            assert_eq!(origin.is_some_and(|w| w.via == "Discord" && w.text == "原信" && w.ts == 1), confirmed);
+            confirmed
+        };
+        assert!(matched(body, body));
+        assert!(matched(body, &wrapped));
+        assert!(matched(body, &wrapped.replace("402f", "ab19")));
+        assert!(!matched(body.trim(), &wrapped));
+        assert!(!matched(body, &wrapped.replacen("402f", "ab19", 1)));
+        assert!(!matched(body, &format!("前{wrapped}")));
+        assert!(!matched(body, &format!("{wrapped}后")));
+        assert!(!matched(&format!("前\n\n{body}\n后"), &format!("前{wrapped}后")));
+        let pair = format!("{wrapped}{wrapped}");
+        let joined = pair.trim().strip_prefix("<pasted_content id=\"402f\">\n").unwrap();
+        let joined = joined.strip_suffix("\n</pasted_content id=\"402f\">").unwrap();
+        assert!(!matched(joined, &pair));
+    }
+
+    #[test]
+    fn a_wrapped_reply_pasted_by_aca_keeps_its_inbox_origin_once() {
+        let mail = [Msg { from: "you".into(), via: "Discord".into(), ..msg("m1", "msg", "  请继续\n保留「这句」  ") }];
+        let input = render_as_input(&mail, 1000, "");
+        let origin = opening_words(&mail).unwrap();
+        let mut router = Run {
+            shift: "current".into(),
+            router_input: Some((input_hash(&input), Some(origin.clone()))),
+            ..Default::default()
+        };
+        let prompt = format!("\n\n<pasted_content id=\"402f\">\n{input}\n</pasted_content id=\"402f\">\n");
+        assert_eq!(typed_words(&mut router, &prompt, 2000), Some(origin));
+        assert_eq!(typed_words(&mut router, &prompt, 3000), Some(user_words(&input, "", 3000)));
+    }
+
+    #[test]
+    fn claude_paste_quotes_keep_the_body_and_the_users_surrounding_text() {
+        let body = "  第一行\n「第二行」\n ";
+        let block = format!("<pasted_content id=\"402f\">\n{body}\n</pasted_content id=\"402f\">");
+        let wrapped = format!("\n\n{block}\n");
+        let mut router = Run { shift: "current".into(), ..Default::default() };
+        let mut words = |prompt: &str| typed_words(&mut router, prompt, 1).unwrap().text;
+        assert_eq!(words(&wrapped), body);
+        let mixed = format!("我说\n{block} 接着 {}。\n", block.replace("402f", "a0be"));
+        assert_eq!(words(&mixed), format!("我说\n{body} 接着 {body}。\n"));
+        let mismatched = block.replacen("402f", "ab19", 1);
+        assert_eq!(words(&mismatched), mismatched);
+        assert_eq!(typed_words(&mut Run::default(), &wrapped, 1).unwrap().text, wrapped);
+    }
+
+    #[test]
+    fn escaped_tags_and_a_final_newline_confirm_only_the_same_handoff() {
+        let original = concat!(
+            "[aca] 项目交接 · probe\n",
+            "17:57  用户  <pasted_content id=\"402f\"> 上一班\n",
+            "</pasted_content id=\"402f\">\n",
+        );
+        let received = concat!(
+            "\n\n<pasted_content id=\"c90b\">\n",
+            "[aca] 项目交接 · probe\n",
+            "17:57  用户  <\\pasted_content id=\"402f\"> 上一班\n",
+            "<\\/pasted_content id=\"402f\">\n",
+            "</pasted_content id=\"c90b\">\n",
+        );
+        for (prompt, matches) in [(received.to_owned(), true), (received.replace("上一班", "下一班"), false)] {
+            let mut router = Run {
+                shift: "current".into(),
+                opening_mail: Some(vec!["m1".into()]),
+                router_input: Some((input_hash(original), None)),
+                ..Default::default()
+            };
+            assert!(typed_words(&mut router, &prompt, 100).is_none());
+            assert_eq!(router.opening_mail.is_some(), matches);
+        }
+        assert_eq!(input_hash("a<\\b \t\n"), input_hash("a<b"));
+        assert_ne!(input_hash(" a<b"), input_hash("a<b"));
+        let mut ordinary = Run::default();
+        ordinary.router_input = Some((pasted_input_hash(&ordinary, "reply \n"), Some(user_words("reply \n", "Discord", 1))));
+        assert_eq!(typed_words(&mut ordinary, "reply", 2), Some(user_words("reply", "", 2)));
+    }
+
+    #[test]
+    fn claude_user_quotes_restore_only_paste_tag_escapes() {
+        let original = r#"请保留 <pasted_content id="abcd"> 和 </pasted_content>，还有 a<\b 与 <\pasted_content-extra"#;
+        let escaped = r#"请保留 <\pasted_content id="abcd"> 和 <\/pasted_content>，还有 a<\b 与 <\pasted_content-extra"#;
+        let prompt = format!("\n\n<pasted_content id=\"c90b\">\n{escaped}\n</pasted_content id=\"c90b\">\n");
+        let mut router = Run { shift: "current".into(), ..Default::default() };
+        assert_eq!(typed_words(&mut router, &prompt, 100).unwrap().text, original);
+        assert_eq!(typed_words(&mut Run::default(), &prompt, 100).unwrap().text, prompt);
+    }
+
+    #[test]
+    fn only_router_doorbells_omit_the_inbox_and_reply_commands() {
+        let m = msg("m1", "msg", "原话里有 aca inbox");
+        let batch = std::slice::from_ref(&m);
+        let body = "1 条新消息(m1)\n1. ef56「读文档」codex:labs · 发来一句话 · 刚刚\n   「原话里有 aca inbox」";
+        assert_eq!(render_bell(batch, 100, "", false, true), body);
+        assert_eq!(render_bell(batch, 100, "ef56", false, true), format!("{body}  派你干活的会话交代的:直接在这里做"));
+        assert_eq!(
+            render(batch, 100, "", false),
+            "1 条新消息(m1)· 全部:aca inbox\n1. ef56「读文档」codex:labs · 发来一句话 · 刚刚\n   「原话里有 aca inbox」  回话:aca msg ef56 \"…\""
+        );
     }
 
     #[test]

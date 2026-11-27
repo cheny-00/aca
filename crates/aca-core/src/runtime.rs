@@ -29,6 +29,16 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
+/// The user's opening words for a router turn, and the sessions that have already received them.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UserWords {
+    pub text: String,
+    pub chars: usize,
+    pub via: String,
+    pub ts: u64,
+    pub sent_to: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Run {
@@ -55,10 +65,44 @@ pub struct Run {
     /// What you said this turn (truncated). A Claude turn opened by another session's message or a background task's notice
     /// gets what you last said yourself back when the turn ends ([`crate::agent::Agent::turn_record`])
     pub prompt: String,
-    /// The id Claude gave the prompt that opened this turn (UserPromptSubmit's `prompt_id`; its entries in the conversation
-    /// record carry it as `promptId`): when the turn ends, that entry tells who opened it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_words: Option<UserWords>,
+    /// External channel that opened this turn. A later message in an active turn does not redirect its reply.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub turn_via: String,
+    /// The channel at inbox take, restored when Claude submits the corresponding doorbell notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bell_via: Option<String>,
+    /// The next input pasted by aca (or its opening handoff), matched once by its fingerprint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router_input: Option<(u64, Option<UserWords>)>,
+    /// Mail included in the handoff remains pending until UserPromptSubmit confirms its fingerprint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opening_mail: Option<Vec<String>>,
+    /// This shift's MCP server has flushed its router tools to the client.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tools_listed: bool,
+    /// Initial conversation id for this router process, also passed to its hooks to discard late hooks from the old shift.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub shift: String,
+    /// The id of the prompt that opened this turn (Claude's `prompt_id`, Codex's `turn_id`), also found in its record
     #[serde(skip_serializing_if = "String::is_empty")]
     pub prompt_id: String,
+    /// The four agy title fields that drive lifecycle events. Other title fields change on almost every redraw.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agy: Option<AgyTitle>,
+    /// Last recorded title quota, excluding the countdown that changes on every redraw.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agy_quota: Option<u64>,
+    /// Successive agy permission boxes can appear within the same second and in the same turn.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub agy_confirmation: u64,
+    /// A new title update may arrive while the previous command box is still visible.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub agy_previous_command: u64,
+    /// A Codex submit hook can finish before the relay processes its first working report for the same turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_submit_pid: Option<u32>,
     /// The last reply (truncated): `c` copy, notices and plugins all take it from here, without digging through the conversation
     /// record again
     pub last: String,
@@ -75,8 +119,7 @@ pub struct Run {
     /// each tool's `Agent::title`
     pub hook_title: String,
     pub locked: bool,
-    /// The name last handed to Claude as its own name (`aca hook-name`): if it's still called that and you renamed it in aca again,
-    /// follow along
+    /// The name handed to Claude by `aca hook-name`, or the registered fallback for agy's title command.
     pub named: String,
     /// Claude's inbox address for messages from other Claude sessions (`uds:` + this socket), as Claude exports it to hooks
     /// (`CLAUDE_CODE_MESSAGING_SOCKET`); a new one each start. Empty for others, and for Claude before 2.1.224
@@ -137,6 +180,15 @@ pub struct Run {
     pub ps: Option<Program>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AgyTitle {
+    pub agent_state: String,
+    #[serde(default)]
+    pub conversation_id: String,
+    pub conversation_title: Option<String>,
+    pub tool_confirmation_pending: Option<bool>,
+}
+
 /// The agent's own report of its state (OSC 7501's root record)
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -151,6 +203,20 @@ pub struct Program {
     /// One line on what it's doing or waiting for
     pub msg: String,
     pub at: u64,
+    /// The turn witnessed by this local Codex relay. A startup prompt or a bare done has no completed turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_turn: Option<CodexTurn>,
+    /// A late hook from the preceding turn must not supply the reply for an OSC-only submit.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub previous_turn_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexTurn {
+    Ready,
+    Working,
+    Done,
 }
 
 /// One account change: when, which conversation, which configuration directory it was copied from and to
@@ -164,6 +230,14 @@ pub struct Move {
 }
 
 impl Run {
+    pub(crate) fn current_shift(&self) -> bool {
+        self.shift.is_empty() || std::env::var("ACA_ROUTER_SHIFT").map_or(true, |generation| generation == self.shift)
+    }
+
+    pub fn codex_turn(&self, pane_pid: u32) -> Option<CodexTurn> {
+        self.ps.as_ref().filter(|p| pane_pid != 0 && p.pid == pane_pid)?.codex_turn
+    }
+
     /// The last time the agent really did something (0 if the hook never reported an event): this turn starting / finishing, aca
     /// starting it, starting to ask you. An idle Claude also redraws and adds a few lines to the conversation record when settings
     /// change or the window resizes, so the window's activity time and the record's modified time both become "just now"; the
@@ -244,10 +318,40 @@ pub fn update(id: &str, f: impl FnOnce(&mut Run)) -> (Run, Run) {
     (before, after)
 }
 
+/// Deletes the session's state file. Its account switches are kept first (see [`kept_moves`])
 pub fn remove(id: &str) {
     let path = paths::run_file(id);
+    append_moves(&moves_log(), &load(id).moves);
     let _ = std::fs::remove_file(path.with_extension("lock"));
     let _ = std::fs::remove_file(path);
+}
+
+/// The account switches of deleted sessions, one JSON line each. Their conversations' turns before a switch stay in both
+/// account directories after the session is gone, and billing still needs to know which account ran them
+fn moves_log() -> std::path::PathBuf {
+    paths::state_dir().join("moves.jsonl")
+}
+
+fn append_moves(log: &std::path::Path, moves: &[Move]) {
+    use std::io::Write;
+    if moves.is_empty() {
+        return;
+    }
+    let text: String = moves.iter().filter_map(|m| serde_json::to_string(m).ok()).map(|l| l + "\n").collect();
+    let _ = std::fs::create_dir_all(log.parent().unwrap_or(std::path::Path::new(".")));
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
+/// The account switches kept from deleted sessions ([`remove`]); lines that don't parse are skipped
+pub fn kept_moves() -> Vec<Move> {
+    read_moves(&moves_log())
+}
+
+fn read_moves(log: &std::path::Path) -> Vec<Move> {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
 }
 
 /// Keep the first n characters
@@ -261,6 +365,20 @@ pub fn clip(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_switches_outlive_the_session() {
+        let dir = std::env::temp_dir().join(format!("aca-moves-{}", paths::short_id()));
+        let log = dir.join("moves.jsonl");
+        let m = |at: u64, conv: &str| Move { at, conv: conv.into(), from: "/ca".into(), to: "/cb".into() };
+        assert!(read_moves(&log).is_empty());
+        append_moves(&log, &[m(1, "c1"), m(2, "c1")]);
+        // A session that never switched adds nothing
+        append_moves(&log, &[]);
+        append_moves(&log, &[m(3, "c2")]);
+        assert_eq!(read_moves(&log), vec![m(1, "c1"), m(2, "c1"), m(3, "c2")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_new_conversation_is_remembered_once_and_becomes_current() {

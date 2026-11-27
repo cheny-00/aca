@@ -2,33 +2,64 @@ id = "aca.discord"
 name = "Discord"
 version = "0.1.0"
 api = 1
-needs = ["curl", "jq"]
-description = "会话完成一轮、等待回应或出错时发送到 Discord 频道(webhook);有人正在查看该会话时不发送。只发送,不接收"
-description_en = "Posts to a Discord channel (webhook) when a session finishes, waits or fails; not while someone is watching it. Outgoing only."
+needs = ["curl", "jq", "python3"]
+description = "用 bot 在频道主线和总台对话,在以会话标题命名的公开串里接收该会话的完成、提问和出错消息。每分钟收一次你的回话。只填 webhook 地址时沿用原来的通知方式"
+description_en = "Talk to the desk in the main channel and to each session in a public thread named after it. The bot posts replies, questions and errors and reads your messages once a minute. A webhook URL alone keeps the original notifications."
 
-# The address goes in plugins.toml: [plugins."aca.discord"] settings = { url = "https://discord.com/api/webhooks/…" }
-# or aca plugin setting aca.discord url <url>
+[channel]
+name = "Discord"
+settings = ["token", "channel", "user|mention"]
 
 [settings.url]
+label = "Webhook 地址"
+label_en = "Webhook URL"
 default = ""
 secret = true
-desc = "频道的 webhook 地址(频道设置 → 整合 → Webhooks → 复制网址)。留空则不发送"
-desc_en = "The channel's webhook URL (channel settings → Integrations → Webhooks → Copy Webhook URL). Empty: post nothing."
+desc = "可选。未配齐 token 和 channel 时,用这个地址发送原有的频道通知(需要 jq)"
+desc_en = "Optional. When token or channel is missing, post the original channel notifications through this webhook (requires jq)."
 
 [settings.mention]
+label = "@ 谁"
+label_en = "Mention"
 default = ""
 desc = "等待回应时 @ 谁:你的 Discord 用户 id(一串数字)。留空则不 @ 任何人"
 desc_en = "Who to @ when a session waits for you: your Discord user id (a string of digits). Empty: @ nobody."
 
 [settings.workers]
+label = "worker 也发送"
+label_en = "Workers too"
 default = false
 desc = "派出的 worker(有 parent 的会话)也发送。默认不发送:worker 完成后会通知派出它的会话"
 desc_en = "Also post for dispatched workers (sessions with a parent). Off by default: a finished worker reports to the session that dispatched it."
 
 [settings.username]
+label = "发送者名称"
+label_en = "Sender name"
 default = "aca"
-desc = "消息在频道中显示的发送者名称"
-desc_en = "The name the messages are posted under in the channel."
+desc = "仅 webhook 使用的发送者名称。bot 使用自己在 Discord 中的名字"
+desc_en = "Sender name for webhook posts only. Bot posts use the bot's Discord name."
+
+[settings.token]
+label = "Bot token"
+label_en = "Bot token"
+default = ""
+secret = true
+desc = "收发消息用的 bot token。填好 token 和 channel 即可发送。bot 模式需要 Python 3.8 或更新版本。收话还要打开 Message Content Intent,并填写 user 或 mention"
+desc_en = "Bot token for sending and receiving. Set token and channel to post. Bot mode requires Python 3.8 or later. To read messages, enable Message Content Intent and set user or mention."
+
+[settings.channel]
+label = "总台所在频道"
+label_en = "Desk channel"
+default = ""
+desc = "频道 ID。给 bot 查看频道、发送消息、读取消息历史、创建公开串、在串中发送消息、管理串(改名、收起)权限"
+desc_en = "Channel ID. Grant the bot View Channel, Send Messages, Read Message History, Create Public Threads, Send Messages in Threads and Manage Threads (rename and archive)."
+
+[settings.user]
+label = "只收谁的"
+label_en = "From whom"
+default = ""
+desc = "只收这个 Discord 用户 id 发的话,别人的不收。留空则用上面「@ 谁」那个 id"
+desc_en = "Only messages from this Discord user id are taken in, nobody else's. Empty: the id in Mention above."
 
 [[events]]
 on = "turn.done"
@@ -42,11 +73,46 @@ command = ["sh", "post.sh"]
 on = "turn.failed"
 command = ["sh", "post.sh"]
 
+[[events]]
+on = "session.renamed"
+command = ["sh", "post.sh"]
+
+[[events]]
+on = "session.titled"
+command = ["sh", "post.sh"]
+
+[[events]]
+on = "session.archived"
+command = ["sh", "post.sh"]
+
+[[events]]
+on = "session.removed"
+command = ["sh", "post.sh"]
+
 [[commands]]
 id = "test"
 title = "发送一条测试消息"
-title_en = "Post a test one"
-desc = "Post a test message to check the Discord webhook URL."
+title_en = "Post a test message"
+desc = "Post a test message through the configured bot or webhook."
 # For diagnosis, kept out of the : menu (that one acts on the highlighted row); aca plugin run aca.discord.test
 expose = ["cli"]
 command = ["sh", "post.sh", "test"]
+
+[[commands]]
+id = "pull"
+title = "立即收一次频道里的话"
+title_en = "Take in the channel's messages now"
+expose = ["cli"]
+command = ["sh", "pull.sh"]
+
+[[commands]]
+id = "check"
+title = "检查 bot 能否读频道、你的消息和活跃的串"
+title_en = "Check access to the channel, your messages and active threads"
+expose = ["cli"]
+command = ["sh", "pull.sh", "check"]
+
+# Once a minute, the shortest a timer goes. With token, channel or user not set the script asks Discord nothing
+[[timers]]
+run = "pull"
+every = "1m"

@@ -12,6 +12,8 @@ use super::Events;
 use crate::runtime::{Run, clip};
 use crate::t;
 
+pub(crate) const PROMPT_CHARS: usize = 400;
+
 /// One line about a tool call for people: the command / file / URL, whichever is there
 fn tool_brief(v: &Value) -> String {
     let input = &v["tool_input"];
@@ -107,14 +109,11 @@ fn question(r: &mut Run, v: &Value, out: &mut Events) {
     waiting(r, clip(&q, 200), "choice", out);
 }
 
-/// One event → how the state changes and which events to emit. A pure function
-pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
+/// Conversation details can arrive in a hook after its turn was already recorded by the terminal.
+pub(crate) fn metadata(r: &mut Run, v: &Value) -> Events {
     let s = |k: &str| v[k].as_str().unwrap_or("");
-    let ev = s("hook_event_name");
     let mut out: Events = vec![];
     let from = r.conv.clone();
-    r.event = ev.to_string();
-    r.ts = now;
     r.note_conv(s("session_id"));
     if !s("transcript_path").is_empty() {
         r.transcript = s("transcript_path").to_string();
@@ -128,6 +127,28 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
     if r.conv != from && !from.is_empty() {
         out.push(("conversation.changed", json!({ "conv": r.conv, "from": from })));
     }
+    out
+}
+
+/// One event → how the state changes and which events to emit. A pure function
+pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
+    if v["hook_event_name"] == "Stop" {
+        reply(r, v);
+    }
+    apply_state(r, v, now)
+}
+
+pub(crate) fn reply(r: &mut Run, v: &Value) {
+    r.last = clip(v["last_assistant_message"].as_str().unwrap_or(""), 4000);
+    r.bg = v["background_tasks"].as_array().map_or(0, |a| a.len()) as u32;
+}
+
+pub(crate) fn apply_state(r: &mut Run, v: &Value, now: u64) -> Events {
+    let s = |k: &str| v[k].as_str().unwrap_or("");
+    let ev = s("hook_event_name");
+    let mut out = metadata(r, v);
+    r.event = ev.to_string();
+    r.ts = now;
     // Compaction finished (including the SessionStart that carries on after it), turn ended, exited: no longer compacting.
     // The state follows each case's own rules below
     if matches!(ev, "PostCompact" | "SessionStart" | "Stop" | "StopFailure" | "SessionEnd") {
@@ -136,14 +157,16 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
     match ev {
         // The SessionStart that carries on after compaction isn't "now idle"
         "SessionStart" if s("source") != "compact" => {
+            r.turn_via.clear();
             r.status = "idle".into();
             r.clear_ask();
             r.clear_error();
         }
         "UserPromptSubmit" => {
+            r.turn_via.clear();
             r.status = "running".into();
             r.turn = now;
-            r.prompt = clip(s("prompt"), 400);
+            r.prompt = clip(s("prompt"), PROMPT_CHARS);
             r.prompt_id = s("prompt_id").to_string();
             r.clear_ask();
             r.clear_error();
@@ -173,8 +196,6 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
         "Stop" => {
             r.status = "done".into();
             r.done = now;
-            r.last = clip(s("last_assistant_message"), 4000);
-            r.bg = v["background_tasks"].as_array().map_or(0, |a| a.len()) as u32;
             r.clear_ask();
             let secs = if r.turn == 0 { 0 } else { now.saturating_sub(r.turn) };
             out.push(("turn.done", json!({ "last": r.last, "bg": r.bg, "secs": secs })));
@@ -217,12 +238,33 @@ pub fn apply(r: &mut Run, v: &Value, now: u64) -> Events {
         }
         _ => {}
     }
+    if !r.turn_via.is_empty() {
+        for (name, data) in &mut out {
+            if matches!(*name, "turn.done" | "agent.waiting" | "turn.failed") {
+                data["via"] = json!(r.turn_via);
+            }
+        }
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_channel_turns_reply_question_and_failure_name_its_origin() {
+        let mut r = Run { turn_via: "Discord".into(), ..Run::default() };
+        let question = json!({"hook_event_name":"PreToolUse","tool_input":{"questions":[{"question":"Proceed?"}]}});
+        let done = json!({"hook_event_name":"Stop","last_assistant_message":"yes"});
+        let failed = json!({"hook_event_name":"StopFailure","error":"timeout"});
+        for (event, name) in [(&question, "agent.waiting"), (&done, "turn.done"), (&failed, "turn.failed")] {
+            let events = apply(&mut r, event, 10);
+            assert_eq!((events[0].0, events[0].1["via"].as_str()), (name, Some("Discord")));
+        }
+        let local = apply(&mut r, &json!({"hook_event_name":"UserPromptSubmit","prompt":"another turn"}), 11);
+        assert!(local[0].1.get("via").is_none() && apply(&mut r, &done, 12)[0].1.get("via").is_none());
+    }
 
     fn ev(r: &mut Run, json: &str, now: u64) -> Vec<&'static str> {
         apply(r, &serde_json::from_str(json).unwrap(), now).into_iter().map(|e| e.0).collect()

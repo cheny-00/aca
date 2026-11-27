@@ -7,16 +7,22 @@ description = "会话完成一轮、等待回应或出错时显示桌面通知;�
 description_en = "Shows a desktop notification when a session finishes, waits or fails; not while you are watching it."
 
 [settings.command]
+label = "通知命令"
+label_en = "Command"
 default = ""
 desc = "改用其他命令显示通知,标题和正文是它的两个参数(例如你自己写的脚本)。留空,或该命令失败(退出码不为 0)时:macOS 用 osascript,Linux 用 notify-send"
 desc_en = "Another command to show notifications with; the title and body are its two arguments (a script of your own, say). Empty, or if it fails (exit code not 0): osascript on macOS, notify-send on Linux."
 
 [settings.workers]
+label = "worker 也通知"
+label_en = "Workers too"
 default = false
 desc = "派出的 worker 也显示通知(worker 完成后本来就会通知派出它的会话)"
 desc_en = "Also notify for dispatched workers (a finished worker reports to the session that dispatched it anyway)."
 
 [settings.attached]
+label = "查看时也通知"
+label_en = "While attached"
 default = false
 desc = "你正在查看该会话时也显示通知"
 desc_en = "Also notify while you are attached to that session."

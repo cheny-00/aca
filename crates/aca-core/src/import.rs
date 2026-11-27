@@ -171,7 +171,7 @@ pub fn agent_deck(store: &Store, cfg: &Config, apply: bool, all: bool) -> Res<()
     let dbs = dbs(&root).map_err(|e| format!("{}:{e}", root.display()))?;
     // agent-deck's sessions are on the real tmux server; ACA_TMUX_SOCKET isn't consulted
     let live: Vec<String> = std::process::Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
+        .args(["-u", "list-sessions", "-F", "#{session_name}"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect())
         .unwrap_or_default();

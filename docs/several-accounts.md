@@ -40,7 +40,7 @@ default for a tool, set `account = "work"` under `[tools.claude]` in `config.tom
 | `$` | Every account's quota at the top of the billing page; see [Usage, cost and limits](usage-and-cost.md) |
 
 Quotas read like `5h 7% · 7d 1%`: the share of the 5-hour and the 7-day allowance used. They turn amber past
-70% and red past 90%. Codex reports them by itself. Claude reports them only to its status bar, so to see
+70% and red past 90%. Listed together, each kind sits in its own column, left blank for an account without it. Codex reports them by itself. Claude reports them only to its status bar, so to see
 Claude's, connect the status bar as described in [Accounts](accounts.md). Accounts logged in with an API key
 have no quota.
 
@@ -55,7 +55,7 @@ it. Press `X` on it (or on any Claude or Codex session):
    accounts page to log in, `+` adds an account. Then press `X` again.
 
 The session restarts in place under the new account and resumes the same conversation. Its record is
-copied into the new account's directory, so the whole context comes along, and the row, title and note
+copied into the new account's directory, so the whole context comes along, and the row, title and draft
 stay as they were. If the session is running or waiting for you, the box warns that switching interrupts
 the turn. The first turn afterwards costs more than usual: the new account has nothing cached yet, so the
 whole context is written to its cache again.
@@ -74,8 +74,8 @@ hand it off.
 `H` starts a new session that picks up where this one is. Pick its tool and account (the `n` menu without
 the shell). It is created in the same directory and group, and is sent a handoff note: the conversation
 record, a text version of it (what both sides said, subagent reports, the files changed), the directory, the
-conversation id, and your note on the session. It reads all that and carries on, asking you first only if
-the original ended on a question that your note doesn't answer. The original is left as it is.
+conversation id, and your draft on the session. It reads all that and carries on, asking you first only if
+the original ended on a question that your draft doesn't answer. The original is left as it is.
 
 ## Fork: `f`
 

@@ -1,23 +1,61 @@
-//! Types the interface shares with the modules around it: how far back the list goes ([`Scope`], [`DAYS`]), where the preview
+//! Types the interface shares with the modules around it: which sessions the list shows ([`Scope`]), where the preview
 //! goes ([`Preview`]), and what the run loop does after giving up the terminal ([`External`], [`Split`], [`TermReq`]).
 
+use aca_core::t;
 use aca_records::workdir::Where;
-
-/// Day counts offered for "recent days"; `*` cycles through them in this order (wraps around at the end; all is `a`). One day by default
-pub const DAYS: [u64; 3] = [1, 3, 7];
 
 /// Output within this many seconds after coming back from viewing doesn't count as "new activity" (detach may redraw once)
 pub(crate) const SEEN_SLACK: u64 = 3;
 
-/// How far back sessions are listed. "Open ones" (`w`) is another layer on top (see `App::open`)
+/// "Last 7 days": stopped sessions idle for less than this are listed too
+pub const WEEK: u64 = 7 * 86400;
+
+/// Which sessions the list shows. The second lists everything the first does and more; `w` switches between them. Older
+/// stopped ones are reached through `F` and search, so the list never grows to every session ever started. Picking one state
+/// with `F` sets this aside until it's cleared (see `App::status`)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Scope {
-    /// Active within recent days (one by default, `*` changes the number of days)
-    Recent,
-    All,
+    /// The default: everything whose pane is still there (● ◆ ◐ ○ ✕), plus pinned ones
+    Open,
+    /// The above, plus stopped ones idle for less than [`WEEK`]
+    Week,
 }
 
-/// Layout (where the preview goes). Wide screens (desktop) and narrow ones (phone) remember theirs separately; `v` cycles only through
+impl Scope {
+    pub const ALL: [Scope; 2] = [Scope::Open, Scope::Week];
+
+    pub fn next(self) -> Scope {
+        match self {
+            Scope::Open => Scope::Week,
+            Scope::Week => Scope::Open,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Scope::Open => t!("未停止", "Open"),
+            Scope::Week => t!("近 7 天", "7 days"),
+        }
+    }
+
+    /// What the view file calls it
+    pub fn key(self) -> &'static str {
+        match self {
+            Scope::Open => "open",
+            Scope::Week => "week",
+        }
+    }
+
+    /// `all` was a third step once; a view file saved on it lands on the wider one left
+    pub fn from_key(k: &str) -> Option<Scope> {
+        if k == "all" {
+            return Some(Scope::Week);
+        }
+        Scope::ALL.into_iter().find(|s| s.key() == k)
+    }
+}
+
+/// Layout (where the preview goes). Wide screens (desktop) and narrow ones (phone) remember theirs separately; `L` cycles only through
 /// the ones that fit the current kind of screen:
 /// wide: preview right → preview below → list only; narrow: split → mostly preview → list only
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,8 +79,9 @@ pub enum External {
     Edit { path: String, line: usize },
     /// e in a session record: view read-only in the editor at this line; temp = a temporary file deleted afterwards
     View { path: String, line: usize, temp: bool },
-    /// The config file (config.toml) the settings page opens in the editor: written from the template first if missing
-    Config { path: String, template: String },
+    /// The config file (config.toml) the settings page opens in the editor: written from the template first if missing.
+    /// section: open at that `[section]` (added at the end when it isn't there); None = at the top
+    Config { path: String, template: String, section: Option<&'static str> },
     /// yazi, opened in the directory the session really works in (looked up when giving up the terminal, as with T).
     /// In a tmux popup it's instead run in a zoomed pane split off in the session (see the run loop); empty `target` = the session isn't
     /// running, so it can only open in place

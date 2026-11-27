@@ -1,6 +1,7 @@
 //! The billing page (`$`): what each account cost over a range, read in the background, and the picker for which accounts it counts.
 
 use super::*;
+use crate::sheet::{Key, key, more, named};
 
 /// `$` billing panel (content in `bill`, data in `usage`)
 #[derive(Default)]
@@ -169,10 +170,18 @@ impl App {
         if k.code == KeyCode::Char('l') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return self.ask_relaunch();
         }
+        let ask = k.code == KeyCode::Char('?') && !k.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(b) = self.bill.as_ref().filter(|_| ask) {
+            let keys = match &b.pick {
+                Some(p) => bill_pick_keys(p.anchor.is_some(), p.unpick),
+                None => bill_keys(b.more),
+            };
+            return self.open_sheet(&keys);
+        }
         if self.bill.as_ref().is_some_and(|b| b.pick.is_some()) {
             return self.on_bill_pick_key(k);
         }
-        if k.code == KeyCode::Char('r') {
+        if k.code == KeyCode::Char('r') && k.modifiers.contains(KeyModifiers::CONTROL) {
             self.bill_want = true;
             return;
         }
@@ -252,21 +261,54 @@ pub(super) fn draw_bill(f: &mut Frame, app: &mut App) {
     let foot_line = match &app.msg {
         Some((m, t)) if t.elapsed() < app.msg_ttl => Line::styled(m.clone(), theme::warn()).centered(),
         _ => {
-            let mut keys = vec![
-                ("←→", t!("时段", "period"), 0),
-                ("a", t!("账号", "accounts"), 1),
-                ("m", if more { t!("收起", "less") } else { t!("更多", "more") }, 1),
-                ("↑↓", t!("滚动", "scroll"), 2),
-                ("r", t!("重新读取", "reload"), 1),
-            ];
-            keys.retain(|k| long || k.0 != "↑↓");
-            menu_bar(&[keys, vec![("Esc", t!("返回", "back"), 0)]], None, w)
+            let all = bill_keys(more);
+            let keys: Vec<MenuItem> = [("←→", 0), ("a", 1), ("m", 1), ("↑↓", 2), ("^R", 1)]
+                .into_iter()
+                .filter(|(k, _)| long || *k != "↑↓")
+                .map(|(k, p)| (k, named(&all, k), p))
+                .collect();
+            page_bar(&[keys, vec![("Esc", named(&all, "Esc"), 0)]], None, w)
         }
     };
     f.render_widget(Paragraph::new(foot_line), foot);
     if let Some(sel) = app.bill.as_ref().and_then(|b| b.pick.as_ref()).map(|p| p.sel) {
         draw_bill_pick(f, app, sel);
     }
+}
+
+/// The billing page's keys (m says what it'll do now), for `?`; the bottom bar names its keys from here
+fn bill_keys(more_shown: bool) -> Vec<Key> {
+    vec![
+        key("←→", t!("时段", "period")),
+        key("a", t!("账号", "accounts")),
+        key("m", if more_shown { t!("收起", "less") } else { t!("更多", "more") }),
+        key("↑↓", t!("滚动", "scroll")),
+        key("^R", t!("重新读取", "reload")),
+        more("1-4", t!("选这个时段", "this period")),
+        more(t!("空格 b", "Space b"), t!("翻页", "page")),
+        more("g G", t!("顶部 / 底部", "top / bottom")),
+        more("^L", t!("重启 aca", "restart aca")),
+        key("Esc", t!("返回", "back")),
+    ]
+}
+
+/// The account picker's keys (a range in progress: only moving and ⏎), for its bottom bar and `?`
+fn bill_pick_keys(ranging: bool, unpick: bool) -> Vec<Key> {
+    let mut v = match ranging {
+        true => vec![
+            key("↑↓", if unpick { t!("取消选中", "range unselect") } else { t!("连选", "range") }),
+            key("⏎", t!("查看已选", "show selected")),
+        ],
+        false => vec![
+            key(t!("⏎ 数字", "⏎ digit"), t!("仅显示此项", "only it")),
+            key("v", t!("多选", "multi")),
+            key(t!("空格", "Space"), t!("选中", "tick")),
+            key("0", t!("全部", "all")),
+            more("V", t!("连续取消", "range unselect")),
+        ],
+    };
+    v.push(more("Esc", t!("关闭", "close")));
+    v
 }
 
 /// a's account picker floating window: first row 「全部」 ("all"), then one account per row (number, tick, name colored by provider,
@@ -283,7 +325,7 @@ fn draw_bill_pick(f: &mut Frame, app: &App, sel: usize) {
             modal_title(
                 t!("按账号筛选", "Which accounts"),
                 theme::accent(),
-                esc_hint(if ranging { t!("确定", "keep") } else { t!("关闭", "close") }),
+                esc_hint(if ranging { t!("结束", "end") } else { t!("关闭", "close") }),
                 w,
             ),
             Line::raw(""),
@@ -323,19 +365,8 @@ fn draw_bill_pick(f: &mut Frame, app: &App, sel: usize) {
             out.push(line);
         }
         out.push(Line::raw(""));
-        let keys: &[(&str, &str)] = if ranging && pick.is_some_and(|p| p.unpick) {
-            &[("↑↓", t!("取消选中", "range unselect")), ("⏎", t!("查看已选", "show selected"))]
-        } else if ranging {
-            &[("↑↓", t!("连选", "range")), ("⏎", t!("查看已选", "show selected"))]
-        } else {
-            &[
-                (t!("⏎ 数字", "⏎ digit"), t!("仅显示此项", "only it")),
-                ("v", t!("多选", "multi")),
-                (t!("空格", "Space"), t!("选中", "tick")),
-                ("0", t!("全部", "all")),
-            ]
-        };
-        out.push(keys_line(keys, vec![], w));
+        let keys = bill_pick_keys(ranging, pick.is_some_and(|p| p.unpick));
+        out.push(keys_line_help(&crate::sheet::foot(&keys), vec![], w));
         out
     });
 }
@@ -384,6 +415,17 @@ mod tests {
         shows(&reader_rows(&mut app, 80, 10), &["m 收起"]);
         press(&mut app, KeyCode::Char('m'));
         assert!(!app.bill.as_ref().unwrap().more);
+    }
+
+    #[test]
+    fn ctrl_r_rereads_the_bill_and_a_bare_r_does_nothing() {
+        let mut app = App::new(String::new(), sessions());
+        press(&mut app, KeyCode::Char('$'));
+        app.bill_want = false;
+        press(&mut app, KeyCode::Char('r'));
+        assert!(!app.bill_want && app.bill.is_some());
+        ctrl(&mut app, 'r');
+        assert!(app.bill_want);
     }
 
     #[test]

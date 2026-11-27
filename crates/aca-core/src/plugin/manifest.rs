@@ -235,6 +235,8 @@ pub struct Hotkey {
 #[serde(default)]
 pub struct Setting {
     pub default: Option<toml::Value>,
+    /// What the interface calls it (`label_en` for English); unset = the setting's name
+    pub label: String,
     pub desc: String,
     /// Not shown in full (webhook URLs, keys and the like): masked where the interface and `aca plugin setting` list it
     pub secret: bool,
@@ -278,6 +280,8 @@ pub struct AgentPart {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Manifest {
+    pub role: String,
+    pub channel: Option<Channel>,
     pub id: String,
     pub name: String,
     pub version: String,
@@ -302,6 +306,28 @@ pub struct Manifest {
     pub agent: AgentSpec,
     /// Old form: what to bring to which agent (`[agents.claude]`)
     pub agents: BTreeMap<String, AgentPart>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Channel {
+    pub name: String,
+    #[serde(default)]
+    pub settings: Vec<String>,
+}
+
+impl Channel {
+    /// Reserved for messages Claude delivered itself.
+    pub const NATIVE: &str = "claude";
+
+    pub fn check_name(name: &str) -> Res<()> {
+        if name.is_empty() || name.chars().count() > 16 || name.chars().any(char::is_whitespace) || name == Self::NATIVE {
+            return Err(t!(
+                "--via 的名称应为 1–16 个字符,不能含空白,不能是 claude",
+                "the name after --via must be 1–16 characters, with no whitespace, and can't be claude"
+            ).into());
+        }
+        Ok(())
+    }
 }
 
 impl Manifest {
@@ -368,7 +394,7 @@ impl Manifest {
             human.push(tr!("{} 个视图", "{} views", self.views.len()));
         }
         if !human.is_empty() {
-            out.push(tr!("插件菜单:{}(在会话列表按 :)", "plugin menu: {} (press : on the session list)", human.join(" · ")));
+            out.push(tr!("插件的命令:{}(在会话列表按 ?)", "plugin commands: {} (press ? on the session list)", human.join(" · ")));
         }
         if !self.timers.is_empty() {
             let each: Vec<String> = self
@@ -442,8 +468,16 @@ pub(crate) fn id_ok(id: &str, dots: bool) -> bool {
 pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     let unreadable = |e: toml::de::Error| tr!("无法解析清单:{}", "can't parse the manifest: {}", e.message());
     let mut t: toml::Table = text.parse().map_err(unreadable)?;
+    // A channel's name is a protocol value passed to --via in every language.
+    let channel = t.remove("channel");
     localize(&mut t);
+    if let Some(channel) = channel {
+        t.insert("channel".into(), channel);
+    }
     let mut m: Manifest = toml::Value::Table(t).try_into().map_err(unreadable)?;
+    if !matches!(m.role.as_str(), "" | "router") {
+        return Err(tr!("无法识别的插件角色 {}", "unknown plugin role {}", m.role));
+    }
     if !id_ok(&m.id, true) {
         return Err(t!("清单需要 id(字母、数字、. : _ -)", "the manifest needs an id (letters, digits, . : _ -)").into());
     }
@@ -660,7 +694,7 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
             return Err(tr!("[[keys]] 的 key 应为单个字符:「{}」", "a [[keys]] key is one character: “{}”", k.key));
         }
         if MENU_KEYS_TAKEN.contains(&k.key.as_str()) {
-            return Err(tr!("键 {} 已被 : 菜单占用(用于筛选)", "key {} is taken by the : menu (filter)", k.key));
+            return Err(tr!("键 {} 已被 ? 占用(用于筛选)", "key {} is taken by ? (filter)", k.key));
         }
         if !keys.insert(&k.key) {
             return Err(tr!("键 {} 重复", "key {} is bound twice", k.key));
@@ -742,6 +776,14 @@ pub fn parse(text: &str) -> Res<(Manifest, Vec<String>)> {
     if let Some(k) = m.settings.keys().find(|k| !id_ok(k, false)) {
         return Err(tr!("设置名「{k}」无效(只能用字母、数字、: _ -)", "setting name “{k}” is invalid (letters, digits, : _ -)"));
     }
+    if let Some(c) = &m.channel {
+        Channel::check_name(&c.name).map_err(|e| format!("[channel] name: {e}"))?;
+        for key in c.settings.iter().flat_map(|s| s.split('|')) {
+            if !m.settings.contains_key(key) {
+                return Err(tr!("[channel] settings 中的「{key}」没有对应设置", "[channel] settings refers to unknown setting “{key}”"));
+            }
+        }
+    }
     let mut vars = std::collections::HashMap::new();
     for k in m.settings.keys() {
         if let Some(other) = vars.insert(var("ACA_SETTING_", k), k) {
@@ -796,6 +838,7 @@ pub(crate) fn var(prefix: &str, name: &str) -> String {
 // Fields each table accepts. Add new fields here too (the full manifest in docs/plugins.md must read without a single
 // warning; a test checks it)
 const TOP_KEYS: &[&str] = &[
+    "role",
     "id",
     "name",
     "version",
@@ -813,6 +856,7 @@ const TOP_KEYS: &[&str] = &[
     "requires",
     "needs",
     "settings",
+    "channel",
     "agent",
     "agents",
 ];
@@ -823,7 +867,7 @@ const VIEW_KEYS: &[&str] = &["id", "title", "contexts", "command", "rows", "keys
 const ROW_KEY_KEYS: &[&str] = &["key", "title", "run", "args", "copy", "confirm", "row"];
 const KEY_KEYS: &[&str] = &["key", "run"];
 const TIMER_KEYS: &[&str] = &["run", "every", "manual"];
-const SETTING_KEYS: &[&str] = &["default", "desc", "secret"];
+const SETTING_KEYS: &[&str] = &["default", "label", "desc", "secret"];
 const AGENT_KEYS: &[&str] = &["for", "dir", "auto", "mcp"];
 const MCP_KEYS: &[&str] = &["command", "via", "scope"];
 const AGENT_PART_KEYS: &[&str] = &["plugin_dir"];
@@ -834,8 +878,8 @@ fn unknown_keys(t: &toml::Table) -> Vec<String> {
     fn check(t: &toml::Table, at: &str, known: &[&str], out: &mut Vec<String>) {
         // The copy of human-facing text in the other language (`desc_en`): accepted wherever this table accepts desc (see
         // [`localize`])
-        let other_lang =
-            |k: &str| ["_en", "_zh"].iter().any(|s| k.strip_suffix(s).is_some_and(|base| TEXTS.contains(&base) && known.contains(&base)));
+        let other_lang = |k: &str| at != "channel" &&
+            ["_en", "_zh"].iter().any(|s| k.strip_suffix(s).is_some_and(|base| TEXTS.contains(&base) && known.contains(&base)));
         out.extend(
             t.keys()
                 .filter(|k| !known.contains(&k.as_str()) && !other_lang(k))
@@ -850,6 +894,9 @@ fn unknown_keys(t: &toml::Table) -> Vec<String> {
     }
     let mut out = vec![];
     check(t, "", TOP_KEYS, &mut out);
+    if let Some(c) = t.get("channel").and_then(toml::Value::as_table) {
+        check(c, "channel", &["name", "settings"], &mut out);
+    }
     for (name, known) in [
         ("actions", ACTION_KEYS),
         ("commands", ACTION_KEYS),
@@ -906,11 +953,11 @@ pub fn read_manifest(dir: &Path) -> Res<(Manifest, Vec<String>)> {
     if super::user::is_dir(dir) { parse_user(&text) } else { parse(&text) }
 }
 
-/// Human-facing text (name, description, title) can have a copy per language: suffixed ones like `description_en`,
+/// Human-facing text (name, description, title, a setting's desc and label) can have a copy per language: suffixed ones like `description_en`,
 /// `title_zh` replace the unsuffixed one when the interface is in that language; the unsuffixed one is still the default,
 /// used when neither language has its own copy. An older aca doesn't know the suffixes and keeps using the unsuffixed one
 /// — only added, never changed (see [`API`])
-const TEXTS: [&str; 4] = ["name", "description", "title", "desc"];
+const TEXTS: [&str; 5] = ["name", "description", "title", "desc", "label"];
 
 /// Puts the copy for the current language in place and drops all suffixed ones. Every level of table and every table in
 /// an array of tables is looked at
@@ -1078,7 +1125,7 @@ scope = "session"
             parse("id = \"a\"\nname = \"x\"\nversion = \"1\"\n[[commands]]\nid = \"c\"\nexpose = [\"agent\"]\ncommand = [\"true\"]")
                 .unwrap();
         assert_eq!(warn.len(), 1, "{warn:?}");
-        // input, cwd, agent?, keys the : menu keeps for itself
+        // input, cwd, agent?, keys ? keeps for itself
         assert!(bad("[[commands]]\nid = \"c\"\ninput = \"clipboard\"\ncommand = [\"true\"]").contains("clipboard"));
         assert!(bad("[[panes]]\nid = \"p\"\ncwd = \"home\"\ncommand = [\"true\"]").contains("home"));
         assert!(bad("[[commands]]\nid = \"c\"\nexpose = [\"agent\", \"agent?\"]\ncommand = [\"true\"]").contains("agent?"));
@@ -1104,9 +1151,28 @@ scope = "session"
     const BASE: &str = "id = \"t.x\"\nname = \"x\"\nversion = \"1\"\n";
 
     #[test]
+    fn channels_use_via_names_and_declared_setting_alternatives() {
+        let with = |name: &str, extra: &str| parse(&format!("{BASE}[channel]\nname = '{name}'\n{extra}"));
+        assert!(parse(BASE).unwrap().0.channel.is_none());
+        assert!(with(&"界".repeat(16), "").unwrap().0.channel.unwrap().settings.is_empty());
+        for name in ["", &"界".repeat(17), "a b", "a　b", "claude"] {
+            assert!(with(name, "").unwrap_err().contains("[channel] name"));
+        }
+        let (m, warnings) = with("Local", "settings = ['a|b']\n[settings.a]\n[settings.b]").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(m.channel.unwrap().settings, ["a|b"]);
+        for req in ["bad", "a|bad", "a|"] {
+            assert!(with("Local", &format!("settings = ['{req}']\n[settings.a]")).unwrap_err().contains("[channel] settings"));
+        }
+        let (m, warnings) = with("Local", "name_en = 'Other'").unwrap();
+        assert_eq!(m.channel.unwrap().name, "Local");
+        assert!(warnings.iter().any(|w| w.contains("channel.name_en")));
+    }
+
+    #[test]
     fn text_can_be_written_per_language_and_the_plain_one_is_the_fallback() {
         let m = format!(
-            "{BASE}description = \"中文说明\"\ndescription_en = \"In English\"\n[settings.a]\ndesc = \"甲\"\ndesc_en = \"A\"\n\
+            "{BASE}description = \"中文说明\"\ndescription_en = \"In English\"\n[settings.a]\nlabel = \"开关甲\"\nlabel_en = \"Switch A\"\ndesc = \"甲\"\ndesc_en = \"A\"\n\
              [settings.b]\ndesc = \"只有一种\"\n[[commands]]\nid = \"go\"\ntitle = \"走\"\ntitle_en = \"Go\"\ncommand = [\"true\"]\n\
              [[panes]]\nid = \"p\"\ntitle = \"Pad\"\ntitle_zh = \"便签\"\ncommand = [\"true\"]\n"
         );
@@ -1116,12 +1182,14 @@ scope = "session"
                 m.description,
                 m.settings["a"].desc.clone(),
                 m.settings["b"].desc.clone(),
+                m.settings["a"].label.clone(),
+                m.settings["b"].label.clone(),
                 m.actions[0].title.clone(),
                 m.panes[0].title.clone(),
             ]
         };
-        assert_eq!(texts(crate::i18n::Lang::En), ["In English", "A", "只有一种", "Go", "Pad"]);
-        assert_eq!(texts(crate::i18n::Lang::Zh), ["中文说明", "甲", "只有一种", "走", "便签"]);
+        assert_eq!(texts(crate::i18n::Lang::En), ["In English", "A", "只有一种", "Switch A", "", "Go", "Pad"]);
+        assert_eq!(texts(crate::i18n::Lang::Zh), ["中文说明", "甲", "只有一种", "开关甲", "", "走", "便签"]);
         // The suffixed ones aren't unknown; other suffixes, or a suffix on a field this table doesn't have, are still named
         let (_, warn) = crate::i18n::with(crate::i18n::Lang::Zh, || parse(&m).unwrap());
         assert!(warn.is_empty(), "{warn:?}");

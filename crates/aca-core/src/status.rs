@@ -37,6 +37,18 @@ pub enum State {
     Stopped,
 }
 
+/// What a state is called
+pub fn state_name(s: State) -> &'static str {
+    match s {
+        State::Running => crate::t!("运行中", "running"),
+        State::Ask => crate::t!("等待回应", "needs you"),
+        State::Unread => crate::t!("未读", "unread"),
+        State::Idle => crate::t!("空闲", "idle"),
+        State::Error => crate::t!("出错", "error"),
+        State::Exited | State::Stopped => crate::t!("已停止", "stopped"),
+    }
+}
+
 impl State {
     pub fn glyph(self) -> &'static str {
         match self {
@@ -114,7 +126,8 @@ pub fn follow_titles(cfg: &Config, sessions: &[Session], panes: &[Pane]) -> bool
             continue;
         }
         // Only now take the lock and ask again: the hook may be changing it at the same moment
-        for (name, data) in hook::retitle(&s.id, |r| agent.live_title(r, &p.title)) {
+        let (_, events) = hook::retitle(&s.id, |r| agent.live_title(r, &p.title));
+        for (name, data) in events {
             event::emit(name, &s.id, data);
             renamed = true;
         }
@@ -176,6 +189,11 @@ pub fn merge(pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64) -> (St
     }
     let since_turn = if r.status == "running" && r.turn > 0 { now.saturating_sub(r.turn) } else { 0 };
     if let Some(ps) = reported(p, r) {
+        let done = match ps.codex_turn {
+            Some(runtime::CodexTurn::Done) => r.done,
+            Some(_) => 0,
+            None => ps.at,
+        };
         return match ps.state.as_str() {
             // After approving a prompt the turn the hook started goes on: count from there
             "working" => (State::Running, String::new(), now.saturating_sub(if r.turn > 0 && r.turn <= ps.at { r.turn } else { ps.at })),
@@ -193,7 +211,7 @@ pub fn merge(pane: Option<&Pane>, r: &Run, seen: Option<&Seen>, now: u64) -> (St
             "error" => (State::Error, String::new(), 0),
             // A failure the hook reported (with its kind, used for retrying) outlasts the agent's done / idle, until the next turn
             _ if r.status == "error" => (State::Error, String::new(), 0),
-            "done" if unread(p, r, ps.at) => (State::Unread, String::new(), 0),
+            "done" if unread(p, r, done) => (State::Unread, String::new(), 0),
             _ => (State::Idle, String::new(), 0),
         };
     }
@@ -334,7 +352,7 @@ pub fn collect(store: &Store, cfg: &Config, read_screen: bool) -> Res<Vec<Row>> 
         .zip(&picked)
         .zip(&seen)
         .zip(&agents)
-        .map(|(((s, p), sn), a)| row(s, *p, &settled(cfg, s, a.as_deref(), sn.as_ref()), sn.as_ref(), now))
+        .map(|(((s, p), sn), a)| row(s, *p, &settled(cfg, s, *p, a.as_deref(), sn.as_ref()), sn.as_ref(), now))
         .collect();
     rows.sort_by(|a, b| {
         let key = |r: &Row| (rank.get(&r.group).copied().unwrap_or(i64::MAX), r.group.clone(), r.order, r.created);
@@ -353,10 +371,16 @@ pub fn peek(store: &Store) -> Res<Vec<Row>> {
 
 /// A session as it is now (`show`, waiting for it to go idle before sending a message)
 pub fn one(cfg: &Config, s: &Session, read_screen: bool) -> Row {
+    let (pane, r, seen) = observe(cfg, s, read_screen);
+    row(s, pane.as_ref(), &r, seen.as_ref(), paths::now())
+}
+
+pub(crate) fn observe(cfg: &Config, s: &Session, read_screen: bool) -> (Option<Pane>, Run, Option<Seen>) {
     let pane = tmux::find(&s.id);
     let agent = agent_of(cfg, s);
     let seen = pane.as_ref().filter(|p| read_screen && !p.dead).and_then(|p| Some(look(&s.id, agent.as_deref()?, &tmux::capture(&p.pane))));
-    row(s, pane.as_ref(), &settled(cfg, s, agent.as_deref(), seen.as_ref()), seen.as_ref(), paths::now())
+    let r = settled(cfg, s, pane.as_ref(), agent.as_deref(), seen.as_ref());
+    (pane, r, seen)
 }
 
 /// The runtime state, after first filling in a turn end it didn't report: if the hook says running but the screen has
@@ -364,18 +388,16 @@ pub fn one(cfg: &Config, s: &Session, read_screen: bool) -> Row {
 /// [`Agent::unreported_end`]). If so, fill in that event for it, recording the state, emitting `turn.done` /
 /// `turn.failed` and notifying the session that delegated it, just like a real hook. There's no resident process: it's
 /// only noticed when someone looks (`aca ls`, an interface refresh, `aca wait`)
-fn settled(cfg: &Config, s: &Session, agent: Option<&dyn Agent>, seen: Option<&Seen>) -> Run {
+fn settled(cfg: &Config, s: &Session, pane: Option<&Pane>, agent: Option<&dyn Agent>, seen: Option<&Seen>) -> Run {
     let r = load(&s.id);
-    if r.status != "running" || seen != Some(&Seen::Quiet) {
+    let open = |r: &Run| r.status == "running" && pane.and_then(|p| reported(p, r)).and_then(|p| p.codex_turn).is_none();
+    let Some(agent) = agent.filter(|_| seen == Some(&Seen::Quiet) && open(&r)) else {
         return r;
-    }
-    match agent.and_then(|a| Some((a, a.unreported_end(&r)?))) {
-        Some((a, v)) => {
-            hook::feed(cfg, &s.id, a, &v);
-            load(&s.id)
-        }
-        None => r,
-    }
+    };
+    let Some(end) = agent.unreported_end(&r) else { return r };
+    hook::feed_if(cfg, &s.id, agent, |current| {
+        (open(current) && current.turn == r.turn && current.conv == r.conv && current.prompt_id == r.prompt_id).then_some(end)
+    })
 }
 
 /// [`settled`] for the side that reads screens and builds the list itself (the interface): asks each session the hook says
@@ -388,7 +410,7 @@ pub fn settle(cfg: &Config, sessions: &[Session], panes: &[Pane], screen: &dyn F
         }
         let Some(p) = tmux::agent_pane(panes, &s.id).filter(|p| !p.dead) else { continue };
         let Some(agent) = agent_of(cfg, s) else { continue };
-        settled(cfg, s, Some(&*agent), Some(&look(&s.id, &*agent, &screen(p))));
+        settled(cfg, s, Some(p), Some(&*agent), Some(&look(&s.id, &*agent, &screen(p))));
     }
 }
 

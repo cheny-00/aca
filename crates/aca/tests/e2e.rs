@@ -9,6 +9,8 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 
+mod discord_threads;
+
 struct Sandbox {
     home: PathBuf,
     socket: String,
@@ -49,7 +51,8 @@ impl Sandbox {
         std::fs::create_dir_all(home.join("config")).unwrap();
         std::fs::create_dir_all(home.join("proj")).unwrap();
         // The fake agent: started the Claude way (with --session-id, --settings), and does nothing itself
-        std::fs::write(home.join("agent.sh"), "#!/bin/sh\necho fake agent up\nexec sleep 600\n").unwrap();
+        std::fs::write(home.join("router.py"), include_str!("fake_router.py")).unwrap();
+        std::fs::write(home.join("agent.sh"), "#!/bin/sh\nif [ -n \"$ACA_ROUTER_SHIFT\" ]; then exec python3 \"$ACA_HOME/router.py\" \"$@\"; fi\necho fake agent up\nexec sleep 600\n").unwrap();
         let cfg = format!("[tools.fake]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{}\"]\n", home.join("agent.sh").display());
         std::fs::write(home.join("config/config.toml"), cfg).unwrap();
         Some(Sandbox { socket: format!("aca-e2e-{}-{name}", std::process::id()), home })
@@ -97,7 +100,7 @@ impl Sandbox {
 
     fn tmux(&self, args: &[&str]) -> String {
         let mut c = Command::new("tmux");
-        let o = scrub(&mut c).args(["-L", &self.socket]).args(args).output().unwrap();
+        let o = scrub(&mut c).args(["-u", "-L", &self.socket]).args(args).output().unwrap();
         String::from_utf8_lossy(&o.stdout).trim().to_string()
     }
 
@@ -226,6 +229,48 @@ fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
+/// The interface's bottom bar for keys written "⏎ 打开 • s 回话" ("⏎ open • s reply"), as it reads on screen: each key a cap
+/// with a cell of room either side, a space, its words, three cells to the next cap; from the first key to the last word
+fn caps(keys: &str) -> String {
+    let items: Vec<String> = keys
+        .split(" • ")
+        .map(|item| match item.split_once(' ') {
+            Some((k, d)) => format!(" {k}  {d}"),
+            None => format!(" {item} "),
+        })
+        .collect();
+    items.join("   ").trim_start().to_string()
+}
+
+#[test]
+fn creating_two_sessions_in_the_same_directory_without_a_locale_keeps_both_live() {
+    let Some(sb) = Sandbox::new("no-locale") else { return };
+    let aca = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aca"));
+        cmd.env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &sb.home)
+            .env("ACA_HOME", &sb.home)
+            .env("ACA_TMUX_SOCKET", &sb.socket);
+        if let Some(tmp) = std::env::var_os("TMUX_TMPDIR") {
+            cmd.env("TMUX_TMPDIR", tmp);
+        }
+        let out = cmd.args(args).output().unwrap();
+        assert!(out.status.success(), "aca {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let new = ["new", "fake", &sb.proj()];
+    let first = aca(&new);
+    let second = aca(&new);
+    let rows: Vec<Value> = serde_json::from_str(&aca(&["ls", "--json"])).unwrap();
+    assert_eq!(rows.len(), 2);
+    for (id, name) in [(first, "proj"), (second, "proj (2)")] {
+        let row = rows.iter().find(|r| r["id"] == id).unwrap();
+        assert_eq!(row["tmux"], name);
+        assert_eq!(row["state"], "idle");
+    }
+}
+
 #[test]
 fn a_session_is_a_tmux_session_named_by_its_title_and_stops_and_restarts_in_place() {
     let Some(sb) = Sandbox::new("life") else { return };
@@ -259,6 +304,227 @@ fn a_session_is_a_tmux_session_named_by_its_title_and_stops_and_restarts_in_plac
     sb.aca(&["rm", &id]);
     assert_eq!(sb.tmux(&["list-sessions", "-F", "#{session_name}"]), "");
     assert_eq!(sb.json(&["ls", "--json"]), serde_json::json!([]));
+}
+
+/// A group names one of its own sessions as its router, for as long as that session is in it. Sessions move in a batch, with
+/// what they sent out when asked, and the event says where each came from and whose command moved it
+#[test]
+fn a_group_names_its_router_and_sessions_move_in_a_batch_with_what_they_sent_out() {
+    let Some(sb) = Sandbox::new("router") else { return };
+    let new = |title: &str, group: &str, parent: &str| {
+        let dir = sb.proj();
+        let mut args = vec!["new", "fake", dir.as_str(), "--hold", "-t", title, "-g", group];
+        if !parent.is_empty() {
+            args.extend(["--parent", parent]);
+        }
+        sb.aca(&args)
+    };
+    let router = new("nuc router", "nuc", "");
+    let lead = new("电压", "scratch", "");
+    let kid = new("电压-测量", "scratch", &lead);
+    let grandkid = new("电压-测量-画图", "scratch", &kid);
+    let elsewhere = new("电压-别处", "other", &lead);
+    let alone = new("功耗", "scratch", "");
+    let stays = new("墨水屏", "scratch", "");
+    let group = |id: &str| sb.json(&["show", id, "--json"])["group"].as_str().unwrap().to_string();
+
+    // No router yet: nothing printed, exit 1. Only one of the group's own sessions can be named
+    let none = sb.run(&["group", "router", "nuc"]);
+    assert_eq!((none.status.code(), String::from_utf8_lossy(&none.stdout).trim()), (Some(1), ""));
+    assert!(!sb.run(&["group", "router", "nuc", &lead]).status.success());
+    assert!(!sb.run(&["group", "router", "nowhere"]).status.success());
+    sb.aca(&["group", "router", "nuc", &router]);
+    assert_eq!(sb.aca(&["group", "router", "nuc"]), router);
+    let listed = sb.json(&["group", "ls", "--json"]);
+    let of = |g: &str| listed.as_array().unwrap().iter().find(|x| x["path"] == g).unwrap()["router"].clone();
+    assert_eq!((of("nuc"), of("scratch")), (Value::from(router.as_str()), Value::Null));
+    assert!(sb.aca(&["group", "ls"]).lines().any(|l| l.contains("nuc") && l.ends_with(&format!("@{router}"))));
+
+    // The router pulls two sessions over, with what they sent out: the ones in the same group follow however deep, the one put
+    // elsewhere stays there, and who sent out whom is as it was
+    let out = sb.as_session(&router, &["move", "--tree", &lead, &alone, "nuc"], "");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for id in [&lead, &kid, &grandkid, &alone] {
+        assert_eq!(group(id), "nuc");
+    }
+    assert_eq!((group(&elsewhere), group(&stays)), ("other".to_string(), "scratch".to_string()));
+    assert_eq!(sb.json(&["show", &grandkid, "--json"])["parent"], kid.as_str());
+    let moved: Vec<Value> = sb
+        .aca(&["events", "-n", "100"])
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|e| e["event"] == "session.moved")
+        .collect();
+    let ids: Vec<&str> = moved.iter().map(|e| e["session"].as_str().unwrap()).collect();
+    assert_eq!(ids, [lead.as_str(), kid.as_str(), grandkid.as_str(), alone.as_str()]);
+    assert!(moved.iter().all(|e| e["group"] == "nuc" && e["from"] == "scratch" && e["by"] == router.as_str()), "{moved:?}");
+
+    // Without --tree only the one named moves; one already there stays put and nothing is said about it; moved by you = no `by`
+    sb.aca(&["move", &kid, &alone, "scratch"]);
+    assert_eq!((group(&kid), group(&grandkid), group(&alone)), ("scratch".to_string(), "nuc".to_string(), "scratch".to_string()));
+    sb.aca(&["move", &kid, "scratch"]);
+    let all = sb.aca(&["events", "-n", "100"]);
+    let last: Vec<Value> =
+        all.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).filter(|e| e["event"] == "session.moved").skip(4).collect();
+    assert_eq!(last.len(), 2, "{last:?}");
+    assert!(last.iter().all(|e| e["from"] == "nuc" && e["by"].is_null()));
+    // A key that finds no session moves nothing at all
+    assert!(!sb.run(&["move", &stays, "no-such-session", "nuc"]).status.success());
+    assert_eq!(group(&stays), "scratch");
+
+    // The router moved away is no group's router; back, it is this one's again. Deleted, the group has none
+    sb.aca(&["move", &router, "other"]);
+    assert_eq!(sb.run(&["group", "router", "nuc"]).status.code(), Some(1));
+    assert_eq!(sb.run(&["group", "router", "other"]).status.code(), Some(1));
+    sb.aca(&["move", &router, "nuc"]);
+    assert_eq!(sb.aca(&["group", "router", "nuc"]), router);
+    sb.aca(&["group", "router", "nuc", ""]);
+    assert_eq!(sb.run(&["group", "router", "nuc"]).status.code(), Some(1));
+    sb.aca(&["group", "router", "nuc", &router]);
+    sb.aca(&["rm", &router]);
+    assert_eq!(sb.run(&["group", "router", "nuc"]).status.code(), Some(1));
+}
+
+/// Task tickets from the command line: you and a group's router make them and hand them over, the session doing one marks
+/// it done, and word is passed each time — to the session handed the ticket, and to the router when one is made with nobody
+/// on it or is done. A session started for a ticket has it from the start, in the ticket's group
+#[test]
+fn tickets_are_made_and_handed_over_by_you_and_routers_and_marked_done_by_the_session_doing_them() {
+    let Some(sb) = Sandbox::new("task") else { return };
+    let new = |title: &str, group: &str| {
+        let dir = sb.proj();
+        sb.aca(&["new", "fake", dir.as_str(), "--hold", "-t", title, "-g", group, "--parent", "-"])
+    };
+    let router = new("probe router", "probe");
+    let (w1, w2) = (new("fix-alert", "probe"), new("fix-panel", "probe"));
+    sb.aca(&["group", "router", "probe", &router]);
+    let said = |o: Output| {
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let refused = |o: Output, why: &str| {
+        let err = String::from_utf8_lossy(&o.stderr).to_string();
+        assert!(!o.status.success() && err.contains(why), "{err}");
+    };
+    // What a session was told, oldest first: (who by, the words)
+    let told = |id: &str| -> Vec<(String, String)> {
+        let v = sb.json(&["inbox", id, "--json"]);
+        v.as_array().unwrap().iter().map(|m| (m["from"].as_str().unwrap().into(), m["text"].as_str().unwrap().into())).collect()
+    };
+    let task = |n: &str| sb.json(&["task", "show", n, "--json"]);
+
+    // Made by you with nobody on it: only its number is printed, and the group's router hears of it
+    assert_eq!(sb.aca(&["task", "add", "-g", "probe", "-t", "告警规则上测试集群", "--criteria", "造一次延迟,告警响"]), "#1");
+    assert_eq!(told(&router), [("you".to_string(), "#1 新任务:告警规则上测试集群\n完成标准:造一次延迟,告警响\n还没有会话在做。".to_string())]);
+    assert_eq!((task("1")["state"].as_str(), task("#1")["by"].as_str()), (Some("todo"), Some("")));
+    // A session that is no router makes none and hands none over; the router does both, in its own group by default
+    refused(sb.as_session(&w1, &["task", "add", "-t", "x"], ""), "router");
+    refused(sb.as_session(&w1, &["task", "give", "1", &w1], ""), "router");
+    assert_eq!(said(sb.as_session(&router, &["task", "add", "-t", "面板加三张图", "--note", "等 #1:改同一个文件"], "")), "#2");
+    assert_eq!((task("2")["group"].as_str(), task("2")["by"].as_str()), (Some("probe"), Some(router.as_str())));
+    let line = said(sb.as_session(&router, &["task", "give", "1", &w1, "这块你昨天改过"], ""));
+    assert!(line.starts_with("#1  ● 告警规则上测试集群  probe  ·  fix-alert"), "{line}");
+    let want = "任务 #1:告警规则上测试集群\n完成标准:造一次延迟,告警响\n这块你昨天改过\n做完后运行:aca task done 1 \"一句话说结果\"";
+    assert_eq!(told(&w1), [(router.clone(), want.to_string())]);
+    let t = task("1");
+    assert_eq!((t["state"].as_str(), t["session"].as_str(), t["given_by"].as_str()), (Some("doing"), Some(w1.as_str()), Some(router.as_str())));
+
+    // The list: the ones not done, every group's or one's; its line on a ticket is the router's to write, and the doer's own
+    let ls = sb.aca(&["task", "ls"]);
+    assert!(ls.lines().count() == 2 && ls.contains("#2  · 面板加三张图  probe"), "{ls}");
+    assert_eq!(sb.aca(&["task", "ls", "-g", "probe"]).lines().count(), 2);
+    assert!(!sb.run(&["task", "ls", "-g", "nope"]).status.success());
+    said(sb.as_session(&w1, &["task", "set", "1", "--note", "卡在集群权限"], ""));
+    refused(sb.as_session(&w2, &["task", "set", "1", "--note", "x"], ""), "router");
+    refused(sb.as_session(&w1, &["task", "set", "1", "-t", "改个名"], ""), "router");
+    assert_eq!(task("1")["note"], "卡在集群权限");
+    assert!(sb.aca(&["task", "show", "1"]).contains("完成标准  造一次延迟,告警响"));
+
+    // Done: not by the router, not by another session; the one doing it needs no number, and the router hears the result
+    refused(sb.as_session(&router, &["task", "done", "1"], ""), "做它的会话");
+    refused(sb.as_session(&w2, &["task", "done", "1", "好了"], ""), "做它的会话");
+    let line = said(sb.as_session(&w1, &["task", "done", "测试集群上响了"], ""));
+    assert!(line.starts_with("#1  ✓ 告警规则上测试集群"), "{line}");
+    assert_eq!(told(&router).last().unwrap(), &(w1.clone(), "#1 完成:告警规则上测试集群\n测试集群上响了".to_string()));
+    assert_eq!((task("1")["state"].as_str(), task("1")["result"].as_str()), (Some("done"), Some("测试集群上响了")));
+    assert_eq!(sb.aca(&["task", "ls"]).lines().count(), 1);
+    assert_eq!(sb.json(&["task", "ls", "--all", "--json"]).as_array().unwrap().len(), 2);
+
+    // A session started for a ticket: it's the ticket's doer at once, in the ticket's group, with nothing sent after
+    let dir = sb.proj();
+    let w3 = said(sb.as_session(&router, &["new", "fake", &dir, "--hold", "--parent", "-", "-t", "fix-panel-2", "--task", "2", "--say", "照这个做"], ""));
+    let t = task("2");
+    assert_eq!((t["state"].as_str(), t["session"].as_str(), t["say"].as_str()), (Some("doing"), Some(w3.as_str()), Some("照这个做")));
+    assert_eq!(sb.json(&["show", &w3, "--json"])["group"], "probe");
+    assert!(told(&w3).is_empty());
+    refused(sb.as_session(&w1, &["new", "fake", &dir, "--hold", "--task", "2"], ""), "router");
+
+    // Handed on by you: the one that had it is told to stop. Taken back, it waits again; only you delete
+    sb.aca(&["task", "give", "2", &w2]);
+    assert_eq!(told(&w3), [("you".to_string(), "任务 #2 已交给「fix-panel」,不用再做。".to_string())]);
+    sb.aca(&["task", "give", "2", "-"]);
+    assert_eq!(task("2")["state"], "todo");
+    refused(sb.as_session(&router, &["task", "rm", "2"], ""), "只有你");
+    assert_eq!(sb.aca(&["task", "rm", "#2"]), "已删除任务 #2「面板加三张图」");
+    assert!(!sb.run(&["task", "show", "2"]).status.success());
+    // The next one doesn't take the deleted one's number; what happened is all in the events
+    assert_eq!(sb.aca(&["task", "add", "-g", "probe", "-t", "下一张", "--to", &w2]), "#3");
+    let names: Vec<String> = sb.event_names().into_iter().filter(|n| n.starts_with("task.")).collect();
+    let want = ["added", "added", "given", "changed", "done", "given", "given", "given", "removed", "added", "given"];
+    assert_eq!(names, want.map(|n| format!("task.{n}")));
+}
+
+/// The tasks page in the real interface: a group with a ticket to finish opens on its tasks; n makes one, m hands one to a
+/// session (which is sent the ticket), c marks it done, d deletes one — each in the registry `aca task` reads, and each
+/// back on the page without a key pressed
+#[test]
+fn the_tasks_page_makes_hands_over_finishes_and_deletes_tickets_in_the_real_interface() {
+    let Some(sb) = Sandbox::new("task-ui") else { return };
+    let dir = sb.proj();
+    let w1 = sb.aca(&["new", "fake", &dir, "--hold", "-g", "probe", "-t", "fix-alert", "--parent", "-"]);
+    assert_eq!(sb.aca(&["task", "add", "-g", "probe", "-t", "告警规则上测试集群", "--criteria", "告警响"]), "#1");
+    let task = |n: &str| sb.json(&["task", "show", n, "--json"]);
+    let ui = Ui::open_sized(&sb, "", 150, 40);
+    // Into probe from the rail: its tasks page, with the ticket under the cursor beside it
+    ui.keys(&["h", "j", "l"]);
+    let on_page = || {
+        let s = ui.screen();
+        s.contains("任务 1   会话 ") && s.contains("· 告警规则上测试集群  #1") && s.contains("#1 · 待办") && s.contains("完成标准  告警响")
+    };
+    assert!(sb.until(on_page), "{}", ui.screen());
+    assert!(ui.screen().contains(&caps("m 交给 • c 完成 • n 新任务")), "{}", ui.screen());
+    // n: its title, then what counts as done; it's yours, and nobody's yet
+    ui.keys(&["n", "text:面板加三张图", "Enter"]);
+    assert!(sb.until(|| ui.screen().contains("新任务 · 面板加三张图 · 完成标准")), "{}", ui.screen());
+    ui.keys(&["text:三张都有数据", "Enter"]);
+    assert!(sb.until(|| ui.screen().contains("· 面板加三张图  #2") && ui.screen().contains("任务 2   会话 ")), "{}", ui.screen());
+    let t = task("2");
+    assert_eq!((t["criteria"].as_str(), t["by"].as_str(), t["state"].as_str()), (Some("三张都有数据"), Some(""), Some("todo")));
+    // m: the group's sessions; ⏎ hands the ticket under the cursor to the one highlighted, which is sent the ticket
+    ui.keys(&["m"]);
+    assert!(sb.until(|| ui.screen().contains("交给 · #1") && ui.screen().contains("fix-alert")), "{}", ui.screen());
+    ui.keys(&["Enter"]);
+    assert!(sb.until(|| task("1")["session"] == w1.as_str()), "{}", ui.screen());
+    let inbox = sb.json(&["inbox", &w1, "--json"]);
+    let got = inbox.as_array().unwrap().last().unwrap().clone();
+    assert_eq!(got["from"], "you");
+    assert!(got["text"].as_str().unwrap().starts_with("任务 #1:告警规则上测试集群\n完成标准:告警响\n做完后运行:aca task done 1"), "{got}");
+    assert!(sb.until(|| ui.screen().contains("你 → fix-alert")), "{}", ui.screen());
+    // c: done; the page lists it first now, and the cursor is on the one still to finish
+    ui.keys(&["c"]);
+    assert!(sb.until(|| task("1")["state"] == "done"), "{}", ui.screen());
+    assert!(sb.until(|| ui.screen().contains("✓ 告警规则上测试集群  #1") && ui.screen().contains("任务 1   会话 ")), "{}", ui.screen());
+    // The session's row on the sessions page says which ticket it finished (it was never started: listed among the recent)
+    ui.keys(&["Tab", "w"]);
+    assert!(sb.until(|| ui.screen().contains("fix-alert  ✓ #1")), "{}", ui.screen());
+    ui.keys(&["Tab", "Tab"]);
+    // d asks; y deletes the one under the cursor (#2: the first not done)
+    assert!(sb.until(|| ui.screen().contains("#2 · 待办")), "{}", ui.screen());
+    ui.keys(&["d"]);
+    assert!(sb.until(|| ui.screen().contains("删除任务？") && ui.screen().contains("面板加三张图  #2")), "{}", ui.screen());
+    ui.keys(&["y"]);
+    assert!(sb.until(|| !sb.run(&["task", "show", "2"]).status.success()), "{}", ui.screen());
+    assert!(sb.until(|| !ui.screen().contains("面板加三张图")), "{}", ui.screen());
 }
 
 #[test]
@@ -434,6 +700,73 @@ fn hooks_move_the_status_and_the_agents_own_title_becomes_the_session_name() {
     for want in ["session.created", "session.started", "turn.started", "agent.waiting", "turn.done", "session.titled", "session.renamed"] {
         assert!(names.iter().any(|n| n == want), "事件流里没有 {want}:{names:?}");
     }
+}
+
+#[test]
+fn agy_changed_and_delayed_first_turn_titles_reach_the_event_stream() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let Some(sb) = Sandbox::new("agy-title") else { return };
+    let dir = sb.home.join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("conversation_summaries.db");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE conversation_summaries(conversation_id TEXT PRIMARY KEY, title TEXT);")
+        .unwrap();
+    let frame = |id: &str, conv: &str, state: &str| {
+        let mut child = sb
+            .cmd()
+            .args(["hook-title", "agy"])
+            .env("HOME", &sb.home)
+            .env("ACA_SESSION_ID", id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let payload = serde_json::json!({"conversation_id":conv, "agent_state":state});
+        child.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let id = sb.aca(&["new", "fake", &sb.proj()]);
+    // Resuming work after review schedules no submit timer: only the changed frame can find the first title.
+    assert_eq!(frame(&id, "busy", "reviewing"), "proj\n");
+    assert_eq!(frame(&id, "busy", "working"), "proj\n");
+    db.execute("INSERT INTO conversation_summaries VALUES ('busy', 'New title')", []).unwrap();
+    let mut expected = sb.event_names();
+    assert_eq!(frame(&id, "busy", "working"), "proj\n");
+    assert_eq!(sb.event_names(), expected);
+    assert_eq!(frame(&id, "busy", "tool_use"), "New title\n");
+    expected.push("session.titled".into());
+    assert_eq!(sb.event_names(), expected);
+    let run = |id: &str| serde_json::from_slice::<Value>(&std::fs::read(sb.home.join(format!("state/run/{id}.json"))).unwrap()).unwrap();
+    assert_eq!(run(&id)["auto_title"], "New title");
+
+    db.execute("INSERT INTO conversation_summaries VALUES ('closed', 'Checkpointed title')", []).unwrap();
+    drop(db);
+    let closed = sb.aca(&["new", "fake", &sb.proj()]);
+    assert!(!path.with_extension("db-wal").exists() && !path.with_extension("db-shm").exists());
+    assert_eq!(frame(&closed, "closed", "working"), "Checkpointed title\n");
+    let event = sb.json(&["events", "-n", "1"]);
+    assert_eq!(event["event"], "session.titled");
+    assert_eq!(event["session"], closed);
+    assert_eq!(event["title"], "Checkpointed title");
+    assert_eq!(run(&closed)["auto_title"], "Checkpointed title");
+    assert!(!path.with_extension("db-wal").exists() && !path.with_extension("db-shm").exists());
+
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let quiet = sb.aca(&["new", "fake", &sb.proj()]);
+    assert_eq!(frame(&quiet, "quiet", "working"), "proj\n");
+    db.execute("INSERT INTO conversation_summaries VALUES ('quiet', 'Delayed title')", []).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while run(&quiet)["auto_title"] != "Delayed title" {
+        assert!(Instant::now() < deadline, "the first submit did not pick up the title");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(frame(&quiet, "quiet", "working"), "Delayed title\n");
 }
 
 /// Another agent reads a session with `aca output --turns N` / `--file`: found through the transcript the hook reported, a line
@@ -1084,7 +1417,7 @@ fn a_dir_becomes_a_group_named_after_it_and_the_group_can_be_renamed_and_rehomed
     assert_eq!(sb.aca(&["group", "dir", "aca-2"]), b);
 
     // Rename (under another parent): the sessions move along, and what the UI remembers about it (workspace, the group being
-    // viewed, folded ones) changes with it
+    // viewed) changes with it. A view file from when groups could fold still reads; that line isn't written back
     let ui = sb.home.join("state/ui");
     write(&ui.join("spaces"), "group\tdefault\taca-2\th\ngroup\tdefault\taca\t2\n");
     write(&ui.join("view"), "group=aca-2\nfolded=aca-2\tother\n");
@@ -1093,7 +1426,7 @@ fn a_dir_becomes_a_group_named_after_it_and_the_group_can_be_renamed_and_rehomed
     let spaces = std::fs::read_to_string(ui.join("spaces")).unwrap();
     assert!(spaces.contains("group\tdefault\tlab/aca\th\n") && spaces.contains("group\tdefault\taca\t2\n"), "{spaces}");
     let view = std::fs::read_to_string(ui.join("view")).unwrap();
-    assert!(view.contains("group=lab/aca\n") && view.contains("folded=lab/aca\tother\n"), "{view}");
+    assert!(view.contains("group=lab/aca\n") && !view.contains("folded="), "{view}");
     // Clashes with an existing one: not changed
     let o = sb.run(&["group", "rename", "lab/aca", "ACA"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("aca 已存在"));
@@ -2205,6 +2538,41 @@ impl GwConn {
 }
 
 #[test]
+fn a_sessionless_gateway_client_can_list_and_call_plugins_with_agent_filters() {
+    let Some(sb) = Sandbox::new("gw-unbound") else { return };
+    let aca = env!("CARGO_BIN_EXE_aca");
+    sb.aca(&["plugin", "install", "aca.gateway"]);
+    for (id, capability) in [
+        ("t.cmd", "[[commands]]\nid = \"ping\"\ntitle = \"Ping\"\nexpose = [\"agent\"]\ncommand = [\"echo\", \"pong\"]".into()),
+        ("t.mcp", format!("[agent.mcp]\ncommand = [\"{aca}\", \"plugin\", \"tools\"]")),
+    ] {
+        let dir = sb.home.join(id);
+        write(&dir.join("aca-plugin.toml"), &format!("id = \"{id}\"\nname = \"{id}\"\nversion = \"0.1.0\"\n{capability}\n"));
+        sb.aca(&["plugin", "link", &dir.to_string_lossy()]);
+    }
+    let decl = sb.home.join("config/plugins.toml");
+    let mut text = std::fs::read_to_string(&decl).unwrap();
+    for id in ["t.cmd", "t.mcp"] {
+        let header = format!("[plugins.\"{id}\"]");
+        assert!(text.contains(&header));
+        text = text.replace(&header, &format!("{header}\nagents = [\"claude\"]"));
+    }
+    std::fs::write(decl, text).unwrap();
+
+    let mut client = GwConn::open(&sb, "");
+    let names = client.tools();
+    let command = client.call(3, "t-cmd__ping");
+    let mcp = client.call(4, "t-mcp__t-cmd__ping");
+    client.close();
+    sb.aca(&["plugin", "gateway", "stop"]);
+    for name in ["t-cmd__ping", "t-mcp__t-cmd__ping"] {
+        assert!(names.iter().any(|n| n == name), "{name} missing from {names:?}");
+    }
+    assert_eq!(command, "pong");
+    assert_eq!(mcp, "pong");
+}
+
+#[test]
 fn with_the_gateway_on_an_agent_mounts_one_server_and_a_shared_mcp_runs_once_for_everyone() {
     let Some(sb) = Sandbox::new("gw") else { return };
     let aca = env!("CARGO_BIN_EXE_aca");
@@ -2667,6 +3035,66 @@ fn the_remote_plugin_sends_a_task_off_and_its_result_lands_in_the_sessions_inbox
     let (good, out) = run(&["plugin", "run", "aca.remote.rm", "id=zz"]);
     assert!(!good && out.contains("没有以 zz 开头的 id"), "{out}");
     assert_eq!(timer()["on"], false);
+}
+
+#[test]
+fn timer_plist_upgrades_from_a_login_shell_and_survives_a_locale_free_tick() {
+    let Some(sb) = Sandbox::new("timer-locale") else { return };
+    let dir = sb.home.join("timed");
+    write(
+        &dir.join("aca-plugin.toml"),
+        "id='t.locale'\nname='locale'\nversion='1'\n[[commands]]\nid='probe'\ncommand=['true']\n[[timers]]\nrun='probe'\nevery='1m'\n",
+    );
+    let q = "t.locale.probe";
+    let cmd = |args: &[&str], vars: &[(&str, &str)]| {
+        let mut c = sb.cmd();
+        c.env_remove("LANG").env_remove("LC_ALL").env_remove("LC_CTYPE");
+        let o = c.envs(vars.iter().copied()).args(args).output().unwrap();
+        assert!(o.status.success(), "{args:?}: {o:?}");
+    };
+    let path = sb.home.join("state/timers/com.aca.timer.t-locale.probe.plist");
+    let read = || std::fs::read_to_string(&path).unwrap();
+    cmd(&["plugin", "link", dir.to_str().unwrap()], &[]);
+    let old = read();
+    assert!(!old.contains("<key>LANG</key>"));
+    let all = [("LANG", "en_US.UTF-8"), ("LC_CTYPE", "UTF-8"), ("LC_ALL", "C")];
+    cmd(&["plugin", "timer", "tick", q], &all);
+    assert_eq!(read(), old);
+    for args in [vec!["plugin", "timer", "on", q], vec!["plugin", "sync"]] {
+        write(&path, &old);
+        cmd(&args, &[]);
+        assert_eq!(read(), old);
+        cmd(&args, &[("LC_CTYPE", "UTF-8"), ("ACA_PLUGIN_TIMER", q)]);
+        assert_eq!(read(), old);
+        cmd(&args, &[("LC_CTYPE", "UTF-8")]);
+        let partial = read();
+        assert!(partial.contains("<key>LC_CTYPE</key>\n        <string>UTF-8</string>"));
+        assert!(!partial.contains("<key>LANG</key>") && !partial.contains("<key>LC_ALL</key>"));
+        cmd(&args, &all);
+        let upgraded = read();
+        for (k, v) in all {
+            assert!(upgraded.contains(&format!("<key>{k}</key>\n        <string>{v}</string>")), "{upgraded}");
+        }
+        let modified = path.metadata().unwrap().modified().unwrap();
+        cmd(&["plugin", "timer", "tick", q], &[]);
+        cmd(&args, &[]);
+        cmd(&args, &all);
+        assert_eq!(read(), upgraded);
+        assert_eq!(path.metadata().unwrap().modified().unwrap(), modified);
+    }
+
+    let state = sb.home.join("state/timers/t.locale.probe.json");
+    let record = || serde_json::from_str::<Value>(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    let mut changed = record();
+    changed["installed"] = 120.into();
+    write(&state, &changed.to_string());
+    write(&path, &old);
+    cmd(&["plugin", "sync"], &all);
+    assert_eq!(record(), changed);
+    assert_eq!(read(), old);
+    cmd(&["plugin", "timer", "on", q], &all);
+    assert_eq!(record()["installed"], 60);
+    assert!(read().contains("<key>LC_CTYPE</key>"));
 }
 
 /// Timers: the [[timers]] in the manifest; when the time comes, launchd runs aca plugin timer tick (the test doesn't touch
@@ -3540,6 +3968,272 @@ fn your_own_plugin_is_there_without_linking_and_gets_the_sessions_text() {
     assert!(!sb.aca(&["plugin", "ls"]).contains("user"));
 }
 
+#[test]
+fn routers_get_only_their_own_tools_and_dispatch_literal_text() {
+    use serde_json::json;
+    let Some(sb) = Sandbox::new("router-tools") else { return };
+    let dir = sb.proj();
+    let scratch = sb.home.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    add_config(&sb, &format!("[scratch]\ndir = {:?}\n", scratch));
+    sb.aca(&["group", "create", "p", &dir]);
+    sb.aca(&["group", "create", "else", scratch.to_str().unwrap()]);
+    let new = |g: &str, title: &str| sb.aca(&["new", "fake", &dir, "-g", g, "-t", title, "--hold"]);
+    let worker = new("p", "worker");
+    let router = new("p", "router");
+    let desk = new("else", "desk");
+    sb.aca(&["plugin", "install", "aca.core"]);
+    sb.aca(&["group", "router", "p", &router]);
+    sb.aca(&["group", "router", "else", &desk]);
+    sb.aca(&["start", &router]);
+    let ask = |who: &str, method: &str, params: Value| {
+        let msg = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
+        let out = sb.as_session(who, &["plugin", "tools"], &format!("{msg}\n"));
+        assert!(out.status.success(), "{out:?}");
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"].clone()
+    };
+    let names = |who: &str| {
+        ask(who, "tools/list", json!({}))["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let mut want: Vec<String> = "sessions look tickets ticket start give set message move note notes wake_me"
+        .split_whitespace()
+        .map(|id| format!("aca-router__{id}"))
+        .collect();
+    assert_eq!(names(&router), want);
+    want.push("aca-router__groups".into());
+    assert_eq!(names(&desk), want);
+    assert!(names(&worker).iter().all(|n| n.starts_with("aca-core__")));
+    let call = |who: &str, tool: &str, args: Value, ok: bool| {
+        let r = ask(who, "tools/call", json!({"name":format!("aca-router__{tool}"),"arguments":args}));
+        assert_eq!(r["isError"], !ok, "{tool}: {r}");
+        r["content"][0]["text"].as_str().unwrap().trim_end_matches('\n').to_owned()
+    };
+    let payload = "  | > $ ; \x60ticks\x60 \"double\" 'single'\n--help\n";
+    let run = |tool: &str, args| call(&router, tool, args, true);
+    let inbox = |id: &str| sb.json(&["inbox", id, "--json"]);
+    assert!(call(&router, "sessions", json!({"group":"else"}), false).contains("p"));
+    for id in ["groups", "rm", "stop"] {
+        call(&router, id, json!({}), false);
+    }
+    assert!(call(&desk, "groups", json!({}), true).contains(&format!("p  {dir}  @{router}")));
+    assert_eq!(run("ticket", json!({"title":"first","criteria":"done","to":worker,"say":payload})), "#1");
+    let brief = format!("任务 #1:first\n完成标准:done\n{payload}\n做完后运行:aca task done 1 \"一句话说结果\"");
+    assert_eq!(inbox(&worker)[0]["text"], brief);
+    let sessions = run("sessions", json!({}));
+    assert!(sessions.lines().any(|l| l.starts_with(&worker) && l.contains("worker  #1")), "{sessions}");
+    for listing in [sessions, call(&desk, "sessions", json!({"group":"p"}), true)] {
+        assert!(listing.lines().any(|l| l.starts_with(&router) && l.ends_with("  router  router")), "{listing}");
+        assert!(listing.lines().any(|l| l.starts_with(&worker) && l.ends_with("  #1")), "{listing}");
+    }
+    let tail = "答".repeat(2000);
+    sb.hook(&worker, "", &json!({"hook_event_name":"Stop","session_id":"w","last_assistant_message":format!("skip{tail}")}).to_string());
+    let look = run("look", json!({"id":worker}));
+    assert!(look.lines().next().unwrap().contains("worker"), "{look}");
+    assert_eq!(look.lines().nth(1), Some(tail.as_str()));
+    assert!(run("tickets", json!({})).contains("#1  ● first"));
+    assert!(run("give", json!({"ticket":1,"to":"-"})).contains("#1  · first"));
+    assert!(run("give", json!({"ticket":1,"to":worker,"say":payload})).contains("#1  ● first"));
+    assert_eq!(inbox(&worker).as_array().unwrap().last().unwrap()["text"], brief);
+    assert!(run("set", json!({"ticket":1,"note":"wait","title":"renamed","criteria":"ready"})).contains("renamed"));
+    assert_eq!(sb.json(&["task", "show", "1", "--json"])["note"], "wait");
+    assert!(run("message", json!({"to":worker,"text":payload})).contains(&worker));
+    assert_eq!(inbox(&worker).as_array().unwrap().last().unwrap()["text"], payload);
+    let note = run("note", json!({"text":"remember\nsecond line"}));
+    assert!(run("notes", json!({})).contains(&note));
+    assert_eq!(sb.json(&["note", "show", &note, "--json"])["text"], "remember\nsecond line");
+    assert!(run("wake_me", json!({"after":"1h","text":payload})).contains(&router));
+    assert_eq!(inbox(&router).as_array().unwrap().last().unwrap()["text"], payload);
+    let other = new("else", "other");
+    run("move", json!({"ids":other}));
+    assert_eq!(sb.json(&["show", &other, "--json"])["group"], "p");
+    call(&router, "start", json!({"title":"missing","say":"x","dir":"missing"}), false);
+    assert!(!Path::new(&dir).join("missing").exists());
+    write(&sb.home.join("agent.sh"), "#!/bin/sh\nprintf '%s' \"$@\" > \"$ACA_HOME/open-$ACA_SESSION_ID\"\nexec sleep 600\n");
+    let text = run("start", json!({"title":"second","say":payload,"criteria":"ready"}));
+    let id = text.strip_prefix("#2 ").unwrap();
+    let s = sb.json(&["show", id, "--json"]);
+    assert_eq!((&s["group"], &s["parent"], &s["tool"]), (&json!("p"), &json!(""), &json!("fake")));
+    assert!(!s["pane"].as_str().unwrap().is_empty());
+    assert_eq!(sb.json(&["task", "show", "2", "--json"])["session"], id);
+    let opening = format!("任务 #2:second\n完成标准:ready\n{payload}\n做完后运行:aca task done 2 \"一句话说结果\"");
+    assert!(sb.until(|| std::fs::read_to_string(sb.home.join(format!("open-{id}"))).is_ok_and(|s| s.ends_with(&opening))));
+    let sub = Path::new(&dir).join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let n = run("ticket", json!({"title":"third","criteria":"ok"}));
+    assert_eq!(n, "#3");
+    let start = run("start", json!({"ticket":3,"title":"next","say":"next","dir":"sub","tool":"fake"}));
+    let next = start.strip_prefix("#3 ").unwrap();
+    assert_eq!(sb.json(&["show",next,"--json"])["dir"],sub.canonicalize().unwrap().to_string_lossy().as_ref());
+    assert_eq!(sb.json(&["task","show","3","--json"])["session"],next);
+    sb.aca(&["task", "done", "1", "finished"]);
+    assert!(run("tickets", json!({})).lines().any(|l| l.contains("✓ renamed") && l.ends_with("finished")));
+
+    sb.aca(&["plugin", "install", "aca.gateway"]);
+    for (who, expected) in [(&desk, want.as_slice()), (&router, &want[..12])] {
+        let mut c = GwConn::open(&sb, who);
+        assert_eq!(c.tools(), expected);
+        assert!(c.call(3, "aca-router__notes").contains("remember") || who == &desk);
+        c.close();
+    }
+    let mut c = GwConn::open(&sb, &worker);
+    assert_eq!(c.tools(), names(&worker));
+    c.close();
+    let mut c = GwConn::open(&sb, "");
+    assert!(c.tools().iter().all(|n| !n.starts_with("aca-router__")));
+    assert_eq!(c.ask(3, "tools/call", json!({"name":"aca-router__notes","arguments":{}}))["result"]["isError"], true);
+    c.close();
+    sb.aca(&["plugin", "gateway", "stop"]);
+    sb.aca(&["stop", &router]);
+    sb.aca(&["plugin", "disable", "aca.router"]);
+    let out = sb.run(&["start", &router]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("aca.router 已关闭"), "{out:?}");
+}
+
+#[test]
+fn installing_router_tools_preserves_an_ordinary_launch_and_its_messages_byte_for_byte() {
+    let Some(sb) = Sandbox::new("router-ordinary") else { return };
+    write(&sb.home.join("agent.sh"), "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$ACA_HOME/argv-$ACA_SESSION_ID\"\nexec sleep 600\n");
+    let id = sb.aca(&["new", "fake", &sb.proj(), "-g", "p"]);
+    let record = sb.home.join(format!("argv-{id}"));
+    assert!(sb.until(|| record.exists()));
+    let before = std::fs::read(&record).unwrap();
+    let text = "| > $ ; \"quoted\"\nsecond line";
+    sb.aca(&["msg", &id, text]);
+    assert_eq!(sb.json(&["inbox", &id, "--json"])[0]["text"], text);
+    sb.aca(&["stop", &id]);
+    std::fs::remove_file(&record).unwrap();
+    sb.aca(&["plugin", "install", "aca.router"]);
+    sb.aca(&["start", &id]);
+    assert!(sb.until(|| std::fs::read(&record).is_ok_and(|v| v == before)));
+    sb.aca(&["msg", &id, text]);
+    assert_eq!(sb.json(&["inbox", &id, "--json"]).as_array().unwrap().last().unwrap()["text"], text);
+}
+
+#[test]
+fn a_codex_router_keeps_its_existing_ssh_command() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(sb) = Sandbox::new("router-ssh-codex") else { return };
+    let ssh = sb.home.join("bin/ssh");
+    let saved = sb.home.join("ssh-command");
+    // Record the remote command without connecting anywhere or executing it.
+    write(
+        &ssh,
+        &format!(
+            "#!/bin/sh\nfor arg do last=$arg; done\ncase \"$last\" in *\"'codex'\"*) printf %s \"$last\" > {:?}; exec sleep 600;; esac\n",
+            saved
+        ),
+    );
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = sb.proj();
+    add_config(
+        &sb,
+        &format!(
+            "[sandbox.remote]\nssh='fake'\nworkspace={:?}\ndirs=[{dir:?}]\n[accounts.codex]\nx={{sandbox='remote',args=['--account-arg']}}\n",
+            sb.home.join("workspace")
+        ),
+    );
+    let path = format!("{}:{}", ssh.parent().unwrap().display(), std::env::var("PATH").unwrap());
+    let run = |args: &[&str]| {
+        let out = sb.cmd().env("PATH", &path).args(args).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let id = run(&["new", "codex:x", &dir, "-g", "g", "--", "--saved-arg"]);
+    assert!(sb.until(|| saved.exists()));
+    let ordinary = std::fs::read_to_string(&saved).unwrap();
+    assert!(ordinary.ends_with("'codex' '--account-arg' '--saved-arg'"), "{ordinary}");
+    run(&["stop", &id]);
+    run(&["group", "router", "g", &id]);
+    std::fs::remove_file(&saved).unwrap();
+    run(&["start", &id]);
+    assert!(sb.until(|| saved.exists()));
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), ordinary);
+}
+
+#[test]
+fn claude_router_launch_uses_the_selected_account_and_preserves_ordinary_sessions() {
+    let Some(sb) = Sandbox::new("router-account") else { return };
+    let cfg = sb.home.join("config/config.toml");
+    let ws = sb.home.join("workspace");
+    let dir = sb.proj();
+    write(
+        &sb.home.join("agent.sh"),
+        "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$ACA_HOME/args-$ACA_SESSION_ID\"\nprintf %s \"$ROUTER_ACCOUNT_ENV\" > \"$ACA_HOME/env-$ACA_SESSION_ID\"\nif [ -n \"$ACA_ROUTER_SHIFT\" ]; then exec python3 \"$ACA_HOME/router.py\" \"$@\"; fi\nexec sleep 600\n",
+    );
+    add_config(
+        &sb,
+        &format!(
+            "[tools.probe]\nkind='claude'\ncmd=['/bin/sh',{:?}]\nargs=['--tool-only']\n\
+        [sandbox.here]\nworkspace={ws:?}\nenv={{ROUTER_ACCOUNT_ENV='local-value'}}\n\
+        [sandbox.remote]\nworkspace={ws:?}\nssh='unreachable'\n\
+        [accounts.claude]\nhere={{sandbox='here',args=['--account-only']}}\nremote={{sandbox='remote'}}\n",
+            sb.home.join("agent.sh")
+        ),
+    );
+    let ordinary = sb.aca(&["new", "probe:here", &dir, "-g", "workers", "--", "--saved"]);
+    let args_path = |id: &str| sb.home.join(format!("args-{id}"));
+    let read = |id: &str| std::fs::read(args_path(id)).unwrap();
+    assert!(sb.until(|| args_path(&ordinary).is_file()));
+    let before = read(&ordinary);
+    let received = "hello | ' $ \n世界";
+    sb.aca(&["msg", &ordinary, received]);
+    sb.aca(&["stop", &ordinary]);
+    std::fs::remove_file(args_path(&ordinary)).unwrap();
+    let r = sb.aca(&["new", "probe:here", &dir, "-g", "p", "--hold", "--", "--old-session"]);
+    sb.aca(&["group", "router", "p", &r]);
+    let old = std::fs::read_to_string(&cfg).unwrap();
+    write(&cfg, &format!("{old}\n[router]\nmodel='opus'\neffort='medium'\n"));
+    sb.aca(&["start", &r]);
+    assert!(sb.until(|| sb.home.join(format!("env-{r}")).is_file()));
+    assert_eq!(std::fs::read_to_string(sb.home.join(format!("env-{r}"))).unwrap(), "local-value");
+    let bytes = read(&r);
+    let text = std::str::from_utf8(&bytes).unwrap();
+    let args: Vec<_> = text.trim_end_matches('\0').split('\0').collect();
+    let value = |key| args[args.iter().position(|a| *a == key).unwrap() + 1];
+    assert_eq!(
+        (value("--agent"), value("--model"), value("--effort"), value("--tools")),
+        ("aca-router:router", "opus", "medium", "AskUserQuestion")
+    );
+    assert!(args.contains(&"--account-only") && !args.contains(&"--tool-only") && !args.contains(&"--old-session"));
+    let read_json = |path: &str| serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap();
+    let settings = read_json(value("--settings"));
+    assert_eq!(settings["autoMemoryEnabled"], false);
+    assert!(settings["hooks"]["SessionStart"].is_array());
+    assert_eq!(read_json(value("--mcp-config"))["mcpServers"].as_object().unwrap().keys().collect::<Vec<_>>(), ["aca"]);
+    let plugins: Vec<_> = args.windows(2).filter_map(|w| (w[0] == "--plugin-dir").then_some(w[1])).collect();
+    assert_eq!(plugins.len(), 2);
+    assert!(Path::new(plugins[0]).join("hooks/register.js").is_file());
+    for role in ["router", "desk", "router-en", "desk-en"] {
+        assert!(Path::new(plugins[1]).join(format!("agents/{role}.md")).is_file());
+    }
+    assert!(!text.contains("项目交接"));
+    let opening = shift_prompt(&sb, sb.json(&["show", &r, "--json"])["conv"].as_str().unwrap());
+    assert!(opening.contains("项目交接 · p"));
+    assert!(opening.ends_with("\n\n看完等用户说话,只回一个字。"));
+    sb.aca(&["start", &ordinary]);
+    assert!(sb.until(|| args_path(&ordinary).is_file()));
+    assert_eq!(read(&ordinary), before);
+    sb.aca(&["msg", &ordinary, received]);
+    let inbox = sb.json(&["inbox", &ordinary, "--json"]);
+    for i in [0, 1] {
+        assert_eq!(inbox[i]["text"], received);
+    }
+
+    // A change in the registered account binding is rechecked before restarting the router.
+    sb.aca(&["stop", &r]);
+    write(&cfg, &std::fs::read_to_string(&cfg).unwrap().replace("here={sandbox='here'", "here={sandbox='remote'"));
+    std::fs::remove_file(args_path(&r)).unwrap();
+    let refused = sb.run(&["start", &r]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("SSH 沙箱无法使用 router 工具"));
+    assert!(!args_path(&r).exists());
+}
+
 /// The tool names the plugin capability server lists for agents (`aca plugin tools`, no session)
 fn agent_tools(sb: &Sandbox, call: Option<&str>) -> (Vec<String>, String) {
     use std::io::Write;
@@ -3570,7 +4264,7 @@ fn agent_tools(sb: &Sandbox, call: Option<&str>) -> (Vec<String>, String) {
     (names, said)
 }
 
-/// You decide: capabilities written as agent? go to agents only once you name them; you can change or remove keys in the : menu,
+/// You decide: capabilities written as agent? go to agents only once you name them; you can change or remove keys in the list's ?,
 /// and when two plugins want one key, it's named
 #[test]
 fn agent_tools_and_menu_keys_are_yours_to_decide() {
@@ -3630,7 +4324,7 @@ fn agent_tools_and_menu_keys_are_yours_to_decide() {
     assert!(keys.contains("m  t.other.x") && keys.contains("⚠ 键 m 已分配给 t.other「叉」,t.perm「列」未分配到"), "{keys}");
     // An unusable key, a target that doesn't exist
     let o = sb.run(&["plugin", "key", "t.perm", "ls", "/"]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains(": 菜单占用"));
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("已被 ? 占用"));
     let o = sb.run(&["plugin", "key", "t.perm", "nope", "z"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("没有 nope"));
 }
@@ -3888,7 +4582,7 @@ fn the_ref_key_pops_up_the_list_and_puts_the_picked_reference_where_you_were_typ
     let seen = || out(&["capture-pane", "-p"]);
     out(&["send-keys", &sb.tmux(&["show-options", "-gv", "prefix"])]);
     out(&["send-keys", "b"]);
-    assert!(sb.until(|| seen().contains("⏎ 插入")), "列表没弹出来:\n{}", seen());
+    assert!(sb.until(|| seen().contains(&caps("⏎ 插入"))), "列表没弹出来:\n{}", seen());
     out(&["send-keys", "/"]);
     out(&["send-keys", "-l", "对面"]);
     out(&["send-keys", "Enter"]);
@@ -3896,7 +4590,7 @@ fn the_ref_key_pops_up_the_list_and_puts_the_picked_reference_where_you_were_typ
     let typed = || sb.tmux(&["capture-pane", "-p", "-t", &here_pane]);
     assert!(sb.until(|| typed().contains(&format!("给它传话:aca msg {there} \"…\""))), "引用没插进来:\n{}", typed());
     assert!(typed().contains(&format!("aca 会话 {there}「对面」(Claude,")), "{}", typed());
-    assert!(sb.until(|| !seen().contains("⏎ 插入")), "列表没关:\n{}", seen());
+    assert!(sb.until(|| !seen().contains(&caps("⏎ 插入"))), "列表没关:\n{}", seen());
     out(&["kill-server"]);
 
     // Another key, then none
@@ -4164,6 +4858,102 @@ fn the_notify_plugin_shows_a_desktop_notification_for_your_sessions_and_skips_wo
     assert_eq!(all.lines().rev().take(2).collect::<Vec<_>>(), ["sys|✓ 修登录|好了", "tried|✓ 修登录"], "{all}");
 }
 
+/// aca.discord takes in what you said in the channel: its script run as the timer runs it, against a `curl` that answers from
+/// files (no test talks to Discord). Only your messages go in — oldest first, to the desk, saying which channel they came
+/// through; the first run only notes where the channel is; with no desk yet they count as seen and aren't handed on; with
+/// a setting missing Discord isn't asked anything; what Discord refuses fails the run and nothing is counted as seen
+#[test]
+fn the_discord_plugin_hands_what_you_said_in_the_channel_to_the_desk_and_nobody_elses() {
+    use serde_json::json;
+    let Some(sb) = Sandbox::new("discord-pull") else { return };
+    if Command::new("jq").arg("--version").output().is_err() {
+        eprintln!("没有 jq,跳过");
+        return;
+    }
+    sb.aca(&["plugin", "install", "aca.discord"]);
+    assert!(sb.aca(&["plugin", "timer"]).contains("aca.discord.pull"));
+    // The stand-in: notes how it was called, and prints the file named after the address's query (none: an empty list)
+    let (bin, calls, answers) = (sb.home.join("fakebin"), sb.home.join("calls.txt"), sb.home.join("answers"));
+    write(
+        &bin.join("curl"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor a; do url=$a; done\n\
+             f='{}'/$(printf '%s' \"${{url#*\\?}}\" | tr -c 'a-z0-9=' '_')\nif [ -f \"$f\" ]; then cat \"$f\"; else echo '[]'; fi\n",
+            calls.display(),
+            answers.display()
+        ),
+    );
+    Command::new("chmod").arg("+x").arg(bin.join("curl")).status().unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let pull = |what: &str| sb.cmd().env("PATH", &path).args(["plugin", "run", &format!("aca.discord.{what}")]).output().unwrap();
+    let asked = || std::fs::read_to_string(&calls).unwrap_or_default();
+    let answer = |query: &str, body: &str| write(&answers.join(query), body);
+    let seen = || {
+        let file = walk(&sb.home).into_iter().find(|p| p.ends_with("/seen-111"));
+        file.map(|p| std::fs::read_to_string(p).unwrap().trim().to_string()).unwrap_or_default()
+    };
+    let msg = |id: &str, by: &str, text: &str| json!({ "id": id, "author": { "id": by }, "content": text });
+
+    // Not set up to read: nothing is asked of Discord
+    assert!(pull("pull").status.success() && asked().is_empty());
+    for (key, value) in [("token", "T0KEN"), ("channel", "111"), ("user", "42")] {
+        assert!(pull("pull").status.success() && asked().is_empty(), "{key}");
+        sb.aca(&["plugin", "setting", "aca.discord", key, value]);
+    }
+    // The first run takes nothing in: it notes the channel's latest message
+    answer("limit=1", &json!([msg("100", "42", "以前说的")]).to_string());
+    assert!(pull("pull").status.success());
+    assert_eq!(seen(), "100");
+    assert!(asked().contains("Authorization: Bot T0KEN") && asked().contains("https://discord.com/api/v10/channels/111/messages?limit=1"));
+    // No desk yet: what came since counts as seen and goes nowhere, so the first desk isn't handed all of it at once
+    answer("after=100_limit=100", &json!([msg("103", "42", "还没有总台时说的"), msg("101", "42", "更早的")]).to_string());
+    let o = pull("pull");
+    assert!(o.status.success(), "{o:?}");
+    assert_eq!(seen(), "103");
+    let dir = sb.home.join("asks");
+    std::fs::create_dir_all(&dir).unwrap();
+    add_config(&sb, &format!("[scratch]\ndir = \"{}\"\n", dir.display()));
+    let desk = sb.aca(&["new", "fake", &dir.to_string_lossy(), "-g", "随手问", "-t", "总台"]);
+    sb.aca(&["group", "dir", "随手问", &dir.to_string_lossy()]);
+    sb.aca(&["group", "router", "随手问", &desk]);
+    let taken = || -> Vec<(String, String, String)> {
+        let lines = sb.aca(&["events", "-n", "200"]);
+        let events = lines.lines().map(|l| serde_json::from_str::<Value>(l).unwrap());
+        let sent = events.filter(|e| e["event"] == "message.sent" && e["session"] == desk.as_str());
+        let field = |e: &Value, k: &str| e[k].as_str().unwrap_or("").to_string();
+        sent.map(|e| (field(&e, "from"), field(&e, "via"), field(&e, "text"))).collect()
+    };
+    assert!(taken().is_empty());
+    // With a desk: yours go to it oldest first, as written (quotes, lines, something that looks like an option); somebody
+    // else's, a bot's, and one with no words (an attachment) don't
+    let mut bot = msg("105", "42", "bot 发的");
+    bot["author"]["bot"] = json!(true);
+    let batch = json!([
+        msg("107", "42", "--json"),
+        msg("106", "42", ""),
+        bot,
+        msg("104", "7", "别人说的:rm -rf ~"),
+        msg("102", "42", "帮我看 \"机票\"\n周二走")
+    ]);
+    answer("after=103_limit=100", &batch.to_string());
+    let o = pull("pull");
+    assert!(o.status.success(), "{o:?}");
+    let you = |text: &str| ("you".to_string(), "Discord".to_string(), text.to_string());
+    assert_eq!(taken(), [you("帮我看 \"机票\"\n周二走"), you("--json")]);
+    assert_eq!(seen(), "107");
+    // Discord says no (a wrong token): the run fails saying what it said, and nothing more counts as seen
+    answer("after=107_limit=100", r#"{"message":"401: Unauthorized","code":0}"#);
+    let o = pull("pull");
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stdout).contains("401: Unauthorized"), "{o:?}");
+    assert_eq!((seen(), taken().len()), ("107".to_string(), 2));
+    // The check for setting it up: what the bot can read, and whether it sees your words
+    answer("limit=5", &json!([msg("107", "42", "--json")]).to_string());
+    let said = String::from_utf8_lossy(&pull("check").stdout).into_owned();
+    assert!(said.contains("reads the channel: yes") && said.contains("sees what you wrote: yes"), "{said}");
+    answer("limit=5", &json!([msg("107", "42", "")]).to_string());
+    assert!(String::from_utf8_lossy(&pull("check").stdout).contains("Message Content Intent"));
+}
+
 /// Every path (files and directories) under a directory
 fn walk(dir: &Path) -> Vec<String> {
     let mut out = vec![];
@@ -4180,6 +4970,41 @@ fn walk(dir: &Path) -> Vec<String> {
 fn add_config(sb: &Sandbox, more: &str) {
     let cfg = sb.home.join("config/config.toml");
     write(&cfg, &(std::fs::read_to_string(&cfg).unwrap() + more));
+}
+
+/// `aca group ls --json` marks the scratch group — the one `aca msg desk` takes its router from — with `"scratch": true`,
+/// and no other group carries the field. It goes by the directory in config.toml, not by the name
+#[test]
+fn group_ls_json_marks_the_scratch_group_and_only_it() {
+    use serde_json::json;
+    let Some(sb) = Sandbox::new("group-scratch") else { return };
+    let dir = sb.home.join("asks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_string_lossy().into_owned();
+    sb.aca(&["new", "fake", &sb.proj(), "-g", "甲组", "-t", "甲一"]);
+    sb.aca(&["group", "create", "随手问", &dir_s]);
+    let marked = || -> Vec<(String, Value)> {
+        let listed = sb.json(&["group", "ls", "--json"]);
+        let groups = listed.as_array().unwrap();
+        assert_eq!(groups.len(), 2, "{listed}");
+        groups.iter().filter_map(|g| Some((g["path"].as_str().unwrap().to_string(), g.get("scratch")?.clone()))).collect()
+    };
+    // No scratch directory set: none is marked
+    assert_eq!(marked(), []);
+    // Set, written another way than the group's directory
+    add_config(&sb, &format!("[scratch]\ndir = \"{dir_s}/\"\n"));
+    assert_eq!(marked(), [("随手问".to_string(), json!(true))]);
+    sb.aca(&["group", "rename", "随手问", "loose"]);
+    assert_eq!(marked(), [("loose".to_string(), json!(true))]);
+    // Its router is the desk
+    assert_eq!(sb.run(&["msg", "desk", "hi"]).status.code(), Some(3));
+    let desk = sb.aca(&["new", "fake", &dir_s, "-g", "loose", "-t", "总台"]);
+    sb.aca(&["group", "router", "loose", &desk]);
+    let listed = sb.json(&["group", "ls", "--json"]);
+    let scratch: Vec<&Value> = listed.as_array().unwrap().iter().filter(|g| g.get("scratch").is_some()).collect();
+    assert_eq!((scratch.len(), &scratch[0]["router"]), (1, &json!(desk)));
+    sb.aca(&["msg", "desk", "hi"]);
+    assert_eq!(sb.json(&["inbox", &desk, "--json"])[0]["text"], "hi");
 }
 
 #[test]
@@ -4617,6 +5442,10 @@ fn a_sandbox_takes_work_and_messages_from_other_sessions_only_when_it_says_deleg
     // Closed: another session can't start one inside, nor talk to one there
     let o = sb.as_session(&me, &["new", "fake:team", &sb.proj(), "--hold"], "");
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("delegate = true"), "{o:?}");
+    // Saying the new one is nobody's child doesn't change whose command starts it; from outside any session it is yours
+    let o = sb.as_session(&me, &["new", "fake:team", &sb.proj(), "--hold", "--parent", "-"], "");
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("delegate = true"), "{o:?}");
+    sb.aca(&["new", "fake:team", &sb.proj(), "--hold", "--parent", "-"]);
     let o = sb.as_session(&me, &["msg", &inside, "看一下"], "");
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("delegate = true"), "{o:?}");
 
@@ -4628,6 +5457,49 @@ fn a_sandbox_takes_work_and_messages_from_other_sessions_only_when_it_says_deleg
     assert_eq!(sb.json(&["show", &worker, "--json"])["parent"], me.as_str());
     let o = sb.as_session(&me, &["msg", &inside, "看一下"], "");
     assert!(o.status.success(), "{o:?}");
+}
+
+#[test]
+fn a_local_codex_terminal_finishes_wait_and_notifies_its_parent_once() {
+    let Some(sb) = Sandbox::new("codex-terminal") else { return };
+    sb.screen_tools();
+    let parent = sb.aca(&["new", "shell", &sb.proj(), "--hold", "--parent", "-"]);
+    let id = sb.aca(&["new", "fcx", &sb.proj(), "--parent", &parent, "--notify", "done"]);
+    let pane = sb.pane(&id);
+    let frame = |report: &str, label: &str| {
+        write(&sb.home.join("screens").join(&id), &format!("\x1b]7501;{report}\x07{label}\n› "));
+        assert!(sb.wait_screen(&pane, label).contains(label));
+    };
+    let count = |name: &str| sb.event_names().iter().filter(|n| n.as_str() == name).count();
+    let state = || sb.json(&["show", &id, "--json"])["state"].clone();
+    let wait = |seconds| sb.run(&["wait", &id, "--timeout", seconds]);
+    frame("state=done", "startup");
+    assert!(sb.until(|| state() == "idle"));
+    assert_eq!(wait("1").status.code(), Some(124));
+    frame("state=working", "first submit");
+    assert!(sb.until(|| state() == "running"));
+    frame("id=subtask:state=done", "subtask ended");
+    assert_eq!(state(), "running");
+    frame("state=blocked:kind=permission", "needs permission");
+    assert!(sb.until(|| state() == "ask"));
+    frame("state=working", "approved");
+    assert!(sb.until(|| state() == "running"));
+    frame("state=done", "first reply");
+    assert!(sb.until(|| count("turn.done") == 1));
+    let result = wait("4");
+    assert_eq!(result.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), format!("{id} 完成一轮"));
+    sb.hook_as("codex", &id, &pane, r#"{"hook_event_name":"Stop","last_assistant_message":"first reply"}"#);
+    frame("state=done", "redrawn");
+    assert_eq!((count("turn.started"), count("turn.done")), (1, 1));
+    let notices = sb.json(&["inbox", &parent, "--json"]);
+    assert_eq!(notices.as_array().unwrap().iter().filter(|m| m["from"] == id && m["what"] == "turn.done").count(), 1);
+    frame("state=working", "second submit");
+    assert!(sb.until(|| state() == "running"));
+    frame("state=idle", "interrupted");
+    assert!(sb.until(|| state() == "idle"));
+    assert_eq!(wait("4").status.code(), Some(124));
+    assert_eq!(count("turn.done"), 1);
 }
 
 #[test]
@@ -4684,4 +5556,2090 @@ fn a_worker_delegated_into_a_sandbox_reports_its_turn_back_without_hooks() {
     );
     let inbox = sb.json(&["inbox", &lead, "--json"]);
     assert_eq!((inbox[0]["what"].as_str(), inbox[0]["from"].as_str()), (Some("turn.done"), Some(w.as_str())), "{inbox}");
+}
+
+/// The list in a terminal of its own (inside the sandbox's tmux server), with `env` added to its environment: keys go in with
+/// send-keys, its screen comes back with `ui()`
+struct Ui<'a> {
+    sb: &'a Sandbox,
+}
+
+impl<'a> Ui<'a> {
+    fn open(sb: &'a Sandbox, env: &str) -> Ui<'a> {
+        Ui::open_sized(sb, env, 120, 30)
+    }
+
+    /// In a terminal this many columns and rows
+    fn open_sized(sb: &'a Sandbox, env: &str, w: u16, h: u16) -> Ui<'a> {
+        let script = sb.home.join("ui.sh");
+        let q = |p: &Path| format!("'{}'", p.display());
+        write(
+            &script,
+            &format!(
+                "unset TMUX TMUX_PANE KITTY_WINDOW_ID TERM_PROGRAM SSH_CONNECTION SSH_TTY\n\
+                 export HOME={home} ACA_HOME={home} ACA_TMUX_SOCKET={sock} ACA_LANG=zh ACA_IME=0 TERM=xterm-256color {env}\n\
+                 exec {aca} ui\n",
+                home = q(&sb.home),
+                sock = sb.socket,
+                aca = q(Path::new(env!("CARGO_BIN_EXE_aca"))),
+            ),
+        );
+        let (w, h) = (w.to_string(), h.to_string());
+        sb.tmux(&["new-session", "-d", "-s", "ui", "-x", &w, "-y", &h, "/bin/sh", script.to_str().unwrap()]);
+        let ui = Ui { sb };
+        assert!(sb.until(|| ui.screen().contains("快捷键")), "界面没打开");
+        // The list ignores keys in the first moment after opening (STARTUP_QUIET)
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        ui
+    }
+
+    fn screen(&self) -> String {
+        self.sb.tmux(&["capture-pane", "-p", "-t", "ui"])
+    }
+
+    /// One key at a time, as typed by hand (`-l`: as text, not key names)
+    fn keys(&self, keys: &[&str]) {
+        for k in keys {
+            match k.strip_prefix("text:") {
+                Some(t) => self.sb.tmux(&["send-keys", "-t", "ui", "-l", t]),
+                None => self.sb.tmux(&["send-keys", "-t", "ui", k]),
+            };
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Wait until `done` holds and `want` has been on its screen at some point meanwhile: a line in the bottom bar stays only a
+    /// few seconds, so it's watched from the start, not looked for once the rest is done
+    fn said_while(&self, want: &str, done: impl Fn() -> bool) -> bool {
+        let seen = std::cell::Cell::new(false);
+        self.sb.until(|| {
+            if !seen.get() && self.screen().contains(want) {
+                seen.set(true);
+            }
+            seen.get() && done()
+        })
+    }
+
+    /// Highlight the session with this title (search, then leave the search: the highlight stays)
+    fn pick(&self, title: &str) {
+        self.keys(&["/", &format!("text:{title}"), "Enter", "Escape"]);
+    }
+}
+
+/// On a screen wide enough for the rail: h goes out onto it, j / k go from place to place with the list following, Enter goes
+/// into the place and Esc steps back out
+#[test]
+fn the_rail_goes_from_group_to_group_on_a_wide_screen() {
+    let Some(sb) = Sandbox::new("rail") else { return };
+    sb.aca(&["new", "fake", &sb.proj(), "-g", "甲组", "-t", "甲一"]);
+    sb.aca(&["new", "fake", &sb.proj(), "-g", "乙组", "-t", "乙一"]);
+    let ui = Ui::open_sized(&sb, "", 150, 40);
+    let s = ui.screen();
+    assert!(s.contains("回收站") && s.contains("甲一") && s.contains("乙一"), "{s}");
+    // Only one of the two groups' sessions is on screen
+    let one = |s: &str| s.contains("甲一") != s.contains("乙一");
+    // h: out onto the rail; j: the first group, and the list shows only what is in it
+    ui.keys(&["h", "j"]);
+    assert!(sb.until(|| one(&ui.screen()) && ui.screen().contains("在组里新建")), "{}", ui.screen());
+    let first = ui.screen().contains("甲一");
+    ui.keys(&["j"]);
+    assert!(sb.until(|| one(&ui.screen()) && ui.screen().contains("甲一") != first), "{}", ui.screen());
+    // Enter: into it, the cursor on its session; Esc: back out onto the rail
+    ui.keys(&["Enter"]);
+    assert!(sb.until(|| ui.screen().contains(&caps("⏎ 打开"))), "{}", ui.screen());
+    ui.keys(&["Escape"]);
+    assert!(sb.until(|| ui.screen().contains("在组里新建")), "{}", ui.screen());
+    // Up to the top row: every group again
+    ui.keys(&["k", "k"]);
+    assert!(sb.until(|| ui.screen().contains("甲一") && ui.screen().contains("乙一")), "{}", ui.screen());
+    // Into the first group, then a: every group with the jump letters showing; a again: back in the group
+    ui.keys(&["j", "Enter"]);
+    assert!(sb.until(|| one(&ui.screen()) && ui.screen().contains(&caps("a 全部"))), "{}", ui.screen());
+    ui.keys(&["a"]);
+    let both = |s: &str| s.contains("甲一") && s.contains("乙一");
+    assert!(sb.until(|| both(&ui.screen()) && ui.screen().contains(&caps("a 上一处 • 空格 取消"))), "{}", ui.screen());
+    ui.keys(&["a"]);
+    assert!(sb.until(|| one(&ui.screen()) && ui.screen().contains(&caps("a 全部"))), "{}", ui.screen());
+    // Space: the letters show, each group's own capital one before its name on the rail; ⇧ and the other group's goes into
+    // that group, the cursor in its list
+    ui.keys(&["Space"]);
+    assert!(sb.until(|| ui.screen().contains(&caps("⇧字母 进分组"))), "{}", ui.screen());
+    let s = ui.screen();
+    let (here, other) = if s.contains("甲一") { ("甲组", "乙组") } else { ("乙组", "甲组") };
+    let (key, own) = (rail_letter(&s, other), rail_letter(&s, here));
+    assert!(key.chars().all(|c| c.is_ascii_uppercase()) && key.len() == 1 && own.len() == 1 && key != own, "{key:?} {own:?}\n{s}");
+    ui.keys(&[&format!("text:{key}")]);
+    let there = if other == "甲组" { "甲一" } else { "乙一" };
+    assert!(sb.until(|| one(&ui.screen()) && ui.screen().contains(there) && ui.screen().contains(&caps("⏎ 打开"))), "{}", ui.screen());
+}
+
+/// The capital letter written before a group's name on the rail while the jump letters show ("" = none)
+fn rail_letter(screen: &str, group: &str) -> String {
+    let rail = |l: &str| l.split('│').next().unwrap_or_default().to_string();
+    let Some(row) = screen.lines().map(rail).find(|l| l.trim_end().ends_with(group) || l.contains(&format!("{group} "))) else {
+        return String::new();
+    };
+    let before = &row[..row.find(group).unwrap_or(0)];
+    before.trim_end().chars().last().filter(char::is_ascii_uppercase).map(String::from).unwrap_or_default()
+}
+
+/// A screen too narrow to keep the rail: `h` lays it over the left, Enter goes into the group under the cursor and puts it
+/// away, Esc puts it away and goes back
+#[test]
+fn the_rail_is_called_out_over_a_narrow_screen() {
+    let Some(sb) = Sandbox::new("railnarrow") else { return };
+    sb.aca(&["new", "fake", &sb.proj(), "-g", "甲组", "-t", "甲一"]);
+    sb.aca(&["new", "fake", &sb.proj(), "-g", "乙组", "-t", "乙一"]);
+    let ui = Ui::open(&sb, "");
+    let s = ui.screen();
+    assert!(!s.contains("回收站") && s.contains("甲一") && s.contains("乙一"), "{s}");
+    ui.keys(&["h"]);
+    assert!(sb.until(|| ui.screen().contains("回收站") && ui.screen().contains(&caps("⏎ 进入"))), "{}", ui.screen());
+    // Onto the first group and in: the rail is gone, the list is that group's
+    ui.keys(&["j", "Enter"]);
+    let one = |s: &str| s.contains("甲一") != s.contains("乙一");
+    assert!(sb.until(|| !ui.screen().contains("回收站") && one(&ui.screen()) && ui.screen().contains(&caps("⏎ 打开"))), "{}", ui.screen());
+    let first = ui.screen().contains("甲一");
+    // Out again, on to the other group, then Esc: put away, the list back on the first one
+    ui.keys(&["h", "j"]);
+    // (a group's row: 「写笔记」 (write a note) is its key's word; 「在组里新建」 (new in group) goes first as the bar narrows)
+    assert!(sb.until(|| ui.screen().contains("回收站") && ui.screen().contains(&caps("e 写笔记"))), "{}", ui.screen());
+    ui.keys(&["Escape"]);
+    assert!(sb.until(|| !ui.screen().contains("回收站") && one(&ui.screen()) && ui.screen().contains("甲一") == first), "{}", ui.screen());
+    // Tab: the group's notes page, then its tasks page, then back to its sessions; nothing is laid over the screen
+    ui.keys(&["Tab"]);
+    assert!(sb.until(|| ui.screen().contains("这一组还没有笔记") && !ui.screen().contains("回收站")), "{}", ui.screen());
+    ui.keys(&["Tab"]);
+    assert!(sb.until(|| ui.screen().contains("这一组还没有任务") && !ui.screen().contains("回收站")), "{}", ui.screen());
+    ui.keys(&["Tab"]);
+    assert!(sb.until(|| !ui.screen().contains("回收站") && one(&ui.screen())), "{}", ui.screen());
+    // h, then Space on the rail laid over: the groups' own capital letters show on it; ⇧ and the other group's goes into
+    // that group and puts the rail away
+    ui.keys(&["h", "Space"]);
+    assert!(sb.until(|| ui.screen().contains("回收站") && ui.screen().contains(&caps("⇧字母 进分组"))), "{}", ui.screen());
+    let s = ui.screen();
+    let (other, there) = if first { ("乙组", "乙一") } else { ("甲组", "甲一") };
+    let key = rail_letter(&s, other);
+    assert!(key.len() == 1, "{s}");
+    ui.keys(&[&format!("text:{key}")]);
+    assert!(sb.until(|| !ui.screen().contains("回收站") && one(&ui.screen()) && ui.screen().contains(there)), "{}", ui.screen());
+    // With no rail on screen the letters work unseen from inside a group: Space, then ⇧ and the first group's again
+    let back = rail_letter(&s, if first { "甲组" } else { "乙组" });
+    ui.keys(&["Space", &format!("text:{back}")]);
+    assert!(sb.until(|| one(&ui.screen()) && ui.screen().contains("甲一") == first), "{}", ui.screen());
+}
+
+/// `m` with a name no group has: the list says ahead what Enter makes — a group under the one the session is in, working in a
+/// directory of that name under that group's — then both are made and the session moved, still running where it was. Tab
+/// asks for the directory first
+#[test]
+fn m_with_a_new_name_makes_a_group_under_this_one_with_a_directory_of_its_own() {
+    let Some(sb) = Sandbox::new("movehome") else { return };
+    if Command::new("fzf").arg("--version").output().is_err() {
+        eprintln!("没有 fzf,跳过");
+        return;
+    }
+    std::fs::create_dir_all(sb.home.join("home")).unwrap();
+    let home = sb.home.join("home").canonicalize().unwrap().to_string_lossy().into_owned();
+    assert_eq!(sb.aca(&["group", "add", &home]), "home");
+    let one = sb.aca(&["new", "fake", &home, "-g", "home", "-t", "调研一"]);
+    let two = sb.aca(&["new", "fake", &home, "-g", "home", "-t", "调研二"]);
+    let ui = Ui::open_sized(&sb, "", 150, 40);
+    let made = |g: &str| sb.run(&["group", "dir", g]).status.success();
+    ui.pick("调研一");
+    ui.keys(&["m"]);
+    assert!(sb.until(|| ui.screen().contains("只换分组")), "{}", ui.screen());
+    ui.keys(&["text:rss"]);
+    // Above the list's header: the group it makes and where that would work
+    let ahead = |s: &str| s.contains("+ home/rss  新分组") && s.contains("/home/rss   Tab 改目录");
+    assert!(sb.until(|| ahead(&ui.screen())), "{}", ui.screen());
+    ui.keys(&["Enter"]);
+    assert!(sb.until(|| made("home/rss")), "{}", ui.screen());
+    let dir = format!("{home}/rss");
+    assert_eq!(sb.aca(&["group", "dir", "home/rss"]), dir);
+    assert!(Path::new(&dir).is_dir());
+    let s = sb.json(&["show", &one, "--json"]);
+    assert_eq!((s["group"].as_str(), s["dir"].as_str()), (Some("home/rss"), Some(home.as_str())));
+    // On the rail it sits under the group it came out of
+    let nested = |s: &str| s.contains("    home") && s.contains("      rss");
+    assert!(sb.until(|| nested(&ui.screen())), "{}", ui.screen());
+    // Tab: its directory is asked first, and the one given instead is the one made
+    ui.pick("调研二");
+    ui.keys(&["m"]);
+    assert!(sb.until(|| ui.screen().contains("只换分组")), "{}", ui.screen());
+    ui.keys(&["text:feeds", "Tab"]);
+    assert!(sb.until(|| ui.screen().contains("新分组 · home/feeds · 默认目录")), "{}", ui.screen());
+    let other = format!("{home}/elsewhere/feeds");
+    ui.keys(&["C-u", &format!("text:{other}"), "Enter"]);
+    assert!(sb.until(|| made("home/feeds")), "{}", ui.screen());
+    assert_eq!(sb.aca(&["group", "dir", "home/feeds"]), other);
+    assert!(Path::new(&other).is_dir() && !Path::new(&format!("{home}/feeds")).exists());
+    assert_eq!(sb.json(&["show", &two, "--json"])["group"], "home/feeds");
+}
+
+/// A scratch directory in config.toml: opening the list makes the directory and the group that works in it, right under all
+/// groups on the rail; N with nothing of a project under the cursor starts there; the group can't be removed
+#[test]
+fn the_scratch_directory_gets_a_group_that_takes_what_is_started_off_any_project() {
+    let Some(sb) = Sandbox::new("scratch") else { return };
+    let dir = sb.home.join("loose");
+    let cfg = sb.home.join("config/config.toml");
+    let text = std::fs::read_to_string(&cfg).unwrap() + &format!("[scratch]\ndir = \"{}\"\n", dir.display());
+    write(&cfg, &text);
+    sb.aca(&["new", "fake", &sb.proj(), "-g", "甲组", "-t", "甲一"]);
+    let ui = Ui::open_sized(&sb, "", 150, 40);
+    assert!(dir.is_dir());
+    let real = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+    assert_eq!(sb.aca(&["group", "dir", "随手问"]), real);
+    let s = ui.screen();
+    let at = |what: &str| s.find(what).unwrap_or_else(|| panic!("{what}: {s}"));
+    assert!(at("全部") < at("随手问") && at("随手问") < at("甲组"), "{s}");
+    // On the rail's row for all groups, N: the box starts in the scratch directory, and Enter starts the session in its group
+    ui.keys(&["h", "N"]);
+    assert!(sb.until(|| ui.screen().contains("/loose")), "{}", ui.screen());
+    ui.keys(&["Enter"]);
+    let started = || sb.json(&["ls", "--json"]).as_array().is_some_and(|v| v.iter().any(|x| x["group"] == "随手问" && x["dir"] == real.as_str()));
+    assert!(sb.until(started), "{}", sb.aca(&["ls", "--json"]));
+    // The printed list goes in the interface's order: the scratch group's sessions before the group made earlier
+    let printed = sb.aca(&["ui", "-l"]);
+    assert!(printed.find("随手问").zip(printed.find("甲组")).is_some_and(|(s, g)| s < g), "{printed}");
+    let o = sb.run(&["group", "rm", "随手问"]);
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("无法删除随手问所在的分组"), "{o:?}");
+    assert_eq!(sb.aca(&["group", "dir", "随手问"]), real);
+}
+
+/// Several commands started together the very first time all find the registry file new (as every test here does, with a
+/// sandbox of its own): each of them opens it
+#[test]
+fn commands_started_together_on_a_new_registry_all_open_it() {
+    let Some(sb) = Sandbox::new("newdb") else { return };
+    for round in 0..6 {
+        let _ = std::fs::remove_dir_all(sb.home.join("data"));
+        let kids: Vec<_> = (0..4)
+            .map(|_| {
+                sb.cmd().args(["group", "ls"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap()
+            })
+            .collect();
+        for k in kids {
+            let o = k.wait_with_output().unwrap();
+            assert!(o.status.success(), "第 {round} 轮:{}", String::from_utf8_lossy(&o.stderr));
+        }
+    }
+}
+
+/// A group's notebook is in the registry: `aca note` and the interface read and write the same notes. The one note an older
+/// interface kept in its own file is moved in; a group's notes follow it when it's renamed, go with it when it's deleted and
+/// come back with it
+#[test]
+fn a_groups_notes_are_the_same_ones_on_the_command_line_and_in_the_interface() {
+    let Some(sb) = Sandbox::new("notes") else { return };
+    let id = sb.aca(&["new", "fake", &sb.proj(), "-g", "甲组", "-t", "甲一"]);
+    sb.aca(&["group", "create", "乙组"]);
+    assert_eq!(sb.json(&["group", "ls", "--json"]).as_array().map(Vec::len), Some(2));
+    // An older interface left the group's one note in its own file: read from the command line, it's a note of yours
+    let file = sb.home.join("state/ui/notes");
+    write(&file, "{\"group:甲组\": \"旧便签\\n第二行\", \"x1\": \"会话的\"}\n");
+    let ls = sb.aca(&["note", "ls", "-g", "甲组"]);
+    assert!(ls.contains("旧便签") && ls.contains("你") && !ls.contains("第二行"), "{ls}");
+    let left = std::fs::read_to_string(&file).unwrap();
+    assert!(!left.contains("group:") && left.contains("会话的"), "{left}");
+    // Written from inside a session with no group given: into that session's group, recorded as written by it
+    let o = sb.as_session(&id, &["note", "add"], "发布前\n先跑测试\n");
+    assert!(o.status.success(), "{o:?}");
+    let new = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let notes = sb.json(&["note", "ls", "-g", "甲组", "--json"]);
+    let notes = notes.as_array().unwrap();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    // The one moved in is pinned (it goes on showing beside the group's row), so it's listed first
+    assert_eq!((notes[0]["by"].as_str(), notes[0]["group"].as_str(), notes[0]["pinned"].as_bool()), (Some(""), Some("甲组"), Some(true)));
+    assert_eq!(
+        (notes[1]["id"].as_str(), notes[1]["by"].as_str(), notes[1]["text"].as_str(), notes[1]["pinned"].as_bool()),
+        (Some(new.as_str()), Some(id.as_str()), Some("发布前\n先跑测试"), Some(false))
+    );
+    // Outside a session a group has to be named, and it has to be one that's there
+    let fails = |args: &[&str], why: &str| {
+        let o = sb.run(args);
+        assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains(why), "{args:?}:{o:?}");
+    };
+    fails(&["note", "ls"], "需要指定分组");
+    fails(&["note", "add", "-g", "没有的组", "写不进去"], "没有分组");
+    // Unpinned and pinned again (the start of its id is enough): where it's listed follows
+    let old = notes[0]["id"].as_str().unwrap().to_string();
+    sb.aca(&["note", "unpin", &old[..4]]);
+    assert!(sb.aca(&["note", "ls", "-g", "甲组"]).starts_with(&new), "{}", sb.aca(&["note", "ls", "-g", "甲组"]));
+    sb.aca(&["note", "pin", &old[..4]]);
+    assert!(sb.aca(&["note", "ls", "-g", "甲组"]).starts_with(&format!("{old}  ★ 旧便签")), "{}", sb.aca(&["note", "ls", "-g", "甲组"]));
+    assert_eq!(sb.aca(&["note", "show", &old]), "旧便签\n第二行");
+    // The interface names the pinned note beside the group's rail row
+    let ui = Ui::open_sized(&sb, "", 150, 40);
+    ui.keys(&["h", "j"]);
+    if !ui.screen().contains("旧便签") {
+        ui.keys(&["j"]);
+    }
+    assert!(sb.until(|| ui.screen().contains("★ 旧便签")), "{}", ui.screen());
+    // Tab: the group's notes page in the middle column; Enter goes in, the cursor on the first note, the right column showing it
+    ui.keys(&["Tab"]);
+    assert!(sb.until(|| ui.screen().contains("笔记 2") && ui.screen().contains("发布前")), "{}", ui.screen());
+    ui.keys(&["Enter"]);
+    assert!(sb.until(|| ui.screen().contains(&caps("e 编辑")) && ui.screen().contains("第二行")), "{}", ui.screen());
+    // e rewrites the one under the cursor; n writes a new one (its first line is its name); d and y delete one; ^Z brings it back
+    ui.keys(&["e", "text:!", "Escape"]);
+    assert!(sb.until(|| sb.aca(&["note", "show", &old]) == "旧便签\n第二行!"), "{}", sb.aca(&["note", "show", &old]));
+    ui.keys(&["n", "text:third one", "Escape"]);
+    let count = || sb.json(&["note", "ls", "-g", "甲组", "--json"]).as_array().map(Vec::len);
+    assert!(sb.until(|| count() == Some(3) && ui.screen().contains("笔记 3")), "{}", ui.screen());
+    ui.keys(&["d", "y"]);
+    assert!(sb.until(|| count() == Some(2)), "{}", ui.screen());
+    ui.keys(&["C-z"]);
+    assert!(sb.until(|| count() == Some(3)), "{}", ui.screen());
+    ui.keys(&["d", "y"]);
+    assert!(sb.until(|| count() == Some(2)), "{}", ui.screen());
+    // A deleted note is in the trash (b), like a deleted session: Enter there brings it back, d and y there delete it for good
+    ui.keys(&["b"]);
+    assert!(sb.until(|| ui.screen().contains("回收站") && ui.screen().contains("✎ third one")), "{}", ui.screen());
+    ui.keys(&["Enter"]);
+    assert!(ui.said_while("已恢复笔记「third one」", || count() == Some(3)), "{}", ui.screen());
+    ui.keys(&["d", "y"]);
+    assert!(sb.until(|| count() == Some(2)), "{}", ui.screen());
+    ui.keys(&["b"]);
+    assert!(sb.until(|| ui.screen().contains("✎ third one")), "{}", ui.screen());
+    ui.keys(&["d", "y"]);
+    assert!(sb.until(|| ui.screen().contains("回收站为空")), "{}", ui.screen());
+    ui.keys(&["b"]);
+    assert!(sb.until(|| !ui.screen().contains("回收站为空")), "{}", ui.screen());
+    // Tab on to its tasks and round to its sessions; h out onto the group's rail row. The group deleted there: its notes are
+    // gone with it, and ^Z brings them back with it
+    ui.keys(&["Tab", "Tab"]);
+    assert!(sb.until(|| ui.screen().contains(&caps("⏎ 打开"))), "{}", ui.screen());
+    ui.keys(&["h"]);
+    assert!(sb.until(|| ui.screen().contains("在组里新建")), "{}", ui.screen());
+    ui.keys(&["d", "y"]);
+    assert!(sb.until(|| !sb.run(&["note", "show", &old]).status.success()), "{}", ui.screen());
+    assert!(sb.until(|| !sb.aca(&["group", "ls"]).contains("甲组")), "{}", sb.aca(&["group", "ls"]));
+    ui.keys(&["C-z"]);
+    assert!(sb.until(|| sb.run(&["note", "show", &new]).status.success()), "{}", ui.screen());
+    assert_eq!(sb.json(&["note", "ls", "-g", "甲组", "--json"]).as_array().map(Vec::len), Some(2));
+    // Renamed: the notes are the new name's
+    sb.aca(&["group", "rename", "甲组", "丙组/甲"]);
+    assert_eq!(sb.json(&["note", "show", &old, "--json"])["group"], "丙组/甲");
+    // `aca group rm` deletes a group's notes with it; `aca note rm` deletes one
+    let other = sb.aca(&["note", "add", "-g", "乙组", "乙组的", "笔记"]);
+    assert_eq!(sb.aca(&["note", "show", &other]), "乙组的 笔记");
+    sb.aca(&["group", "rm", "乙组"]);
+    fails(&["note", "show", &other], "没有笔记");
+    assert_eq!(sb.aca(&["note", "rm", &new]), "已删除笔记「发布前」");
+    sb.aca(&["note", "unpin", &old]);
+    let left = sb.json(&["note", "ls", "-g", "丙组/甲", "--json"]);
+    assert_eq!((left.as_array().map(Vec::len), left[0]["pinned"].as_bool()), (Some(1), Some(false)));
+    // Both ways of deleting leave the notes in the interface's trash. Selected together and brought back: each is in its
+    // notebook again, and the one whose group is gone brings its group back with it
+    assert!(sb.until(|| ui.screen().contains("丙组")), "{}", ui.screen());
+    ui.keys(&["b"]);
+    let both = |s: &str| s.contains("✎ 发布前  丙组/甲") && s.contains("✎ 乙组的 笔记  乙组");
+    assert!(sb.until(|| both(&ui.screen())), "{}", ui.screen());
+    ui.keys(&["v", "j", "Enter"]);
+    let back = || sb.run(&["note", "show", &other]).status.success() && sb.run(&["note", "show", &new]).status.success();
+    assert!(ui.said_while("已恢复 2 条", back), "{}", ui.screen());
+    assert!(sb.aca(&["group", "ls"]).contains("乙组"), "{}", sb.aca(&["group", "ls"]));
+    assert_eq!(sb.json(&["note", "show", &other, "--json"])["group"], "乙组");
+}
+
+/// `s` in the list: what's written in the reply box is typed into its input box and Enter pressed, without going in. The agent
+/// here reads its input line by line and writes down every line it gets: the text, and the Enter that ends it
+#[test]
+fn a_reply_written_in_the_list_is_typed_into_the_session_with_its_enter() {
+    let Some(sb) = Sandbox::new("reply") else { return };
+    let got = sb.home.join("got.txt");
+    write(
+        &sb.home.join("rd.sh"),
+        &format!("#!/bin/sh\necho ready\nwhile IFS= read -r l; do printf '%s\\n' \"$l\" >> '{}'; done\n", got.display()),
+    );
+    let cfg = sb.home.join("config/config.toml");
+    let text = std::fs::read_to_string(&cfg).unwrap()
+        + &format!("[tools.rd]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{}\"]\n", sb.home.join("rd.sh").display());
+    write(&cfg, &text);
+    let id = sb.aca(&["new", "rd", &sb.proj(), "-t", "回它"]);
+    sb.wait_screen(&sb.pane(&id), "ready");
+    let ui = Ui::open(&sb, "");
+    ui.pick("回它");
+    ui.keys(&["s", "text:继续", "Enter"]);
+    let lines = || std::fs::read_to_string(&got).unwrap_or_default();
+    assert!(ui.said_while("已发给「回它」", || lines() == "继续\n"), "收到的:{:?}\n{}", lines(), ui.screen());
+    // Two lines (^J between them): one paste, then one Enter
+    ui.keys(&["s", "text:一", "C-j", "text:二", "Enter"]);
+    assert!(sb.until(|| lines() == "继续\n一\n二\n"), "收到的:{:?}\n{}", lines(), ui.screen());
+}
+
+/// `o` on the rail row of a group that has no router makes one: a session in that group, named after it, told what a router
+/// does as it starts, and gone into; back from it the cursor is still on the group's row. `s` there writes to the router;
+/// what the router sends out and pulls over shows in the column beside; a stopped one is started by `o`.
+/// The agent here writes down the arguments it was started with and every line typed into it, per session
+#[test]
+fn o_on_a_groups_row_makes_its_router_and_s_there_replies_to_it() {
+    let Some(sb) = Sandbox::new("router-ui") else { return };
+    let script = sb.home.join("agent.sh");
+    add_config(&sb, &format!("[tools.rt]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{}\"]\n", script.display()));
+    let a = sb.aca(&["new", "rt", &sb.proj(), "-g", "甲组", "-t", "甲一"]);
+    let b = sb.aca(&["new", "fake", &sb.proj(), "-g", "乙组", "-t", "乙一"]);
+    let ui = Ui::open_sized(&sb, "", 150, 40);
+    // What the rail (left of the first │) says on some row
+    let rail = |s: &str, want: &str| s.lines().any(|l| l.split('│').next().is_some_and(|cell| cell.contains(want)));
+    // Onto 甲组's row on the rail: the list shows only its session
+    ui.keys(&["h", "j"]);
+    if ui.screen().contains("乙一") {
+        ui.keys(&["j"]);
+    }
+    let on_row = |s: &str| s.contains("甲一") && !s.contains("乙一") && s.contains(&caps("⏎ 进入"));
+    assert!(sb.until(|| on_row(&ui.screen()) && ui.screen().contains(&caps("o 新建 router"))), "{}", ui.screen());
+    assert!(!rail(&ui.screen(), "@"), "{}", ui.screen());
+    // Nobody to reply to yet
+    ui.keys(&["s"]);
+    assert!(sb.until(|| ui.screen().contains("还没有 router · o 新建")), "{}", ui.screen());
+    // o: the new-session box, for a router; ⏎ makes it and goes into it
+    ui.keys(&["o"]);
+    assert!(sb.until(|| ui.screen().contains("新建 router") && ui.screen().contains("⏎ 新建")), "{}", ui.screen());
+    ui.keys(&["Enter"]);
+    let named = || sb.run(&["group", "router", "甲组"]);
+    assert!(sb.until(|| named().status.success()), "{}", ui.screen());
+    let r = String::from_utf8_lossy(&named().stdout).trim().to_string();
+    let shown = sb.json(&["show", &r, "--json"]);
+    assert_eq!((shown["title"].as_str(), shown["group"].as_str(), shown["tool"].as_str()), (Some("甲组 router"), Some("甲组"), Some("rt")));
+    let args = || String::from_utf8_lossy(&std::fs::read(sb.home.join(format!("args-{r}"))).unwrap_or_default()).into_owned();
+    let opening = || std::fs::read_to_string(sb.home.join(format!("open-{r}"))).unwrap_or_default();
+    assert!(
+        sb.until(|| args().contains("aca-router:router\0") && opening().contains("项目交接 · 甲组") && opening().contains(&a)),
+        "{}",
+        opening()
+    );
+    assert!(opening().ends_with("看完等用户说话,只回一个字。"));
+    // The terminal is the router's now
+    assert!(sb.until(|| !ui.screen().contains("快捷键") && ui.screen().contains("ready")), "{}", ui.screen());
+    // Out again, as Ctrl+Q does: still on the group's row, which leads with @ now, and the bar has the router's keys
+    sb.tmux(&["detach-client", "-s", "=甲组 router"]);
+    let with_router = |s: &str| on_row(s) && rail(s, "@ 甲组") && s.contains(&caps("s 回话 • o 打开 router"));
+    assert!(sb.until(|| with_router(&ui.screen())), "{}", ui.screen());
+    // What the router does is in the column beside: what it hands a session, a session it pulls over (its row joins the list)
+    assert!(sb.as_session(&r, &["msg", &a, "看一下登录"], "").status.success());
+    assert!(sb.as_session(&r, &["move", "--tree", &b, "甲组"], "").status.success());
+    assert!(sb.until(|| ui.screen().contains("@ → 甲一") && ui.screen().contains("@ ← 乙组")), "{}", ui.screen());
+    // s: written on the line under the thread; ⏎ types it into the router, and you stay on the row
+    ui.keys(&["s", "text:先看登录"]);
+    assert!(sb.until(|| ui.screen().contains("❯ 先看登录") && ui.screen().contains(&caps("⏎ 发送"))), "{}", ui.screen());
+    ui.keys(&["Enter"]);
+    let got = || std::fs::read_to_string(sb.home.join(format!("got-{r}"))).unwrap_or_default();
+    assert!(ui.said_while("已发给「甲组 router」", || got() == "先看登录\n"), "收到的:{:?}\n{}", got(), ui.screen());
+    // Its agent starts a turn with it: the thread has it as what you said
+    assert!(
+        sb.until(|| {
+            let screen = ui.screen();
+            screen.contains(&caps("⏎ 进入")) && !screen.contains(&caps("⏎ 发送")) && screen.matches("❯ 先看登录").count() == 1
+        }),
+        "{}",
+        ui.screen()
+    );
+    let pane = sb.pane(&r);
+    sb.hook(&r, &pane, r#"{"hook_event_name":"UserPromptSubmit","session_id":"c1","prompt":"先看登录"}"#);
+    assert!(session_events(&sb, &r, "turn.started").iter().any(|e| e["prompt"] == "先看登录"));
+    // Seeing the reply proves the thread has refreshed past the submit.
+    sb.hook(&r, &pane, r#"{"hook_event_name":"Stop","session_id":"c1","last_assistant_message":"收到登录请求"}"#);
+    assert!(sb.until(|| ui.screen().contains("收到登录请求")), "{}", ui.screen());
+    let screen = ui.screen();
+    assert_eq!(screen.matches("❯ 先看登录").count(), 1, "{screen}");
+    // A message starts the next shift; o then goes into it.
+    sb.aca(&["stop", &r]);
+    assert!(sb.until(|| ui.screen().contains(&caps("o 启动 router"))), "{}", ui.screen());
+    ui.keys(&["s"]);
+    assert!(sb.until(|| ui.screen().contains(&caps("⏎ 发送"))), "{}", ui.screen());
+    ui.keys(&["text:换班查一下", "Enter"]);
+    assert!(sb.until(|| opening().contains("叫醒你的") && opening().contains("换班查一下")), "{}", opening());
+    assert!(sb.until(|| ui.screen().contains(&caps("s 回话"))), "{}", ui.screen());
+    ui.keys(&["o"]);
+    assert!(sb.until(|| !ui.screen().contains("快捷键") && ui.screen().contains("ready")), "{}", ui.screen());
+    assert_ne!(sb.json(&["show", &r, "--json"])["state"], "stopped");
+    sb.tmux(&["detach-client", "-s", "=甲组 router"]);
+    assert!(sb.until(|| ui.screen().contains(&caps("o 打开 router")) && ui.screen().contains(&caps("⏎ 进入"))), "{}", ui.screen());
+}
+
+/// `o` on the rail's row for all groups makes the desk. With no scratch directory set that is asked for first; the session
+/// is in the scratch group, named after the desk, told what the desk does as it starts, and gone into; back from it the
+/// cursor is still on the row for all groups, which leads with @ now. `s` there writes to the desk; what it hands out shows
+/// in the column beside; a stopped one is started by `o`.
+/// The agent here writes down the arguments it was started with and every line typed into it, per session
+#[test]
+fn o_on_the_row_for_all_groups_makes_the_desk_and_s_there_replies_to_it() {
+    let Some(sb) = Sandbox::new("desk-ui") else { return };
+    let script = sb.home.join("agent.sh");
+    add_config(&sb, &format!("[tools.rt]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{}\"]\n", script.display()));
+    let a = sb.aca(&["new", "rt", &sb.proj(), "-g", "甲组", "-t", "甲一"]);
+    let ui = Ui::open_sized(&sb, "", 150, 40);
+    // What the rail (left of the first │) says on some row
+    let rail = |s: &str, want: &str| s.lines().any(|l| l.split('│').next().is_some_and(|cell| cell.contains(want)));
+    // Onto the row for all groups: no desk yet, and nobody to reply to — from the command line either
+    ui.keys(&["h"]);
+    assert!(sb.until(|| ui.screen().contains(&caps("⏎ 进入 • o 新建总台"))), "{}", ui.screen());
+    assert!(!rail(&ui.screen(), "@"), "{}", ui.screen());
+    let nobody = sb.run(&["msg", "desk", "你好"]);
+    assert_eq!(nobody.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&nobody.stderr).contains("还没有总台"), "{nobody:?}");
+    ui.keys(&["s"]);
+    assert!(sb.until(|| ui.screen().contains("还没有总台 · o 新建")), "{}", ui.screen());
+    // o: there is no scratch directory for a desk to be in, so that is asked for first
+    ui.keys(&["o"]);
+    assert!(sb.until(|| ui.screen().contains("随手问目录")), "{}", ui.screen());
+    let dir = sb.home.join("asks");
+    ui.keys(&[&format!("text:{}", dir.display()), "Enter"]);
+    // Given: written down, its group made, and on to the desk's box — in that group and directory, with the tool of the
+    // row the list is on
+    assert!(sb.until(|| ui.screen().contains("新建总台") && ui.screen().contains("⏎ 新建")), "{}", ui.screen());
+    let s = ui.screen();
+    assert!(s.contains("分组   随手问") && s.contains("/asks") && s.contains("rt"), "{s}");
+    let cfg = std::fs::read_to_string(sb.home.join("config/config.toml")).unwrap();
+    assert!(cfg.contains("[scratch]") && cfg.contains(&format!("dir = \"{}\"", dir.display())), "{cfg}");
+    assert!(dir.is_dir());
+    ui.keys(&["Enter"]);
+    let named = || sb.run(&["group", "router", "随手问"]);
+    assert!(sb.until(|| named().status.success()), "{}", ui.screen());
+    let r = String::from_utf8_lossy(&named().stdout).trim().to_string();
+    let shown = sb.json(&["show", &r, "--json"]);
+    assert_eq!((shown["title"].as_str(), shown["group"].as_str(), shown["tool"].as_str()), (Some("总台"), Some("随手问"), Some("rt")));
+    let args = || String::from_utf8_lossy(&std::fs::read(sb.home.join(format!("args-{r}"))).unwrap_or_default()).into_owned();
+    let opening = || std::fs::read_to_string(sb.home.join(format!("open-{r}"))).unwrap_or_default();
+    let told = || args().contains("aca-router:desk\0") && opening().contains("总台交接 · 项目") && opening().contains("项目交接 · 随手问");
+    assert!(sb.until(told), "{}", args());
+    // The terminal is the desk's now
+    assert!(sb.until(|| !ui.screen().contains("快捷键") && ui.screen().contains("ready")), "{}", ui.screen());
+    // Out again, as Ctrl+Q does: still on the row for all groups, which leads with @ now (the scratch group's name doesn't),
+    // and the bar has the desk's keys
+    sb.tmux(&["detach-client", "-s", "=总台"]);
+    let with_desk = |s: &str| rail(s, "@ 全部") && !rail(s, "@ 随手问") && s.contains(&caps("⏎ 进入 • s 回话 • o 打开总台"));
+    assert!(sb.until(|| with_desk(&ui.screen())), "{}", ui.screen());
+    // What the desk hands a session is in the column beside
+    assert!(sb.as_session(&r, &["msg", &a, "看一下登录"], "").status.success());
+    assert!(sb.until(|| ui.screen().contains("@ → 甲一")), "{}", ui.screen());
+    // A session it starts the way it is told to is yours: nobody's child, in the group named, and the event says whose
+    // command made it — so the column still has it as one the desk started
+    let o = sb.as_session(&r, &["new", "rt", &sb.proj(), "--parent", "-", "-g", "甲组", "-t", "查登录", "--hold"], "");
+    assert!(o.status.success(), "{o:?}");
+    let made = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let shown = sb.json(&["show", &made, "--json"]);
+    assert_eq!((shown["parent"].as_str().unwrap_or(""), shown["group"].as_str()), ("", Some("甲组")));
+    let events: Vec<Value> = sb.aca(&["events", "-n", "50"]).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let created = events.iter().find(|e| e["event"] == "session.created" && e["session"] == made.as_str()).unwrap();
+    assert_eq!((created["by"].as_str(), created["parent"].as_str()), (Some(r.as_str()), Some("")));
+    assert!(sb.until(|| ui.screen().lines().any(|l| l.contains("@ → 查登录") && l.contains("新会话"))), "{}", ui.screen());
+    // The scratch group's own row shows the same exchange, with the same keys
+    ui.keys(&["j"]);
+    assert!(sb.until(|| ui.screen().contains("@ → 甲一") && ui.screen().contains(&caps("o 打开总台 • Tab 换页"))), "{}", ui.screen());
+    ui.keys(&["k"]);
+    // What comes in from outside goes to `desk`, whichever session that is, and says which channel it came through: kept
+    // on the message, and written at the right end of its line
+    let put = sb.aca(&["msg", "desk", "--via", "Discord", "帮我看下周的机票"]);
+    assert!(put.contains(&r), "{put}");
+    let sent: Vec<Value> = sb.aca(&["events", "-n", "50"]).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let relayed = sent.iter().find(|e| e["event"] == "message.sent" && e["text"] == "帮我看下周的机票").unwrap();
+    assert_eq!((relayed["session"].as_str(), relayed["from"].as_str(), relayed["via"].as_str()), (Some(r.as_str()), Some("you"), Some("Discord")));
+    let named = |s: &str| s.lines().any(|l| l.contains("❯ 帮我看下周的机票") && l.contains("Discord"));
+    assert!(sb.until(|| named(&ui.screen())), "{}", ui.screen());
+    assert!(sb.aca(&["inbox", &r]).contains("说(Discord)"), "{}", sb.aca(&["inbox", &r]));
+    // A channel is where your words came from: a session can't name one, and the name is a short word
+    let o = sb.as_session(&r, &["msg", &a, "--via", "Discord", "冒充"], "");
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("--via 只能在会话外使用"), "{o:?}");
+    for bad in ["claude", "two words", "averyveryverylongname"] {
+        assert!(!sb.run(&["msg", "desk", "--via", bad, "x"]).status.success(), "{bad}");
+    }
+    // s: written on the line under the thread; ⏎ types it into the desk, and you stay on the row
+    ui.keys(&["s", "text:电压的事给谁"]);
+    assert!(sb.until(|| ui.screen().contains("❯ 电压的事给谁") && ui.screen().contains(&caps("⏎ 发送"))), "{}", ui.screen());
+    ui.keys(&["Enter"]);
+    let got = || std::fs::read_to_string(sb.home.join(format!("got-{r}"))).unwrap_or_default();
+    // (what was relayed above may have been typed in before it, or still be waiting in its inbox)
+    assert!(ui.said_while("已发给「总台」", || got().lines().last() == Some("电压的事给谁")), "收到的:{:?}\n{}", got(), ui.screen());
+    // A message starts the next shift; o then goes into it.
+    sb.aca(&["stop", &r]);
+    assert!(sb.until(|| ui.screen().contains(&caps("o 启动总台"))), "{}", ui.screen());
+    ui.keys(&["s"]);
+    assert!(sb.until(|| ui.screen().contains(&caps("⏎ 发送"))), "{}", ui.screen());
+    ui.keys(&["text:换班查一下", "Enter"]);
+    assert!(sb.until(|| opening().contains("叫醒你的") && opening().contains("换班查一下")), "{}", opening());
+    assert!(sb.until(|| ui.screen().contains(&caps("s 回话"))), "{}", ui.screen());
+    ui.keys(&["o"]);
+    assert!(sb.until(|| !ui.screen().contains("快捷键") && ui.screen().contains("ready")), "{}", ui.screen());
+    assert_ne!(sb.json(&["show", &r, "--json"])["state"], "stopped");
+    sb.tmux(&["detach-client", "-s", "=总台"]);
+    assert!(sb.until(|| ui.screen().contains(&caps("o 打开总台")) && ui.screen().contains(&caps("⏎ 进入"))), "{}", ui.screen());
+}
+
+/// `s` on a row waiting for you: a single choice is answered by its number, a startup gate by walking to its option — from
+/// the list, by you. The list here was opened carrying another session's ACA_SESSION_ID (as a popup over that session may):
+/// that session couldn't answer these with `aca answer`, the person at the list can, and it's recorded as you
+#[test]
+fn a_question_is_answered_from_the_list_with_a_key_and_counted_as_yours() {
+    let Some(sb) = Sandbox::new("answer-ui") else { return };
+    sb.screen_tools();
+    let other = sb.aca(&["new", "fake", &sb.proj(), "-t", "别的"]);
+    let w = sb.aca(&["new", "scr", &sb.proj(), "-t", "选择题"]);
+    let pane = sb.pane(&w);
+    sb.set_screen(&w, &pane, " ☐ 测试选择\n测试选 A 还是 B？\n❯ 1. A\n  2. B\nEnter to select · ↑/↓ to navigate · Esc to cancel");
+    sb.hook(
+        &w,
+        &pane,
+        r#"{"hook_event_name":"PreToolUse","session_id":"c1","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"测试选 A 还是 B？","multiSelect":false,"options":[{"label":"A"},{"label":"B"}]}]}}"#,
+    );
+    let g = sb.aca(&["new", "fcx", &sb.proj(), "-t", "信任框"]);
+    let gpane = sb.pane(&g);
+    sb.set_screen(
+        &g,
+        &gpane,
+        "Folder access\n  /p/api\n  Trust this folder? Codex can read, edit, and run files here.\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit",
+    );
+    // The session the list's environment names can't answer them itself
+    let o = sb.as_session(&other, &["answer", &w, "2"], "");
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("不是你派出的会话"));
+
+    let ui = Ui::open(&sb, &format!("ACA_SESSION_ID={other}"));
+    ui.pick("选择题");
+    ui.keys(&["s"]);
+    assert!(sb.until(|| ui.screen().contains("1–2 选")), "{}", ui.screen());
+    let shown = ui.screen();
+    assert!(shown.contains("回答 · 选择题") && shown.contains("测试选 A 还是 B？") && shown.contains("2 B"), "{shown}");
+    ui.keys(&["2"]);
+    // The fake agent doesn't read keys: the terminal echoes the 2 on its screen
+    let echoed = || sb.tmux(&["capture-pane", "-p", "-t", &pane]).ends_with("Esc to cancel\n2");
+    assert!(ui.said_while("已回答「选择题」:2 B", echoed), "{}\n{}", sb.tmux(&["capture-pane", "-p", "-t", &pane]), ui.screen());
+    let answered = sb.aca(&["events", "-n", "100"]).lines().find(|l| l.contains("ask.answered")).unwrap().to_string();
+    assert!(answered.contains("\"by\":\"you\"") && answered.contains("\"answer\":\"2 B\""), "{answered}");
+
+    // The gate the list read off its screen is the one answering reads: one down, then Enter (echoed as ^[[B)
+    ui.pick("信任框");
+    ui.keys(&["s"]);
+    assert!(sb.until(|| ui.screen().contains("2 Quit")), "{}", ui.screen());
+    ui.keys(&["2"]);
+    let screen = sb.wait_screen(&gpane, "^[[B");
+    assert!(screen.contains("esc quit\n^[[B"), "{screen}");
+    assert!(sb.until(|| sb.aca(&["events", "-n", "100"]).contains("\"kind\":\"gate\"")), "{}", ui.screen());
+}
+
+/// A window opened inside a session with a built-in agent in it (an agent team's teammate): `s` on that window's row types
+/// into the window's own pane, not the session's. Both write down every line they get: the session's pane runs the same
+/// line reader as above, the window a compiled program called claude (the name is what makes it a built-in agent, see
+/// `foreign_claude`)
+#[test]
+fn a_reply_to_a_window_goes_into_that_pane_and_not_the_sessions_own() {
+    let Some(sb) = Sandbox::new("reply-win") else { return };
+    let (main, win) = (sb.home.join("main.txt"), sb.home.join("win.txt"));
+    let bin = sb.home.join("bin/claude");
+    let src = sb.home.join("bin/rd.rs");
+    write(
+        &src,
+        "use std::io::{BufRead, Write};\nfn main() {\n    let path = std::env::args().nth(1).unwrap();\n    for l in std::io::stdin().lock().lines() {\n        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();\n        writeln!(f, \"{}\", l.unwrap()).unwrap();\n    }\n}\n",
+    );
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    if !Command::new(rustc).arg("-o").arg(&bin).arg(&src).status().is_ok_and(|s| s.success()) {
+        eprintln!("编不出假的 claude,跳过");
+        return;
+    }
+    write(
+        &sb.home.join("rd.sh"),
+        &format!("#!/bin/sh\necho ready\nwhile IFS= read -r l; do printf '%s\\n' \"$l\" >> '{}'; done\n", main.display()),
+    );
+    let cfg = sb.home.join("config/config.toml");
+    let text = std::fs::read_to_string(&cfg).unwrap()
+        + &format!("[tools.rd]\nkind = \"claude\"\ncmd = [\"/bin/sh\", \"{}\"]\n", sb.home.join("rd.sh").display());
+    write(&cfg, &text);
+    let id = sb.aca(&["new", "rd", &sb.proj(), "-t", "主会话"]);
+    let pane = sb.pane(&id);
+    sb.wait_screen(&pane, "ready");
+    let session = sb.tmux(&["display-message", "-p", "-t", &pane, "#{session_id}"]);
+    let wpane = sb.tmux(&[
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        &format!("{session}:"),
+        &format!("'{}' '{}'", bin.display(), win.display()),
+    ]);
+    assert!(wpane.starts_with('%'), "{wpane}");
+    let ui = Ui::open(&sb, "");
+    assert!(sb.until(|| ui.screen().lines().any(|l| l.contains("└ ○ #") && l.contains("claude"))), "{}", ui.screen());
+    ui.pick("主会话");
+    ui.keys(&["Down", "s", "text:进第二格", "Enter"]);
+    let got = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    // The window's title comes from the command tmux names for its pane, which on a busy machine is now and then some other
+    // process's (kernel_task, seen): only that it was sent is checked here, where it went is checked by what each pane got
+    assert!(ui.said_while("已发给「", || got(&win) == "进第二格\n"), "窗口收到的:{:?}\n{}", got(&win), ui.screen());
+    assert_eq!(got(&main), "", "主窗格不该收到");
+}
+
+fn router_tool(sb: &Sandbox, router: &str, tool: &str, args: Value) -> String {
+    let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":format!("aca-router__{tool}"),"arguments":args}});
+    let out = sb.as_session(router, &["plugin", "tools"], &format!("{req}\n"));
+    assert!(out.status.success(), "{out:?}");
+    let reply = serde_json::from_slice::<Value>(&out.stdout).unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    reply["result"]["content"][0]["text"].as_str().unwrap().trim_end_matches('\n').into()
+}
+
+fn leave_draft(sb: &Sandbox, id: &str) {
+    let pane = sb.pane(id);
+    sb.tmux(&["set-buffer", "-b", "draft", "我的草稿"]);
+    sb.tmux(&["paste-buffer", "-p", "-d", "-b", "draft", "-t", &pane]);
+    assert!(sb.wait_screen(&pane, "❯ 我的草稿").contains("❯ 我的草稿"));
+}
+
+fn bell_worker(sb: &Sandbox) -> String {
+    write(&sb.home.join("follow-bell"), "");
+    add_config(sb, &format!("[tools.mail]\nkind='claude'\ncmd=['python3',{:?}]\n", sb.home.join("router.py")));
+    sb.aca(&["new", "mail", &sb.proj(), "-g", "project", "-t", "worker", "--hold"])
+}
+
+fn session_events(sb: &Sandbox, id: &str, name: &str) -> Vec<Value> {
+    sb.aca(&["events", "-n", "100"])
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|e| e["session"] == id && e["event"] == name)
+        .collect()
+}
+
+fn delivery_methods(sb: &Sandbox, id: &str) -> Vec<Value> {
+    session_events(sb, id, "message.delivered").into_iter().map(|e| e["how"].clone()).collect()
+}
+
+#[test]
+fn connected_claude_rings_the_bell_when_pasting_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(sb) = Sandbox::new("paste-error") else { return };
+    let w = bell_worker(&sb);
+    sb.aca(&["start", &w]);
+    assert!(sb.wait_screen(&sb.pane(&w), "ready").contains("ready"));
+    let bin = sb.home.join("bin");
+    let shim = bin.join("tmux");
+    write(
+        &shim,
+        r#"#!/bin/sh
+if [ "$3" = paste-buffer ]; then
+    touch "$ACA_HOME/paste-failed"
+    echo "injected paste failure" >&2
+    exit 1
+fi
+PATH="$TEST_TMUX_PATH" exec tmux "$@"
+"#,
+    );
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var("PATH").unwrap();
+    let mut cmd = sb.cmd();
+    cmd.env("PATH", format!("{}:{path}", bin.display())).env("TEST_TMUX_PATH", path);
+    let out = cmd.args(["msg", &w, "可以"]).output().unwrap();
+    assert!(sb.home.join("paste-failed").exists());
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("已按门铃"));
+    assert!(sb.until(|| std::fs::read_to_string(sb.home.join("bell-submit")).is_ok_and(|s| s.contains("「可以」"))));
+    assert_eq!(delivery_methods(&sb, &w), ["bell"]);
+}
+
+#[test]
+fn connected_claude_types_when_idle_and_rings_while_busy_or_with_a_draft() {
+    let Some(sb) = Sandbox::new("type-or-bell") else { return };
+    let w = bell_worker(&sb);
+    sb.aca(&["start", &w]);
+    let pane = sb.pane(&w);
+    assert!(sb.wait_screen(&pane, "ready").contains("ready"));
+    let bell = sb.home.join(format!("state/inbox/{w}.bell"));
+    let before = std::fs::read(&bell).unwrap();
+    let send = || sb.aca(&["msg", &w, "可以"]);
+    let submits = || session_events(&sb, &w, "turn.started");
+    assert!(send().contains("已输入并发送"));
+    assert!(sb.until(|| submits().iter().any(|e| e["prompt"] == "可以")));
+    assert_eq!(delivery_methods(&sb, &w), ["type"]);
+    assert_eq!(std::fs::read(bell).unwrap(), before);
+
+    assert!(send().contains("已按门铃"));
+    assert!(sb.until(|| submits().len() == 2));
+    sb.hook(&w, &pane, r#"{"hook_event_name":"Stop","last_assistant_message":"完成"}"#);
+    leave_draft(&sb, &w);
+    assert!(send().contains("已按门铃"));
+    assert!(sb.until(|| submits().len() == 3));
+    assert!(submits()[1..].iter().all(|e| e["prompt"].as_str().unwrap().starts_with("<task-notification>")));
+    assert_eq!(delivery_methods(&sb, &w), ["type", "bell", "bell"]);
+    assert!(sb.tmux(&["capture-pane", "-p", "-t", &pane]).contains("❯ 我的草稿"));
+    // Submit the draft still in the fake's input buffer, checking its actual contents.
+    sb.tmux(&["send-keys", "-t", &pane, "Enter"]);
+    assert!(sb.until(|| submits().last().is_some_and(|e| e["prompt"] == "我的草稿")));
+    assert_eq!(std::fs::read_to_string(sb.home.join(format!("got-{w}"))).unwrap(), "可以\n我的草稿\n");
+
+    sb.hook(&w, &pane, r#"{"hook_event_name":"Stop","last_assistant_message":"好"}"#);
+    let long = format!("  第一行\n{}  ", "字".repeat(4100));
+    sb.aca(&["msg", &w, &long]);
+    assert!(sb.until(|| std::fs::read_to_string(sb.home.join(format!("got-{w}"))).is_ok_and(|s| s.ends_with(&format!("{long}\n")))));
+}
+
+#[test]
+fn connected_claude_leaves_peer_mail_in_a_mixed_batch_until_stop() {
+    let Some(sb) = Sandbox::new("mixed-bell") else { return };
+    let w = bell_worker(&sb);
+    let peer = sb.aca(&["new", "fake", &sb.proj(), "--hold"]);
+    assert!(sb.as_session(&peer, &["msg", &w, "同事写的"], "").status.success());
+    sb.aca(&["msg", &w, "可以"]);
+    sb.aca(&["start", &w]);
+    assert!(sb.wait_screen(&sb.pane(&w), "ready").contains("ready"));
+    let bell_path = sb.home.join(format!("state/inbox/{w}.bell"));
+    let before = std::fs::read(&bell_path).unwrap();
+    assert!(sb.until(|| session_events(&sb, &w, "turn.started").iter().any(|e| e["prompt"] == "可以")));
+    let mail = sb.json(&["inbox", &w, "--json"]);
+    assert_eq!(mail[0]["stage"], "pending");
+    assert_eq!(mail[1]["stage"], "got");
+    assert_eq!(delivery_methods(&sb, &w), ["type"]);
+    assert_eq!(std::fs::read(&bell_path).unwrap(), before);
+    sb.hook(&w, "", r#"{"hook_event_name":"Stop","last_assistant_message":"完成"}"#);
+    assert!(sb.until(|| sb.home.join("bell-submit").is_file()));
+    assert_eq!(session_events(&sb, &w, "turn.started").len(), 2);
+    let deliveries = session_events(&sb, &w, "message.delivered");
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!((&deliveries[0]["id"], &deliveries[1]["id"]), (&mail[1]["id"], &mail[0]["id"]));
+    assert_eq!(deliveries[1]["how"], "bell");
+    assert_ne!(std::fs::read(&bell_path).unwrap(), before);
+    let bell = std::fs::read_to_string(sb.home.join("bell-submit")).unwrap();
+    assert!(bell.contains("同事写的") && !bell.contains("可以"), "{bell}");
+    assert_eq!(std::fs::read_to_string(sb.home.join(format!("got-{w}"))).unwrap(), "可以\n");
+}
+
+#[test]
+fn connected_claude_receives_interface_replies_as_user_mail() {
+    let Some(sb) = Sandbox::new("ui-type-or-bell") else { return };
+    let w = bell_worker(&sb);
+    sb.aca(&["start", &w]);
+    let pane = sb.pane(&w);
+    assert!(sb.wait_screen(&pane, "ready").contains("ready"));
+    let ui = Ui::open(&sb, "");
+    ui.pick("worker");
+    ui.keys(&["s", "text:可以", "Enter"]);
+    assert!(sb.until(|| session_events(&sb, &w, "turn.started").iter().any(|e| e["prompt"] == "可以")));
+    assert_eq!(delivery_methods(&sb, &w), ["type"]);
+    ui.keys(&["s", "text:再说一句"]);
+    sb.tmux(&["select-pane", "-T", "⠋ Working", "-t", &pane]);
+    ui.keys(&["Enter"]);
+    assert!(sb.until(|| std::fs::read_to_string(sb.home.join("bell-submit")).is_ok_and(|s| s.contains("再说一句"))));
+    let mail = sb.json(&["inbox", &w, "--json"]);
+    assert!(mail.as_array().unwrap().iter().all(|m| m["from"] == "you" && m["kind"] == "msg" && m["at"] == 0 && m["what"] == ""));
+    assert_eq!(delivery_methods(&sb, &w), ["type", "bell"]);
+}
+
+#[test]
+fn connected_claude_router_types_channel_mail_and_only_its_first_quote_to_a_worker() {
+    use serde_json::json;
+    let Some(sb) = Sandbox::new("typed-dispatch") else { return };
+    let r = shift_fixture(&sb);
+    std::fs::remove_file(sb.home.join("manual-submit")).unwrap();
+    let w = bell_worker(&sb);
+    sb.aca(&["start", &w]);
+    assert!(sb.wait_screen(&sb.pane(&w), "ready").contains("ready"));
+    sb.aca(&["start", &r]);
+    assert!(sb.until(|| !session_events(&sb, &r, "turn.done").is_empty()));
+    let words = "可以，保留这句";
+    sb.aca(&["msg", &r, "--via", "Discord", words]);
+    assert!(sb.until(|| session_events(&sb, &r, "turn.started").iter().any(|e| e["prompt"] == words)));
+    let send = |text| router_tool(&sb, &r, "message", json!({"to": w, "text": text}));
+    send("请继续");
+    assert!(sb.until(|| !session_events(&sb, &w, "turn.started").is_empty()));
+    let typed = std::fs::read_to_string(sb.home.join(format!("got-{w}"))).unwrap();
+    assert!(typed.starts_with(&format!("[aca] 来自会话 {r}")) && typed.contains("用户对「dispatcher」说(Discord,"), "{typed}");
+    assert!(typed.ends_with(&format!("「{words}」\ndispatcher:请继续\n")), "{typed}");
+    // An idle recipient could accept another paste; this turn's second message still takes the bell.
+    sb.hook(&w, "", r#"{"hook_event_name":"Stop","last_assistant_message":"收到"}"#);
+    send("第二句");
+    assert!(sb.until(|| std::fs::read_to_string(sb.home.join("bell-submit")).is_ok_and(|s| s.contains("「第二句」"))));
+    let mail = sb.json(&["inbox", &w, "--json"]);
+    assert_eq!(mail[0]["quoted"], true);
+    assert!(mail[1].get("quoted").is_none());
+    assert_eq!(mail[1]["text"], "第二句");
+    assert_eq!(delivery_methods(&sb, &w), ["type", "bell"]);
+    assert_eq!(delivery_methods(&sb, &r), ["type"]);
+    assert_eq!(std::fs::read_to_string(sb.home.join(format!("got-{r}"))).unwrap(), format!("{words}\n"));
+    sb.hook(&r, "", r#"{"hook_event_name":"Stop","last_assistant_message":"已转交"}"#);
+    assert_eq!(session_events(&sb, &r, "turn.done").last().unwrap()["via"], "Discord");
+}
+
+#[test]
+fn a_router_dispatches_the_opening_users_words_through_all_four_tools() {
+    use serde_json::json;
+    let Some(sb) = Sandbox::new("router-words") else { return };
+    // This test drives each submit itself, including the first one after startup.
+    write(&sb.home.join("manual-submit"), "");
+    let dir = sb.proj();
+    sb.aca(&["group", "create", "p", &dir]);
+    let new = |title| sb.aca(&["new", "fake", &dir, "-g", "p", "-t", title, "--hold"]);
+    let (r, w) = (new("aps"), new("worker"));
+    sb.aca(&["group", "router", "p", &r]);
+    sb.aca(&["start", &r]);
+    sb.aca(&["plugin", "install", "aca.router"]);
+    let run = |tool, args| router_tool(&sb, &r, tool, args);
+    let last = || sb.json(&["inbox", &w, "--json"]).as_array().unwrap().last().unwrap()["text"].as_str().unwrap().to_string();
+    let prompt = |words| sb.hook(&r, "", &json!({"hook_event_name":"UserPromptSubmit","prompt":words}).to_string());
+    let words = "  可以,,你帮我决定吧\n ";
+    prompt(words);
+    run("ticket", json!({"title":"fix","criteria":"OK","to":w}));
+    assert!(last().contains(&format!("「{words}」\naps:任务 #1:fix")), "{}", last());
+    run("message", json!({"to":w,"text":" 再一句 "}));
+    assert_eq!(last(), " 再一句 ");
+    sb.aca(&["msg", "--via", "Discord", &r, words]);
+    assert_eq!(sb.as_session(&r, &["inbox", "take"], "").status.code(), Some(2));
+    run("give", json!({"ticket":1,"to":w,"say":"  follow  "}));
+    assert!(last().starts_with("用户对「aps」说(Discord,") && last().contains(&format!("「{words}」\naps:任务 #1:fix")), "{}", last());
+    write(&sb.home.join("agent.sh"), "#!/bin/sh\nprintf '%s' \"$@\" > \"$ACA_HOME/open-$ACA_SESSION_ID\"\nexec sleep 600\n");
+    let opened = run("start", json!({"title":"second","say":" go ","tool":"fake"}));
+    let id = opened.strip_prefix("#2 ").unwrap();
+    assert!(sb.until(|| {
+        std::fs::read_to_string(sb.home.join(format!("open-{id}")))
+            .is_ok_and(|s| s.contains("用户对「aps」说(Discord,") && s.contains(&format!("「{words}」\naps:任务 #2:second")))
+    }));
+    assert!(sb.as_session(&w, &["msg", &r, "worker words"], "").status.success());
+    assert_eq!(sb.as_session(&r, &["inbox", "take"], "").status.code(), Some(2));
+    run("message", json!({"to":w,"text":"  follow  "}));
+    assert_eq!(last(), "  follow  ");
+    prompt("再问一次");
+    let text = "路".repeat(4000);
+    run("message", json!({"to":w,"text":text}));
+    assert!(last().ends_with(&format!("「再问一次」\naps:{text}")));
+}
+
+#[test]
+fn doorbell_words_reach_four_distinct_router_tool_recipients() {
+    let Some(sb) = Sandbox::new("bell-dispatch") else { return };
+    let r = shift_fixture(&sb);
+    std::fs::remove_file(sb.home.join("manual-submit")).unwrap();
+    write(&sb.home.join("follow-bell"), "");
+    let new = |name| sb.aca(&["new", "fake", &sb.proj(), "-g", "project", "-t", name, "--hold"]);
+    let (a, b, c) = (new("message"), new("ticket"), new("give"));
+    sb.aca(&["start", &r]);
+    assert!(sb.until(|| sb.home.join("watching").exists() && sb.event_names().iter().any(|e| e == "turn.done")));
+    leave_draft(&sb, &r);
+    let words = "可以,你帮我决定吧\n保留这句 `原话`。";
+    sb.aca(&["msg", "--via", "Discord", &r, words]);
+    assert!(sb.until(|| std::fs::read_to_string(sb.home.join("bell-submit")).is_ok_and(|s| s.contains("<task-notification>"))));
+    for text in four_tool_deliveries(&sb, &r, [a, b, c]) {
+        assert!(text.starts_with("用户对「dispatcher」说(Discord,") && text.contains(&format!("):\n「{words}」\ndispatcher:")), "{text}");
+    }
+}
+
+#[test]
+fn wrapped_user_words_reach_all_four_router_tools_without_paste_tags() {
+    let Some(sb) = Sandbox::new("paste-dispatch") else { return };
+    let r = shift_fixture(&sb);
+    std::fs::remove_file(sb.home.join("manual-submit")).unwrap();
+    write(&sb.home.join("wrap-pastes"), "");
+    sb.aca(&["start", &r]);
+    assert!(sb.until(|| sb.event_names().iter().any(|e| e == "turn.done")));
+    let words = format!("  用户原话\n「{}」\n`保留空白`  ", "好".repeat(1100));
+    sb.aca(&["send", &r, "-m", &words]);
+    assert!(sb.until(|| {
+        sb.aca(&["events", "-n", "20"]).lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).any(|e| {
+            e["event"] == "turn.started"
+                && e["session"] == r
+                && e["prompt"].as_str().is_some_and(|p| p.starts_with("\n\n<pasted_content id=\"") && p.contains(">\n  用户原话\n"))
+        })
+    }));
+    let recipients = ["message", "ticket", "give"].map(|name| sb.aca(&["new", "fake", &sb.proj(), "-g", "project", "-t", name, "--hold"]));
+    for text in four_tool_deliveries(&sb, &r, recipients) {
+        assert!(text.starts_with("用户对「dispatcher」说(界面,"), "{text}");
+        assert!(text.contains(&format!("):\n「{words}」\ndispatcher:")), "{text}");
+        assert!(!text.contains("pasted_content"), "{text}");
+    }
+}
+
+fn four_tool_deliveries(sb: &Sandbox, router: &str, [a, b, c]: [String; 3]) -> [String; 4] {
+    use serde_json::json;
+    let tool = |name, args| router_tool(sb, router, name, args);
+    let mail = |id| sb.json(&["inbox", id, "--json"])[0]["text"].as_str().unwrap().to_owned();
+    tool("message", json!({"to":a,"text":"去看"}));
+    tool("ticket", json!({"title":"two","criteria":"ok","to":b}));
+    tool("ticket", json!({"title":"three","criteria":"ok"}));
+    tool("give", json!({"ticket":2,"to":c}));
+    write(
+        &sb.home.join("agent.sh"),
+        "#!/bin/sh\nfor arg do last=$arg; done\nprintf %s \"$last\" > \"$ACA_HOME/worker-opening\"\nexec sleep 600\n",
+    );
+    tool("start", json!({"title":"four","say":"接手","tool":"fake"}));
+    let opening = sb.home.join("worker-opening");
+    assert!(sb.until(|| opening.exists()));
+    [mail(&a), mail(&b), mail(&c), std::fs::read_to_string(opening).unwrap()]
+}
+
+#[test]
+fn unwatched_results_reach_the_router_thread_without_ringing_until_work_needs_assignment() {
+    let Some(sb) = Sandbox::new("router-results") else { return };
+    let dir = sb.proj();
+    sb.aca(&["group", "create", "p", &dir]);
+    let r = sb.aca(&["new", "fake", &dir, "-g", "p", "-t", "dispatcher", "--hold"]);
+    let w = sb.aca(&["new", "fake", &dir, "-g", "p", "-t", "worker", "--parent", "-"]);
+    sb.aca(&["group", "router", "p", &r]);
+    sb.aca(&["start", &r]);
+    let result = |args: &[&str]| assert!(sb.as_session(&w, args, "").status.success());
+    let give = |title| assert!(sb.as_session(&r, &["task", "add", "-t", title, "--to", &w], "").status.success());
+    let inbox = || sb.json(&["inbox", &r, "--json"]);
+    let view = || sb.aca(&["ui", "--snapshot", "150x34", "hj"]);
+    let bell = sb.home.join(format!("state/inbox/{r}.bell"));
+    assert!(sb.as_session(&r, &["inbox", "watch"], "{}").status.success());
+    let baseline = std::fs::read(&bell).unwrap();
+    give("first");
+    sb.hook(&w, "", r#"{"hook_event_name":"Stop","last_assistant_message":"第一轮结果\n第二行省略"}"#);
+    let screen = view();
+    assert!(screen.contains("第一轮结果") && !screen.contains("第二行省略"), "{screen}");
+    assert_eq!(inbox(), serde_json::json!([]));
+    result(&["task", "done", "1", "验证通过"]);
+    let screen = view();
+    assert_eq!(screen.matches("验证通过").count(), 1, "{screen}");
+    assert_eq!(inbox(), serde_json::json!([]));
+    assert_eq!(std::fs::read(&bell).unwrap(), baseline);
+    give("second");
+    assert!(sb.as_session(&r, &["task", "add", "-t", "queued"], "").status.success());
+    result(&["task", "done", "2", "可以继续"]);
+    let messages = inbox();
+    assert_eq!(messages.as_array().unwrap().len(), 1);
+    assert_eq!(messages[0]["text"], "#2 完成:second\n可以继续");
+    assert_eq!(messages[0]["wake"], true);
+    let screen = view();
+    assert_eq!(screen.matches("#2 完成").count(), 1, "{screen}");
+}
+
+#[test]
+fn new_requires_a_ticket_for_each_watch_flag_before_creating_the_session() {
+    let Some(sb) = Sandbox::new("new-watch") else { return };
+    let proj = sb.proj();
+    for flag in ["--watch", "--no-watch"] {
+        for (lang, message) in [("zh", "要和 --task 一起用"), ("en", "goes with --task")] {
+            let o = sb.cmd().env("ACA_LANG", lang).args(["new", "fake", &proj, "--hold", flag]).output().unwrap();
+            assert!(!o.status.success() && o.stdout.is_empty(), "{o:?}");
+            assert!(String::from_utf8_lossy(&o.stderr).contains(&format!("{flag} {message}")), "{o:?}");
+            assert_eq!(sb.json(&["ls", "--json"]), serde_json::json!([]));
+        }
+    }
+    sb.aca(&["group", "create", "p", &proj]);
+    for (n, flag, watch) in [("1", "--watch", true), ("2", "--no-watch", false)] {
+        let before = if watch { "--no-watch" } else { "--watch" };
+        sb.aca(&["task", "add", "-g", "p", "-t", "test", before]);
+        let id = sb.aca(&["new", "fake", &proj, "--hold", "--task", n, flag]);
+        let ticket = sb.json(&["task", "show", n, "--json"]);
+        assert_eq!(ticket["watch"], watch);
+        assert_eq!(ticket["session"], id);
+    }
+}
+
+#[test]
+fn watch_tools_ring_on_each_turn_until_the_pair_hits_the_brake() {
+    use serde_json::json;
+    let Some(sb) = Sandbox::new("router-watch") else { return };
+    let dir = sb.proj();
+    sb.aca(&["group", "create", "p", &dir]);
+    let r = sb.aca(&["new", "fake", &dir, "-t", "dispatcher", "-g", "p", "--hold"]);
+    let w = sb.aca(&["new", "fake", &dir, "-t", "worker", "-g", "p", "--parent", "-"]);
+    sb.aca(&["group", "router", "p", &r]);
+    sb.aca(&["start", &r]);
+    let run = |name, args| router_tool(&sb, &r, name, args);
+    let watched = |n| sb.json(&["task", "show", n, "--json"])["watch"] == true;
+    assert_eq!(run("ticket", json!({"title":"first","criteria":"ok","to":w,"watch":true})), "#1");
+    assert!(watched("1") && run("tickets", json!({})).contains("盯着"));
+    assert!(sb.aca(&["task", "show", "1"]).contains("盯着"));
+    assert!(sb.aca(&["ui", "--snapshot", "150x34", "hjl"]).contains("盯着"));
+    // Restart to read the ticket from the registry in the opening handoff.
+    write(
+        &sb.home.join("agent.sh"),
+        "#!/bin/sh\nif [ -n \"$ACA_ROUTER_SHIFT\" ]; then exec python3 \"$ACA_HOME/router.py\" \"$@\"; fi\nprintf '%s' \"$@\" > \"$ACA_HOME/open-$ACA_SESSION_ID\"\nexec sleep 600\n",
+    );
+    sb.aca(&["stop", &r]);
+    sb.aca(&["start", &r]);
+    assert!(sb.until(|| std::fs::read_to_string(sb.home.join(format!("open-{r}"))).is_ok_and(|s| s.contains("盯着"))));
+    assert!(sb.as_session(&r, &["inbox", "watch"], "{}").status.success());
+    let bell = || std::fs::read(sb.home.join(format!("state/inbox/{r}.bell"))).unwrap();
+    let stop = |i| {
+        sb.hook(&w, "", &json!({"hook_event_name":"UserPromptSubmit","prompt":"check"}).to_string());
+        sb.hook(&w, "", &json!({"hook_event_name":"Stop","last_assistant_message":format!("result {i}")}).to_string());
+    };
+    for i in 1..=20 {
+        if i == 2 {
+            run("message", json!({"to":w,"text":"接着看"}));
+        }
+        let before = bell();
+        stop(i);
+        assert!(sb.until(|| bell() != before), "turn {i} did not ring");
+        let take = sb.as_session(&r, &["inbox", "take"], "");
+        assert_eq!(take.status.code(), Some(2));
+        let msg = String::from_utf8(take.stderr).unwrap();
+        assert!(msg.contains("#1") && msg.contains(&format!("result {i}")) && msg.contains(&format!("look {w}")), "{msg}");
+    }
+    let before = bell();
+    stop(21);
+    let messages = sb.json(&["inbox", &r, "-n", "30", "--json"]);
+    assert_eq!(messages.as_array().unwrap().len(), 21);
+    assert_eq!(messages[20]["wake"], false);
+    assert!(messages[20]["text"].as_str().unwrap().contains("result 21"));
+    assert_eq!(sb.as_session(&r, &["inbox", "take"], "").status.code(), Some(0));
+    assert_eq!(bell(), before);
+    assert_eq!(sb.event_names().iter().filter(|x| *x == "message.throttled").count(), 1);
+
+    run("set", json!({"ticket":1,"watch":false}));
+    assert!(!watched("1") && !run("tickets", json!({})).contains("盯着"));
+    run("give", json!({"ticket":1,"to":"-","watch":true}));
+    assert!(watched("1"));
+    run("give", json!({"ticket":1,"to":w}));
+    assert!(watched("1"));
+    run("give", json!({"ticket":1,"to":w,"watch":false}));
+    assert!(!watched("1"));
+    assert!(!sb.as_session(&w, &["task", "set", "1", "--watch"], "").status.success());
+    assert!(!sb.run(&["task", "set", "1", "--watch", "--no-watch"]).status.success());
+
+    write(&sb.home.join("agent.sh"), "#!/bin/sh\n\"$ACA_BIN\" task ls --json > \"$ACA_HOME/at-start-$ACA_SESSION_ID\"\nexec sleep 600\n");
+    for (n, args) in [
+        ("2", json!({"title":"new","say":"do it","tool":"fake","watch":true})),
+        ("1", json!({"ticket":1,"title":"assigned","say":"go","tool":"fake","watch":true})),
+    ] {
+        let reply = run("start", args);
+        let id = reply.split_whitespace().nth(1).unwrap();
+        assert!(watched(n));
+        assert!(sb.until(|| {
+            std::fs::read(sb.home.join(format!("at-start-{id}")))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok())
+                .is_some_and(|ts| ts.iter().any(|t| t["session"] == id && t["watch"] == true))
+        }));
+    }
+    let old = sb.json(&["task", "show", "1", "--json"]);
+    add_config(&sb, "[tools.broken]\nkind='claude'\ncmd=['missing-aca-watch-test-executable']\n");
+    assert!(!sb.as_session(&r, &["new", "broken", &dir, "--task", "1", "--no-watch"], "").status.success());
+    assert_eq!(sb.json(&["task", "show", "1", "--json"]), old);
+}
+
+#[test]
+#[ignore = "set ACA_V5_BIN to an installed schema-5 aca binary"]
+fn an_installed_v5_binary_reads_and_updates_a_v6_registry() {
+    let Some(sb) = Sandbox::new("router-v5") else { return };
+    let binary = std::env::var_os("ACA_V5_BIN").expect("ACA_V5_BIN");
+    let old = |args: &[&str]| {
+        let mut c = Command::new(&binary);
+        let out = scrub(&mut c).env("ACA_HOME", &sb.home).env("ACA_TMUX_SOCKET", &sb.socket).args(args).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let version = || {
+        let db = rusqlite::Connection::open(sb.home.join("data/aca.db")).unwrap();
+        db.query_row("pragma user_version", [], |r| r.get::<_, i64>(0)).unwrap()
+    };
+    println!("{}", old(&["version"]));
+    old(&["group", "create", "p", &sb.proj()]);
+    assert_eq!(old(&["task", "add", "-g", "p", "-t", "old"]), "#1");
+    assert_eq!(version(), 5);
+    assert_eq!(sb.json(&["task", "show", "1", "--json"])["watch"], false);
+    assert_eq!(version(), 6);
+    sb.aca(&["task", "set", "1", "--watch"]);
+    assert!(old(&["task", "ls"]).contains("old"));
+    old(&["task", "set", "1", "--note", "old writer"]);
+    assert_eq!(old(&["task", "add", "-g", "p", "-t", "second"]), "#2");
+    let ticket = sb.json(&["task", "show", "1", "--json"]);
+    assert_eq!(ticket["note"], "old writer");
+    assert_eq!(ticket["watch"], true);
+    assert_eq!(sb.json(&["task", "show", "2", "--json"])["watch"], false);
+    assert_eq!(version(), 6);
+    println!("v5 -> v6: existing ticket defaults off; old writer preserved watch and added an unwatched ticket");
+}
+
+fn shift_fixture(sb: &Sandbox) -> String {
+    write(&sb.home.join("manual-submit"), "");
+    add_config(sb, &format!("[tools.shift]\nkind='claude'\nprogram_status=false\ncmd=['python3',{:?}]\n", sb.home.join("router.py")));
+    let id = sb.aca(&["new", "shift", &sb.proj(), "-g", "project", "-t", "dispatcher", "--hold"]);
+    sb.aca(&["group", "router", "project", &id]);
+    id
+}
+
+fn shift_prompt(sb: &Sandbox, conv: &str) -> String {
+    let path = sb.home.join(format!("open-{conv}"));
+    assert!(sb.until(|| std::fs::read_to_string(&path).is_ok_and(|s| s.starts_with("[aca] "))));
+    std::fs::read_to_string(path).unwrap()
+}
+
+#[test]
+fn a_router_submits_the_literal_handoff_after_its_own_tools_list_or_timeout() {
+    check_handoff_submit("handoff-list", false);
+}
+
+#[test]
+fn a_wrapped_router_handoff_is_delivered_once_after_tools_list_or_timeout() {
+    check_handoff_submit("wrapped-list", true);
+}
+
+fn check_handoff_submit(sandbox: &str, wrapped: bool) {
+    use std::time::{Duration, Instant};
+    let Some(sb) = Sandbox::new(sandbox) else { return };
+    let id = shift_fixture(&sb);
+    std::fs::remove_file(sb.home.join("manual-submit")).unwrap();
+    if wrapped {
+        write(&sb.home.join("wrap-pastes"), "");
+    }
+    write(&sb.home.join("delay-list"), "");
+    let words = format!("「保留原话」\n`echo literal`\n{};  ", "行".repeat(7000));
+    let log = sb.home.join("state/plugin-logs/aca.router.log");
+    let mut previous = String::new();
+    for timeout in [false, true] {
+        if timeout {
+            sb.aca(&["stop", &id]);
+            write(&sb.home.join("skip-list"), "");
+        }
+        let start = Instant::now();
+        let mut sender = sb.cmd().args(["msg", &id, &words]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        if timeout {
+            assert!(sb.until(|| std::fs::read_to_string(sb.home.join("starts")).is_ok_and(|s| s.lines().count() == 2)));
+            // A delayed tools/list from the previous shift cannot release this opening.
+            let mut late = sb
+                .cmd()
+                .env("ACA_SESSION_ID", &id)
+                .env("ACA_ROUTER_SHIFT", &previous)
+                .args(["plugin", "tools"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            late.stdin.take().unwrap().write_all(b"{\"id\":1,\"method\":\"tools/list\"}\n").unwrap();
+            assert!(String::from_utf8(late.wait_with_output().unwrap().stdout).unwrap().contains("aca-router__tickets"));
+        }
+        assert!(sender.wait().unwrap().success());
+        let conv = sb.json(&["show", &id, "--json"])["conv"].as_str().unwrap().to_owned();
+        let opening = shift_prompt(&sb, &conv);
+        assert!(opening.ends_with(&words));
+        let argv = std::fs::read_to_string(sb.home.join(format!("args-{id}"))).unwrap();
+        assert!(!argv.contains("[aca]") && !argv.contains("保留原话"), "{argv}");
+        let stamp = |name| std::fs::read_to_string(sb.home.join(format!("{name}-{conv}"))).map(|s| s.parse::<u64>().unwrap());
+        if timeout {
+            assert!(stamp("listed").is_err() && start.elapsed() >= Duration::from_secs(15));
+        } else {
+            assert!(stamp("listed").unwrap() <= stamp("received").unwrap() && start.elapsed() >= Duration::from_secs(2));
+        }
+        let kind = if timeout { "timeout" } else { "ready" };
+        assert!(std::fs::read_to_string(&log).unwrap().contains(&format!("{conv} tools/list {kind} after ")));
+        let mail = sb.json(&["inbox", &id, "--json"]);
+        let message = mail.as_array().unwrap().last().unwrap()["id"].clone();
+        let delivered = || {
+            sb.aca(&["events", "-n", "100"])
+                .lines()
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .filter(|e| e["event"] == "message.delivered" && e["id"] == message)
+                .map(|e| e["how"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(sb.until(|| delivered() == ["handoff"]));
+        let prefix = if wrapped { "\n\n<pasted_content id=\"" } else { "[aca] " };
+        assert!(sb.until(|| {
+            sb.aca(&["events", "-n", "100"])
+                .lines()
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .filter(|e| e["event"] == "turn.started" && e["session"] == id && e["prompt"].as_str().is_some_and(|p| p.starts_with(prefix)))
+                .count() == 1 + usize::from(timeout)
+        }));
+        assert_eq!(sb.as_session(&id, &["inbox", "take"], "").status.code(), Some(0));
+        assert_eq!(delivered(), ["handoff"]);
+        previous = conv;
+    }
+}
+
+#[test]
+fn three_wrapped_router_shifts_deliver_each_letter_once_without_echoing_the_handoff() {
+    let Some(sb) = Sandbox::new("three-pastes") else { return };
+    let router = shift_fixture(&sb);
+    std::fs::remove_file(sb.home.join("manual-submit")).unwrap();
+    write(&sb.home.join("wrap-pastes"), "");
+    write(&sb.home.join("follow-bell"), "");
+    let padding = "长".repeat(1050);
+    let mail = [
+        format!("第一封来信\n{padding}"),
+        format!("第二封来信\n{padding}"),
+        format!("第三封来信\n{padding}\n<pasted_content id=\"abcd\">原样</pasted_content id=\"abcd\">\n"),
+    ];
+    let mut shifts = std::collections::HashSet::new();
+    for (i, letter) in mail.iter().enumerate() {
+        if i != 0 {
+            sb.aca(&["stop", &router]);
+        }
+        sb.aca(&["msg", &router, letter]);
+        let conv = sb.json(&["show", &router, "--json"])["conv"].as_str().unwrap().to_owned();
+        assert!(shifts.insert(conv.clone()));
+        let opening = shift_prompt(&sb, &conv);
+        assert!(opening.ends_with(letter));
+        if i == 1 {
+            assert!(opening.contains("第一封来信") && !opening.contains("pasted_content"), "{opening}");
+        }
+        assert!(sb.until(|| sb.event_names().iter().filter(|name| *name == "turn.done").count() == i + 1));
+        let submitted = std::fs::read_to_string(sb.home.join(format!("submit-{conv}"))).unwrap();
+        let head = submitted.strip_prefix("\n\n<pasted_content id=\"").unwrap();
+        let (id, _) = head.split_once("\">\n").unwrap();
+        assert!(id.len() == 4 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        let escaped = opening.replace("<pasted_content", r"<\pasted_content").replace("</pasted_content", r"<\/pasted_content");
+        let separator = if opening.ends_with('\n') { "" } else { "\n" };
+        assert_eq!(submitted, format!("\n\n<pasted_content id=\"{id}\">\n{escaped}{separator}</pasted_content id=\"{id}\">\n"));
+
+        assert_eq!(sb.as_session(&router, &["inbox", "take"], "").status.code(), Some(0));
+        let inbox = sb.json(&["inbox", &router, "--json"]);
+        let message = &inbox.as_array().unwrap().iter().find(|m| &m["text"] == letter).unwrap()["id"];
+        let delivered: Vec<_> = sb
+            .aca(&["events", "-n", "100"])
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|e| e["event"] == "message.delivered" && e["id"] == *message)
+            .map(|e| e["how"].clone())
+            .collect();
+        assert_eq!(delivered, ["handoff"]);
+    }
+}
+
+#[test]
+fn only_the_doorbell_submit_consumes_the_taken_channel() {
+    use serde_json::json;
+    let Some(sb) = Sandbox::new("bell-channel") else { return };
+    let r = shift_fixture(&sb);
+    std::fs::remove_file(sb.home.join("manual-submit")).unwrap();
+    sb.aca(&["start", &r]);
+    assert!(sb.until(|| sb.event_names().iter().any(|e| e == "turn.done")));
+    leave_draft(&sb, &r);
+    sb.aca(&["msg", "--via", "Discord", &r, "原话"]);
+    assert_eq!(sb.as_session(&r, &["inbox", "take"], "").status.code(), Some(2));
+    for prompt in [
+        "用户输入",
+        "<task-notification><summary>another task</summary></task-notification>",
+        "<task-notification><summary>aca: 收件箱有新消息</summary></task-notification>",
+    ] {
+        sb.hook(&r, "", &json!({"hook_event_name":"UserPromptSubmit","prompt":prompt}).to_string());
+    }
+    sb.hook(&r, "", r#"{"hook_event_name":"Stop","last_assistant_message":"channel reply"}"#);
+    assert!(
+        sb.aca(&["events", "-n", "30"])
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .any(|e| e["event"] == "turn.done" && e["session"] == r && e["last"] == "channel reply" && e["via"] == "Discord")
+    );
+}
+
+#[test]
+fn an_unmatched_handoff_leaves_its_mail_for_the_doorbell() {
+    let Some(sb) = Sandbox::new("wrong-handoff") else { return };
+    let id = shift_fixture(&sb);
+    sb.aca(&["msg", &id, "original"]);
+    let conv = sb.json(&["show", &id, "--json"])["conv"].as_str().unwrap().to_owned();
+    let opening = shift_prompt(&sb, &conv);
+    assert!(opening.ends_with("\noriginal"));
+    assert!(sb.as_session(&id, &["inbox", "watch"], "{}").status.success());
+    let bell = sb.home.join(format!("state/inbox/{id}.bell"));
+    let before = std::fs::read(&bell).unwrap();
+    sb.hook(&id, "", r#"{"hook_event_name":"UserPromptSubmit","prompt":"a different opening"}"#);
+    assert_eq!(sb.json(&["inbox", &id, "--json"])[0]["stage"], "pending");
+    leave_draft(&sb, &id);
+    sb.hook(&id, "", r#"{"hook_event_name":"Stop","last_assistant_message":"好"}"#);
+    assert!(sb.until(|| std::fs::read(&bell).unwrap() != before));
+    let taken = sb.as_session(&id, &["inbox", "take"], "");
+    assert_eq!(taken.status.code(), Some(2));
+    assert!(String::from_utf8(taken.stderr).unwrap().contains("「original」"));
+    let deliveries: Vec<_> = sb
+        .aca(&["events", "-n", "50"])
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|e| e["event"] == "message.delivered")
+        .map(|e| e["how"].clone())
+        .collect();
+    assert_eq!(deliveries, ["bell"]);
+}
+
+#[test]
+fn a_router_with_gateway_tools_waits_for_its_input_box() {
+    let Some(sb) = Sandbox::new("handoff-gateway") else { return };
+    let id = shift_fixture(&sb);
+    sb.aca(&["plugin", "install", "aca.gateway"]);
+    write(&sb.home.join("hold-screen"), "");
+    let mut start = sb.cmd().args(["start", &id]).stdout(std::process::Stdio::null()).spawn().unwrap();
+    let log = sb.home.join("state/plugin-logs/aca.router.log");
+    assert!(sb.until(|| std::fs::read_to_string(&log).is_ok_and(|s| s.contains("tools/list ready after "))));
+    let mut late = sb.cmd().args(["msg", &id, "after empty opening"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+    assert!(sb.until(|| sb.json(&["inbox", &id, "--json"]).as_array().is_some_and(|m| m.len() == 1)));
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert!(start.try_wait().unwrap().is_none() && late.try_wait().unwrap().is_none());
+    std::fs::remove_file(sb.home.join("hold-screen")).unwrap();
+    assert!(start.wait().unwrap().success() && late.wait().unwrap().success());
+    assert!(shift_prompt(&sb, sb.json(&["show", &id, "--json"])["conv"].as_str().unwrap()).ends_with("只回一个字。"));
+    assert_eq!(sb.as_session(&id, &["inbox", "take"], "").status.code(), Some(0));
+    sb.hook(&id, "", r#"{"hook_event_name":"UserPromptSubmit","prompt":"another prompt"}"#);
+    assert_eq!(sb.as_session(&id, &["inbox", "take"], "").status.code(), Some(2));
+    assert!(
+        sb.aca(&["events", "-n", "50"])
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .any(|e| e["event"] == "message.delivered" && e["how"] == "bell")
+    );
+    sb.aca(&["plugin", "gateway", "stop"]);
+}
+
+#[test]
+fn simultaneous_mail_and_mail_during_router_start_and_stop_reach_one_shift() {
+    use serde_json::json;
+    use std::process::Stdio;
+    let Some(sb) = Sandbox::new("shift-race") else { return };
+    let id = shift_fixture(&sb);
+    let show = || sb.json(&["show", &id, "--json"]);
+    let inbox = || sb.json(&["inbox", &id, "--json"]);
+    let before = show();
+    let starts = || std::fs::read_to_string(sb.home.join("starts")).unwrap_or_default().lines().count();
+    let submit = |conv: &str, text: &str| {
+        sb.hook(&id, "", &json!({"hook_event_name":"UserPromptSubmit","session_id":conv,"prompt":text}).to_string())
+    };
+    let spawn = |args: &[&str]| sb.cmd().args(args).stdout(Stdio::null()).spawn().unwrap();
+    // Both real senders reach the stopped router before either can acquire its start lock.
+    let lock = sb.home.join(format!("state/inbox/{id}.shift"));
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let gate = std::fs::File::options().create(true).append(true).open(lock).unwrap();
+    gate.lock().unwrap();
+    let mut a = spawn(&["msg", "--via", "Discord", &id, "  first\nline  "]);
+    let mut b = spawn(&["msg", "--via", "Discord", &id, "第二句"]);
+    assert!(sb.until(|| inbox().as_array().unwrap().len() == 2));
+    drop(gate);
+    assert!(a.wait().unwrap().success() && b.wait().unwrap().success());
+    let current = show();
+    let conv = current["conv"].as_str().unwrap();
+    assert_ne!(current["conv"], before["conv"]);
+    for key in ["id", "title", "group", "tool", "account"] {
+        assert_eq!(current[key], before[key], "{key}");
+    }
+    assert_eq!(sb.aca(&["group", "router", "project"]), id);
+    let opening = shift_prompt(&sb, conv);
+    for text in ["  first\nline  ", "第二句"] {
+        assert_eq!(opening.matches(text).count(), 1, "{opening}");
+    }
+    assert_eq!(opening.matches("用户 · Discord").count(), 2, "{opening}");
+    assert_eq!(starts(), 1);
+    // The new process received its paste but has not submitted it. The bell must not steal its opening batch.
+    let late = "while starting";
+    sb.aca(&["msg", &id, late]);
+    assert_eq!(sb.as_session(&id, &["inbox", "take"], "").status.code(), Some(0));
+    assert!(inbox().as_array().unwrap().iter().all(|m| m["stage"] == "pending"));
+    submit(conv, &opening);
+    let mail = inbox();
+    let first = mail[0]["text"].as_str().unwrap();
+    let worker = sb.aca(&["new", "fake", &sb.proj(), "--hold"]);
+    assert!(sb.as_session(&id, &["msg", &worker, "dispatch"], "").status.success());
+    let forwarded = sb.json(&["inbox", &worker, "--json"]);
+    let words = forwarded[0]["text"].as_str().unwrap();
+    assert!(words.contains("Discord,") && words.contains(&format!("「{first}」")), "{words}");
+    assert_eq!((&mail[0]["stage"], &mail[1]["stage"], &mail[2]["stage"]), (&json!("got"), &json!("got"), &json!("pending")));
+    let take = sb.as_session(&id, &["inbox", "take"], "");
+    assert_eq!(take.status.code(), Some(2));
+    assert!(String::from_utf8(take.stderr).unwrap().contains(late));
+    assert_eq!(starts(), 1);
+
+    // Synchronize on the agent actually processing SIGTERM, not a sleep before starting the second command.
+    write(&sb.home.join("hold-stop"), "");
+    let mut stopping = spawn(&["stop", &id]);
+    assert!(sb.until(|| sb.home.join("stopping").exists()));
+    let mut from_worker = sb.cmd().env("ACA_SESSION_ID", &worker).args(["msg", &id, "worker first"]).stdout(Stdio::null()).spawn().unwrap();
+    assert!(sb.until(|| inbox().as_array().unwrap().len() == 4));
+    let mut from_user = spawn(&["msg", &id, "user second"]);
+    assert!(sb.until(|| inbox().as_array().unwrap().len() == 5));
+    std::fs::remove_file(sb.home.join("hold-stop")).unwrap();
+    assert!(stopping.wait().unwrap().success() && from_worker.wait().unwrap().success() && from_user.wait().unwrap().success());
+    let next = show()["conv"].as_str().unwrap().to_string();
+    assert_ne!(conv, next);
+    let prompt = shift_prompt(&sb, &next);
+    assert!(prompt.contains("worker first") && prompt.contains("user second") && prompt.contains(&worker), "{prompt}");
+    assert_eq!(starts(), 2);
+    // Exit before acknowledging the handoff: the next start must carry both originals again.
+    sb.aca(&["stop", &id]);
+    sb.aca(&["start", &id]);
+    let final_conv = show()["conv"].as_str().unwrap().to_string();
+    let prompt = shift_prompt(&sb, &final_conv);
+    assert!(prompt.contains("worker first") && prompt.contains("user second"), "{prompt}");
+    submit(&final_conv, &prompt);
+    assert!(inbox().as_array().unwrap().iter().all(|m| m["stage"] == "got"));
+    assert!(sb.as_session(&id, &["msg", &worker, "after worker"], "").status.success());
+    assert_eq!(sb.json(&["inbox", &worker, "--json"])[1]["text"], "after worker");
+    assert_eq!(sb.event_names().iter().filter(|s| s.as_str() == "session.started").count(), 3);
+}
+
+#[test]
+fn router_delivery_rechecks_ten_minutes_and_an_expired_shift_without_a_ui() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(sb) = Sandbox::new("shift-idle") else { return };
+    let id = shift_fixture(&sb);
+    sb.aca(&["start", &id]);
+    let show = || sb.json(&["show", &id, "--json"]);
+    let first = show()["conv"].as_str().unwrap().to_owned();
+    let opening = shift_prompt(&sb, &first);
+    sb.hook(&id, "", &serde_json::json!({"hook_event_name":"UserPromptSubmit","session_id":first,"prompt":opening}).to_string());
+    sb.hook(&id, "", r#"{"hook_event_name":"Stop","last_assistant_message":"ready"}"#);
+    assert!(sb.as_session(&id, &["inbox", "watch"], "{}").status.success());
+    // Keep the real pane, pid, screen and tmux operations; backdate just its three read-only activity clocks.
+    let shim = sb.home.join("bin/tmux");
+    write(
+        &shim,
+        r#"#!/bin/sh
+if [ "$3" = list-panes ]; then
+    format=$(printf '%s' "$6" | sed -e "s/#{session_activity}/$SHIFT_AT/g" -e "s/#{session_last_attached}/$SHIFT_AT/g" -e "s/#{window_activity}/$SHIFT_AT/g")
+    exec "$REAL_TMUX" "$1" "$2" "$3" "$4" "$5" "$format"
+fi
+exec "$REAL_TMUX" "$@"
+"#,
+    );
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var("PATH").unwrap();
+    let tmux = std::env::split_paths(&path).map(|d| d.join("tmux")).find(|f| f.is_file()).unwrap();
+    let send_at_age = |age: u64, text: &str| {
+        let at = aca_core::paths::now() - age;
+        let db = rusqlite::Connection::open(sb.home.join("data/aca.db")).unwrap();
+        db.execute("update sessions set created_at=?1 where id=?2", rusqlite::params![at as i64, id]).unwrap();
+        let file = sb.home.join(format!("state/run/{id}.json"));
+        let mut run: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        for key in ["started", "ts", "turn", "done"] {
+            run[key] = at.into();
+        }
+        write(&file, &run.to_string());
+        let result = sb
+            .cmd()
+            .env("PATH", format!("{}:{path}", shim.parent().unwrap().display()))
+            .env("REAL_TMUX", &tmux)
+            .env("SHIFT_AT", at.to_string())
+            .args(["msg", &id, text])
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        String::from_utf8(result.stdout).unwrap()
+    };
+    assert!(send_at_age(600, "warm").contains("已输入并发送"));
+    assert_eq!(show()["conv"], first);
+    assert_eq!(sb.as_session(&id, &["inbox", "take"], "").status.code(), Some(0));
+    assert!(send_at_age(3601, "cold").contains("新一班"));
+    let next = show()["conv"].as_str().unwrap().to_string();
+    assert_ne!(next, first);
+    assert!(shift_prompt(&sb, &next).ends_with("\ncold"));
+}
+
+#[test]
+fn codex_router_keeps_stopped_mail_and_its_resume_arguments() {
+    let Some(sb) = Sandbox::new("shift-codex") else { return };
+    write(
+        &sb.home.join("cx.sh"),
+        r#"#!/bin/sh
+for a do [ "$a" != queue ] || exit 1; done
+printf '%s\0' "$@" > "$ACA_HOME/codex-args"
+exec sleep 600
+"#,
+    );
+    add_config(&sb, &format!("[tools.cx]\nkind='codex'\ncmd=['/bin/sh',{:?}]\n[router]\nidle='1s'\n", sb.home.join("cx.sh")));
+    let id = sb.aca(&["new", "cx", &sb.proj(), "-g", "p", "--hold"]);
+    sb.aca(&["group", "router", "p", &id]);
+    sb.aca(&["msg", &id, "held"]);
+    assert_eq!(sb.json(&["inbox", &id, "--json"])[0]["stage"], "pending");
+    assert_eq!(sb.json(&["show", &id, "--json"])["state"], "stopped");
+    sb.aca(&["start", &id]);
+    sb.hook_as("codex", &id, "", r#"{"hook_event_name":"SessionStart","session_id":"saved-thread"}"#);
+    let args = sb.home.join("codex-args");
+    let read_resume = || {
+        sb.aca(&["stop", &id]);
+        std::fs::remove_file(&args).unwrap();
+        sb.aca(&["start", &id]);
+        assert!(sb.until(|| std::fs::read(&args).is_ok_and(|s| s.windows(13).any(|w| w == b"saved-thread\0"))));
+        std::fs::read(&args).unwrap()
+    };
+    let before = read_resume();
+    assert!(before.windows(7).any(|w| w == b"resume\0"));
+    let after = read_resume();
+    assert_eq!(after, before);
+    assert!(!String::from_utf8(after).unwrap().contains("交接"));
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    sb.aca(&["stop", "--idle", "1s"]);
+    assert_ne!(sb.json(&["show", &id, "--json"])["state"], "stopped");
+    assert_ne!(sb.json(&["show", &id, "--json"])["state"], "exited");
+}
+
+#[test]
+fn tickets_watch_notices_and_a_due_timer_start_stopped_router_shifts() {
+    use serde_json::json;
+    let Some(sb) = Sandbox::new("shift-notices") else { return };
+    let id = shift_fixture(&sb);
+    let worker = sb.aca(&["new", "fake", &sb.proj(), "-g", "project", "--parent", "-"]);
+    let accept = |message: &str| {
+        assert!(sb.until(|| !matches!(sb.json(&["show", &id, "--json"])["state"].as_str(), Some("stopped" | "exited"))));
+        let conv = sb.json(&["show", &id, "--json"])["conv"].as_str().unwrap().to_owned();
+        let prompt = shift_prompt(&sb, &conv);
+        assert!(prompt.split("叫醒你的\n").nth(1).is_some_and(|body| body.contains(message)), "{prompt}");
+        sb.hook(&id, "", &json!({"hook_event_name":"UserPromptSubmit","session_id":conv,"prompt":prompt}).to_string());
+        assert!(sb.as_session(&id, &["msg", &worker, "dispatch"], "").status.success());
+        let mail = sb.json(&["inbox", &worker, "--json"]);
+        assert_eq!(mail.as_array().unwrap().last().unwrap()["text"], "dispatch");
+        sb.aca(&["stop", &id]);
+    };
+    sb.aca(&["task", "add", "-g", "project", "-t", "queued"]);
+    accept("#1 新任务");
+    sb.aca(&["task", "add", "-g", "project", "-t", "plain", "--to", &worker]);
+    assert!(sb.as_session(&worker, &["task", "done", "2", "finished"], "").status.success());
+    accept("#2 完成");
+    sb.aca(&["task", "add", "-g", "project", "-t", "watched", "--watch", "--to", &worker]);
+    for (event, fields, text) in [
+        ("Stop", json!({"last_assistant_message":"still working"}), "still working"),
+        ("PreToolUse", json!({"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"green?"}]}}), "green?"),
+        ("StopFailure", json!({"error":"failed now"}), "failed now"),
+        ("SessionEnd", json!({"reason":"prompt_input_exit"}), "#3"),
+    ] {
+        sb.hook(&worker, "", r#"{"hook_event_name":"UserPromptSubmit","prompt":"work"}"#);
+        let mut payload = fields;
+        payload["hook_event_name"] = event.into();
+        sb.hook(&worker, "", &payload.to_string());
+        accept(text);
+    }
+    assert!(sb.as_session(&worker, &["task", "done", "3", "all good"], "").status.success());
+    accept("#3 完成");
+    assert!(sb.as_session(&id, &["msg", "--in", "1s", &id, "check again"], "").status.success());
+    accept("check again");
+}
+
+#[test]
+fn mail_arriving_while_tmux_is_starting_the_router_waits_for_its_turn() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    let Some(sb) = Sandbox::new("shift-launch") else { return };
+    let id = shift_fixture(&sb);
+    let mut log = std::fs::File::options().append(true).open(sb.home.join("state/events.jsonl")).unwrap();
+    for n in 0..17 {
+        writeln!(log, "{}", serde_json::json!({"ts":100000+n,"event":"turn.done","session":id,"last":format!("reply-{n:02}")})).unwrap();
+    }
+    drop(log);
+    let shim = sb.home.join("bin/tmux");
+    write(
+        &shim,
+        r#"#!/bin/sh
+if [ "$3" = new-session ]; then
+    touch "$ACA_HOME/launching"
+    while [ -f "$ACA_HOME/launching" ]; do sleep 0.05; done
+fi
+exec "$REAL_TMUX" "$@"
+"#,
+    );
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var("PATH").unwrap();
+    let tmux = std::env::split_paths(&path).map(|d| d.join("tmux")).find(|f| f.is_file()).unwrap();
+    let mut launch = sb
+        .cmd()
+        .env("PATH", format!("{}:{path}", shim.parent().unwrap().display()))
+        .env("REAL_TMUX", tmux)
+        .args(["msg", &id, "first"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(sb.until(|| sb.home.join("launching").exists()));
+    let mut late = sb.cmd().args(["msg", &id, "late"]).stdout(Stdio::null()).spawn().unwrap();
+    let mut manual = sb.cmd().args(["start", &id]).stdout(Stdio::null()).spawn().unwrap();
+    assert!(sb.until(|| sb.json(&["inbox", &id, "--json"]).as_array().unwrap().len() == 2));
+    assert!(launch.try_wait().unwrap().is_none() && late.try_wait().unwrap().is_none());
+    std::fs::remove_file(sb.home.join("launching")).unwrap();
+    assert!(launch.wait().unwrap().success() && late.wait().unwrap().success() && manual.wait().unwrap().success());
+    let current = sb.json(&["show", &id, "--json"]);
+    let conv = current["conv"].as_str().unwrap();
+    let opening = shift_prompt(&sb, conv);
+    assert!(opening.ends_with("\nfirst") && !opening.contains("late"), "{opening}");
+    assert_eq!(opening.matches("reply-").count(), 15);
+    assert!(!opening.contains("reply-01") && opening.contains("reply-02") && opening.contains("reply-16"));
+    sb.hook(&id, "", &serde_json::json!({"hook_event_name":"UserPromptSubmit","session_id":conv,"prompt":opening}).to_string());
+    let take = sb.as_session(&id, &["inbox", "take"], "");
+    assert_eq!(take.status.code(), Some(2));
+    assert!(String::from_utf8(take.stderr).unwrap().contains("「late」"));
+    assert!(sb.json(&["inbox", &id, "--json"]).as_array().unwrap().iter().all(|m| m["stage"] == "got"));
+    assert_eq!(sb.event_names().iter().filter(|e| *e == "session.started").count(), 1);
+}
+
+#[test]
+fn a_router_woken_on_a_cold_tmux_server_only_passes_its_own_identity_to_the_pane() {
+    let Some(sb) = Sandbox::new("cold-server-env") else { return };
+    write(
+        &sb.home.join("agent.sh"),
+        r#"#!/bin/sh
+dump="$ACA_HOME/env-$ACA_SESSION_ID"
+env | sed -n '/^ACA_/p' > "$dump.tmp" && mv "$dump.tmp" "$dump"
+if [ -n "$ACA_ROUTER_SHIFT" ]; then exec python3 "$ACA_HOME/router.py" "$@"; fi
+exec sleep 600
+"#,
+    );
+    let sender = sb.aca(&["new", "fake", &sb.proj(), "--hold"]);
+    let router = sb.aca(&["new", "fake", &sb.proj(), "-g", "project", "--hold"]);
+    sb.aca(&["group", "router", "project", &router]);
+    assert!(sb.tmux(&["show-environment", "-g", "PATH"]).is_empty());
+    let private = [
+        ("ACA_SETTING_TOKEN", "x"),
+        ("ACA_SETTING_URL", "fake-url"),
+        ("ACA_PLUGIN_EVENT", "y"),
+        ("ACA_ARG_TO", "z"),
+        ("ACA_INPUT_FILE", "input"),
+        ("ACA_ROUTER_GROUP", "sender-group"),
+        ("ACA_SESSION_PARENT", "sender-parent"),
+        ("ACA_INVOKED_BY", "agent"),
+        ("ACA_ENV", "1"),
+    ];
+    let out = sb
+        .cmd()
+        .envs(private)
+        .env("ACA_SESSION_ID", &sender)
+        .env("ACA_ROUTER_SHIFT", "sender-shift")
+        .env("ACA_TOOL", "sender-tool")
+        .env("ACA_BIN", "sender-bin")
+        .args(["msg", &router, "wake up"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(sb.json(&["inbox", &router, "--json"])[0]["from"], sender);
+    let shift = sb.json(&["show", &router, "--json"])["conv"].as_str().unwrap().to_owned();
+    assert!(!shift.is_empty());
+    let pid = sb.tmux(&["display-message", "-p", "#{pid}"]);
+    let ordinary = sb.aca(&["new", "fake", &sb.proj()]);
+    assert!(!pid.is_empty() && sb.tmux(&["display-message", "-p", "#{pid}"]) == pid);
+
+    let pane_env = |id: &str| {
+        let dump = sb.home.join(format!("env-{id}"));
+        assert!(sb.until(|| dump.exists()));
+        std::fs::read_to_string(dump).unwrap()
+    };
+    for (id, dump) in
+        [("", sb.tmux(&["show-environment", "-g"])), (router.as_str(), pane_env(&router)), (ordinary.as_str(), pane_env(&ordinary))]
+    {
+        let vars: std::collections::HashMap<_, _> = dump.lines().filter_map(|line| line.split_once('=')).collect();
+        for (key, _) in private {
+            assert!(!vars.contains_key(key), "{key} in {id:?}");
+        }
+        assert_eq!(vars.get("ACA_LANG"), Some(&"zh"));
+        assert_eq!(vars.get("ACA_HOME").copied(), sb.home.to_str());
+        assert_eq!(vars.get("ACA_TMUX_SOCKET").copied(), Some(sb.socket.as_str()));
+        assert_eq!(vars.get("ACA_ROUTER_SHIFT").copied(), (id == router).then_some(shift.as_str()));
+        assert_eq!(vars.get("ACA_SESSION_ID").copied(), (!id.is_empty()).then_some(id));
+        assert_eq!(vars.get("ACA_TOOL").copied(), (!id.is_empty()).then_some("fake"));
+        assert_eq!(vars.get("ACA_BIN").copied(), (!id.is_empty()).then_some(env!("CARGO_BIN_EXE_aca")));
+    }
+}
+
+#[test]
+fn discord_posts_complete_channel_replies_in_order_and_keeps_ordinary_previews() {
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    let Some(sb) = Sandbox::new("discord-post") else { return };
+    assert!(Command::new("jq").arg("--version").output().unwrap().status.success());
+    let curl = sb.home.join("bin/curl");
+    write(
+        &curl,
+        r#"#!/bin/sh
+for body do :; done
+printf '%s\n' "$body" | jq -c . >> "$CAPTURE"
+"#,
+    );
+    let aca = sb.home.join("bin/aca");
+    write(&aca, "#!/bin/sh\nprintf '%s\\n' \"$ROW\"\n");
+    for f in [&curl, &aca] {
+        std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let capture = sb.home.join("posts");
+    let payloads = |event: &str, data: Value, attached: bool, mention: &str| {
+        write(&capture, "");
+        let out = Command::new("sh")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../plugins/discord/post.sh"))
+            .env("PATH", format!("{}:{}", curl.parent().unwrap().display(), std::env::var("PATH").unwrap()))
+            .env("ACA_BIN", &aca)
+            .env("ACA_SETTING_URL", "fake-webhook")
+            .env("ACA_SETTING_MENTION", mention)
+            .env("ACA_SESSION_ID", "desk")
+            .env("ACA_PLUGIN_EVENT", event)
+            .env("ACA_PLUGIN_EVENT_JSON", data.to_string())
+            .env("ROW", json!({"attached":u8::from(attached),"title":"desk"}).to_string())
+            .env("CAPTURE", &capture)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        std::fs::read_to_string(&capture).unwrap().lines().map(|line| serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>()
+    };
+    let post = |event, data, attached| {
+        payloads(event, data, attached, "").into_iter().map(|v| v["content"].as_str().unwrap().to_owned()).collect::<Vec<_>>()
+    };
+    let text = "字".repeat(351) + "\n  quoted \"reply\"  \n";
+    assert_eq!(post("turn.done", json!({"via":"Discord","last":text}), true), [text.as_str()]);
+    assert_eq!(post("turn.done", json!({"last":text}), false), [format!("**✓ desk**\n{}", "字".repeat(300))]);
+    assert!(post("turn.done", json!({"via":"Matrix","last":text}), true).is_empty());
+    let first = "路".repeat(1999) + "\n";
+    let second = " ".to_owned() + &"🌱".repeat(1998) + "\n";
+    assert_eq!(post("turn.done", json!({"via":"Discord","last":format!("{first}{second}")}), true), [first, second]);
+    assert_eq!(post("agent.waiting", json!({"via":"Discord","ask":"Which?"}), true), ["Which?"]);
+    assert_eq!(post("turn.failed", json!({"via":"Discord","error":"connection lost"}), true), ["connection lost"]);
+    let id = "123456789012345678";
+    let mention = format!("<@{id}> ");
+    let first = "问".repeat(2000 - mention.len());
+    let rest = "\n<@999> 🌱\n";
+    let ask = json!({"via":"Discord","ask":format!("{first}{rest}")});
+    assert_eq!(
+        payloads("agent.waiting", ask, true, id),
+        [
+            json!({"username":"aca","content":format!("{mention}{first}"),"allowed_mentions":{"parse":[],"users":[id]}}),
+            json!({"username":"aca","content":rest,"allowed_mentions":{"parse":[]}}),
+        ]
+    );
+    for (event, field, mention) in [("turn.done", "last", id), ("turn.failed", "error", id), ("agent.waiting", "ask", "")] {
+        assert_eq!(
+            payloads(event, json!({"via":"Discord",field:"<@999>"}), true, mention),
+            [json!({"username":"aca","content":"<@999>","allowed_mentions":{"parse":[]}})]
+        );
+    }
+}
+
+#[test]
+fn discord_wakes_the_desk_and_only_its_channel_turns_return_via_discord() {
+    use serde_json::json;
+    let Some(sb) = Sandbox::new("discord-shift") else { return };
+    let id = shift_fixture(&sb);
+    sb.aca(&["group", "dir", "project", &sb.proj()]);
+    add_config(&sb, &format!("[scratch]\ndir={:?}\n", sb.proj()));
+    sb.aca(&["msg", "desk", "--via", "Discord", "dispatch now"]);
+    let conv = sb.json(&["show", &id, "--json"])["conv"].as_str().unwrap().to_owned();
+    let opening = shift_prompt(&sb, &conv);
+    assert!(opening.contains("总台交接") && opening.contains("用户 · Discord"));
+    let hook = |v: Value| sb.hook(&id, "", &v.to_string());
+    let events = || sb.aca(&["events", "-n", "100"]).lines().map(|s| serde_json::from_str::<Value>(s).unwrap()).collect::<Vec<_>>();
+    let last = |name: &str| events().into_iter().rev().find(|v| v["event"] == name && v["session"] == id).unwrap();
+    hook(json!({"hook_event_name":"UserPromptSubmit","session_id":conv,"prompt":opening}));
+    hook(json!({"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which?"}]}}));
+    assert_eq!(last("agent.waiting")["via"], "Discord");
+    hook(json!({"hook_event_name":"Stop","last_assistant_message":"confirmed"}));
+    assert_eq!(last("turn.done")["via"], "Discord");
+    hook(json!({"hook_event_name":"UserPromptSubmit","prompt":"local input"}));
+    hook(json!({"hook_event_name":"Stop","last_assistant_message":"local reply"}));
+    assert!(last("turn.done").get("via").is_none());
+    assert!(sb.as_session(&id, &["inbox", "watch"], "{}").status.success());
+    sb.aca(&["msg", "desk", "--via", "Discord", "warm shift"]);
+    assert_eq!(sb.as_session(&id, &["inbox", "take"], "").status.code(), Some(0));
+    hook(json!({"hook_event_name":"UserPromptSubmit","prompt":"warm shift"}));
+    hook(json!({"hook_event_name":"StopFailure","error":"timeout"}));
+    assert_eq!(last("turn.failed")["via"], "Discord");
+    hook(json!({"hook_event_name":"UserPromptSubmit","prompt":"ordinary turn"}));
+    sb.aca(&["msg", "desk", "--via", "Discord", "mid-turn addition"]);
+    assert_eq!(sb.as_session(&id, &["inbox", "take"], "").status.code(), Some(2));
+    hook(json!({"hook_event_name":"Stop","last_assistant_message":"ordinary reply"}));
+    assert!(last("turn.done").get("via").is_none());
+}
+
+#[test]
+fn channel_mail_to_ordinary_agents_preserves_the_input_and_tracks_its_turn() {
+    use serde_json::json;
+    let Some(sb) = Sandbox::new("ordinary-via") else { return };
+    sb.screen_tools();
+    let words = "say | $ and quotes \" as written";
+    for (tool, kind) in [("scr", "claude"), ("fcx", "codex")] {
+        let id = sb.aca(&["new", tool, &sb.proj()]);
+        let pane = sb.pane(&id);
+        sb.hook_as(kind, &id, &pane, r#"{"hook_event_name":"SessionStart","session_id":"channel-thread"}"#);
+        if kind == "claude" {
+            sb.set_screen(&id, &pane, "ready\n❯ ");
+        }
+        let sent = sb.aca(&["msg", "--via", "Matrix", &id, words]);
+        if kind == "codex" {
+            assert!(sb.queued().contains(&format!("--message\n{words}\n")));
+        } else {
+            assert!(sent.contains("已输入并发送"), "{sent}");
+            assert!(sb.wait_screen(&pane, words).contains(words));
+        }
+        let submit = |text| sb.hook_as(kind, &id, &pane, &json!({"hook_event_name":"UserPromptSubmit","prompt":text}).to_string());
+        let done = || {
+            sb.hook_as(kind, &id, &pane, r#"{"hook_event_name":"Stop","last_assistant_message":"received"}"#);
+            sb.aca(&["events", "-n", "50"])
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .rfind(|e| e["session"] == id && e["event"] == "turn.done")
+                .unwrap()
+        };
+        submit(words);
+        assert_eq!(done()["via"], "Matrix");
+        submit("local");
+        assert!(done().get("via").is_none());
+        assert_eq!(sb.json(&["inbox", &id, "--json"])[0]["text"], words);
+    }
+}
+
+/// A cold router's new shift dies before its input box comes up, so delivering the message fails — but the message is in
+/// its inbox already. `aca msg` says it's held (exit 0) instead of failing, which would have a relay like the Discord plugin
+/// send it again the next minute and the inbox hold it twice; a retry 20 seconds later starts another shift and hands it over.
+/// Errors from before it's put in still fail the command
+#[test]
+fn a_message_already_in_the_inbox_is_held_not_failed_when_delivering_it_fails() {
+    use serde_json::json;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let Some(sb) = Sandbox::new("held-on-error") else { return };
+    let id = shift_fixture(&sb);
+    let text = "冷启动时的一句";
+    // The new shift stays on "loading" and its pane is closed once it has listed its tools: the handoff never finds the input box
+    write(&sb.home.join("hold-screen"), "");
+    let msg = sb.cmd().args(["msg", "--via", "Discord", &id, text]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let log = sb.home.join("state/plugin-logs/aca.router.log");
+    assert!(sb.until(|| std::fs::read_to_string(&log).is_ok_and(|s| s.contains("tools/list ready after "))));
+    let pane = sb.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]);
+    sb.tmux(&["kill-pane", "-t", &pane]);
+    let o = msg.wait_with_output().unwrap();
+    let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(o.status.success(), "aca msg 退出码 {:?}:{out}{err}", o.status.code());
+    assert!(out.contains("暂存:无法送达(会话未运行)"), "{out}");
+    let inbox = || sb.json(&["inbox", &id, "--json"]);
+    let mail = inbox();
+    assert_eq!(mail.as_array().unwrap().len(), 1, "{mail}");
+    assert_eq!((mail[0]["text"].as_str(), mail[0]["stage"].as_str()), (Some(text), Some("pending")), "{mail}");
+
+    // The retry: this shift comes up, gets the message in its opening once, and it's delivered
+    std::fs::remove_file(sb.home.join("hold-screen")).unwrap();
+    let opening = sb.home.join(format!("open-{id}"));
+    let t = Instant::now();
+    while !std::fs::read_to_string(&opening).is_ok_and(|s| s.contains(text)) {
+        assert!(t.elapsed() < Duration::from_secs(45), "重试没有送达:{}", inbox());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let opening = std::fs::read_to_string(&opening).unwrap();
+    assert_eq!(opening.matches(text).count(), 1, "{opening}");
+    let conv = sb.json(&["show", &id, "--json"])["conv"].as_str().unwrap().to_string();
+    sb.hook(&id, "", &json!({"hook_event_name":"UserPromptSubmit","session_id":conv,"prompt":opening}).to_string());
+    let mail = inbox();
+    assert_eq!((mail.as_array().unwrap().len(), mail[0]["stage"].as_str()), (1, Some("got")), "{mail}");
+    assert_eq!(std::fs::read_to_string(sb.home.join("starts")).unwrap().lines().count(), 2);
+
+    // Not put in at all: still a failure
+    let o = sb.run(&["msg", "nope", "x"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("没有会话 nope"), "{err}");
+    assert_eq!(sb.json(&["inbox", &id, "--json"]).as_array().unwrap().len(), 1);
+}
+
+/// `aca events -f` while the log rotates: the lines that went into the old file after it last looked, and those already in
+/// the new one when it notices, are each printed once and in order. It's stopped (SIGSTOP) across the rotation so it can't
+/// look in between, as if its 100 ms nap had fallen right there
+#[test]
+fn following_the_events_across_a_rotation_prints_every_line_once_and_in_order() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    let Some(sb) = Sandbox::new("events-rotate") else { return };
+    let sh = sb.aca(&["new", "shell", &sb.proj()]);
+    let rotated = sb.home.join("state/events.jsonl.1");
+    // A little under the 4 MB limit: the next few events go into this file and take it over, the one after rotates it
+    let mut f = std::fs::OpenOptions::new().append(true).open(sb.home.join("state/events.jsonl")).unwrap();
+    let pad = "x".repeat(200);
+    let mut n = 0;
+    while f.metadata().unwrap().len() < 4 * 1024 * 1024 - 3000 {
+        writeln!(f, "{{\"ts\":0,\"event\":\"fill\",\"session\":\"\",\"n\":{n},\"pad\":\"{pad}\"}}").unwrap();
+        n += 1;
+    }
+    drop(f);
+
+    struct Follower(std::process::Child);
+    impl Drop for Follower {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut follower = Follower(sb.cmd().args(["events", "-f", "-n", "1"]).stdout(Stdio::piped()).spawn().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (out, lines) = (follower.0.stdout.take().unwrap(), seen.clone());
+    std::thread::spawn(move || BufReader::new(out).lines().map_while(Result::ok).for_each(|l| lines.lock().unwrap().push(l)));
+    let marks = || -> Vec<String> {
+        let seen = seen.lock().unwrap();
+        let events = seen.iter().filter_map(|l| serde_json::from_str::<Value>(l).ok());
+        events.filter(|e| e["event"] == "message.sent").map(|e| e["text"].as_str().unwrap_or("").to_string()).collect()
+    };
+    // It's up: the last line already there
+    let last = format!("\"n\":{},", n - 1);
+    assert!(sb.until(|| seen.lock().unwrap().iter().any(|l| l.contains(&last))));
+    let say = |mark: &str| {
+        sb.aca(&["msg", &sh, mark]);
+    };
+    let mut want = vec!["mark-00".to_string()];
+    say("mark-00");
+    assert!(sb.until(|| marks() == want), "{:?}", marks());
+
+    let pid = follower.0.id().to_string();
+    let signal = |sig: &str| assert!(Command::new("kill").args([sig, &pid]).status().unwrap().success());
+    signal("-STOP");
+    // While it can't look: events into the old file, the rotation, events into the new one
+    let (mut before, mut after) = (0, 0);
+    for i in 1..60 {
+        let mark = format!("mark-{i:02}");
+        say(&mark);
+        want.push(mark);
+        if !rotated.exists() {
+            before += 1;
+        } else {
+            after += 1;
+            if after == 3 {
+                break;
+            }
+        }
+    }
+    assert!(before > 0 && after == 3, "轮转前 {before} 条,轮转后 {after} 条");
+    signal("-CONT");
+    // And one more once it's looking again
+    say("mark-last");
+    want.push("mark-last".into());
+    sb.until(|| marks().last().is_some_and(|m| m == "mark-last"));
+    assert_eq!(marks(), want);
+}
+
+/// The new file can grow past where the old one was read to before `aca events -f` looks again: it isn't any smaller, but
+/// it's another file, so it's read from its start. Then a second rotation while it's looking
+#[test]
+fn following_the_events_reads_a_new_file_from_its_start_even_once_it_outgrew_the_old_one() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    let Some(sb) = Sandbox::new("events-regrow") else { return };
+    let sh = sb.aca(&["new", "shell", &sb.proj()]);
+    let live = sb.home.join("state/events.jsonl");
+    let pad = "x".repeat(200);
+    let fill = |tag: &str, to: u64| {
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&live).unwrap();
+        let mut n = 0;
+        while f.metadata().unwrap().len() <= to {
+            writeln!(f, "{{\"ts\":0,\"event\":\"{tag}\",\"session\":\"\",\"n\":{n},\"pad\":\"{pad}\"}}").unwrap();
+            n += 1;
+        }
+        n
+    };
+    // Over the limit already: the next event rotates it
+    let old = fill("fill", 4 * 1024 * 1024);
+    struct Follower(std::process::Child);
+    impl Drop for Follower {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut follower = Follower(sb.cmd().args(["events", "-f", "-n", "1"]).stdout(Stdio::piped()).spawn().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (out, lines) = (follower.0.stdout.take().unwrap(), seen.clone());
+    std::thread::spawn(move || BufReader::new(out).lines().map_while(Result::ok).for_each(|l| lines.lock().unwrap().push(l)));
+    let events = || -> Vec<Value> { seen.lock().unwrap().iter().filter_map(|l| serde_json::from_str(l).ok()).collect() };
+    let last = format!("\"n\":{},", old - 1);
+    assert!(sb.until(|| seen.lock().unwrap().iter().any(|l| l.contains(&last))));
+
+    let pid = follower.0.id().to_string();
+    let signal = |sig: &str| assert!(Command::new("kill").args([sig, &pid]).status().unwrap().success());
+    signal("-STOP");
+    sb.aca(&["msg", &sh, "mark-a"]);
+    assert!(sb.home.join("state/events.jsonl.1").exists());
+    // The new file, past the old one's size before it looks again
+    let grown = fill("grown", 4 * 1024 * 1024 + 10_000);
+    signal("-CONT");
+    let marks = || -> Vec<String> {
+        events().iter().filter(|e| e["event"] == "message.sent").map(|e| e["text"].as_str().unwrap_or("").to_string()).collect()
+    };
+    let grown_seen = || events().iter().filter(|e| e["event"] == "grown").map(|e| e["n"].as_u64().unwrap()).collect::<Vec<_>>();
+    sb.until(|| grown_seen().len() as u64 >= grown);
+    let broken = seen.lock().unwrap().iter().filter(|l| serde_json::from_str::<Value>(l).is_err()).count();
+    assert_eq!((marks(), grown_seen().len() as u64, broken), (vec!["mark-a".to_string()], grown, 0));
+    assert_eq!(grown_seen(), (0..grown).collect::<Vec<_>>());
+    // That one is over the limit too: the next event rotates it while it's looking
+    sb.aca(&["msg", &sh, "mark-b"]);
+    sb.until(|| marks().len() >= 2);
+    assert_eq!(marks(), ["mark-a", "mark-b"]);
+    assert_eq!(grown_seen().len() as u64, grown);
 }

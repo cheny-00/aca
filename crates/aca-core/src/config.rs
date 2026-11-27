@@ -23,7 +23,7 @@
 //!                              # (off when unset; the API is early, see agent/claude_mod.rs)
 //!
 //! [tools.ccx]                  # a tool you name yourself: `aca new ccx`
-//! kind = "claude"              # which built-in tool it starts as and takes hooks from (claude / codex / pi / opencode / shell)
+//! kind = "claude"              # which built-in tool it starts as and takes hooks from (claude / codex / pi / opencode / agy / shell)
 //! cmd = ["claude"]             # unset = that tool's command
 //! args = ["--model", "opus"]
 //! account = "personal"
@@ -127,6 +127,9 @@ pub struct Tool {
     /// files on this Mac). Set at start
     #[serde(skip)]
     pub bare: bool,
+    /// Only for a Claude router launch: project and account directories used by its settings.
+    #[serde(skip)]
+    pub router_dirs: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 /// Account: one more layer on top of the tool when starting an agent. Authentication is the harness's own business (its config
@@ -205,6 +208,8 @@ pub struct Config {
     pub login: Login,
     #[serde(deserialize_with = "lenient")]
     pub idle: Idle,
+    #[serde(deserialize_with = "lenient")]
+    pub router: Router,
 }
 
 /// `[sandbox.<name>]`, a special environment (see [`crate::sandbox`]): with `ssh`, a cage reached over ssh, with directories of
@@ -228,6 +233,54 @@ pub struct Sandbox {
     /// Other sessions may start its sessions (delegating) and send them messages; their workers' notices come back out
     /// as usual. Off = closed (see [`crate::sandbox`])
     pub delegate: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Router {
+    model: Option<toml::Value>,
+    effort: Option<toml::Value>,
+    idle: Option<toml::Value>,
+}
+
+impl Router {
+    fn valid_model(&self) -> Option<&str> {
+        self.model.as_ref()?.as_str().map(str::trim).filter(|s| !s.is_empty() && !s.starts_with('-') && !s.contains(char::is_whitespace))
+    }
+
+    fn valid_effort(&self) -> Option<&str> {
+        self.effort.as_ref()?.as_str().filter(|s| matches!(*s, "low" | "medium" | "high" | "xhigh" | "max"))
+    }
+
+    pub fn model(&self) -> &str {
+        self.valid_model().unwrap_or("sonnet")
+    }
+    pub fn effort(&self) -> &str {
+        self.valid_effort().unwrap_or("high")
+    }
+    fn idle_limit(&self) -> Result<Option<u64>, ()> {
+        let Some(v) = &self.idle else { return Ok(Some(3600)) };
+        let value = v.as_str().ok_or(())?.trim();
+        if value == "never" {
+            return Ok(None);
+        }
+        span(value).filter(|n| *n > 0).map(Some).ok_or(())
+    }
+
+    pub fn idle(&self) -> Option<u64> {
+        self.idle_limit().unwrap_or(Some(3600))
+    }
+}
+
+pub fn router_problem_in(text: &str) -> Option<String> {
+    let (key, default) = match toml::from_str::<toml::Value>(text).ok()?.get("router")?.clone().try_into::<Router>() {
+        Err(_) => return Some(crate::tr!("router 设置格式有误,已使用默认值", "Invalid router settings, using defaults")),
+        Ok(r) if r.model.is_some() && r.valid_model().is_none() => ("model", "sonnet"),
+        Ok(r) if r.effort.is_some() && r.valid_effort().is_none() => ("effort", "high"),
+        Ok(r) if r.idle_limit().is_err() => ("idle", "1h"),
+        _ => return None,
+    };
+    Some(crate::tr!("router {key} 无效,使用 {default}", "Invalid router {key}, using {default}"))
 }
 
 /// `[idle]`: idle sessions (see [`crate::session::stop_idle`])
@@ -434,6 +487,37 @@ pub struct Inbox {
     pub notify: Vec<String>,
 }
 
+/// Relative scratch directories are resolved from home, as in the new-session dialog.
+pub fn scratch_dir_in(text: &str) -> String {
+    let table = text.parse::<toml::Table>().ok();
+    let Some(dir) = table.as_ref().and_then(|t| t.get("scratch")?.get("dir")?.as_str()).map(str::trim).filter(|d| !d.is_empty()) else {
+        return String::new();
+    };
+    let path = paths::home().join(paths::expand(dir));
+    let path = path.to_string_lossy();
+    if path.trim_end_matches('/').is_empty() { "/".into() } else { path.trim_end_matches('/').into() }
+}
+
+/// The default path for a new group, shared by the picker and the desk's project list.
+pub fn new_group_dir_in(text: &str, workspace: bool) -> String {
+    let t = text.parse::<toml::Table>().ok();
+    t.as_ref()
+        .and_then(|t| t.get("new_group")?.get("default_path")?.as_str())
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .unwrap_or(if workspace { "~/workspace" } else { "~" })
+        .to_string()
+}
+
+pub fn new_group_dir() -> String {
+    let text = std::fs::read_to_string(paths::config_dir().join("config.toml")).unwrap_or_default();
+    new_group_dir_in(&text, paths::home().join("workspace").is_dir())
+}
+
+pub fn scratch_dir() -> String {
+    std::fs::read_to_string(paths::config_dir().join("config.toml")).map(|s| scratch_dir_in(&s)).unwrap_or_default()
+}
+
 pub fn load() -> Config {
     std::fs::read_to_string(paths::config_dir().join("config.toml")).map(|t| parse(&t)).unwrap_or_default()
 }
@@ -485,6 +569,24 @@ mod tests {
     use crate::agent::{names, tool};
 
     #[test]
+    fn router_settings_fall_back_per_field_and_keep_other_sections() {
+        let r = parse("").router;
+        assert_eq!((r.model(), r.effort(), r.idle()), ("sonnet", "high", Some(3600)));
+        let r = parse("[router]\nmodel='haiku'\neffort='medium'\nidle='never'").router;
+        assert_eq!((r.model(), r.effort(), r.idle()), ("haiku", "medium", None));
+        let txt = "[router]\nmodel='opus'\neffort=10\nidle='3h'\n[tools.f]\nkind='claude'";
+        let c = parse(txt);
+        assert_eq!((c.router.model(), c.router.effort(), c.router.idle()), ("opus", "high", Some(10800)));
+        assert_eq!(c.tools["f"].kind, "claude");
+        assert!(router_problem_in(txt).unwrap().contains("effort"));
+        for (key, value) in [("model", "[]"), ("effort", "'nope'"), ("idle", "'bad'")] {
+            assert!(router_problem_in(&format!("[router]\n{key}={value}")).unwrap().contains(key));
+        }
+        assert!(router_problem_in("router=6").is_some());
+        assert_eq!(router_problem_in("[router]\nidle='never'"), None);
+    }
+
+    #[test]
     fn builtin_tools_exist_without_any_config_and_custom_ones_name_their_kind() {
         let c = parse("");
         assert_eq!(tool(&c, "claude").unwrap().kind, "claude");
@@ -500,7 +602,7 @@ mod tests {
         );
         assert!(c.account("claude", "sub").unwrap().home.ends_with("/.claude-subscription"));
         assert!(c.account("claude", "nope").is_none());
-        assert_eq!(names(&c), ["claude", "codex", "pi", "opencode", "shell", "ccx", "claude:sub"]);
+        assert_eq!(names(&c), ["claude", "codex", "pi", "opencode", "agy", "shell", "ccx", "claude:sub"]);
         // A broken file doesn't blow up
         assert_eq!(parse("[accounts\nx"), Config::default());
     }
@@ -531,7 +633,7 @@ mod tests {
         assert_eq!((t.kind.as_str(), t.resume.len(), t.busy[0].as_str(), t.env["A"].as_str()), ("", 2, r"Working\.\.\.", "1"));
         // A built-in tool with other keys set still has itself as kind
         assert_eq!((tool(&c, "claude").unwrap().kind.as_str(), tool(&c, "claude").unwrap().env["B"].as_str()), ("claude", "2"));
-        assert_eq!(names(&c), ["claude", "codex", "pi", "opencode", "shell", "aider"]);
+        assert_eq!(names(&c), ["claude", "codex", "pi", "opencode", "agy", "shell", "aider"]);
     }
 
     #[test]
@@ -553,7 +655,7 @@ mod tests {
             (api.home.as_str(), api.env_file.as_str(), api.env["OPENAI_BASE_URL"].as_str()),
             ("", format!("{home}/k.env").as_str(), "https://x")
         );
-        assert_eq!(names(&c), ["claude", "codex", "pi", "opencode", "shell", "codex:api", "codex:corp", "codex:labs"]);
+        assert_eq!(names(&c), ["claude", "codex", "pi", "opencode", "agy", "shell", "codex:api", "codex:corp", "codex:labs"]);
     }
 
     #[test]

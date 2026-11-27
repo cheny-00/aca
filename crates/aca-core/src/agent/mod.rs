@@ -26,7 +26,10 @@
 //! - The command goes straight to tmux (not wrapped in `bash -c`): the pane's process is the agent itself, so signals reach
 //!   it when stopping, and there are no quotes to escape.
 
+pub(crate) mod agy;
+pub use agy::Limits as AgyLimits;
 mod claude;
+pub(crate) use claude::{BELL_SUMMARY, configure_router, paste_text};
 pub mod claude_mod;
 mod codex;
 pub mod declared;
@@ -66,6 +69,8 @@ pub struct Launch {
     /// The opening message was passed as a startup argument (see [`Agent::opening`]); false = there's no such message, or this
     /// tool doesn't take it and it has to be typed in once it's up
     pub said: bool,
+    /// A Claude router's opening, to paste once its tools and pane are ready.
+    pub handoff: Option<String>,
 }
 
 /// How messages from other sessions are delivered ([`crate::inbox`])
@@ -309,24 +314,78 @@ pub struct Live {
     pub args: Option<Vec<String>>,
 }
 
+/// Remove settings flags in command-line order, leaving unrelated arguments in place.
+fn settings_args(extra: &mut Vec<String>) -> Vec<String> {
+    let (mut found, mut i) = (Vec::new(), 0);
+    while i < extra.len() {
+        if extra[i] == "--settings" && i + 1 < extra.len() {
+            found.push(extra.remove(i + 1));
+            extra.remove(i);
+        } else if let Some(v) = extra[i].strip_prefix("--settings=") {
+            found.push(v.to_string());
+            extra.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    found
+}
+
+/// Inline JSON or a settings file relative to the directory the agent will start in.
+fn settings_object(theirs: &str, dir: &str) -> Res<serde_json::Map<String, Value>> {
+    let text = if theirs.trim_start().starts_with('{') {
+        theirs.to_string()
+    } else {
+        let file = Path::new(dir).join(paths::expand(theirs));
+        std::fs::read_to_string(&file)
+            .map_err(|e| tr!("无法读取 --settings 指定的 {}:{e}", "can't read the --settings you passed {}: {e}", file.display()))?
+    };
+    let all: Value =
+        serde_json::from_str(&text).map_err(|e| tr!("--settings 不是有效的 JSON:{e}", "the --settings you passed isn't JSON: {e}"))?;
+    match all {
+        Value::Object(obj) => Ok(obj),
+        _ => Err(crate::t!("--settings 不是 JSON 对象", "the --settings you passed isn't a JSON object").into()),
+    }
+}
+
 /// The arguments from a command line that can be carried over: drop the program name and what `skip` says (`skip` looks at
 /// the run starting at this word and returns how many words to drop, 0 = keep). Only flags and single-word values are
 /// carried. If there's a message in it (a word with whitespace, or two words in a row without `-`: most likely the message
 /// it was started with), nothing is carried: not sure, and getting it wrong would resend that message on every restart
-pub(crate) fn carry(argv: &[String], skip: impl Fn(&[String]) -> usize) -> Option<Vec<String>> {
+pub(crate) fn carry(argv: &[String], skip: impl FnMut(&[String]) -> usize) -> Option<Vec<String>> {
+    carry_valued(argv, &[], skip)
+}
+
+/// With a known flag list, preserve each whole option and value, including spaces. Other bare words are positional messages.
+pub(crate) fn carry_valued(argv: &[String], flags: &[&str], mut skip: impl FnMut(&[String]) -> usize) -> Option<Vec<String>> {
     let mut rest = argv.get(1..)?;
     let mut kept: Vec<String> = vec![];
+    let mut plain = true;
+    let mut after_flag = false;
     while let Some(word) = rest.first() {
-        let n = skip(rest).min(rest.len());
-        if n == 0 {
-            kept.push(word.clone());
+        if !flags.is_empty() && word == "--" {
+            plain &= rest.len() == 1;
+            break;
         }
-        rest = &rest[n.max(1)..];
+        let skip = skip(rest).min(rest.len());
+        if skip > 0 {
+            rest = &rest[skip..];
+            continue;
+        }
+        let n = valued(rest, flags);
+        if n > rest.len() {
+            return None;
+        }
+        if n == 0 {
+            let flag = word.starts_with('-');
+            plain &= !word.is_empty() && !word.contains(char::is_whitespace) && (flag || after_flag);
+            // Agents without a flag list historically accept one plain word after an unknown flag.
+            after_flag = flags.is_empty() && flag;
+        }
+        let (option, remaining) = rest.split_at(n.max(1));
+        kept.extend_from_slice(option);
+        rest = remaining;
     }
-    let flag = |w: &String| w.starts_with('-');
-    let plain = kept.iter().all(|w| !w.contains(char::is_whitespace) && !w.is_empty())
-        && kept.first().is_none_or(flag)
-        && kept.windows(2).all(|w| flag(&w[0]) || flag(&w[1]));
     plain.then_some(kept)
 }
 
@@ -348,7 +407,7 @@ pub(crate) fn optional(rest: &[String], names: &[&str]) -> usize {
 }
 
 /// The built-in tools. **Adding one = adding a file to this directory and a line here**
-static BUILTIN: &[&dyn Agent] = &[&claude::Claude, &codex::Codex, &pi::Pi, &opencode::Opencode, &shell::Shell];
+static BUILTIN: &[&dyn Agent] = &[&claude::Claude, &codex::Codex, &pi::Pi, &opencode::Opencode, &agy::Agy, &shell::Shell];
 
 pub fn builtin(kind: &str) -> Option<&'static dyn Agent> {
     BUILTIN.iter().copied().find(|a| a.name() == kind)
@@ -411,7 +470,7 @@ impl std::ops::Deref for Handle {
 /// Removed from the environment before starting an agent: variables other sessions (agent-deck's, an outer Claude / Codex)
 /// use to identify themselves. If the tmux server was started from inside one of those sessions, these get into every new
 /// session, and your globally installed hooks would record this session's events under that one
-pub(crate) const FOREIGN: &[&str] = &[
+pub const FOREIGN: &[&str] = &[
     "AGENTDECK_INSTANCE_ID",
     "AGENTDECK_PROFILE",
     "AGENTDECK_ACCOUNT",
@@ -470,6 +529,10 @@ pub(crate) fn which(cmd: &str) -> Option<String> {
     std::env::split_paths(&path).map(|d| d.join(cmd)).find(|f| f.is_file()).map(|f| f.to_string_lossy().into_owned())
 }
 
+pub fn on_path(cmd: &str) -> bool {
+    which(cmd).is_some_and(|path| std::path::Path::new(&path).is_file())
+}
+
 pub fn self_exe() -> String {
     self_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "aca".into())
 }
@@ -516,6 +579,21 @@ pub fn resolve(cfg: &Config, name: &str) -> Res<(Handle, Tool)> {
 /// Which tool the session uses
 pub fn of(cfg: &Config, s: &Session) -> Res<(Handle, Tool)> {
     resolve(cfg, &s.tool)
+}
+
+/// The session's last reply: the copy the hook recorded (at most 4000 characters). If none was recorded (an adopted
+/// session not restarted yet has no hooks) or it was cut short (ends with …), read the full one from its conversation
+/// record (see [`Agent::last_reply`]). Empty when there's neither
+pub fn reply(session: &str) -> String {
+    let r = crate::runtime::load(session);
+    if !r.last.trim().is_empty() && !r.last.ends_with('…') {
+        return r.last;
+    }
+    let full = crate::store::Store::open().ok().and_then(|st| st.get(session).ok()).and_then(|s| {
+        let (agent, _) = of(&config::load(), &s).ok()?;
+        agent.last_reply(&r)
+    });
+    full.unwrap_or(r.last)
 }
 
 /// Whether the account is written as a directory (`~/.x`, `/abs`, `./rel`): no registration needed, used as the config
@@ -777,7 +855,7 @@ pub fn tool_cmd(cfg: &Config, s: &Session, args: &[String]) -> Res<Launch> {
     cmd[0] = which(&cmd[0]).ok_or_else(|| tr!("PATH 中找不到 {}", "{} isn't on PATH", cmd[0]))?;
     cmd.extend(args.iter().cloned());
     let env = layered_env(&*agent, &tool, &layer)?;
-    Ok(Launch { argv: without(&[FOREIGN, OURS], &env, cmd), env, said: false })
+    Ok(Launch { argv: without(&[FOREIGN, OURS], &env, cmd), env, ..Default::default() })
 }
 
 /// The common part of the command: the tool's own command if it set one, otherwise this tool's program name

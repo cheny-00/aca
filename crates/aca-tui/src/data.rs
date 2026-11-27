@@ -21,7 +21,7 @@ use aca_core::runtime::Run;
 use aca_core::store::{self, Store};
 use aca_core::tmux::Pane;
 use aca_core::i18n::{self, Lang};
-use aca_core::{paths, status};
+use aca_core::{answer, paths, status};
 use aca_core::{t, tr};
 use aca_records::agent::{Agent, agent_in, agent_of_tool, builtin, config_home, home_var, kind_of, registered};
 use aca_records::subagent::Subagent;
@@ -68,6 +68,12 @@ pub struct Session {
     pub state: State,
     /// In the Ask state, what it's asking (empty if not found)
     pub question: String,
+    /// In the Ask state, a registered session's question as answering reads it and the keys the list can answer it with (`s`);
+    /// None otherwise, and for the unregistered ones (only their own screen answers them)
+    pub asked: Option<Asked>,
+    /// The first sentence of its last reply: the hook's copy (`Run::last`), shown under or beside the row (see `row_segments`). Empty
+    /// without a hook (adopted, not restarted yet) or before a turn ends
+    pub replied: String,
     pub idle_for: u64,
     /// When there was last activity (epoch seconds): for a registered agent that isn't running it's what the hook reported
     /// (see `Run::hook_at`), otherwise when the window last printed something
@@ -140,9 +146,33 @@ pub struct Session {
     /// auto-stopped while idle. Claude's two live only in its process, so they exist only while the agent is still open; only
     /// registered sessions have them, and the UI's first screen doesn't read them
     pub due: Vec<aca_core::schedule::Due>,
+    /// Its group names it as its router (see `Store::routers`): the group's row leads with @ in its state's color, and so does
+    /// its own
+    pub router: bool,
+    /// The router of the scratch group: the desk, which dispatches for every group. Its @ leads the rail's row for all
+    /// groups, not its own group's; its row leads that group's, and the group's sessions that hang under nothing are drawn
+    /// under it — drawn only: it is not their parent. Set by the interface once it knows which group that is (see
+    /// `App::apply_pins`)
+    pub desk: bool,
+    /// How many bytes of `group` are the scratch group's path: 0 = the group is neither it nor under it. For writing the
+    /// group's name (see `kit::group_shown`). Set by the interface with `desk`
+    pub scratch: usize,
+    /// The task ticket it's doing, as its row says it ("#9"); with none, the one it finished last ("✓ #8"); empty = neither.
+    /// Set by the interface from the tickets it read (see `App::apply_pins`)
+    pub ticket: String,
+    /// A router's thread, oldest first (see `aca_core::thread`): what was said to it, what it answered, sent out and pulled
+    /// over. Empty on the UI's first screen
+    pub thread: Vec<aca_core::thread::Entry>,
     /// This item isn't a session but an empty group in the registry (not even subgroups have sessions, see `blank_row`):
     /// the list draws only its title, and the highlight rests on the title
     pub blank: bool,
+}
+
+/// What a session waiting for you asks (see `aca_core::answer::asking`) and how it can be answered from the list
+#[derive(Clone, Debug, PartialEq)]
+pub struct Asked {
+    pub what: answer::Asking,
+    pub offer: answer::Offer,
 }
 
 /// Parent/child sessions (`aca new` run inside some session, or set with `--parent`).
@@ -252,6 +282,7 @@ static HOST: LazyLock<String> = LazyLock::new(|| sh(&["hostname", "-s"]).trim().
 /// separate server holding only fake sessions, so they can't possibly read or enter real ones.
 pub fn tmux_cmd() -> Command {
     let mut c = Command::new("tmux");
+    c.arg("-u");
     if let Some(sock) = std::env::var_os("ACA_TMUX_SOCKET").filter(|s| !s.is_empty()) {
         c.arg("-L").arg(sock);
     }
@@ -464,6 +495,19 @@ pub fn client_term() -> String {
     }
     args.push("#{client_termname}");
     tmux(&args).trim().to_string()
+}
+
+/// Whether the screen is a terminal on this machine (kitty / Ghostty / WezTerm) rather than a phone over mosh or a session over
+/// ssh: inside tmux, this client's terminal type (a phone over mosh is xterm-256color or the like); outside tmux, TERM
+pub fn local_term() -> bool {
+    let term = if std::env::var_os("TMUX").is_some() {
+        client_term()
+    } else if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+        return false;
+    } else {
+        std::env::var("TERM").unwrap_or_default()
+    };
+    ["kitty", "ghostty", "wezterm"].iter().any(|t| term.contains(t))
 }
 
 /// Already inside tmux: switch this client to that session (no nested attach). Callers add the Ctrl+Q binding first
@@ -969,9 +1013,9 @@ pub fn collect_first() -> Vec<Session> {
 fn gather(schedules: bool) -> Vec<Session> {
     let now = paths::now();
     let cfg = aca_core::config::load();
-    let (sessions, groups) = match Store::open() {
-        Ok(st) => (st.sessions(false).unwrap_or_default(), st.groups().unwrap_or_default()),
-        Err(_) => (vec![], vec![]),
+    let (sessions, groups, routers) = match Store::open() {
+        Ok(st) => (st.sessions(false).unwrap_or_default(), st.groups().unwrap_or_default(), st.routers().unwrap_or_default()),
+        Err(_) => (vec![], vec![], vec![]),
     };
     let panes = aca_core::tmux::panes();
     // Record pane titles whose title changed first (so the state files read below are current); no need to relist when the
@@ -1009,8 +1053,21 @@ fn gather(schedules: bool) -> Vec<Session> {
             s.due = due;
         }
     }
+    // The groups' routers, each with its thread. The threads are read off the event stream: all of it the first time (so not
+    // for the first screen), then only what was appended
+    let ids: Vec<String> = routers.into_iter().map(|(_, id)| id).collect();
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    if schedules {
+        threads.refresh(&ids);
+    }
+    for s in out.iter_mut().filter(|s| s.sub.is_none() && ids.contains(&s.deck_id)) {
+        s.router = true;
+        s.thread = threads.of(&s.deck_id).to_vec();
+    }
     out
 }
+
+static THREADS: LazyLock<std::sync::Mutex<aca_core::thread::Threads>> = LazyLock::new(Default::default);
 
 type Homes = HashMap<(u32, Agent), Option<String>>;
 
@@ -1045,6 +1102,43 @@ fn seen_state(tool: Option<&str>, plain: &[String]) -> (Option<State>, String, u
         },
         None => screen_state(plain),
     }
+}
+
+/// Text on one line, runs of whitespace (newlines included) made one space
+pub fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether a turn's prompt is what you typed, not something that opened the turn for you: a background task finishing (Claude gets
+/// `<task-notification>…`) or a message aca typed in from another session, a schedule or a delegated task (`[aca] …`, see
+/// `aca_core::inbox`). The hook puts back what you said yourself once such a turn ends
+pub fn by_you(prompt: &str) -> bool {
+    let t = prompt.trim_start();
+    let tag = t.strip_prefix('<').and_then(|r| r.split_once('>')).map(|(tag, _)| tag);
+    let notice = tag.is_some_and(|tag| !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    !notice && !t.starts_with("[aca] ")
+}
+
+/// The first sentence of a reply, for the list: its first line with text, without Markdown marks (heading, list, quote, bold,
+/// code), cut after the first 。！？ or ". " "! " "? ". The list clips it further to fit
+pub fn first_sentence(text: &str) -> String {
+    let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("```") && !l.starts_with("---")) else {
+        return String::new();
+    };
+    let line = line.trim_start_matches(['#', '>', '-', '*', '+', ' ']);
+    // A numbered list item: "1. " / "2) "
+    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let line = match line[digits..].strip_prefix(['.', ')']) {
+        Some(rest) if digits > 0 && rest.starts_with(' ') => rest,
+        _ => line,
+    };
+    let line = one_line(&line.replace("**", "").replace('`', ""));
+    let end = line.char_indices().find_map(|(i, c)| match c {
+        '。' | '！' | '？' => Some(i + c.len_utf8()),
+        '.' | '!' | '?' if line[i + 1..].starts_with(' ') => Some(i + 1),
+        _ => None,
+    });
+    end.map_or(line.clone(), |e| line[..e].to_string())
 }
 
 /// Merge the registry, the panes actually in tmux, the state the hook writes and what's seen on screen into the list.
@@ -1098,6 +1192,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
                 group: "-".into(),
                 state,
                 question: scr_q,
+                asked: None,
+                replied: String::new(),
                 idle_for: now.saturating_sub(act),
                 active_at: act,
                 ran: scr_ran,
@@ -1130,6 +1226,11 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
                 error_kind: String::new(),
                 idle_stopped: 0,
                 due: vec![],
+                router: false,
+                desk: false,
+                scratch: 0,
+                ticket: String::new(),
+                thread: vec![],
                 blank: false,
             });
             continue;
@@ -1160,6 +1261,11 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             None => registered(&cfg, s),
         };
         let conv = if r.conv.is_empty() { s.conv.clone() } else { r.conv.clone() };
+        // Waiting for you: what it asks as answering reads it, and what the list can answer it with
+        let asked = (state == State::Ask).then(|| {
+            let what = answer::asking(&r, &plain);
+            Asked { offer: answer::offer(handle.as_deref(), &what), what }
+        });
         let group = group_name(&s.group);
         // A shell session's dir is wherever it cd'd to (the registered one is only where it opened)
         let dir = if shell && !p.path.is_empty() { p.path.clone() } else { s.dir.clone() };
@@ -1172,6 +1278,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             group,
             state,
             question,
+            asked,
+            replied: first_sentence(&r.last),
             idle_for: now.saturating_sub(act),
             active_at: act,
             ran,
@@ -1203,6 +1311,11 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             error_kind: if state == State::Error { r.error_kind.clone() } else { String::new() },
             idle_stopped: if p.dead { r.idle_stopped } else { 0 },
             due: vec![],
+            router: false,
+            desk: false,
+            scratch: 0,
+            ticket: String::new(),
+            thread: vec![],
             blank: false,
         });
     }
@@ -1243,6 +1356,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             title,
             state,
             question,
+            asked: None,
+            replied: String::new(),
             idle_for: now.saturating_sub(act),
             active_at: act,
             ran,
@@ -1264,6 +1379,11 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             sub: Some(Sub { parent: parent.name.clone(), parent_title: parent.title.clone(), win: p.window, pane: p.index, split }),
             idle_stopped: 0,
             due: vec![],
+            router: false,
+            desk: false,
+            scratch: 0,
+            ticket: String::new(),
+            thread: vec![],
             ..parent.clone()
         });
     }
@@ -1286,6 +1406,8 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             group,
             state: if r.status == "error" { State::Crashed } else { State::Stopped },
             question: String::new(),
+            asked: None,
+            replied: first_sentence(&r.last),
             idle_for: now.saturating_sub(at),
             active_at: at,
             ran: 0,
@@ -1317,6 +1439,11 @@ pub fn build(inp: Inputs, run: &dyn Fn(&str) -> Run, home_of: &dyn Fn(u32, Agent
             error_kind: String::new(),
             idle_stopped: r.idle_stopped,
             due: vec![],
+            router: false,
+            desk: false,
+            scratch: 0,
+            ticket: String::new(),
+            thread: vec![],
             blank: false,
         });
     }
@@ -1346,6 +1473,8 @@ pub fn blank_row(group: &str, rank: usize) -> Session {
         group: group.to_string(),
         state: State::Idle,
         question: String::new(),
+        asked: None,
+        replied: String::new(),
         idle_for: 0,
         active_at: 0,
         ran: 0,
@@ -1378,6 +1507,11 @@ pub fn blank_row(group: &str, rank: usize) -> Session {
         error_kind: String::new(),
         idle_stopped: 0,
         due: vec![],
+        router: false,
+        desk: false,
+        scratch: 0,
+        ticket: String::new(),
+        thread: vec![],
         blank: true,
     }
 }
@@ -1386,6 +1520,28 @@ pub fn blank_row(group: &str, rank: usize) -> Session {
 pub(crate) mod tests {
     use super::*;
     use aca_records::agent::accounts;
+
+    #[test]
+    fn a_reply_gives_the_list_its_first_sentence_without_markdown() {
+        assert_eq!(first_sentence("改好了。测试也过了。"), "改好了。");
+        assert_eq!(first_sentence("\n\n## 结论\n\n后面"), "结论");
+        assert_eq!(first_sentence("- **装好了**,`aca` 是新的\n- 第二条"), "装好了,aca 是新的");
+        assert_eq!(first_sentence("1. 范围\n2. 任务"), "范围");
+        assert_eq!(first_sentence("Done. Tests pass."), "Done.");
+        assert_eq!(first_sentence("v0.1.2 is out"), "v0.1.2 is out");
+        assert_eq!(first_sentence("```sh\nmake\n```"), "make");
+        assert_eq!(first_sentence("  \n"), "");
+    }
+
+    #[test]
+    fn a_notice_is_not_you() {
+        assert!(by_you("先跑测试\n\n再提交"));
+        assert!(!by_you("<task-notification>\n<task-id>b1</task-id>…"));
+        assert!(by_you("a < b 时怎么办"));
+        assert!(by_you("<这不是标签>"));
+        assert!(!by_you("[aca] 来自会话 zz99「别的」claude:sub:\n补一下测试"));
+        assert!(!by_you("[aca] 定时到点了(你 2 分钟前定的):\n回来看看 CI"));
+    }
 
     #[test]
     fn the_session_left_last_comes_first_then_the_one_entered() {
@@ -1500,6 +1656,8 @@ pub(crate) mod tests {
             group: "-".into(),
             state: State::Idle,
             question: String::new(),
+            asked: None,
+            replied: String::new(),
             idle_for: 0,
             active_at: 0,
             ran: 0,
@@ -1532,6 +1690,11 @@ pub(crate) mod tests {
             error_kind: String::new(),
             idle_stopped: 0,
             due: vec![],
+            router: false,
+            desk: false,
+            scratch: 0,
+            ticket: String::new(),
+            thread: vec![],
             blank: false,
         }
     }
@@ -1931,7 +2094,7 @@ account = \"alt\"
             store::Session { dir: "/q".into(), ..reg("bb22", "shell", "", 1, 20) },
             store::Session { title: "停着的".into(), ..reg("cc33", "codex", "work", 2, 30) },
         ];
-        let groups = vec![store::Group { path: "work".into(), order: 1, default_path: String::new() }];
+        let groups = vec![store::Group { path: "work".into(), order: 1, ..Default::default() }];
         let panes = vec![
             Pane {
                 pid: 100,
@@ -1974,7 +2137,7 @@ account = \"alt\"
     #[test]
     fn groups_without_sessions_get_a_blank_in_their_place() {
         let cfg = aca_core::config::parse(CONFIG);
-        let g = |path: &str, order: i64| store::Group { path: path.into(), order, default_path: String::new() };
+        let g = |path: &str, order: i64| store::Group { path: path.into(), order, ..Default::default() };
         // The empty group empty comes before work; fun itself has no sessions but subgroup fun/app does: not empty;
         // fun/lab with no session at all is
         let groups = vec![g("empty", 1), g("work", 2), g("fun", 3), g("fun/app", 1), g("fun/lab", 2)];

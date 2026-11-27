@@ -4,17 +4,18 @@ version = 4
 
 [[package]]
 name = "aca"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aca-core",
  "aca-records",
  "aca-tui",
+ "rusqlite",
  "serde_json",
 ]
 
 [[package]]
 name = "aca-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "regex",
@@ -26,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "aca-records"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aca-core",
  "memchr",
@@ -38,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "aca-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aca-core",
  "aca-records",
@@ -51,6 +52,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
  "syntect",
  "toml",

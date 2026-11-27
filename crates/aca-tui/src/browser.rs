@@ -479,6 +479,18 @@ fn deliver(back: &str, pasted: &str) -> Result<(), String> {
     }
 }
 
+/// The login link's keys (picking how to open it), for the bottom bar and `?`
+fn pick_keys() -> Vec<crate::sheet::Key> {
+    use crate::sheet::{key, more};
+    vec![
+        key("⏎", t!("选择", "select")),
+        more("1-9", t!("用这一种", "use this one")),
+        more("c", t!("复制链接", "copy the link")),
+        more("↑↓", t!("选择", "select")),
+        more("Esc", t!("暂不打开", "not now")),
+    ]
+}
+
 impl Overlay for Pick {
     fn width(&self) -> u16 {
         64
@@ -530,12 +542,17 @@ impl Overlay for Pick {
             out.push(kit::picked(line, w, i == self.sel));
         }
         out.push(Line::raw(""));
-        out.push(kit::keys_line(&[("⏎", t!("选择", "select"))], vec![], w));
+        out.push(crate::kit::keys_line_help(&crate::sheet::foot(&pick_keys()), vec![], w));
         out
     }
 
     fn typing(&self) -> bool {
         self.paste.is_some()
+    }
+
+    /// Pasting the address back: ? is a character there
+    fn sheet(&self) -> Option<Vec<crate::sheet::Key>> {
+        self.paste.is_none().then(pick_keys)
     }
 
     fn on_key(&mut self, k: KeyEvent, fx: &mut Fx) -> Flow {

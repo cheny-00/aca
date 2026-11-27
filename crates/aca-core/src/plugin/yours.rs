@@ -5,7 +5,7 @@
 //!   `agent?` ones (that change things on your machine) are given only when you name them. aca checks this both when it
 //!   lists tools and when one is actually called. This is the list of tools for agents, not a sandbox: an agent with a
 //!   shell can still type `aca` commands.
-//! - **Keys in the `:` menu**: `keys = { tasks = "T", run = "" }` (command / pane / view id → one character, empty = no key).
+//! - **Keys in the list's `?`**: `keys = { tasks = "T", run = "" }` (command / pane / view id → one character, empty = no key).
 //!   The rest follow the manifest's `[[keys]]`. When two plugins want the same key: yours wins; if both come from manifests,
 //!   the one registered first gets it. The one left without is named (plugins page, `aca plugin ls`), instead of quietly
 //!   losing it.
@@ -150,12 +150,12 @@ fn settle_by<K: Clone + Eq + std::hash::Hash + std::fmt::Display>(
     (got, notes)
 }
 
-/// A key usable in the `:` menu
+/// A key usable in the list's `?`
 fn key_ok(k: &str) -> Res<char> {
     let mut cs = k.chars();
     match (cs.next(), cs.next()) {
         (Some(c), None) if !c.is_whitespace() && !MENU_KEYS_TAKEN.contains(&k) => Ok(c),
-        (Some(_), None) if !k.trim().is_empty() => Err(tr!("{k} 已被 : 菜单占用", "{k} is taken by the : menu")),
+        (Some(_), None) if !k.trim().is_empty() => Err(tr!("{k} 已被 ? 占用", "{k} is taken by ?")),
         _ => Err(tr!("键应为单个字符:「{k}」", "a key is one character: “{k}”")),
     }
 }
@@ -170,8 +170,8 @@ pub fn set_key(id: &str, target: &str, key: Option<&str>) -> Res<()> {
         || m.views.iter().any(|v| v.id == target);
     if !in_menu {
         return Err(tr!(
-            "{id} 没有 {target}(只有 : 菜单中的能力、窗格、视图能设键)",
-            "{id} has no {target} (only : menu commands, panes and views take keys)"
+            "{id} 没有 {target}(只有 ? 中的能力、窗格、视图能设键)",
+            "{id} has no {target} (only the commands, panes and views in ? take keys)"
         ));
     }
     if let Some(k) = key.filter(|k| !k.is_empty()) {
@@ -269,7 +269,7 @@ mod tests {
             ]);
             assert_eq!(got, [Some('M'), None, None, None]);
             assert_eq!(notes.len(), 2, "{notes:?}");
-            assert!(notes[0].1.contains("单个字符") && notes[1].1.contains(": 菜单占用"), "{notes:?}");
+            assert!(notes[0].1.contains("单个字符") && notes[1].1.contains("已被 ? 占用"), "{notes:?}");
         });
     }
 }

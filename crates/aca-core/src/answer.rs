@@ -16,7 +16,8 @@
 //! - Anything else whose kind can't be told isn't pressed for you
 //!
 //! Who may press: from outside, you can press anything; an agent (calling from inside a session) may only press for the
-//! sessions it delegated (whose parent is it, or further down).
+//! sessions it delegated (whose parent is it, or further down). A person pressing in an interface ([`answer_for_you`]) isn't
+//! an agent, wherever the interface was opened: it's recorded as you.
 
 use serde_json::json;
 
@@ -30,12 +31,76 @@ use crate::status::{self, State};
 use crate::store::{Session, Store};
 use crate::{event, t, tmux, tr};
 
-/// What it's asking (printed by `aca answer <session>` without an answer). `screen` = its current screen (only needed for
-/// prompts recognized from the screen)
-pub fn show(s: &Session, r: &Run, screen: &[String]) -> String {
+/// What it's asking, as answering reads it: the hook's report (while it still waits on it), or a startup gate read off the
+/// screen when the hook reported no kind. What an interface shows, and what [`answer_for_you`] compares with before pressing
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Asking {
+    /// The question (a gate: the lines above its options)
+    pub ask: String,
+    /// choice / permission / gate; empty = can't tell (or the hook's report is no longer a live wait)
+    pub kind: String,
+    /// A choice's options (only the first question's), a gate's options
+    pub opts: Vec<String>,
+    /// Several questions at once, or multi-select: one number can't answer it
+    pub multi: bool,
+    /// A gate: what was recognized on the screen (pressing walks from its highlight)
+    pub gate: Option<Gate>,
+}
+
+/// Use the current screen for startup gates and for agy confirmations, whose title feed omits the command.
+pub fn asking(r: &Run, screen: &[String]) -> Asking {
+    // The title feed signals a confirmation but only the command dialog has verified keys.
+    if r.agy.is_some() {
+        return match agent::agy::Agy.screen(screen) {
+            crate::screen::Seen::Ask(ask) if r.status == "waiting" && r.ask_kind == "permission" => {
+                Asking { ask, kind: "permission".into(), ..Default::default() }
+            }
+            _ => Asking::default(),
+        };
+    }
     if r.ask_kind.is_empty()
         && let Some(g) = gate(screen)
     {
+        return Asking { ask: g.title.clone(), kind: "gate".into(), opts: g.opts.clone(), multi: false, gate: Some(g) };
+    }
+    let kind = if r.status == "waiting" { r.ask_kind.clone() } else { String::new() };
+    Asking { ask: r.ask.clone(), kind, opts: r.ask_opts.clone(), multi: r.ask_multi, gate: None }
+}
+
+/// The keys an interface can offer for it, by the same rules [`answer`] presses by
+#[derive(Clone, Debug, PartialEq)]
+pub enum Offer {
+    /// An option's number, 1 to this
+    Number(usize),
+    /// Allow (this once) / deny
+    YesNo,
+    /// Only in its own screen
+    Nothing,
+}
+
+/// A single choice or a gate: by number (options listed, at most 9); a permission prompt: yes / no where this tool's keys are
+/// known (`agent` None = unknown tool); anything else is answered in its own screen
+pub fn offer(agent: Option<&dyn Agent>, a: &Asking) -> Offer {
+    match a.kind.as_str() {
+        "choice" | "gate" if !a.multi && !a.opts.is_empty() => Offer::Number(a.opts.len().min(9)),
+        "permission" if agent.and_then(|x| x.permission_keys()).is_some() => Offer::YesNo,
+        _ => Offer::Nothing,
+    }
+}
+
+/// Why [`answer_for_you`] didn't answer
+#[derive(Debug, PartialEq)]
+pub enum Unanswered {
+    /// It isn't asking what was shown any more (another question, answered meanwhile, no longer waiting): nothing pressed
+    Changed,
+    Failed(String),
+}
+
+/// What it's asking (printed by `aca answer <session>` without an answer). `screen` = its current screen (only needed for
+/// prompts recognized from the screen)
+pub fn show(s: &Session, r: &Run, screen: &[String]) -> String {
+    let asks = asking(r, screen);
+    if let Some(g) = asks.gate {
         let mut out = tr!("{} 正在询问:{}", "{} is asking: {}", s.id, g.title);
         for (i, o) in g.opts.iter().enumerate() {
             out += &format!("\n  {} {o}", i + 1);
@@ -51,9 +116,10 @@ pub fn show(s: &Session, r: &Run, screen: &[String]) -> String {
         "{} 正在询问:{}",
         "{} is asking: {}",
         s.id,
-        if r.ask.is_empty() { t!("(未提供问题内容)", "(no question given)") } else { &r.ask }
+        if asks.ask.is_empty() { t!("(未提供问题内容)", "(no question given)") } else { &asks.ask }
     );
-    match r.ask_kind.as_str() {
+    let kind = if r.agy.is_some() { &asks.kind } else { &r.ask_kind };
+    match kind.as_str() {
         "choice" if r.ask_multi => {
             out += t!(
                 "\n包含多个问题(或可多选),无法用一个数字回答:请在它的界面中回答",
@@ -174,12 +240,17 @@ pub fn interrupt(store: &Store, cfg: &Config, key: &str) -> Res<String> {
         tmux::keys(&pane.pane, &[k])?;
     }
     if !agent.reports_interrupt() {
-        // Claude sends no hook when stopped with Esc: mark it idle ourselves
-        runtime::update(&s.id, |r| {
+        // agy's idle redraw can beat this write. Only the first one to close the turn reports it.
+        let (before, _) = runtime::update(&s.id, |r| {
+            if r.agy.is_some() && !matches!(r.status.as_str(), "running" | "waiting") {
+                return;
+            }
             r.status = "idle".into();
             r.clear_ask();
         });
-        event::emit("turn.interrupted", &s.id, json!({ "by": me.unwrap_or_else(|| "you".into()) }));
+        if before.agy.is_none() || matches!(before.status.as_str(), "running" | "waiting") {
+            event::emit("turn.interrupted", &s.id, json!({ "by": me.unwrap_or_else(|| "you".into()) }));
+        }
     }
     Ok(tr!("已中止 {} 正在运行的这一轮", "interrupted the running turn of {}", s.id))
 }
@@ -194,36 +265,79 @@ const CHANGED: Tr = Tr::new(
 pub fn answer(store: &Store, cfg: &Config, key: &str, reply: &str) -> Res<String> {
     let s = store.get(key)?;
     let me = caller(store, &s, t!("回答", "answer for"))?;
-    let (agent, _) = agent::of(cfg, &s)?;
-    let pane = tmux::find(&s.id).filter(|p| !p.dead).ok_or(t!("会话未运行", "the session isn't running"))?;
-    if status::one(cfg, &s, true).state != State::Ask {
-        return Err(t!("它当前未在等待确认", "it isn't waiting for a confirmation").into());
+    match press(cfg, &s, reply, me, None) {
+        Ok(said) => Ok(tr!("已代 {} 回答:{said}", "answered for {}: {said}", s.id)),
+        Err(Unanswered::Changed) => Err(CHANGED.get().into()),
+        Err(Unanswered::Failed(e)) => Err(e),
+    }
+}
+
+/// A person answering from an interface (the list's `s` on a row waiting for them): `saw` is what it showed them; nothing is
+/// pressed unless that's still exactly what it asks. Not limited like an agent (only the sessions it dispatched), even when the
+/// interface was opened inside a session and carries that session's ACA_SESSION_ID: `by` is you. Returns what was answered
+/// (`2 B`, `yes`)
+pub fn answer_for_you(store: &Store, cfg: &Config, key: &str, reply: &str, saw: &Asking) -> Result<String, Unanswered> {
+    let s = store.get(key).map_err(Unanswered::Failed)?;
+    press(cfg, &s, reply, None, Some(saw))
+}
+
+/// Still asking what was shown
+fn still(saw: &Asking, now: &Asking) -> Result<(), Unanswered> {
+    if saw == now { Ok(()) } else { Err(Unanswered::Changed) }
+}
+
+/// Presses for `aca answer` (`saw` None) and for a person in an interface (`saw` = what they were shown); returns what was
+/// answered. `me` = the session pressing it, None = you
+fn press(cfg: &Config, s: &Session, reply: &str, me: Option<String>, saw: Option<&Asking>) -> Result<String, Unanswered> {
+    let fail = |e: &str| Unanswered::Failed(e.into());
+    let (agent, _) = agent::of(cfg, s).map_err(Unanswered::Failed)?;
+    let pane = tmux::find(&s.id).filter(|p| !p.dead).ok_or(fail(t!("会话未运行", "the session isn't running")))?;
+    if status::one(cfg, s, true).state != State::Ask {
+        return Err(match saw {
+            Some(_) => Unanswered::Changed,
+            None => fail(t!("它当前未在等待确认", "it isn't waiting for a confirmation")),
+        });
     }
     let r = runtime::load(&s.id);
-    if r.ask_kind.is_empty()
-        && let Some(g) = gate(&tmux::capture(&pane.pane))
-    {
-        return answer_gate(&s, &pane.pane, &g, reply.trim(), me);
+    let screen = if r.ask_kind.is_empty() || r.agy.is_some() { tmux::capture(&pane.pane) } else { vec![] };
+    let asks = asking(&r, &screen);
+    if let Some(saw) = saw {
+        still(saw, &asks)?;
     }
-    let (key, said) = keys_for(&*agent, &r, reply.trim())?;
+    if let Some(g) = &asks.gate {
+        return answer_gate(s, &pane.pane, g, reply.trim(), me);
+    }
+    if r.agy.is_some() && asks.kind.is_empty() {
+        return Err(fail(t!("无法识别确认框类型:请在它的界面中回答", "can't tell what kind of prompt this is; answer in its own screen")));
+    }
+    let (key, said) = keys_for(&*agent, &r, reply.trim()).map_err(Unanswered::Failed)?;
     // Look once more before pressing: still asking the same question (if someone pressed at the same time and the prompt has
     // changed, don't press)
     let now = runtime::load(&s.id);
-    if now.status != "waiting" || now.ask != r.ask || now.ask_kind != r.ask_kind {
-        return Err(CHANGED.get().into());
+    // agy may have filled in the command since the first capture without changing the question.
+    let changed = if r.agy.is_some() { now.agy_confirmation != r.agy_confirmation } else { now.ask != r.ask };
+    if now.status != "waiting" || changed || now.ask_kind != r.ask_kind {
+        return Err(Unanswered::Changed);
     }
-    tmux::keys(&pane.pane, &[key])?;
+    if now.agy.is_some() {
+        still(&asks, &asking(&now, &tmux::capture(&pane.pane)))?;
+    }
+    tmux::keys(&pane.pane, &[key]).map_err(Unanswered::Failed)?;
     box_gone(&*agent, &pane.pane);
     let refused = r.ask_kind == "permission" && reply.starts_with('n');
     runtime::update(&s.id, |r| {
+        // agy's next title update resumes or closes the turn, possibly before its box disappears.
+        if r.agy.is_some() {
+            return;
+        }
         // On a deny, Claude stops and waits for you to say something else, without a hook; otherwise it carries on and its own
         // hooks report again
         r.status = if refused { "idle".into() } else { "running".into() };
         r.clear_ask();
     });
     let by = me.unwrap_or_else(|| "you".into());
-    event::emit("ask.answered", &s.id, json!({ "by": by, "answer": said, "ask": r.ask, "kind": r.ask_kind }));
-    Ok(tr!("已代 {} 回答:{said}", "answered for {}: {said}", s.id))
+    event::emit("ask.answered", &s.id, json!({ "by": by, "answer": said, "ask": asks.ask, "kind": r.ask_kind }));
+    Ok(said)
 }
 
 /// After pressing, wait for the prompt to leave the screen, at most 1.5 seconds: the list and `aca wait` go by the
@@ -240,22 +354,22 @@ fn box_gone(agent: &dyn Agent, pane: &str) {
 
 /// A startup gate: the state comes from the screen (no hook reports it), so runtime isn't changed after pressing; it
 /// changes by itself once past the gate
-fn answer_gate(s: &Session, pane: &str, g: &Gate, reply: &str, me: Option<String>) -> Res<String> {
-    let n: usize = reply
-        .parse()
-        .map_err(|_| t!("这是启动时的确认框,请输入选项号:1、2 …", "this is a startup gate: give an option number: 1, 2 …").to_string())?;
+fn answer_gate(s: &Session, pane: &str, g: &Gate, reply: &str, me: Option<String>) -> Result<String, Unanswered> {
+    let n: usize = reply.parse().map_err(|_| {
+        Unanswered::Failed(t!("这是启动时的确认框,请输入选项号:1、2 …", "this is a startup gate: give an option number: 1, 2 …").into())
+    })?;
     if n == 0 || n > g.opts.len() {
-        return Err(tr!("只有 {} 个选项", "there are only {} options", g.opts.len()));
+        return Err(Unanswered::Failed(tr!("只有 {} 个选项", "there are only {} options", g.opts.len())));
     }
     // Capture once more before pressing: if the prompt changed (someone pressed at the same time), don't press
     if gate(&tmux::capture(pane)).as_ref() != Some(g) {
-        return Err(CHANGED.get().into());
+        return Err(Unanswered::Changed);
     }
-    tmux::keys(pane, &gate_keys(g, n))?;
+    tmux::keys(pane, &gate_keys(g, n)).map_err(Unanswered::Failed)?;
     let said = format!("{n} {}", g.opts[n - 1]);
     let by = me.unwrap_or_else(|| "you".into());
     event::emit("ask.answered", &s.id, json!({ "by": by, "answer": said, "ask": g.title, "kind": "gate" }));
-    Ok(tr!("已代 {} 回答:{said}", "answered for {}: {said}", s.id))
+    Ok(said)
 }
 
 #[cfg(test)]
@@ -329,6 +443,53 @@ mod tests {
         // When the hook reported the kind (multiple choice, permission prompt), it stands, without looking at the screen
         let q = Run { ask: "选?".into(), ask_kind: "choice".into(), ask_opts: vec!["A".into(), "B".into()], ..Default::default() };
         assert!(show(&s, &q, &lines(review)).contains("选?"));
+    }
+
+    #[test]
+    fn what_an_interface_shows_is_the_hooks_report_or_the_gate_and_what_it_can_offer_for_it() {
+        let claude = agent::builtin("claude").unwrap();
+        let pi = agent::builtin("pi").unwrap();
+        let q = Run {
+            status: "waiting".into(),
+            ask: "用哪种方式存?".into(),
+            ask_kind: "choice".into(),
+            ask_opts: vec!["SQLite".into(), "JSON 文件".into(), "先不存".into()],
+            ..Default::default()
+        };
+        let a = asking(&q, &[]);
+        assert_eq!((a.ask.as_str(), a.kind.as_str(), a.opts.len(), a.gate.is_none()), ("用哪种方式存?", "choice", 3, true));
+        assert_eq!(offer(Some(claude), &a), Offer::Number(3));
+        // Several questions / multi-select, no options: only in its own screen
+        assert_eq!(offer(Some(claude), &asking(&Run { ask_multi: true, ..q.clone() }, &[])), Offer::Nothing);
+        assert_eq!(offer(Some(claude), &asking(&Run { ask_opts: vec![], ..q.clone() }, &[])), Offer::Nothing);
+        // The hook's report no longer a live wait: nothing to press by
+        assert_eq!(asking(&Run { status: "running".into(), ..q.clone() }, &[]).kind, "");
+        // A permission prompt: yes / no where the tool's keys are known
+        let p = Run { status: "waiting".into(), ask: "Bash: cargo test".into(), ask_kind: "permission".into(), ..Default::default() };
+        assert_eq!(offer(Some(claude), &asking(&p, &[])), Offer::YesNo);
+        assert_eq!(offer(Some(pi), &asking(&p, &[])), Offer::Nothing);
+        assert_eq!(offer(None, &asking(&p, &[])), Offer::Nothing);
+        // No kind reported: a gate on the screen, by number
+        let trust = lines("  Folder access\n  Trust this folder?\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit");
+        let g = asking(&Run::default(), &trust);
+        assert_eq!((g.kind.as_str(), g.opts.len(), g.gate.as_ref().map(|g| g.at)), ("gate", 2, Some(0)));
+        assert_eq!(offer(Some(pi), &g), Offer::Number(2));
+        // A kind reported wins over the screen
+        assert_eq!(asking(&q, &trust).kind, "choice");
+        // Neither: can't tell
+        assert_eq!(offer(Some(claude), &asking(&Run { status: "waiting".into(), ..Default::default() }, &[])), Offer::Nothing);
+    }
+
+    #[test]
+    fn nothing_is_pressed_unless_it_still_asks_what_was_shown() {
+        let a = |ask: &str| Asking { ask: ask.into(), kind: "choice".into(), opts: vec!["A".into(), "B".into()], ..Default::default() };
+        assert_eq!(still(&a("选 A 还是 B?"), &a("选 A 还是 B?")), Ok(()));
+        // Shown A, now it asks B: changed
+        assert_eq!(still(&a("选 A 还是 B?"), &a("换个问题?")), Err(Unanswered::Changed));
+        // Same words, other options; same gate with the highlight moved
+        assert_eq!(still(&a("q"), &Asking { opts: vec!["A".into(), "C".into()], ..a("q") }), Err(Unanswered::Changed));
+        let gate = |at| Asking { gate: Some(Gate { title: "t".into(), opts: vec!["x".into(), "y".into()], at }), ..a("t") };
+        assert_eq!(still(&gate(0), &gate(1)), Err(Unanswered::Changed));
     }
 
     #[test]

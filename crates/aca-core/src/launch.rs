@@ -24,21 +24,47 @@ use crate::tr;
 pub fn launch(cfg: &Config, s: &Session, how: &How, say: Option<&str>) -> Res<Launch> {
     let (agent, mut tool) = of(cfg, s)?;
     let layer = account(cfg, &*agent, &s.account)?;
+    let store = crate::store::Store::open()?;
+    let role = store.router_role(&s.id)?;
+    let claude_role = role.filter(|_| agent.name() == "claude");
+    if claude_role.is_some() {
+        crate::router::check_account(cfg, agent.name(), &s.account)?;
+    }
+    if role.is_some() {
+        crate::plugin::ensure_router()?;
+    }
     // A sandbox on this Mac starts like any account: the layer already carries its env and config directory
     if cfg.sandbox.get(&layer.sandbox).is_some_and(|b| b.cage()) {
         return inside(cfg, s, how, &*agent, tool, &layer);
     }
     // The account's arguments go after the tool's; each tool includes them when building its command ([`extra`])
+    if claude_role.is_some() {
+        tool.args.clear();
+    }
     tool.args.extend(layer.args.iter().cloned());
+    let mut opening = None;
+    let mut handoff_mail = Vec::new();
+    if let Some(role) = claude_role {
+        let mail = crate::inbox::pending(&s.id);
+        let (dir, text) = crate::router::handoff(&store, role, s, paths::now(), say, &mail)?;
+        let home = crate::agent::home(cfg, &s.tool, &s.account)?.unwrap_or_else(|| paths::home().join(".claude"));
+        crate::agent::configure_router(&mut tool, &cfg.router, role, dir.into(), home);
+        handoff_mail = mail;
+        opening = Some(text);
+    }
+    let say = say.filter(|_| opening.is_none());
     // The config's first, aca's own after: on a name clash the later one wins
     let mut env = layered_env(&*agent, &tool, &layer)?;
     // What enabled plugins give it (plugin directories, MCP servers; Codex also needs a copy it recognizes prepared)
     let codex_home = (agent.name() == "codex").then(|| codex_home(&env));
-    let m = crate::plugin::mount::plan(agent.name(), &s.tool, &s.account, codex_home.as_deref());
+    let m = crate::plugin::mount::plan(agent.name(), &s.tool, &s.account, codex_home.as_deref(), role);
+    if claude_role.is_some() && (m.dirs.is_empty() || !m.mcp.iter().any(|(name, _)| name == crate::plugin::mount::TOOLS_SERVER)) {
+        return Err(tr!("账号未挂载 aca.router", "aca.router is unavailable for this account"));
+    }
     (tool.plugin_dirs, tool.mcp, tool.codex_plugins) = (m.dirs, m.mcp, m.codex_plugins);
     // Record what was passed this time: when plugins change, the Plugins page uses this to say which running sessions need
     // a restart
-    let sig = crate::plugin::mount::signature(agent.name(), &s.tool, &s.account);
+    let sig = crate::plugin::mount::signature(agent.name(), &s.tool, &s.account, role);
     if crate::runtime::load(&s.id).mounts != sig {
         crate::runtime::update(&s.id, |r| r.mounts = sig);
     }
@@ -53,6 +79,44 @@ pub fn launch(cfg: &Config, s: &Session, how: &How, say: Option<&str>) -> Res<La
     }
     let more = agent.env(&tool, &aca, &env)?;
     env.extend(more);
+    if let Some(text) = opening.as_deref() {
+        store.set_conv(&s.id, &s.conv)?;
+        crate::runtime::update(&s.id, |r| {
+            r.user_words = None;
+            r.turn_via.clear();
+            r.bell_via = None;
+            r.router_input = Some((crate::inbox::input_hash(text), crate::inbox::opening_words(&handoff_mail)));
+            r.opening_mail = Some(handoff_mail.iter().map(|m| m.id.clone()).collect());
+            r.tools_listed = false;
+            r.shift.clone_from(&s.conv);
+            r.note_conv(&s.conv);
+            r.transcript.clear();
+            r.bell = false;
+            r.status = "idle".into();
+            r.clear_ask();
+            r.clear_error();
+            r.ps = None;
+            r.compacting = 0;
+            r.bg = 0;
+            r.started_file.clear();
+            r.started_len = 0;
+            r.turn = 0;
+            r.done = 0;
+            r.peer.clear();
+            r.started = paths::now();
+        });
+        env.push(("ACA_ROUTER_SHIFT".into(), s.conv.clone()));
+    } else if !crate::runtime::load(&s.id).shift.is_empty() {
+        // A former router now uses the ordinary launch and delivery paths.
+        crate::runtime::update(&s.id, |r| {
+            r.shift.clear();
+            r.router_input = None;
+            r.bell_via = None;
+            r.opening_mail = None;
+            r.tools_listed = false;
+            r.user_words = None;
+        });
+    }
     env.extend([
         ("ACA_SESSION_ID".to_string(), s.id.clone()),
         ("ACA_TOOL".to_string(), s.tool.clone()),
@@ -65,7 +129,7 @@ pub fn launch(cfg: &Config, s: &Session, how: &How, say: Option<&str>) -> Res<La
         }
     }
     let argv = without(&[FOREIGN], &env, cmd);
-    Ok(Launch { argv: relayed(agent.name(), &tool, &aca, argv), env, said })
+    Ok(Launch { argv: relayed(agent.name(), &tool, &aca, argv), env, said, handoff: opening })
 }
 
 /// [`launch`] for an account bound to a cage (see [`crate::sandbox`]): the tool's own command, run inside over ssh. The
@@ -104,7 +168,7 @@ fn inside(cfg: &Config, s: &Session, how: &How, agent: &dyn Agent, mut tool: Too
         }
     }
     let argv = without(&[FOREIGN], &here, argv);
-    Ok(Launch { argv: relayed(agent.name(), &tool, &aca, argv), env: here, said: false })
+    Ok(Launch { argv: relayed(agent.name(), &tool, &aca, argv), env: here, ..Default::default() })
 }
 
 /// The agents known to report their own state (OSC 7501): Claude Code (2.1.322 on, after the terminal answers its query) and
@@ -164,7 +228,7 @@ pub fn direct(cfg: &Config, spec: &str, args: &[String]) -> Res<Launch> {
             }
         }
         argv.extend([name.to_string(), crate::sandbox::remote(None, &env, &cmd)]);
-        return Ok(Launch { argv: without(&[FOREIGN, OURS], &[], argv), env: vec![], said: false });
+        return Ok(Launch { argv: without(&[FOREIGN, OURS], &[], argv), ..Default::default() });
     }
     let mut cmd = base(&p.def, &p.agent.program());
     cmd[0] = which(&cmd[0]).ok_or_else(|| tr!("PATH 中找不到 {}", "{} isn't on PATH", cmd[0]))?;
@@ -174,7 +238,7 @@ pub fn direct(cfg: &Config, spec: &str, args: &[String]) -> Res<Launch> {
     let asked = std::env::var_os(LOGIN_LINK).is_some();
     let theirs = std::env::var_os("BROWSER").is_some_and(|b| !b.is_empty());
     let argv = quiet_login(p.agent.name(), args, Seat { asked, theirs, remote: remote(cfg) }, &mut env, argv);
-    Ok(Launch { argv, env, said: false })
+    Ok(Launch { argv, env, ..Default::default() })
 }
 
 /// Circumstances of a login: asked = started by the aca interface (with [`LOGIN_LINK`]); theirs = BROWSER set outside;

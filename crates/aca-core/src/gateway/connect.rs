@@ -3,7 +3,7 @@
 //! am" (`ACA_SESSION_ID` from the environment). If the gateway isn't running: take a lock (two agents starting at once start only
 //! one), look again, start one if there's still none, and connect once it's listening.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
@@ -26,8 +26,21 @@ pub fn connect() -> Res<i32> {
         let _ = w.shutdown(std::net::Shutdown::Write);
     });
     // gateway → agent: when the gateway side closes, this process ends too (the agent sees the server exit)
-    let mut r = s;
-    let _ = pump(&mut r, &mut std::io::stdout().lock());
+    let mut out = std::io::stdout().lock();
+    let mut r = BufReader::new(s);
+    if std::env::var_os("ACA_ROUTER_SHIFT").is_some() {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap_or(0) == 0 || out.write_all(line.as_bytes()).and_then(|()| out.flush()).is_err() {
+                return Ok(0);
+            }
+            if serde_json::from_str(&line).is_ok_and(|reply| crate::plugin::tools::note_listed(&reply)) {
+                break;
+            }
+        }
+    }
+    let _ = pump(&mut r, &mut out);
     Ok(0)
 }
 

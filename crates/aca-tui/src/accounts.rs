@@ -16,11 +16,14 @@
 //! - Order: Claude first, then Codex, each sorted by `[ui] menu` (the order of the `n` menu); moving one step edits that line
 //! - Checking the dir: a dir that looks like the other family's (registering `~/.codex` as a Claude account) can't be
 //!   added, and ones already registered like that are flagged
-//! - Logged in or not: ask the tool itself (`claude auth status` / `codex login status`); aca doesn't read credentials
+//! - Logged in or not: a Claude account on this Mac is read from what Claude keeps on disk (whether its login exists, and
+//!   who it's for); the rest ask the tool itself (`claude auth status` / `codex login status`). aca never reads what a
+//!   login holds
 //!
 //! Logging in goes through the tool's own command: `aca run <family>:<account> -- login`, with the environment layer this
 //! account starts sessions with.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use regex::Regex;
@@ -44,6 +47,7 @@ pub(crate) fn fam(a: Agent) -> Option<&'static str> {
     match a {
         Agent::Claude => Some("claude"),
         Agent::Codex => Some("codex"),
+        Agent::Agy => Some("agy"),
         _ => None,
     }
 }
@@ -131,7 +135,11 @@ pub struct Account {
 
 /// What each family is called (in table headers, and when adding an account)
 pub fn who(a: Agent) -> &'static str {
-    if a == Agent::Codex { "Codex" } else { "Claude Code" }
+    match a {
+        Agent::Agy => aca_records::words::ANTIGRAVITY,
+        Agent::Codex => "Codex",
+        _ => "Claude Code",
+    }
 }
 
 /// Registered accounts: Claude first, then Codex, each in `[ui] menu` order, unlisted ones following by name
@@ -181,6 +189,9 @@ pub(crate) fn defaults(text: &str, home: &str, installed: fn(&str) -> bool) -> V
             out.push(Account { agent: a, name: String::new(), dir: format!("~/.{f}") });
         }
     }
+    if let Some(src) = aca_records::usage::Source::agy(&cfg, home, installed) {
+        out.push(Account { agent: src.agent, name: String::new(), dir: tilde(&src.dir.to_string_lossy(), home) });
+    }
     out
 }
 
@@ -189,8 +200,7 @@ pub(crate) fn on_path(prog: &str) -> bool {
     if prog.contains('/') {
         return Path::new(&expand(prog, &home())).is_file();
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path).any(|d| d.join(prog).is_file())
+    aca_core::agent::on_path(prog)
 }
 
 /// Which files in a dir only one family has (history.jsonl, sessions, plugins exist in both and don't count)
@@ -243,6 +253,28 @@ pub enum Login {
     Out,
     /// Can't tell (tool not installed, its output not recognized): its own words
     Unknown(String),
+    /// Not asked, and not to be logged in from here: its directory is missing or is the other tool's (asking or logging in would
+    /// write into it). Why
+    Unsafe(String),
+}
+
+/// Why this account's directory mustn't be asked about or logged in from here (missing, or the other tool's); None = fine. Accounts
+/// that don't switch directories, ones bound to a special environment (their directory is there, not here) and ones not listed
+/// count as fine
+pub fn unsafe_dir(a: Agent, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(crate::config::path()).ok()?;
+    if aca_core::sandbox::of(&aca_core::config::parse(&text), fam(a)?, name).is_some() {
+        return None;
+    }
+    let home = home();
+    let (_, abs) = listed(&text, &home).into_iter().find(|(x, _)| x.agent == a && x.name == name)?;
+    if abs.is_empty() {
+        return None;
+    }
+    if !Path::new(&abs).is_dir() {
+        return Some(t!("目录不存在", "directory missing").into());
+    }
+    foreign(a, &abs, &home).map(|(other, _)| tr!("是 {} 的目录", "a {} directory", who(other)))
 }
 
 /// The JSON `claude auth status` prints
@@ -257,11 +289,141 @@ fn claude_said(out: &str) -> Login {
     }
     // A subscription says its tier (max / pro / team), anything else says how it's logged in
     let how = [s("subscriptionType"), s("authMethod")].into_iter().find(|x| !x.is_empty());
-    let email = s("email");
+    claude_in(provider, how, &s("email"), &s("orgName"))
+}
+
+/// A Claude login as the accounts page writes it: provider (only when not Anthropic's own) · how · email · org
+fn claude_in(provider: Option<String>, how: Option<String>, email: &str, org: &str) -> Login {
     // Org: a personal subscription's is just "<email>'s Organization", the same thing as the email, so not written
-    let org = Some(s("orgName")).filter(|o| !o.is_empty() && (email.is_empty() || !o.contains(&email)));
-    let parts: Vec<String> = [provider, how, Some(email).filter(|e| !e.is_empty()), org].into_iter().flatten().collect();
+    let org = Some(org.to_string()).filter(|o| !o.is_empty() && (email.is_empty() || !o.contains(email)));
+    let email = Some(email.to_string()).filter(|e| !e.is_empty());
+    let parts: Vec<String> = [provider, how, email, org].into_iter().flatten().collect();
     Login::In(parts.join(" · "))
+}
+
+/// Where the managed settings of this Mac's administrator live (they can set an `apiKeyHelper` too)
+const MANAGED_SETTINGS: &str = "/Library/Application Support/ClaudeCode/managed-settings.json";
+
+/// The plan Claude names from the organization type in `.claude.json` (the same table Claude has)
+fn claude_plan(org_type: &str) -> Option<&'static str> {
+    match org_type {
+        "claude_max" => Some("max"),
+        "claude_pro" => Some("pro"),
+        "claude_team" => Some("team"),
+        "claude_enterprise" => Some("enterprise"),
+        _ => None,
+    }
+}
+
+/// The name of the keychain item Claude keeps a login in: `Claude Code-credentials`, plus the first 8 hex digits of the
+/// directory's sha256 when it's a directory of its own (`CLAUDE_CONFIG_DIR` / `CLAUDE_SECURESTORAGE_CONFIG_DIR`)
+fn claude_item(dir: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let Some(d) = dir else { return "Claude Code-credentials".into() };
+    let hex: String = Sha256::digest(d.as_bytes()).iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("Claude Code-credentials-{hex}")
+}
+
+/// Claude's own login for this environment on macOS, read from what Claude keeps on disk without starting it: whether its
+/// keychain item exists (`has_item`), never what's in it, and who it's for from `.claude.json`. None = can't tell from here,
+/// ask Claude: logged in some other way (any ANTHROPIC_* variable, a token, another provider, an `apiKeyHelper` here or in
+/// the `managed` settings, a Console key), a directory name Claude would normalize before naming its item, a `.claude.json`
+/// that doesn't parse, a login with no account recorded, no item but a `.credentials.json` (whether Claude takes it there
+/// is its own business), or the keychain gave no answer
+fn claude_on_disk(env: &BTreeMap<String, String>, home: &str, managed: &Path, has_item: impl Fn(&str) -> Option<bool>) -> Option<Login> {
+    let other_way = |k: &str| k.starts_with("ANTHROPIC_") || k.starts_with("CLAUDE_CODE_USE_") || k == "CLAUDE_CODE_OAUTH_TOKEN";
+    if env.iter().any(|(k, v)| !v.is_empty() && other_way(k)) {
+        return None;
+    }
+    let own = format!("{home}/.claude");
+    let conf = env.get("CLAUDE_CONFIG_DIR").map(String::as_str).filter(|d| !d.is_empty());
+    // Where the login is kept: CLAUDE_SECURESTORAGE_CONFIG_DIR ahead of the config directory (an account may set it on purpose)
+    let (item_dir, file_dir) = match env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR").map(String::as_str) {
+        Some("") => (None, own.as_str()),
+        Some(d) => (Some(d), d),
+        None => (conf, conf.unwrap_or(&own)),
+    };
+    if item_dir.is_some_and(|d| !d.is_ascii()) {
+        return None;
+    }
+    let json = |p: &Path| std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    let filled = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).is_some_and(|x| !x.trim().is_empty());
+    let settings = Path::new(conf.unwrap_or(&own)).join("settings.json");
+    if [settings.as_path(), managed].into_iter().any(|p| json(p).is_some_and(|v| filled(&v, "apiKeyHelper"))) {
+        return None;
+    }
+    let cfg = match std::fs::read_to_string(Path::new(conf.unwrap_or(home)).join(".claude.json")) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text).ok()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+        Err(_) => return None,
+    };
+    if filled(&cfg, "primaryApiKey") {
+        return None;
+    }
+    if !has_item(&claude_item(item_dir))? {
+        return (!Path::new(file_dir).join(".credentials.json").exists()).then_some(Login::Out);
+    }
+    let who = cfg.get("oauthAccount").filter(|a| a.is_object())?;
+    let s = |k: &str| who.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    let how = claude_plan(s("organizationType")).unwrap_or("claude.ai");
+    Some(claude_in(None, Some(how.into()), s("emailAddress"), s("organizationName")))
+}
+
+/// A Claude account on this Mac, read from disk ([`claude_on_disk`]) in the environment `aca run claude:<account>` would give
+/// it: this program's own, less what aca removes ([`aca_core::agent::FOREIGN`]), with the account's layer on top. None = ask
+/// Claude: not on macOS, one in a cage (Claude runs in there), Claude started through a command of your own (`[tools.claude]
+/// cmd`, which may set up its login), or the layer can't be worked out
+fn claude_here(name: &str) -> Option<Login> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let text = std::fs::read_to_string(crate::config::path()).unwrap_or_default();
+    let cfg = aca_core::config::parse(&text);
+    if aca_core::sandbox::cage_of(&cfg, "claude", name).is_some() {
+        return None;
+    }
+    let cmd = aca_core::agent::tool(&cfg, "claude").and_then(|t| t.cmd.first().cloned());
+    if cmd.is_some_and(|c| Path::new(&c).file_name().is_none_or(|f| f != "claude")) {
+        return None;
+    }
+    let layer = aca_core::agent::account_env(&cfg, &crate::tools::spec("claude", name)).ok()?;
+    let mut env: BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .filter(|(k, _)| !aca_core::agent::FOREIGN.contains(&k.as_str()))
+        .collect();
+    env.extend(layer);
+    claude_on_disk(&env, &home(), Path::new(MANAGED_SETTINGS), keychain_has)
+}
+
+/// Whether the login keychain has an item of this name. `security find-generic-password -s` without -w / -g looks at the
+/// item's attributes only, never its secret. None = couldn't tell (no answer in a few seconds, an error other than "not found")
+fn keychain_has(item: &str) -> Option<bool> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new("/usr/bin/security");
+    cmd.args(["find-generic-password", "-s", item]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    match finished(&mut child, std::time::Duration::from_secs(3))?.code() {
+        Some(0) => Some(true),
+        // errSecItemNotFound
+        Some(44) => Some(false),
+        _ => None,
+    }
+}
+
+/// Wait for a child to exit, at most this long; past that, kill it and return None
+fn finished(child: &mut std::process::Child, within: std::time::Duration) -> Option<std::process::ExitStatus> {
+    let began = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if began.elapsed() < within => std::thread::sleep(std::time::Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 /// The line `codex login status` prints (the exit code isn't 0 when logged out)
@@ -282,9 +444,108 @@ fn first_line(out: &str) -> String {
     out.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string()
 }
 
+/// What this program remembers of [`login`]'s answers
+#[derive(Default)]
+struct Kept {
+    /// "tool:account=where its login lives" → the answer
+    answers: std::collections::HashMap<String, Login>,
+    /// "tool:account" → when a login was started here for it
+    logging_in: std::collections::HashMap<String, std::time::Instant>,
+}
+
+static KEPT: std::sync::LazyLock<std::sync::Mutex<Kept>> = std::sync::LazyLock::new(Default::default);
+
+/// For this long after a login starts here, the account is asked afresh every time and its answers aren't kept: enough to
+/// finish it in the browser (there's no word from the login terminal when it's done)
+const LOGGING_IN: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn kept() -> std::sync::MutexGuard<'static, Kept> {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether this account is logged in. A Claude account on this Mac is read from disk afresh each time ([`claude_here`]),
+/// without starting Claude: a Claude started only to ask goes online to api.anthropic.com as it starts and is gone within
+/// milliseconds, before an outbound firewall (LuLu) can check its signature, so LuLu keys it on its path and asks again for
+/// every new Claude version.
+/// The rest ask the tool itself ([`ask`]), remembered for as long as this program runs: the accounts page, the `n` menu and
+/// switching accounts open often, and each ask starts the tool once per account. Asked again after a login starts here
+/// ([`logging_in`]), when the account's directory changes, and on the accounts page's ^R ([`forget_all`]); an unclear answer
+/// (no answer in time, output not recognized) the next time too. Logging out elsewhere shows only after one of those
+pub fn login(a: Agent, name: &str) -> Login {
+    if a == Agent::Agy {
+        let path = Path::new(&home()).join(".gemini/google_accounts.json");
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Login::Out,
+            Err(e) => return Login::Unknown(e.to_string()),
+        };
+        let v: serde_json::Value = match serde_json::from_slice(&data) {
+            Ok(v) => v,
+            Err(e) => return Login::Unknown(e.to_string()),
+        };
+        let Some(email) = v["active"].as_str().map(str::trim).filter(|s| !s.is_empty()) else { return Login::Out };
+        let plan = crate::rehome::quotas(a).into_iter().next().map(|q| q.plan).unwrap_or_default();
+        return Login::In(if plan.is_empty() { email.into() } else { format!("{plan} · {email}") });
+    }
+    if let Some(why) = unsafe_dir(a, name) {
+        return Login::Unsafe(why);
+    }
+    if a == Agent::Claude
+        && let Some(l) = claude_here(name)
+    {
+        return l;
+    }
+    let spec = crate::tools::spec(fam(a).unwrap_or("claude"), name);
+    let key = format!("{spec}={}", lives(a, name));
+    kept_or(&spec, &key, || ask(a, name))
+}
+
+fn kept_or(spec: &str, key: &str, ask: impl FnOnce() -> Login) -> Login {
+    {
+        let mut k = kept();
+        k.logging_in.retain(|_, t| t.elapsed() < LOGGING_IN);
+        if !k.logging_in.contains_key(spec)
+            && let Some(l) = k.answers.get(key)
+        {
+            return l.clone();
+        }
+    }
+    let got = ask();
+    let mut k = kept();
+    // A login started while asking: this answer may be from before it
+    if matches!(got, Login::In(_) | Login::Out) && !k.logging_in.contains_key(spec) {
+        k.answers.insert(key.to_string(), got.clone());
+    }
+    got
+}
+
+/// A login for this account starts here: drop its answer and ask afresh for a while (see [`LOGGING_IN`])
+pub fn logging_in(a: Agent, name: &str) {
+    let spec = crate::tools::spec(fam(a).unwrap_or("claude"), name);
+    let mut k = kept();
+    let mine = format!("{spec}=");
+    k.answers.retain(|key, _| !key.starts_with(&mine));
+    k.logging_in.insert(spec, std::time::Instant::now());
+}
+
+/// Ask every account again (^R on the accounts page)
+pub fn forget_all() {
+    kept().answers.clear();
+}
+
+/// Where this account's login lives, as config.toml says now: the special environment it's bound to, or its directory (empty:
+/// the tool's own)
+fn lives(a: Agent, name: &str) -> String {
+    let Ok(text) = std::fs::read_to_string(crate::config::path()) else { return String::new() };
+    if let Some((env, _)) = aca_core::sandbox::of(&aca_core::config::parse(&text), fam(a).unwrap_or("claude"), name) {
+        return format!("@{env}");
+    }
+    listed(&text, &home()).into_iter().find(|(x, _)| x.agent == a && x.name == name).map(|(_, abs)| abs).unwrap_or_default()
+}
+
 /// Ask the tool itself whether this account is logged in: run its command with the account's environment
 /// (`aca run <family>:<account> -- …`), read-only, and stop waiting after a few seconds without an answer
-pub fn login(a: Agent, name: &str) -> Login {
+fn ask(a: Agent, name: &str) -> Login {
     use std::process::{Command, Stdio};
     let spec = crate::tools::spec(fam(a).unwrap_or("claude"), name);
     let ask: &[&str] = if a == Agent::Codex { &["login", "status"] } else { &["auth", "status", "--json"] };
@@ -294,17 +555,8 @@ pub fn login(a: Agent, name: &str) -> Login {
         Ok(c) => c,
         Err(e) => return Login::Unknown(e.to_string()),
     };
-    let began = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if began.elapsed() < std::time::Duration::from_secs(8) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Login::Unknown(t!("无响应", "no answer").into());
-            }
-        }
+    if finished(&mut child, std::time::Duration::from_secs(8)).is_none() {
+        return Login::Unknown(t!("无响应", "no answer").into());
     }
     let Ok(out) = child.wait_with_output() else { return Login::Unknown(t!("无响应", "no answer").into()) };
     let (said, err) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -411,7 +663,7 @@ fn add_line(text: &str, fam: &str, name: &str, dir: &str) -> Result<String, Stri
 /// The checks before adding, without writing: are name and dir valid, do they duplicate existing ones, can config.toml be
 /// edited. Returns (config.toml's current full text, the full text after adding, the expanded dir)
 fn planned(path: &Path, home: &str, a: Agent, name: &str, dir: &str) -> Result<(String, String, String), String> {
-    let fam = fam(a).ok_or(t!("只能添加 Claude / Codex 账号", "only Claude / Codex accounts can be added"))?;
+    let fam = fam(a).filter(|_| a != Agent::Agy).ok_or(t!("只能添加 Claude / Codex 账号", "only Claude / Codex accounts can be added"))?;
     if !valid_name(name) {
         return Err(t!("账号名只能包含字母、数字、- 和 _", "an account name is letters, digits, - and _").into());
     }
@@ -593,18 +845,22 @@ fn with_common_args(text: &str, fam: &str, args: &[String]) -> Result<String, St
         "无法识别 config.toml 的写法,未修改(请手动修改)",
         "can't make out how config.toml is written; nothing changed (edit those lines yourself)"
     ))?;
+    Ok(keep_comment(text, new))
+}
+
+fn keep_comment(text: &str, new: String) -> String {
     // with_value replaces that line in place: with the same line count, the line that differs is it, so re-attach the
     // original line's comment
     let (old, got): (Vec<&str>, Vec<&str>) = (text.lines().collect(), new.lines().collect());
-    let Some(i) = (old.len() == got.len()).then(|| (0..old.len()).find(|&i| old[i] != got[i])).flatten() else { return Ok(new) };
+    let Some(i) = (old.len() == got.len()).then(|| (0..old.len()).find(|&i| old[i] != got[i])).flatten() else { return new };
     let rest = old[i].split_once('=').map_or("", |(_, r)| r);
     // A `#` inside a string doesn't count: the part up to it must parse as a value, and only what follows is the comment
     let cut = rest.match_indices('#').map(|(j, _)| j).find(|&j| format!("x = {}", &rest[..j]).parse::<Table>().is_ok());
-    let Some(cut) = cut else { return Ok(new) };
+    let Some(cut) = cut else { return new };
     let mut lines: Vec<String> = got.iter().map(|l| l.to_string()).collect();
     lines[i].push_str(&rest[rest[..cut].trim_end().len()..]);
     let out = lines.join("\n") + "\n";
-    Ok(if out.parse::<Table>().ok() == new.parse::<Table>().ok() { out } else { new })
+    if out.parse::<Table>().ok() == new.parse::<Table>().ok() { out } else { new }
 }
 
 /// Replace the launch args every account of this family gets (the previous file saved as config.toml.bak-aca). false =
@@ -654,43 +910,57 @@ pub(crate) fn default_of(cfg: &aca_core::config::Config, a: Agent, name: &str) -
 /// (ones added later still follow at the end)
 pub(crate) fn shift_in(path: &Path, home: &str, a: Agent, name: &str, up: bool) -> Result<bool, String> {
     let text = read(path).map_err(|e| tr!("无法读取 config.toml:{e}", "can't read config.toml: {e}"))?;
-    let cfg = aca_core::config::parse(&text);
     let menu = crate::config::list_in(&text, "ui", "menu");
-    let order = |menu: &[String]| -> Vec<String> {
-        ordered(&text, home, menu).into_iter().filter(|(x, _)| x.agent == a).map(|(x, _)| x.name).collect()
-    };
-    let mut want = order(&menu);
+    let want: Vec<_> = ordered(&text, home, &menu).into_iter().filter(|(x, _)| x.agent == a).map(|(x, _)| x.name).collect();
     let Some(at) = want.iter().position(|n| n == name) else {
         return Err(tr!("账号不存在:{name}", "no such account: {name}"));
     };
     let to = if up { at.checked_sub(1) } else { Some(at + 1).filter(|i| *i < want.len()) };
     let Some(to) = to else { return Ok(false) };
-    let by = want[to].clone();
-    want.swap(at, to);
-    // The menu's whole current order (hidden ones included): take only this one out and insert it before / after its
-    // neighbor in the same family, nobody else moves (the two families are interleaved in the menu: with a swap, the one
-    // jumped over would move elsewhere too)
-    let lay = crate::tools::Layout { menu, hide: vec![] };
-    let mut names: Vec<String> = vec![];
-    for t in crate::tools::menu(&cfg, &lay).into_iter().filter(|t| t.tool != "shell" && t.name != name) {
-        if !names.contains(&t.name) {
-            names.push(t.name);
-        }
-    }
-    let Some(j) = names.iter().position(|n| *n == by) else { return Ok(false) };
-    names.insert(if up { j } else { j + 1 }, name.to_string());
-    // With same-named accounts in both families the menu can't tell them apart by name: if the result isn't the wanted
-    // order, don't write
+    let all = crate::tools::menu(&aca_core::config::parse(&text), &crate::tools::Layout::default());
+    write_move(path, &text, all, name, &want[to], up)
+}
+
+pub(crate) fn move_next_to(path: &Path, name: &str, by: &str, up: bool, installed: fn(&str) -> bool) -> Result<bool, String> {
+    let text = read(path).map_err(|e| tr!("无法读取 config.toml:{e}", "can't read config.toml: {e}"))?;
+    let all = crate::tools::menu_with(&aca_core::config::parse(&text), &crate::tools::Layout::default(), installed);
+    write_move(path, &text, all, name, by, up)
+}
+
+fn write_move(path: &Path, text: &str, all: Vec<crate::tools::Tool>, name: &str, by: &str, up: bool) -> Result<bool, String> {
     let hand = t!(
         "无法移动(有重名项,或 [ui] menu 分成了多行):请在 config.toml 的 [ui] menu 中手动调整顺序",
         "can't move it (a duplicate name, or [ui] menu spans several lines): order it yourself under [ui] menu in config.toml"
     );
-    if order(&names) != want {
+    let mut names = crate::config::list_in(text, "ui", "menu");
+    let mut seen = std::collections::HashSet::new();
+    if names.iter().any(|n| !seen.insert(n.as_str())) {
         return Err(hand.into());
     }
+    let mut seen = std::collections::HashSet::new();
+    let shell_implicit = !names.iter().any(|n| n == "shell");
+    if shell_implicit {
+        names.insert(0, "shell".into());
+    }
+    // Keep hidden and currently unavailable names in place when crossing a visible neighbor.
+    for t in &all {
+        if !seen.insert(&t.name) {
+            return Err(hand.into());
+        }
+        if !names.contains(&t.name) {
+            names.push(t.name.clone());
+        }
+    }
+    let Some(i) = names.iter().position(|n| n == name) else { return Ok(false) };
+    names.remove(i);
+    let Some(j) = names.iter().position(|n| n == by) else { return Ok(false) };
+    names.insert(if up { j } else { j + 1 }, name.to_string());
+    if shell_implicit && names.first().is_some_and(|n| n == "shell") {
+        names.remove(0);
+    }
     let value = Value::Array(names.into_iter().map(Value::String).collect());
-    let new = crate::config::with_value(&text, "ui", "menu", &value).ok_or(hand)?;
-    if !write(path, &text, &new).map_err(|e| tr!("写入 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
+    let new = keep_comment(text, crate::config::with_value(text, "ui", "menu", &value).ok_or(hand)?);
+    if !write(path, text, &new).map_err(|e| tr!("写入 config.toml 失败:{e}", "writing config.toml failed: {e}"))? {
         return Err(t!("config.toml 已被修改,请重试", "config.toml just changed; move it again").into());
     }
     Ok(true)
@@ -699,6 +969,66 @@ pub(crate) fn shift_in(path: &Path, home: &str, a: Agent, name: &str, up: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_named_tools_preserves_unavailable_names_and_refuses_ambiguous_orders() {
+        let root = tmp("menu-tools");
+        let path = root.join("config.toml");
+        let text = "[tools.mine]\n[ui]\nmenu = [\"codex\", \"offline\", \"mine\"] # keep\n";
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(move_next_to(&path, "mine", "codex", true, |_| false), Ok(true));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(crate::config::list_in(&saved, "ui", "menu"), ["mine", "codex", "offline", "claude"]);
+        for bad in [
+            text.replace("\"offline\"", "\"mine\""),
+            text.replace("menu = [", "menu = [\n"),
+            format!("[accounts.claude]\nmine = {{}}\n{text}"),
+        ] {
+            std::fs::write(&path, &bad).unwrap();
+            assert!(move_next_to(&path, "mine", "codex", true, |_| false).unwrap_err().contains("手动调整顺序"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One test for all of it: the memory is shared by the whole program. Names no other test uses
+    #[test]
+    fn a_clear_login_answer_is_kept_until_a_login_starts_here_or_everything_is_asked_again() {
+        use std::cell::Cell;
+        let asked = Cell::new(0);
+        let get = |key: &str, says: Login| {
+            kept_or("claude:kept-a", key, || {
+                asked.set(asked.get() + 1);
+                says
+            })
+        };
+        let me = || Login::In("max · me@example.com".into());
+        assert_eq!(get("claude:kept-a=/d", me()), me());
+        // Asked once; the next opens take what's kept, even if the tool would now say otherwise
+        assert_eq!(get("claude:kept-a=/d", Login::Out), me());
+        assert_eq!(asked.get(), 1);
+        // The directory changed: a different account as far as the answer goes
+        assert_eq!(get("claude:kept-a=/e", Login::Out), Login::Out);
+        assert_eq!(asked.get(), 2);
+        // A login starts: asked every time, nothing kept, until it's had time to finish
+        logging_in(Agent::Claude, "kept-a");
+        assert_eq!(get("claude:kept-a=/d", Login::Out), Login::Out);
+        assert_eq!(get("claude:kept-a=/d", me()), me());
+        assert_eq!(asked.get(), 4);
+        assert!(!kept().answers.keys().any(|k| k.starts_with("claude:kept-a=")));
+        kept().logging_in.insert("claude:kept-a".into(), std::time::Instant::now() - LOGGING_IN);
+        assert_eq!(get("claude:kept-a=/d", me()), me());
+        assert_eq!(get("claude:kept-a=/d", Login::Out), me());
+        assert_eq!(asked.get(), 5);
+        // ^R: everything asked again
+        forget_all();
+        assert_eq!(get("claude:kept-a=/d", Login::Out), Login::Out);
+        assert_eq!(asked.get(), 6);
+        // Unclear answers aren't kept
+        let unclear = || kept_or("claude:kept-b", "claude:kept-b=/d", || Login::Unknown("no answer".into()));
+        assert_eq!(unclear(), Login::Unknown("no answer".into()));
+        assert!(!kept().answers.contains_key("claude:kept-b=/d"));
+    }
 
     #[test]
     fn an_account_bound_to_a_sandbox_lists_the_config_dir_it_uses_inside() {
@@ -762,6 +1092,89 @@ mod tests {
         assert_eq!(codex_said(false, "Not logged in\n"), Login::Out);
         assert_eq!(codex_said(false, ""), Login::Out);
         assert_eq!(codex_said(false, "error: no such profile\n"), Login::Unknown("error: no such profile".into()));
+    }
+
+    #[test]
+    fn claudes_keychain_item_is_named_after_its_directory() {
+        assert_eq!(claude_item(None), "Claude Code-credentials");
+        assert_eq!(claude_item(Some("/h/.claude-work")), "Claude Code-credentials-55414178");
+    }
+
+    #[test]
+    fn a_claude_login_is_read_from_disk_without_starting_claude() {
+        let d = tmp("on-disk");
+        let home = d.to_string_lossy().to_string();
+        let work = format!("{home}/.claude-work");
+        std::fs::create_dir_all(&work).unwrap();
+        let managed = d.join("managed-settings.json");
+        let account = |org: &str, kind: &str| {
+            format!(
+                r#"{{"oauthAccount": {{"emailAddress": "me@example.com", "organizationName": "{org}", "organizationType": "{kind}"}}}}"#
+            )
+        };
+        std::fs::write(format!("{work}/.claude.json"), account("Acme", "claude_team")).unwrap();
+        let env =
+            |pairs: &[(&str, &str)]| -> BTreeMap<String, String> { pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+        let in_work = env(&[("CLAUDE_CONFIG_DIR", &work), ("PATH", "/usr/bin")]);
+        let item = claude_item(Some(&work));
+        let has = |want: &str| {
+            let want = want.to_string();
+            move |name: &str| Some(name == want)
+        };
+        let team = Login::In("team · me@example.com · Acme".into());
+        // Its keychain item there: logged in, as who .claude.json says; none there: logged out
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, has(&item)), Some(team.clone()));
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, has("Claude Code-credentials")), Some(Login::Out));
+        // The keychain gave no answer: ask Claude
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, |_| None), None);
+        // Logged in some other way: ask Claude
+        for other in [("ANTHROPIC_API_KEY", "sk-x"), ("CLAUDE_CODE_USE_BEDROCK", "1"), ("CLAUDE_CODE_OAUTH_TOKEN", "t")] {
+            let mut e = in_work.clone();
+            e.insert(other.0.into(), other.1.into());
+            assert_eq!(claude_on_disk(&e, &home, &managed, has(&item)), None, "{other:?}");
+        }
+        // An empty one doesn't count
+        let mut empty = in_work.clone();
+        empty.insert("ANTHROPIC_API_KEY".into(), String::new());
+        assert_eq!(claude_on_disk(&empty, &home, &managed, has(&item)), Some(team.clone()));
+        // An apiKeyHelper in the account's settings or the administrator's: ask Claude
+        std::fs::write(format!("{work}/settings.json"), r#"{"apiKeyHelper": "~/bin/key"}"#).unwrap();
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, has(&item)), None);
+        std::fs::remove_file(format!("{work}/settings.json")).unwrap();
+        std::fs::write(&managed, r#"{"apiKeyHelper": "/opt/key"}"#).unwrap();
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, has(&item)), None);
+        std::fs::remove_file(&managed).unwrap();
+        // No keychain item but a .credentials.json: whether Claude takes it is up to Claude, ask it
+        std::fs::write(format!("{work}/.credentials.json"), "{}").unwrap();
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, |_| Some(false)), None);
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, has(&item)), Some(team.clone()));
+        std::fs::remove_file(format!("{work}/.credentials.json")).unwrap();
+        // CLAUDE_SECURESTORAGE_CONFIG_DIR names where the login is kept
+        let mut store = in_work.clone();
+        store.insert("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), "/h/store".into());
+        assert_eq!(claude_on_disk(&store, &home, &managed, has("Claude Code-credentials-720b9851")), Some(team.clone()));
+        assert_eq!(claude_on_disk(&store, &home, &managed, has(&item)), Some(Login::Out));
+        // A personal subscription: the org is just the email's; an organization type Claude has no plan for says claude.ai
+        std::fs::write(format!("{work}/.claude.json"), account("me@example.com's Organization", "claude_max")).unwrap();
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, has(&item)), Some(Login::In("max · me@example.com".into())));
+        std::fs::write(format!("{work}/.claude.json"), account("Acme", "api")).unwrap();
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, has(&item)), Some(Login::In("claude.ai · me@example.com · Acme".into())));
+        // Logged in but no account recorded, a Console key, a .claude.json that doesn't parse: ask Claude
+        std::fs::write(format!("{work}/.claude.json"), "{}").unwrap();
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, has(&item)), None);
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, has("x")), Some(Login::Out));
+        std::fs::write(format!("{work}/.claude.json"), r#"{"primaryApiKey": "sk-x"}"#).unwrap();
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, has(&item)), None);
+        std::fs::write(format!("{work}/.claude.json"), "{").unwrap();
+        assert_eq!(claude_on_disk(&in_work, &home, &managed, has(&item)), None);
+        // No CLAUDE_CONFIG_DIR: ~/.claude.json and the item with no suffix
+        std::fs::write(format!("{home}/.claude.json"), account("Acme", "claude_pro")).unwrap();
+        let pro = Some(Login::In("pro · me@example.com · Acme".into()));
+        assert_eq!(claude_on_disk(&env(&[]), &home, &managed, has("Claude Code-credentials")), pro);
+        assert_eq!(claude_on_disk(&env(&[("CLAUDE_CONFIG_DIR", "")]), &home, &managed, has("Claude Code-credentials")), pro);
+        // A directory name Claude would normalize first: ask Claude
+        assert_eq!(claude_on_disk(&env(&[("CLAUDE_CONFIG_DIR", "/h/账号")]), &home, &managed, |_| Some(true)), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

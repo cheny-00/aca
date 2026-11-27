@@ -29,6 +29,19 @@ macro_rules! file {
 
 pub const ALL: &[Bundled] = &[
     Bundled {
+        id: "aca.router",
+        dir: "router",
+        files: &[
+            file!("router", "aca-plugin.toml"),
+            file!("router", "router.sh"),
+            file!("router", "agent/.claude-plugin/plugin.json"),
+            file!("router", "agent/agents/router.md"),
+            file!("router", "agent/agents/router-en.md"),
+            file!("router", "agent/agents/desk.md"),
+            file!("router", "agent/agents/desk-en.md"),
+        ],
+    },
+    Bundled {
         id: "aca.core",
         dir: "core",
         files: &[
@@ -52,7 +65,16 @@ pub const ALL: &[Bundled] = &[
     Bundled { id: "aca.gateway", dir: "gateway", files: &[file!("gateway", "aca-plugin.toml")] },
     Bundled { id: "aca.remote", dir: "remote", files: &[file!("remote", "aca-plugin.toml"), file!("remote", "remote.sh")] },
     Bundled { id: "aca.bark", dir: "bark", files: &[file!("bark", "aca-plugin.toml"), file!("bark", "push.sh")] },
-    Bundled { id: "aca.discord", dir: "discord", files: &[file!("discord", "aca-plugin.toml"), file!("discord", "post.sh")] },
+    Bundled {
+        id: "aca.discord",
+        dir: "discord",
+        files: &[
+            file!("discord", "aca-plugin.toml"),
+            file!("discord", "post.sh"),
+            file!("discord", "pull.sh"),
+            file!("discord", "discord.py"),
+        ],
+    },
     Bundled { id: "aca.notify", dir: "notify", files: &[file!("notify", "aca-plugin.toml"), file!("notify", "notify.sh")] },
     Bundled { id: "aca.tailnet", dir: "tailnet", files: &[file!("tailnet", "aca-plugin.toml"), file!("tailnet", "tailnet.sh")] },
     Bundled { id: "aca.copy", dir: "copy", files: &[file!("copy", "aca-plugin.toml"), file!("copy", "copy.sh")] },

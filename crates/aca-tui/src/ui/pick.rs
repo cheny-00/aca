@@ -4,18 +4,22 @@
 use super::*;
 
 impl App {
-    /// Go into the nearest one in the visible list that needs you (red / yellow `◐`). Ones looked at with no new output since are
-    /// skipped — come back with prefix+d and press `i` again for the next one, going through them one by one
+    /// Go into the next one in the visible list that needs you, in the order `aca next` goes (see `bar::waiting`): ones wanting
+    /// your answer (`◆`) before finished-and-unread ones (`◐`), within a kind the most recently active first. Ones looked at with
+    /// no new output since are skipped — come back and press `i` again for the next one, going through them one by one
     pub(super) fn jump_waiting(&mut self) {
         let pick = (0..self.view.len())
-            .filter(|&p| !self.is_fold_row(p))
             .filter(|&p| {
                 let s = &self.all[self.view[p]];
                 waiting(s) && self.reads.read_at(&notes::key(s)).is_none_or(|t| s.active_at > t + SEEN_SLACK)
             })
-            .min_by_key(|&p| self.all[self.view[p]].idle_for);
+            .min_by_key(|&p| {
+                let s = &self.all[self.view[p]];
+                (s.state != State::Ask, s.idle_for)
+            });
         match pick {
             Some(p) => {
+                self.rail = None;
                 self.select(Some(p));
                 self.enter();
             }
@@ -23,28 +27,48 @@ impl App {
         }
     }
 
-    /// Keys in jump mode, like agent-deck: lowercase letters spell a hint, a match goes into that session (a group heading: the
-    /// highlight stays on the heading); Esc leaves. Other keys leave jump mode and are handled as usual (returns false)
+    /// Keys in jump mode, like agent-deck: lowercase letters spell a hint, a match goes into that session. A capital letter is
+    /// a group's own (see `group_keys`): into that group; one no group has only puts the letters away. Space and Esc put the
+    /// letters away; so does a (no hint has it), which then goes back to where it was pressed from, if it was. Other keys
+    /// leave jump mode and are handled as usual (returns false)
     pub(super) fn on_jump_key(&mut self, k: KeyEvent) -> bool {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char(' ') => {
                 self.jump = None;
                 true
             }
-            KeyCode::Char(c) if c.is_ascii_lowercase() && !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                let targets = self.stops();
+            KeyCode::Char('a') if !ctrl => {
+                self.jump = None;
+                if let Some(back) = self.hop_back.take() {
+                    self.hop_to(back);
+                }
+                true
+            }
+            KeyCode::Char(c) if c.is_ascii_uppercase() && !ctrl => {
+                self.jump = None;
+                if let Some((_, g)) = self.group_keys().into_iter().find(|(key, _)| *key == c) {
+                    self.jump_into(g);
+                }
+                true
+            }
+            // A rail laid over the list covers the sessions' letters: only the groups' are there to press
+            KeyCode::Char(c) if c.is_ascii_lowercase() && !ctrl && self.on_rail() && !rail_shown(self.screen) => {
+                self.jump = None;
+                true
+            }
+            KeyCode::Char(c) if c.is_ascii_lowercase() && !ctrl => {
+                let targets = self.jump_stops();
                 let hints = jump_hints(targets.len());
                 let typed = self.jump.get_or_insert_default();
                 typed.push(c);
                 match match_hint(&hints, typed) {
                     HintMatch::Hit(i) => {
                         self.jump = None;
-                        match targets[i] {
-                            Jump::Row(p) => {
-                                self.select(Some(p));
-                                self.enter();
-                            }
-                            Jump::Head(p) => self.select_head(p),
+                        self.rail = None;
+                        if let Jump::Row(p) = targets[i] {
+                            self.select(Some(p));
+                            self.enter();
                         }
                     }
                     HintMatch::Prefix => {}
@@ -59,16 +83,41 @@ impl App {
         }
     }
 
+    /// A key while the groups' letters show for `` ` `` (see `Letters`): a group's letter, either case (no session has a letter
+    /// to share them with), puts the cursor on that group's row. False = not taken here: the letters go, and the key is
+    /// pressed as usual on the row the cursor is on (j k move along the rail, ⏎ goes in, o into its router)
+    pub(super) fn on_letters_key(&mut self, k: KeyEvent) -> bool {
+        let Some(back) = self.letters.take() else { return false };
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        match k.code {
+            KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                let c = c.to_ascii_uppercase();
+                let Some((_, g)) = self.group_keys().into_iter().find(|(key, _)| *key == c) else { return false };
+                self.rail_go(&RailKind::Group(g));
+            }
+            // ` again or Esc: back where it was
+            KeyCode::Char('`') | KeyCode::Esc => {
+                self.rail = back.rail;
+                self.rail_from = back.from;
+                self.hop_back = back.hop;
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// Multi-selecting: some are ticked, or a range is in progress
     pub(super) fn picking(&self) -> bool {
         !self.picked.is_empty() || self.anchor.is_some()
     }
 
     /// Whether row p of the visible list can be multi-selected: only registered sessions (not windows, subagents, plain tmux
-    /// sessions, empty groups or fold rows)
+    /// sessions or empty groups)
     pub(super) fn pickable(&self, p: usize) -> bool {
         let s = &self.all[self.view[p]];
-        s.sub.is_none() && !s.blank && !s.deck_id.is_empty() && !self.is_fold_row(p)
+        s.sub.is_none() && !s.blank && !s.deck_id.is_empty()
     }
 
     /// The range being selected (positions in the visible list): from the start row to the highlighted row. Start not listed = None.
@@ -81,7 +130,7 @@ impl App {
     }
 
     /// Selected sessions (registered ids): ticked plus the range in progress (an unticking range: minus), in list order;
-    /// ticked ones not listed now (filtered out, folded) come last
+    /// ticked ones not listed now (filtered out) come last
     pub(super) fn chosen(&self) -> Vec<String> {
         let id = |p: usize| &self.all[self.view[p]].deck_id;
         let ranged: Vec<&String> = self.range().map_or(vec![], |r| r.filter(|&p| self.pickable(p)).map(id).collect());
@@ -122,20 +171,23 @@ impl App {
 
     /// v: range select from the highlighted row (↑↓ extends it); V (unpick) unticks a range. v again while ranging: the unfixed
     /// range is dropped and starts again from this row (like yazi). On a group heading it starts from the group's first session
-    pub(super) fn start_pick(&mut self, unpick: bool) {
-        if self.on_fold_row() {
-            return self.flash(t!("先展开再多选", "unfold first, then select"));
+    /// Why the highlighted row can't be selected (None = it can)
+    fn unpickable(&self) -> Option<&'static str> {
+        let p = self.list.selected()?;
+        let s = &self.all[self.view[p]];
+        match () {
+            _ if self.pickable(p) => None,
+            _ if s.blank => Some(t!("空分组里没有会话", "the group has no sessions")),
+            _ if s.sub.is_some() => Some(t!("只能多选会话", "only sessions can be selected")),
+            _ => Some(t!("普通 tmux 会话 · A 接管后才能多选", "can't select an ordinary tmux session · A adopts it")),
         }
-        let Some(p) = self.list.selected() else { return };
-        if !self.pickable(p) {
-            let s = &self.all[self.view[p]];
-            let m = match () {
-                _ if s.blank => t!("空分组里没有会话", "the group has no sessions"),
-                _ if s.sub.is_some() => t!("只能多选会话", "only sessions can be selected"),
-                _ => t!("普通 tmux 会话 · A 接管后才能多选", "can't select an ordinary tmux session · A adopts it"),
-            };
+    }
+
+    pub(super) fn start_pick(&mut self, unpick: bool) {
+        if let Some(m) = self.unpickable() {
             return self.flash(m);
         }
+        let Some(p) = self.list.selected() else { return };
         self.unpick = unpick;
         self.anchor = Some(self.all[self.view[p]].deck_id.clone());
     }
@@ -426,16 +478,20 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::tests::{ctrl, fixture, keys, many, mk, order, pin, press, reader_rows, said, select, sessions, shows, space, ticked};
+    use crate::ui::tests::{
+        at, caps, ctrl, fixture, keys, many, mk, only, order, pin, press, reader_rows, said, select, sessions, shows, space, ticked,
+        to_scope,
+    };
 
     #[test]
-    fn i_goes_through_waiting_sessions_newest_first() {
+    fn i_goes_through_waiting_sessions_the_asking_ones_first_and_newest_first_within_a_kind() {
         let v = vec![
             mk("旧问", "fun", State::Ask, 50),
             mk("新读", "fun", State::Unread, 10),
             mk("跑", "work", State::Running, 1),
             mk("错", "work", State::Error, 5),
             mk("中读", "work", State::Unread, 30),
+            mk("新问", "work", State::Ask, 40),
         ];
         let mut app = App::new(String::new(), v.clone());
         let next = |app: &mut App| {
@@ -446,10 +502,12 @@ mod tests {
             }
             name
         };
-        assert_eq!(next(&mut app).as_deref(), Some("新读"));
-        assert_eq!(app.current().unwrap().title, "新读"); // back, the highlight is on the one just looked at
-        assert_eq!(next(&mut app).as_deref(), Some("中读"));
+        // The asking ones first, though both unread ones were active more recently (the order `aca next` goes in)
+        assert_eq!(next(&mut app).as_deref(), Some("新问"));
+        assert_eq!(app.current().unwrap().title, "新问"); // back, the highlight is on the one just looked at
         assert_eq!(next(&mut app).as_deref(), Some("旧问"));
+        assert_eq!(next(&mut app).as_deref(), Some("新读"));
+        assert_eq!(next(&mut app).as_deref(), Some("中读"));
         assert_eq!(next(&mut app), None); // running and error ones don't count; all seen, so it doesn't enter
         let mut v = v;
         v[1].active_at = epoch() + 10; // 新读 has new output again
@@ -460,26 +518,29 @@ mod tests {
     #[test]
     fn i_only_looks_at_what_is_shown() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('}'));
-        press(&mut app, KeyCode::Char('}')); // nothing in the work group needs you (未读 is in fun, and over a day old)
+        app.set_group(Some("work".into())); // nothing in the work group needs you (问 and 未读 are in fun)
         press(&mut app, KeyCode::Char('i'));
         assert!(app.attach.is_none());
-        press(&mut app, KeyCode::Char('}')); // back to all groups: 未读 is over a day old, hidden by "1 day", only 问 is left
+        app.set_group(None);
+        only(&mut app, '1'); // only running ones listed
         press(&mut app, KeyCode::Char('i'));
-        assert_eq!(app.attach.as_deref(), Some("问"));
+        assert!(app.attach.is_none());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.attach.as_deref(), Some("问")); // the one asking, before the unread one with later activity
     }
 
     #[test]
     fn v_stretches_a_range_and_d_deletes_them_together_as_one_trash_entry() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('v'));
         keys(&mut app, "jj");
         assert_eq!(ticked(&mut app), ["跑", "闲", "错"]);
         let foot = reader_rows(&mut app, 80, 20).pop().unwrap();
-        for want in ["连选", "已选 3", "d 删除", "m 移到分组", "Esc 确定"] {
-            assert!(foot.contains(want), "缺「{want}」:{foot}");
+        for want in ["连选".to_string(), "已选 3".into(), caps("d 删除"), caps("m 移到分组"), caps("Esc 结束")] {
+            assert!(foot.contains(&want), "缺「{want}」:{foot}");
         }
         // Pulling back, the range shrinks with it
         press(&mut app, KeyCode::Char('k'));
@@ -512,28 +573,65 @@ mod tests {
     }
 
     #[test]
+    fn space_jumps_until_something_is_selected_and_then_ticks() {
+        let mut app = fixture();
+        to_scope(&mut app, Scope::Week);
+        select(&mut app, "跑");
+        // Nothing selected: Space is the letter jump, nothing gets ticked
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.jump.is_some() && !app.picking());
+        press(&mut app, KeyCode::Esc);
+        // Once a range is kept, Space ticks / unticks the highlighted row and moves down
+        keys(&mut app, "vj");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(ticked(&mut app), ["跑", "闲"]);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!((ticked(&mut app), at(&app)), (vec!["跑".to_string()], "错".to_string()));
+        assert!(app.jump.is_none());
+        // Unticking the last one ends multi-select, and Space jumps again
+        select(&mut app, "跑");
+        press(&mut app, KeyCode::Char(' '));
+        assert!(!app.picking());
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.jump.is_some());
+        press(&mut app, KeyCode::Esc);
+        // Picking a reference (aca ui --ref): Space jumps there too, and ⇧ with a group's letter goes into that group, still
+        // picking
+        app.insert_to = Some("%7".into());
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.jump.is_some() && !app.picking());
+        press(&mut app, KeyCode::Char('F'));
+        assert!(app.jump.is_none() && app.group.as_deref() == Some("fun") && app.insert_to.is_some() && app.put.is_none());
+    }
+
+    #[test]
     fn v_and_shift_v_stretch_runs_that_select_and_unselect_as_in_yazi() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a'));
-        let foot = |app: &mut App| reader_rows(app, 80, 20).pop().unwrap();
-        let has = |foot: String, want: &[&str]| want.iter().for_each(|w| assert!(foot.contains(w), "缺「{w}」:{foot}"));
+        to_scope(&mut app, Scope::Week);
+        // (wide enough for all four keys after the first act: each cap is two cells wider than the words were)
+        let foot = |app: &mut App| reader_rows(app, 90, 20).pop().unwrap();
+        // What the green block says, then keys (as caps)
+        let has = |foot: String, said: &[&str], keys: &[&str]| {
+            let keys = keys.iter().map(|k| caps(k));
+            said.iter().map(|s| s.to_string()).chain(keys).for_each(|w| assert!(foot.contains(&w), "缺「{w}」:{foot}"))
+        };
         // v again while range-selecting: the unsettled range is dropped, starting over from the highlighted row (this row
         // included)
         select(&mut app, "问");
         keys(&mut app, "vjv");
         assert!(app.anchor.is_some());
         assert_eq!(ticked(&mut app), ["未读"]);
-        has(foot(&mut app), &["连选", "已选 1", "Esc 确定"]);
+        has(foot(&mut app), &["连选", "已选 1"], &["Esc 结束"]);
         // Esc: this range is settled (ticked), range select ends
         keys(&mut app, "k");
         press(&mut app, KeyCode::Esc);
         assert!(app.anchor.is_none());
         assert_eq!(ticked(&mut app), ["问", "未读"]);
         // Highlight on a ticked row: Space unticks it; v range-selects, V range-unticks, whether or not this row is ticked
-        has(foot(&mut app), &["已选 2", "空格 取消选中", "v 连选", "V 连续取消", "Esc 清空选择"]);
+        has(foot(&mut app), &["已选 2"], &["空格 取消选中", "v 连选", "V 连续取消", "Esc 清空选择"]);
         // Space ticks one and moves down a row; back on it, pressing again unticks it
         select(&mut app, "闲");
-        has(foot(&mut app), &["空格 选中", "v 连选"]);
+        has(foot(&mut app), &[], &["空格 选中", "v 连选"]);
         press(&mut app, KeyCode::Char(' '));
         assert_eq!(app.current().unwrap().title, "错");
         assert_eq!(ticked(&mut app), ["问", "未读", "闲"]);
@@ -549,12 +647,12 @@ mod tests {
         select(&mut app, "问");
         keys(&mut app, "Vj");
         assert!(ticked(&mut app).is_empty());
-        has(foot(&mut app), &["取消选中", "已选 0", "Esc 确定"]);
+        has(foot(&mut app), &["取消选中", "已选 0"], &["Esc 结束"]);
         press(&mut app, KeyCode::Char('V'));
         assert_eq!(ticked(&mut app), ["问"]);
         press(&mut app, KeyCode::Char('v'));
         assert_eq!(ticked(&mut app), ["问", "未读"]);
-        has(foot(&mut app), &["连选", "已选 2"]);
+        has(foot(&mut app), &["连选", "已选 2"], &[]);
         press(&mut app, KeyCode::Esc);
         // Space while ranging: ticks / unticks this one and moves down, still ranging, the range grows with it
         select(&mut app, "跑");
@@ -575,8 +673,8 @@ mod tests {
         // V works with nothing ticked (as in yazi): an untick range, none selected; Esc leaves
         press(&mut app, KeyCode::Char('V'));
         assert!(app.picking());
-        has(foot(&mut app), &["取消选中", "已选 0", "Esc 确定"]);
-        assert!(!foot(&mut app).contains("d 删除"));
+        has(foot(&mut app), &["取消选中", "已选 0"], &["Esc 结束"]);
+        assert!(!foot(&mut app).contains(&caps("d 删除")));
         press(&mut app, KeyCode::Esc);
         assert!(!app.picking() && !app.quit);
         // Space on a group header while multi-selecting: ticks all listed in the group, again unticks them all (outside
@@ -612,7 +710,7 @@ mod tests {
     #[test]
     fn p_u_and_q_on_the_selection_are_one_step_each() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         let pinned = |app: &App| app.all.iter().filter(|s| s.pinned).map(|s| s.title.clone()).collect::<Vec<_>>();
         let st = |app: &App, t: &str| app.all.iter().find(|s| s.title == t).unwrap().state;
         // p: if any aren't pinned, pin them all
@@ -621,8 +719,9 @@ mod tests {
         keys(&mut app, "vj");
         app.msg = None;
         let foot = reader_rows(&mut app, 120, 20).pop().unwrap();
-        assert!(foot.contains("p 置顶") && foot.contains("Q 移动到工作区"), "{foot}");
-        assert!(!reader_rows(&mut app, 80, 20).pop().unwrap().contains("p 置顶")); // when narrow, the later ones are dropped first
+        assert!(foot.contains(&caps("p 置顶")) && foot.contains(&caps("Q 移动到工作区")), "{foot}");
+        // When narrow, the later ones are dropped first
+        assert!(!reader_rows(&mut app, 80, 20).pop().unwrap().contains(&caps("p 置顶")));
         press(&mut app, KeyCode::Char('p'));
         assert_eq!((pinned(&app), said(&app)), (vec!["跑".to_string(), "闲".into(), "错".into()], "已置顶 2 个"));
         assert!(!app.picking());

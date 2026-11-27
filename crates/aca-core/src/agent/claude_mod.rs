@@ -162,7 +162,7 @@ fn validate(program: &str, dir: &Path) -> Result<(), String> {
 
 /// The mod's directory: write it (untouched if the content is the same — running sessions watch this directory and reload
 /// on any change), return the path
-fn write() -> Option<PathBuf> {
+pub(super) fn write() -> Option<PathBuf> {
     let at = |name: &str| format!("claude-mod/aca/{name}");
     let manifest = super::hook_file(&at(".claude-plugin/plugin.json"), MANIFEST).ok()?;
     super::hook_file(&at("hooks/hooks.json"), HOOKS).ok()?;

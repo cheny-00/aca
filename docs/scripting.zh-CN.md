@@ -19,7 +19,8 @@
 | `aca answer <id> <选项号 \| yes \| no>` | 替它回答:选那个选项,或者允许 / 拒绝权限请求 |
 | `aca interrupt <id>` | 方向不对时:中断它正在运行的这一轮(相当于按 `Esc`) |
 | `aca msg <id> <话>` | 把话放进它的收件箱,在它方便时送达(见[下文](#等合适的时机再送达的消息)) |
-| `aca ls`、`aca show <id>` | 列表;某个会话的全部信息 |
+| `aca ls [-g 分组]` | 列出会话。用 `-g` 只列直接在这个分组的会话。文字行附未完成的单号和 router 标记。加 `--json` 得到筛选后的数组 |
+| `aca show <id>` | 某个会话的全部信息 |
 
 会话在等待确认时,`aca send` 不会输入,因为回车可能会选中默认选项。这时用 `aca answer`。
 
@@ -69,7 +70,20 @@ aca wait "$id" && aca output "$id"
 
 - `aca ls`、`aca show`、`aca new`、`aca adopt`、`aca group ls` 加 `--json`。例如找出所有等待回应的会话的 id:
   `aca ls --json | jq -r '.[] | select(.state == "ask") | .id'`
+- `aca group ls --json`:每个分组的 `path`、`order`、`default_path`,指定了 router 的还有 `router`。随手问那组
+  (不属于项目的会话在这里开,由 `[scratch] dir` 定)另有 `"scratch": true`,别的分组没有这个字段。它的 router
+  就是 `aca msg desk` 送到的总台。
 - `aca inbox <id> --json`:它收到的消息,是一个 JSON 数组,每条带发件人、内容和 `stage`(是否已送达)。
+- `aca note ls --json`、`aca note show <笔记 id> --json`:分组的笔记(一个分组一本,你和组里的会话都能往里写),
+  每条带全文 `text`、谁写的(`by`:会话 id,空 = 你)、是否置顶 `pinned`。在会话里运行时,就是那个会话的分组;
+  `aca note add '…'` 写一条并打印它的 id。
+- `aca task ls --json`、`aca task show <单号> --json`:任务单(一件交给一个会话做的事),每张带 `state`(todo / doing / done)、
+  做它的会话 `session`、完成标准 `criteria`、结果 `result` 和布尔值 `watch`(盯单)。`aca task add -g <分组> -t <名字>` 新建并打印单号(`#9`),
+  `aca task give <单号> <id>` 交给会话(它会收到这张单),`aca task done <单号> '结果'` 标成完成。新建、交给只有你和
+  router 可以;标成完成只有你和做它的会话可以;谁等谁由 router 决定,aca 不排(`aca help task`)。
+- `aca task add`、`aca task give`、`aca task set`、`aca new <工具> --task <单号>` 都可用 `--watch` 或 `--no-watch` 开关盯单。不写就沿用原设置,新单默认不盯。盯着的单,做它的会话一轮结束、等回答、出错、退出或标成完成时,分组 router 收到通知,没有 router 就通知交单的会话。
+- `aca group router <分组>`:这个分组的 router(替你把这个分组的事分给会话的那个会话)的 id,没有就什么都不打印、
+  退出码 1。`aca group router <分组> <id>` 指定(必须是这个分组里的会话),`''` 取消。
 - `aca events -f`:会话发生的一切(一轮开始、结束、出错,提出问题、被回答……)以 JSON 行实时输出。
   有哪些事件、各有什么字段,见[事件](plugins.zh-CN.md#事件)。
 
@@ -86,7 +100,17 @@ aca inbox 3f2a                              # 收到了什么,送达了没有
 ```
 
 定时的消息在 `aca inbox` 里显示为 `[定时 12:27]`,在列表里标题后面显示 `◷ 12:27`;送达之前,
-这个会话不会因为空闲被自动停止。会话也可以给自己定一条,到时间叫醒自己。
+普通会话不会因为空闲被自动停止。Claude router 可以先停,到点由消息唤醒。
+
+`aca start <id>` 和 `aca restart <id>` 对 Claude router 都开新对话。用 `aca msg` 给停着的 Claude router 发话会启动它,待送的话进交接。即使界面没开,投递时也会检查这班是否已经闲满时限。`aca stop --idle 3h` 对 Claude router 用 `[router] idle` 的时限。Codex router 空闲时不停,停着时来话排队或暂存,启动时继续原对话。
+
+替你把别处的话转进来的脚本(聊天软件的机器人、邮件……)不用知道该交给哪个会话:发给 `desk` 就是交给总台
+(随手问那个分组的 router,见[会话多了以后](many-sessions.zh-CN.md)),由它分发;`--via` 写上是从哪来的,
+界面里总台的往来上那一行右端会写出来。还没有总台时这条命令报错,退出码 3(别的错误是 1)。
+
+```sh
+aca msg desk --via Discord '帮我看下周去成都的机票'
+```
 
 ## 一个 agent 把任务交给另一个
 
@@ -100,8 +124,8 @@ aca inbox 3f2a                              # 收到了什么,送达了没有
   `wait`(每次最多等 240 秒)、`answer`、`interrupt` 和 `wakeup`(给自己定一条消息)。
   `aca plugin allow aca.core` 列出它们。
 - **`aca.delegate`** 给你的 agent 一个 `/aca:delegate`(Claude 里是斜杠命令,Codex 里是 skill):
-  它规划任务,通过 aca 派出 worker,检查它们做的结果,再向你汇报。派给谁是一项设置:
-  `aca plugin setting aca.delegate worker codex:work`(默认 `codex`)。worker 的一轮因为限流或过载失败时,
+  它规划任务,通过 aca 派出 worker,检查它们做的结果,再向你汇报。派给谁:你交代时说了就用你说的,
+  没说就弹选单让你挑,排第一的是设置 `aca plugin setting aca.delegate worker codex:work`(默认 `codex`)。worker 的一轮因为限流或过载失败时,
   插件会隔一会儿替你让它继续,最多几次。
 
 ### 父会话怎样知道子会话做完了
@@ -119,7 +143,7 @@ notify = ["done", "failed"]    # 还有 "exited"、"waiting";"all" 表示全部
 ```
 
 这样子会话完成一轮、出错、退出或等待确认时,它自己的 hook 会往父会话的收件箱里放一条简短的消息,并唤醒父会话:
-是谁、发生了什么、它最后一句话,以及查看全文的 `aca output <id>`。两样都没设置时,什么都不发,也不唤醒谁。
+是谁、发生了什么、它最后一句话,以及查看全文的 `aca output <id>`。盯单通知另按单上的设置。
 父会话已经用 `aca wait` 等过的子会话,它的消息会标为已送达,不会再唤醒一次。
 
 ## 更多

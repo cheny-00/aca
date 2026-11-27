@@ -1,0 +1,39 @@
+#!/bin/sh
+set -eu
+body=null
+auth=
+while [ "$#" -gt 1 ]; do
+  case "$1" in
+    -X) method=$2; shift 2 ;;
+    -H) case "$2" in 'Authorization: Bot T0KEN') auth=yes ;; esac; shift 2 ;;
+    -d) body=$2; shift 2 ;;
+    --max-time|-w) shift 2 ;;
+    -sS) shift ;;
+    *) echo "unexpected curl option $1" >&2; exit 1 ;;
+  esac
+done
+case "$1" in https://discord.com/api/v10/*) path=${1#*/v10/} ;; *) exit 1 ;; esac
+[ "$auth" = yes ]
+cd "$ACA_HOME"
+jq -cn --arg m "$method" --arg p "$path" --argjson b "$body" '[$m,$p,$b]' >> calls
+file="answers/$method-$(printf %s "$path" | tr / _)"
+if [ -f "$file" ]; then
+  cat "$file"
+  [ ! -f "$file.status" ] || cat "$file.status" >&2
+  exit 0
+fi
+case "$method $path" in
+  'POST channels/111/threads') sleep 0.1; printf '{"id":"12000000000000%05d"}\n' "$$" ;;
+  'POST channels/'*/messages) echo '{}' ;;
+  'PATCH channels/'*)
+    archive="archived-${path##*/}"
+    flag=$(printf %s "$body" | jq -r .archived)
+    case "$flag" in
+      false) rm -f "$archive" ;;
+      *) if [ -f "$archive" ]; then echo '{"code":50083,"message":"Thread is archived"}'; exit 0; fi
+         if [ "$flag" = true ]; then touch "$archive"; fi ;;
+    esac
+    echo '{}' ;;
+  'GET channels/'*/messages\?*) echo '[]' ;;
+  *) echo "unexpected request: $method $path" >&2; exit 1 ;;
+esac

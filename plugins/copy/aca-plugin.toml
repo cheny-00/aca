@@ -18,16 +18,22 @@ description_en = "One key picks a command or code block from the last reply and 
 #   map cmd+shift+c send_text all \x1b\x19
 
 [settings.inline]
+label = "行内代码"
+label_en = "Inline code"
 default = "spaced"
 desc = "列出哪些行内的 `…`:spaced 只列含空格的(通常是一条命令)/ all 全部列出 / none 只列代码块"
 desc_en = "Which inline `…` spans to offer: spaced = only those with a space in them (most likely a command) / all / none = code blocks only."
 
 [settings.lines]
+label = "逐条列出命令"
+label_en = "One per command"
 default = true
 desc = "shell 代码块中有多条命令时,也逐条单独列出(可以只复制其中一条)"
 desc_en = "When a shell code block holds several commands, also list each one on its own (so you can copy just one)."
 
 [settings.copy]
+label = "复制命令"
+label_en = "Copy command"
 default = ""
 desc = "用于复制的命令(内容从标准输入传入)。留空 = tmux 缓冲区 + 通过 OSC 52 发给外层终端 + 本机的 pbcopy / wl-copy / xclip"
 desc_en = "The command that copies (it gets the text on standard input). Empty = the tmux buffer + OSC 52 to the outer terminal + pbcopy / wl-copy / xclip on this machine."

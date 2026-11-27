@@ -1,6 +1,6 @@
 # aca
 
-**在一个屏幕上管理你所有的 AI 编程助手会话** —— Claude Code、Codex、pi、opencode,以及你自己接进来的其他 agent。
+**在一个屏幕上管理你所有的 AI 编程助手会话** —— Claude Code、Codex、pi、opencode、Antigravity CLI (agy),以及你自己接进来的其他 agent。
 
 [English](README.md) | 简体中文
 
@@ -50,7 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/cheny-00/aca/main/install.sh | ACA_
 - macOS 或 Linux
 - [tmux](https://github.com/tmux/tmux) 3.3 或更新的版本
 - [Claude Code](https://github.com/anthropics/claude-code)、[Codex CLI](https://github.com/openai/codex)、
-  [pi](https://pi.dev) 或 [opencode](https://opencode.ai)(有一个就行),已经装好并登录
+  [pi](https://pi.dev)、[opencode](https://opencode.ai) 或 Antigravity CLI (`agy`)(有一个就行),已经装好并登录
 
 其他装法、安装脚本的参数、升级和卸载,见[安装](docs/install.zh-CN.md)。
 

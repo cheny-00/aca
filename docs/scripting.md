@@ -20,7 +20,8 @@ A session id can be shortened to its first few characters, or replaced by the se
 | `aca answer <id> <number \| yes \| no>` | Answer it: pick that option, or allow / deny a permission prompt |
 | `aca interrupt <id>` | Stop the current turn (like pressing `Esc`), when it went the wrong way |
 | `aca msg <id> <text>` | Leave a message in its inbox, delivered when it is convenient (see [below](#messages-that-wait-for-a-good-moment)) |
-| `aca ls`, `aca show <id>` | The list; everything about one session |
+| `aca ls [-g GROUP]` | List sessions. With `-g`, list only sessions directly in that group. Text rows include open ticket numbers and mark its router. Add `--json` for the filtered array |
+| `aca show <id>` | Everything about one session |
 
 `aca send` refuses a session that is waiting for a confirmation, since `Enter` might pick the default
 option. Use `aca answer` there.
@@ -73,8 +74,25 @@ For programs:
 
 - `--json` on `aca ls`, `aca show`, `aca new`, `aca adopt` and `aca group ls`. For example, the ids of the
   sessions waiting for you: `aca ls --json | jq -r '.[] | select(.state == "ask") | .id'`
+- `aca group ls --json`: each group's `path`, `order` and `default_path`, and `router` when it names one. The
+  scratch group (where sessions that belong to no project start, set by `[scratch] dir`) also has
+  `"scratch": true`; no other group has the field. Its router is the desk that `aca msg desk` reaches.
 - `aca inbox <id> --json`: its messages as a JSON array, each with its sender, text and `stage` (whether
   it was delivered).
+- `aca note ls --json`, `aca note show <NOTE-ID> --json`: a group's notes (one notebook per group; you and
+  the sessions in it write there), each with its `text`, who wrote it (`by`: a session id, empty = you)
+  and whether it's `pinned`. Run inside a session, the group is that session's; `aca note add 'text'`
+  writes one and prints its id.
+- `aca task ls --json`, `aca task show <N> --json`: task tickets (a thing handed to one session to do), each
+  with its `state` (todo / doing / done), the `session` doing it, what counts as done (`criteria`) and the
+  `result` and the boolean `watch`. `aca task add -g <GROUP> -t <TITLE>` makes one and prints its number (`#9`), `aca task give <N> <id>`
+  hands it to a session (which is sent the ticket), `aca task done <N> 'result'` marks it done. Only you and
+  routers make tickets and hand them over; only you and the session doing one mark it done; what waits for
+  what is the router's to decide, not aca's (`aca help task`).
+- `--watch` or `--no-watch` on `aca task add`, `aca task give`, `aca task set` or `aca new <tool> --task <N>` turns watching on or off for that ticket. Omit both to keep its setting (off for a new ticket). The group router, or the dispatcher if there is no router, hears when the worker finishes a turn, asks, fails, exits or marks it done.
+- `aca group router <GROUP>`: the id of the group's router (the session that hands the group's work to
+  sessions for you), or nothing and exit 1 when it has none. `aca group router <GROUP> <id>` names one of
+  the group's own sessions, `''` nobody.
 - `aca events -f`: everything that happens to sessions (a turn starts, ends, fails, a question is asked or
   answered…) as JSON lines, as it happens. The event names and fields are in [Events](plugins.md#events).
 
@@ -92,8 +110,21 @@ aca inbox 3f2a                                      # what came in, delivered or
 ```
 
 A scheduled message shows as `[scheduled 12:27]` in `aca inbox` and `◷ 12:27` after the title in the list,
-and the session is not stopped for being idle until it is delivered. A session can schedule one to itself,
-to be woken up later.
+and keeps an ordinary session running until delivery. A Claude router can stop and wake when the message is due.
+
+`aca start <id>` and `aca restart <id>` start a fresh conversation for a Claude router. An immediate `aca msg`
+to a stopped one starts it with the pending messages in its handoff. Delivery checks the idle limit even when the
+interface is closed. `aca stop --idle 3h` uses `[router] idle` for Claude routers. A Codex router stays up when
+idle, queues or holds messages while stopped, and resumes its saved conversation when started.
+
+A script that relays what you say somewhere else (a chat bot, mail…) need not know which session to give it
+to: `desk` is the desk (the scratch group's router, see [many sessions](many-sessions.md)), which passes it
+on; `--via` says where it came from, and the interface writes that at the right end of its line in the
+exchange with the desk. With no desk yet the command fails with exit code 3 (any other error is 1).
+
+```sh
+aca msg desk --via Discord 'look up flights to Chengdu next week'
+```
 
 ## One agent handing work to another
 
@@ -108,8 +139,9 @@ Two bundled plugins make this easy. Install them with `aca plugin install aca.co
   `wait` (up to 240 seconds per call), `answer`, `interrupt` and `wakeup` (a scheduled message to itself).
   `aca plugin allow aca.core` lists them.
 - **`aca.delegate`** gives your agent `/aca:delegate` (a slash command in Claude, a skill in Codex): it plans
-  the work, dispatches workers through aca, checks what they did and reports back. Who gets the work is
-  a setting: `aca plugin setting aca.delegate worker codex:work` (default `codex`). When a worker's turn
+  the work, dispatches workers through aca, checks what they did and reports back. Who gets the work:
+  the one you name when you ask, or the one you pick from the menu it shows otherwise; the setting
+  `aca plugin setting aca.delegate worker codex:work` (default `codex`) comes first there. When a worker's turn
   fails on a rate limit or overload, the plugin tells it to carry on, a few times, after a pause.
 
 ### How the parent hears that the child is done
@@ -128,7 +160,7 @@ notify = ["done", "failed"]    # also "exited", "waiting"; "all" for everything
 
 Then the child's own hooks put a short message in the parent's inbox when it finishes a turn, fails, exits
 or waits for a confirmation, and the parent is woken: who it is, what happened, its last sentence, and
-`aca output <id>` for the rest. Without either, nothing is sent and nobody is woken. When the parent has
+`aca output <id>` for the rest. Watched tickets notify their dispatcher independently of these parent settings. When the parent has
 already waited for a child with `aca wait`, that child's messages are marked delivered so it is not woken
 twice.
 

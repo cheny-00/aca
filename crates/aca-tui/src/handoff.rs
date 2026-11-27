@@ -91,13 +91,13 @@ pub fn run(from: &Source, req: &NewReq, _to: Agent) -> Outcome {
     let found = aca_records::workdir::find_in(&from.w, (!from.conf.is_empty()).then_some(from.conf.as_str()));
     let msg = prompt(from, &digest, text.lines().count(), &found);
     let id = match crate::create::create(req) {
-        Ok(id) => id,
+        Ok(made) => made.id,
         Err(e) => return Outcome::Failed(tr!("新建失败:{e}", "creating it failed: {e}")),
     };
     match send(&id, &msg) {
         Ok(()) => Outcome::Made { msg: t!("已交接", "handed off").into(), id },
         Err(e) => Outcome::Handed {
-            msg: tr!("发送失败:{e} · 交接说明已存入便签,s 发送", "not sent: {e} · the note has it, s sends it"),
+            msg: tr!("发送失败:{e} · 交接说明已存入便签,s 回话发出", "not sent: {e} · the draft has it, s replies with it"),
             id,
             note: msg,
         },

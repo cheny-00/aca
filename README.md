@@ -1,6 +1,6 @@
 # aca
 
-**One screen for all your AI coding agent sessions** — Claude Code, Codex, pi, opencode, and any other agent you plug in.
+**One screen for all your AI coding agent sessions** — Claude Code, Codex, pi, opencode, Antigravity CLI (agy), and any other agent you plug in.
 
 English | [简体中文](README.zh-CN.md)
 
@@ -55,7 +55,7 @@ You need:
 - macOS or Linux
 - [tmux](https://github.com/tmux/tmux) 3.3 or newer
 - [Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex),
-  [pi](https://pi.dev) or [opencode](https://opencode.ai) (any of them), installed and logged in
+  [pi](https://pi.dev), [opencode](https://opencode.ai) or Antigravity CLI (`agy`) (any of them), installed and logged in
 
 Other ways to install, the script's options, upgrading and uninstalling: [Install](docs/install.md).
 

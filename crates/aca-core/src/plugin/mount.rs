@@ -61,13 +61,13 @@ pub const TOOLS_SERVER: &str = "aca";
 
 /// What this tool (`kind`) and this session (tool name, account) get. With `codex_home` given (Codex), the copies and
 /// link are prepared along the way
-pub fn plan(kind: &str, tool: &str, account: &str, codex_home: Option<&Path>) -> Mounts {
+pub fn plan(kind: &str, tool: &str, account: &str, codex_home: Option<&Path>, role: Option<crate::store::RouterRole>) -> Mounts {
     // aca was just upgraded: refresh the built-in plugins first, then work out what to mount
     if super::AGENTS.contains(&kind) {
         super::first_party::refresh();
     }
     let wants = decl::wants().unwrap_or_default();
-    let reaches = |e: &Entry| e.enabled && wants.get(&e.id).is_none_or(|w| w.reaches(tool, kind, account));
+    let reaches = |e: &Entry| e.enabled && e.for_role(role) && wants.get(&e.id).is_none_or(|w| w.reaches(tool, kind, account));
     let gateway = crate::gateway::enabled();
     let mut out = Mounts::default();
     let mut tools = false;
@@ -102,7 +102,7 @@ pub fn plan(kind: &str, tool: &str, account: &str, codex_home: Option<&Path>) ->
         tools |= !super::yours::agent_tools(&e, wants.get(&e.id)).is_empty();
     }
     if gateway {
-        if crate::gateway::offers(kind, tool, account) {
+        if crate::gateway::offers(kind, tool, account, role) {
             out.mcp.push((crate::gateway::SERVER.into(), vec!["plugin".into(), "gateway".into(), "connect".into()]));
         }
     } else if tools {
@@ -132,13 +132,15 @@ pub fn plan(kind: &str, tool: &str, account: &str, codex_home: Option<&Path>) ->
 /// start and compared later; a difference means the running session needs a restart to get it. Only what goes to the
 /// agent counts (directories, whether the agent may use their commands on its own, MCP, tools, gateway on or off);
 /// plugins with only event hooks don't
-pub fn signature(kind: &str, tool: &str, account: &str) -> String {
+pub fn signature(kind: &str, tool: &str, account: &str, role: Option<crate::store::RouterRole>) -> String {
     if !super::MCP_AGENTS.contains(&kind) {
         return String::new();
     }
     let wants = decl::wants().unwrap_or_default();
     let mut parts = vec![];
-    for e in registry().into_iter().filter(|e| e.enabled && wants.get(&e.id).is_none_or(|w| w.reaches(tool, kind, account))) {
+    for e in
+        registry().into_iter().filter(|e| e.enabled && e.for_role(role) && wants.get(&e.id).is_none_or(|w| w.reaches(tool, kind, account)))
+    {
         let mut p = vec![];
         if e.agents.contains_key(kind) {
             p.push("dir".to_string());
@@ -149,7 +151,8 @@ pub fn signature(kind: &str, tool: &str, account: &str) -> String {
         if let Some(m) = e.mcp.as_ref().filter(|m| m.targets.is_empty() || m.targets.iter().any(|t| t == kind)) {
             p.push(format!("mcp-{}", if m.via.is_empty() { "auto" } else { &m.via }));
         }
-        let given = super::yours::agent_tools(&e, wants.get(&e.id));
+        let mut given = super::yours::agent_tools(&e, wants.get(&e.id));
+        given.retain(|id| e.offers_action(id, role));
         if !given.is_empty() {
             p.push(format!("tools-{}", given.join("+")));
         }
@@ -173,7 +176,7 @@ pub fn stale() -> Vec<(String, String)> {
             continue;
         }
         let kind = crate::agent::tool(&cfg, &s.tool).map(|t| t.kind).unwrap_or_default();
-        if signature(&kind, &s.tool, &s.account) != crate::runtime::load(&s.id).mounts {
+        if signature(&kind, &s.tool, &s.account, store.router_role(&s.id).ok().flatten()) != crate::runtime::load(&s.id).mounts {
             out.push((s.id.clone(), s.title.clone()));
         }
     }

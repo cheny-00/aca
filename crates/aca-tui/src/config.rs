@@ -4,6 +4,9 @@
 //! [new_group]
 //! default_path = "~/workspace"
 //!
+//! [scratch]
+//! dir = "~/scratch"            # where sessions that belong to no project start (unset: there is no such place)
+//!
 //! [ime]
 //! auto = false                 # don't auto-switch to English on desktop (on by default)
 //!
@@ -21,8 +24,9 @@ use toml::Value;
 
 use aca_core::{t, tr};
 
-/// Default directory for `^N` when not configured
-const NEW_GROUP_DIR: &str = "~/workspace";
+pub use aca_core::config::new_group_dir;
+#[cfg(test)]
+use aca_core::config::new_group_dir_in;
 
 /// ~/.config/aca/config.toml (`ACA_HOME` moves it, for tests)
 pub fn path() -> PathBuf {
@@ -33,23 +37,11 @@ fn read() -> String {
     std::fs::read_to_string(path()).unwrap_or_default()
 }
 
-/// The directory on fzf's first line once `^N` has a name, and filled in when Esc goes back to the input box
-/// (`[new_group] default_path`)
-pub fn new_group_dir() -> String {
-    new_group_dir_in(&read(), std::path::Path::new(&aca_core::paths::expand(NEW_GROUP_DIR)).is_dir())
-}
-
-/// Unreadable / malformed / unset all count as not configured. Then it's ~/workspace if that exists, otherwise (usually so on
-/// a new machine) the home directory
-fn new_group_dir_in(text: &str, workspace: bool) -> String {
-    let t = text.parse::<toml::Table>().ok();
-    t.as_ref()
-        .and_then(|t| t.get("new_group")?.get("default_path")?.as_str())
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-        .unwrap_or(if workspace { NEW_GROUP_DIR } else { "~" })
-        .to_string()
-}
+/// Where sessions that belong to no project start (`[scratch] dir`), as an absolute path; empty = not set: there's no such
+/// place, and new sessions start where they always did
+pub use aca_core::config::scratch_dir;
+#[cfg(test)]
+use aca_core::config::scratch_dir_in;
 
 /// On the desktop aca switches the input method itself (`[ime] auto`, unset = switch; the ACA_IME env var overrides it, see
 /// ime.rs)
@@ -60,6 +52,39 @@ pub fn ime_auto() -> bool {
 fn ime_auto_in(text: &str) -> bool {
     let t = text.parse::<toml::Table>().ok();
     t.as_ref().and_then(|t| t.get("ime")?.get("auto")?.as_bool()).unwrap_or(true)
+}
+
+/// The line (counted from 1) of the `[section]` heading in this text (a comment after it is fine); None = it isn't there
+pub fn section_line(text: &str, section: &str) -> Option<usize> {
+    let head = format!("[{section}]");
+    text.lines().position(|l| l.split('#').next().unwrap_or("").trim() == head).map(|i| i + 1)
+}
+
+/// Where to open the config at `[section]`: (the new text to write first, if it has to change; the line). At its heading
+/// when there is one; written another way (`ui.lang = …`, `ui = { … }`, `[ui.x]`), at that line, unchanged; missing, the
+/// heading is added at the end (after a blank line). A file that doesn't read as TOML (or wouldn't after adding) is left
+/// alone and opened at the top
+pub fn open_at(text: &str, section: &str) -> (Option<String>, usize) {
+    if let Some(n) = section_line(text, section) {
+        return (None, n);
+    }
+    let Ok(t) = text.parse::<toml::Table>() else { return (None, 1) };
+    if t.contains_key(section) {
+        let starts = [format!("{section}."), format!("{section} "), format!("{section}="), format!("[{section}.")];
+        let n = text.lines().position(|l| starts.iter().any(|s| l.trim_start().starts_with(s.as_str()))).map_or(1, |i| i + 1);
+        return (None, n);
+    }
+    let gap = match () {
+        _ if text.is_empty() || text.ends_with("\n\n") => "",
+        _ if text.ends_with('\n') => "\n",
+        _ => "\n\n",
+    };
+    let all = format!("{text}{gap}[{section}]\n");
+    if all.parse::<toml::Table>().is_err() {
+        return (None, 1);
+    }
+    let n = all.lines().count();
+    (Some(all), n)
 }
 
 /// The list of strings at `[section] key` (`[ui] menu = ["a", "b"]`); unset / not of this shape = empty
@@ -91,8 +116,14 @@ fn problems_in(text: &str) -> Vec<String> {
                 .into(),
         );
     }
+    if t.get("scratch").and_then(|s| s.get("dir")).is_some_and(|v| !v.is_str()) {
+        bad.push(t!("config.toml [scratch] dir:应写成 \"目录\"", "config.toml [scratch] dir: write it as \"<dir>\"").into());
+    }
     if let Some(e) = aca_core::config::login_problem_in(text) {
         bad.push(tr!("config.toml [login] 已忽略:{e}", "config.toml [login] is ignored: {e}"));
+    }
+    if let Some(e) = aca_core::config::router_problem_in(text) {
+        bad.push(e);
     }
     if let Some(e) = aca_core::config::idle_problem_in(text) {
         bad.push(tr!("config.toml [idle] 已忽略,不会自动停止:{e}", "config.toml [idle] is ignored, nothing is auto-stopped: {e}"));
@@ -169,6 +200,19 @@ mod tests {
     }
 
     #[test]
+    fn there_is_no_scratch_directory_unless_one_is_set() {
+        assert_eq!(scratch_dir_in(""), "");
+        assert_eq!(scratch_dir_in("[scratch]\ndir = \"\"\n"), "");
+        assert_eq!(scratch_dir_in("[scratch\nbroken"), "");
+        // An absolute path, whatever way it's written
+        assert_eq!(scratch_dir_in("[scratch]\ndir = \" /srv/asks/ \"\n"), "/srv/asks");
+        assert!(scratch_dir_in("[scratch]\ndir = \"~/asks\"\n").ends_with("/asks"));
+        // Written wrong: none, and listed on the settings page
+        assert_eq!(scratch_dir_in("[scratch]\ndir = 1\n"), "");
+        assert_eq!(problems_in("[scratch]\ndir = 1\n"), ["config.toml [scratch] dir:应写成 \"目录\""]);
+    }
+
+    #[test]
     fn ime_is_on_unless_turned_off() {
         assert!(ime_auto_in(""));
         assert!(!ime_auto_in("[ime]\nauto = false\n"));
@@ -192,6 +236,31 @@ mod tests {
         assert_eq!(list_in(cfg, "ui", "menu"), ["sub", "firm"]);
         assert!(list_in(cfg, "ui", "hide").is_empty());
         assert!(list_in("", "ui", "menu").is_empty());
+    }
+
+    #[test]
+    fn a_section_heading_is_found_by_its_line() {
+        let cfg = "# [ui] in a comment\n[tools.x]\nui = 1\n  [ui]  # the menu\nmenu = []\n";
+        assert_eq!(section_line(cfg, "ui"), Some(4));
+        assert_eq!(section_line(cfg, "tools.x"), Some(2));
+        assert_eq!(section_line(cfg, "idle"), None);
+    }
+
+    #[test]
+    fn opening_at_a_section_adds_its_heading_only_when_that_keeps_the_file_whole() {
+        // There: its line, nothing written
+        assert_eq!(open_at("[tools.x]\nkind = \"claude\"\n\n[ui]\nmenu = []\n", "ui"), (None, 4));
+        // Missing: added at the end after one blank line, whatever the file ended with
+        assert_eq!(open_at("[a]\nx = 1\n", "ui"), (Some("[a]\nx = 1\n\n[ui]\n".into()), 4));
+        assert_eq!(open_at("[a]\nx = 1", "ui"), (Some("[a]\nx = 1\n\n[ui]\n".into()), 4));
+        assert_eq!(open_at("[a]\nx = 1\n\n", "ui"), (Some("[a]\nx = 1\n\n[ui]\n".into()), 4));
+        assert_eq!(open_at("", "ui"), (Some("[ui]\n".into()), 1));
+        // Written another way: a second [ui] would break the file, so its own line, unchanged
+        assert_eq!(open_at("ui.lang = \"zh\"\n[a]\nx = 1\n", "ui"), (None, 1));
+        assert_eq!(open_at("[a]\nx = 1\n[ui.extra]\ny = 2\n", "ui"), (None, 3));
+        assert_eq!(open_at("x = 1\nui = { lang = \"zh\" }\n", "ui"), (None, 2));
+        // Not TOML: left alone, at the top
+        assert_eq!(open_at("[a\nx = \n", "ui"), (None, 1));
     }
 
     #[test]

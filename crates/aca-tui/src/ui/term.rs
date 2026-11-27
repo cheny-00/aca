@@ -30,7 +30,7 @@ impl App {
             };
             let w = Where { dir, ..Where::default() };
             self.term_req =
-                Some(TermReq { key, family: String::new(), title: group_label(&g).to_string(), w, env: vec![], run: None, link: None });
+                Some(TermReq { key, family: String::new(), title: self.shown(&g).into_owned(), w, env: vec![], run: None, link: None });
             return;
         }
         let Some(s) = self.current() else { return };
@@ -163,7 +163,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::tests::{ctrl, press, reader_rows, said, select, sessions, target, with_windows};
+    use crate::ui::tests::{caps, ctrl, jump_to_group, press, reader_rows, said, select, sessions, target, to_scope, with_windows};
 
     #[test]
     fn shift_t_opens_a_new_window_in_its_session_in_its_real_work_dir() {
@@ -185,6 +185,7 @@ mod tests {
         let mut v = sessions();
         v[3].state = State::Stopped; // 「闲」
         let mut app = App::new(String::new(), v);
+        to_scope(&mut app, Scope::Week); // stopped: listed from the last 7 days on
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('T'));
         assert!(app.split.is_none() && app.msg.as_ref().unwrap().0.contains("未运行"), "{:?}", app.msg);
@@ -230,15 +231,15 @@ mod tests {
         let mut v = sessions();
         v[3].state = State::Stopped; // 「闲」
         let mut app = App::new(String::new(), v);
+        to_scope(&mut app, Scope::Week); // stopped: listed from the last 7 days on
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('y'));
         let Some(External::Yazi(sp)) = app.external.take() else { panic!("{:?}", app.msg) };
         assert_eq!(sp.target, "");
-        // A fold row doesn't know which one to open
-        press(&mut app, KeyCode::Char('o'));
-        assert!(app.on_fold_row());
+        // A group's header doesn't know which one to open
+        jump_to_group(&mut app, "work");
         press(&mut app, KeyCode::Char('y'));
-        assert!(app.external.is_none() && app.msg.as_ref().unwrap().0.contains("先展开"), "{:?}", app.msg);
+        assert!(app.external.is_none() && app.msg.as_ref().unwrap().0.contains("不能对分组"), "{:?}", app.msg);
     }
 
     #[test]
@@ -298,6 +299,7 @@ mod tests {
         let mut v = sessions();
         v[2].state = State::Stopped; // 「跑」
         let mut app = App::new(String::new(), v);
+        to_scope(&mut app, Scope::Week); // stopped: listed from the last 7 days on
         select(&mut app, "闲");
         app.follow_from("$闲", "");
         select(&mut app, "跑");
@@ -324,11 +326,11 @@ mod tests {
             app.follow_done();
             assert!(app.reads.read_at("id-跑").is_some());
         }
-        // Pressed in the keys popup it's only looked up
+        // Pressed in ?: no row does it there, so it goes to the list as if pressed there and closes too
         let mut app = following();
         press(&mut app, KeyCode::Char('?'));
         ctrl(&mut app, '4');
-        assert!(!app.quit);
+        assert!(app.quit && app.sheet.is_none());
         // Closed without moving: no need to record the original one
         let mut app = following();
         ctrl(&mut app, '4');
@@ -374,7 +376,7 @@ mod tests {
         let rows = reader_rows(&mut app, 56, 30);
         assert_eq!((app.mode(), strip(&rows)), (Preview::Off, 28), "{rows:#?}");
         // The bottom bar says what these two keys do while following
-        assert!(rows[29].contains("Esc 返回") && rows[29].contains("⏎ 留下"), "{}", rows[29]);
+        assert!(rows[29].contains(&caps("Esc 返回")) && rows[29].contains(&caps("⏎ 留下")), "{}", rows[29]);
         let saved = app.view_state();
         press(&mut app, KeyCode::Char('L'));
         assert!(app.mode() != Preview::Off);

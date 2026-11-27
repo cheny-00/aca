@@ -14,8 +14,19 @@ use crate::{t, tr};
 
 pub fn cmd() -> Command {
     let mut c = Command::new("tmux");
+    // Without a UTF-8 locale, tmux 3.8 replaces the tab separators in -F output with underscores.
+    c.arg("-u");
+    // A new server inherits its first client's environment. Session identity belongs only to the target pane.
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if ["ACA_SETTING_", "ACA_PLUGIN_", "ACA_ARG_", "ACA_SESSION_", "ACA_ROUTER_"].iter().any(|p| name.starts_with(p))
+            || matches!(name.as_ref(), "ACA_INPUT_FILE" | "ACA_INVOKED_BY" | "ACA_ENV" | "ACA_TOOL" | "ACA_BIN")
+        {
+            c.env_remove(key);
+        }
+    }
     if let Some(s) = std::env::var("ACA_TMUX_SOCKET").ok().filter(|s| !s.is_empty()) {
-        c.args(["-L", &s]);
+        c.arg(format!("-L{s}"));
     }
     c.stdin(Stdio::null());
     c
@@ -308,6 +319,16 @@ pub fn keys(pane: &str, keys: &[&str]) -> Res<()> {
 /// Pastes text into the pane's input box (bracketed paste, so multiple lines aren't taken as sending), without pressing
 /// Enter. If the pane is in copy-mode, leave it first: text pasted then would be typed key by key to tmux
 pub fn paste(pane: &str, text: &str) -> Res<()> {
+    paste_from(pane, Paste::Text(text))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Paste<'a> {
+    Text(&'a str),
+    File(&'a std::path::Path),
+}
+
+pub(crate) fn paste_from(pane: &str, source: Paste<'_>) -> Res<()> {
     let in_mode = || run(&["display-message", "-p", "-t", pane, "#{pane_in_mode}"]).is_ok_and(|o| o.trim() == "1");
     if in_mode() {
         let _ = run(&["copy-mode", "-q", "-t", pane]);
@@ -315,8 +336,15 @@ pub fn paste(pane: &str, text: &str) -> Res<()> {
             return Err(t!("窗格处于 tmux 模式", "the pane is in a tmux mode").into());
         }
     }
-    let buf = format!("aca-{}", std::process::id());
-    run(&["set-buffer", "-b", &buf, "--", text])?;
+    let buf = match source {
+        Paste::Text(_) => format!("aca-{}", std::process::id()),
+        Paste::File(_) => format!("aca-handoff-{pane}"),
+    };
+    match source {
+        Paste::Text(text) => run(&["set-buffer", "-b", &buf, "--", text])?,
+        // Handoffs can exceed the tmux command size limit. The buffer takes the same literal bytes from a file.
+        Paste::File(file) => run(&["load-buffer", "-b", &buf, "--", &file.to_string_lossy()])?,
+    };
     run(&["paste-buffer", "-p", "-d", "-b", &buf, "-t", pane]).map(|_| ())
 }
 

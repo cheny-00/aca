@@ -6,7 +6,7 @@ What you can set in aca's configuration file, and where each part is explained.
 
 Everything is optional. aca works with no configuration file at all.
 
-Settings live in `~/.config/aca/config.toml`. Changes take effect at once, with nothing to restart. If the
+Settings live in `~/.config/aca/config.toml`. aca reads changes as needed. A Claude router picks up its model and effort at the start of its next shift. If the
 file is not valid TOML, aca says so and carries on as if it were empty. You rarely need to edit it by
 hand: the settings page (`Ctrl+S`) changes most things and writes this file for you, and `e` on that page
 opens the file in your editor.
@@ -25,11 +25,16 @@ hook_trust = "bypass"                     # don't ask "Hooks need review" (see G
 folder = true                             # answer "do you trust this folder?" for you
 
 [idle]
-stop_after = "3h"                         # while the interface is open, stop sessions idle this long (they
+stop_after = "3h"                         # while the interface is open, stop ordinary sessions idle this long (they
                                           # resume their conversation with ⏎); idle agents still use CPU
 remove_after = "30d"                      # delete sessions stopped this long (into the trash, ^Z / b brings
                                           # them back within a day); "never" or unset keeps them. Pinned ones
-                                          # and ones with a note are never deleted
+                                          # and ones with a draft are never deleted
+
+[router]                                  # Claude project routers and the desk; defaults shown
+model = "sonnet"
+effort = "high"                           # low, medium, high, xhigh or max
+idle = "1h"                               # "never" turns off idle shift changes
 
 [keys]
 next = "M-n"                              # Alt+N instead of Ctrl+Alt+N for "next session waiting for you"
@@ -46,6 +51,8 @@ resume = ["--session", "{conv}"]
 busy = ['Working\.\.\.']
 ```
 
+Set `idle = "never"` under `[router]` to keep an idle Claude router running. Starting it manually after a stop still opens a new conversation. A router waiting for an answer or with someone attached stays up. An invalid router setting falls back to its default and is flagged on the settings page.
+
 Every section, and where to read more:
 
 | Section | What it is for | More |
@@ -54,6 +61,7 @@ Every section, and where to read more:
 | `[tools.<name>]` | Defaults for the built-in Claude, Codex and shell (account, arguments, environment, a wrapper command); variants you name yourself; other agents declared without writing code | `aca help config` |
 | `[trust]` | Answer "do you trust this folder?" for you | [Getting started](onboarding.md#two-questions-you-will-be-asked-the-first-time) |
 | `[idle]` | Stop sessions that have been idle for a while | `aca help stop` |
+| `[router]` | Model and effort at the start of each Claude router shift. The interface and incoming messages check its own idle limit | [Router shifts](many-sessions.md#let-one-session-dispatch-for-you) |
 | `[inbox]` | What a session that was handed work tells the session that handed it over: done, failed, and so on | `aca help msg` |
 | `[keys]` | The key aca binds in tmux to go to the next session waiting for you | [Keys](keys.md) |
 | `[login]` | Which browsers a login link can open in; logging in on another device when you are on SSH | `aca help config` |

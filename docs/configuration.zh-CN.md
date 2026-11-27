@@ -6,7 +6,7 @@ aca 的配置文件里能设置什么,以及每一部分的详细说明在哪里
 
 所有配置都是可选的。没有配置文件 aca 也能正常使用。
 
-配置写在 `~/.config/aca/config.toml` 里,修改后立即生效,无需重启。文件不是合法的 TOML 时,aca 会提示一次,
+配置写在 `~/.config/aca/config.toml` 里,aca 会在用到时读取。Claude router 的模型和档位在下一班启动时生效。文件不是合法的 TOML 时,aca 会提示一次,
 然后按空配置继续运行。一般不需要手动编辑:大多数设置都能在设置页(`Ctrl+S`)里修改,并自动写入这个文件;
 在设置页按 `e` 会用编辑器打开它。
 
@@ -24,10 +24,15 @@ hook_trust = "bypass"                     # 不再询问「Hooks need review」(
 folder = true                             # 替你回答「是否信任这个目录」
 
 [idle]
-stop_after = "3h"                         # 界面打开时,停止空闲超过这么久的会话(⏎ 重新启动并继续原来的对话);
+stop_after = "3h"                         # 界面打开时,停止空闲超过这么久的普通会话(⏎ 重新启动并继续原来的对话);
                                           # 空闲的 agent 也会一直占用 CPU
 remove_after = "30d"                      # 删除已停止超过这么久的会话(移到回收站,1 天内可用 ^Z / b 恢复);
                                           # 写 "never" 或不写 = 不删除;置顶的、有便签的不会删除
+
+[router]                                  # Claude 的项目 router 和总台,以下是默认值
+model = "sonnet"
+effort = "high"                           # 可选 low、medium、high、xhigh、max
+idle = "1h"                               # "never" 关闭空闲换班
 
 [keys]
 next = "M-n"                              # 「进入下一个待处理的会话」改用 Alt+N,而不是 Ctrl+Alt+N
@@ -44,6 +49,8 @@ resume = ["--session", "{conv}"]
 busy = ['Working\.\.\.']
 ```
 
+在 `[router]` 下写 `idle = "never"` 可以让空闲的 Claude router 一直运行。手动停止后再启动仍会开新对话。等你回答或有人连着时不会因空闲停止。写错的 router 设置会用默认值,设置页会提示。
+
 全部的配置节,以及去哪里看详细说明:
 
 | 配置节 | 用来做什么 | 详细说明 |
@@ -52,6 +59,7 @@ busy = ['Working\.\.\.']
 | `[tools.<名字>]` | 内置的 Claude、Codex、shell 的默认设置(账号、参数、环境变量、外层包装的启动命令);自己命名的变体;不用写代码就能接入的其他 agent | `aca help config` |
 | `[trust]` | 替你回答「是否信任这个目录」 | [上手指南](onboarding.zh-CN.md#第一次会被问到的两个问题) |
 | `[idle]` | 把空闲了一段时间的会话停掉 | `aca help stop` |
+| `[router]` | Claude router 每一班启动时使用的模型、档位。界面和投递来话时按它自己的时限判闲 | [router 换班](many-sessions.zh-CN.md#让一个会话替你分发) |
 | `[inbox]` | 派出去的会话在哪些情况下通知派它的会话:完成、失败等 | `aca help msg` |
 | `[keys]` | aca 绑定在 tmux 上、进入下一个待处理会话的键 | [按键](keys.zh-CN.md) |
 | `[login]` | 登录链接可以用哪些浏览器打开;通过 SSH 连接时改为在其他设备上完成登录 | `aca help config` |

@@ -13,7 +13,7 @@ commands, event hooks, timers), and to agents (skills, slash commands, MCP tools
 The design follows [herdr](https://github.com/herdrdev/herdr)'s plugins. The last section lists the differences.
 
 A plugin says what it would like; you decide (as in kitty, where a kitten doesn't bind its own keys, and you list
-which commands each remote-control password may use). Which tools agents get and which keys go in the `:` menu are
+which commands each remote-control password may use). Which tools agents get and which keys go in the list's `?` are
 set in `plugins.toml` (see [You decide](#you-decide)). For a small addition without making a plugin, write
 `~/.config/aca/user/aca-plugin.toml` (see [Your own plugin](#your-own-plugin)).
 
@@ -53,6 +53,7 @@ requires = ["aca.core"]          # optional: plugins it needs first; only first-
 
 [settings.max_lines]             # a setting: a default and a description; the value lives in plugins.toml and reaches programs as ACA_SETTING_MAX_LINES
 default = 20                     # values are read as the default's type: typing "20x" in the interface or aca plugin setting says it must be an integer
+label = "Summary lines"          # optional: what the plugins page calls it; without one it shows the setting's name (max_lines)
 desc = "At most how many lines of the change summary to show"
 # secret = true                  # for webhook URLs, keys and the like: masked where the interface and aca plugin setting list them
                                  # (the value is still stored in plain text in plugins.toml, so aca writes that file as 0600, readable only by you)
@@ -127,10 +128,10 @@ key = "x"
 title = "Close"
 run = "close"                    # runs one of the plugin's commands with this row (whether it's in the menu or not)
 args = { number = "{id}" }       # arguments filled from the row; any other arguments the command needs are asked for in a form first
-confirm = true                   # needs a second press
+confirm = true                   # asks first; only y goes ahead
 # row = false                    # doesn't need a row selected (for something like "create a new one"); templates read the list's fields
 
-[[keys]]                         # a key in the interface's : menu that runs something directly (a command, pane or view id)
+[[keys]]                         # a key in the list's ? that runs something directly (a command, pane or view id)
 key = "c"
 run = "ci"
 
@@ -149,13 +150,22 @@ via = "auto"                     # auto: registered with the gateway when it's o
 scope = "shared"                 # in the gateway: shared, one copy for everyone / session, one per session (for servers that keep state)
 ```
 
+A top-level `role = "router"` offers the plugin's agent directories, MCP servers and tools only to sessions registered as a
+group router or the desk. Those sessions get only role-matched plugins, including through the gateway. Omit `role`
+for plugins meant for ordinary sessions.
+
+Plugins that bring outside messages into aca can declare a `[channel]` table. Set `name` to the name the script passes to
+`aca msg --via` (1–16 characters, no whitespace, `claude` is reserved). The optional `settings` list names required
+`[settings.*]` entries. For example, Discord uses `settings = ["token", "channel", "user|mention"]`. Either
+`user` or `mention` satisfies the last entry. The settings page lists any missing values by label.
+
 `command` is an argument array. It doesn't go through a shell, and it runs in the plugin directory.
 
 Fields aca doesn't know don't stop a link, but they are named in a warning (when linking, in `aca plugin check` and on
 the plugins page). Usually it's a typo, or a field that ended up under another table — in TOML, fields written after a
 header such as `[[keys]]` belong to that entry.
 
-**Two languages.** `name`, `description`, and every `title` and `desc` can also be written per language:
+**Two languages.** `name`, `description`, and every `title`, `desc` and `label` can also be written per language:
 `description_en = "…"`, `title_zh = "…"`. When the interface is in that language the suffixed one is shown; otherwise
 the plain one is (so always write the plain one). An older aca doesn't know the suffixes and keeps showing the plain
 one. aca's own plugins have Chinese in the plain fields and English in `_en`.
@@ -224,7 +234,7 @@ of them; `true` / `false` means present (non-empty) or not. For example, only tr
 
 ### Hotkeys
 
-`[[keys]]` are keys in the interface's `:` menu; `[[hotkeys]]` are pressed while you're inside a session, facing the
+`[[keys]]` are keys in the list's `?`; `[[hotkeys]]` are pressed while you're inside a session, facing the
 agent. aca binds them in tmux, the same way Ctrl+Q takes you back:
 
 - **Only in aca's sessions.** In other tmux sessions the key still goes to the program inside.
@@ -253,7 +263,7 @@ change it too, and write to that file):
 ```toml
 [plugins."aca.tailnet"]
 tools = ["list", "add"]            # which commands agents get as tools. Default: those marked agent in the manifest; agent? ones must be named here
-keys = { mounts = "M", run = "" }  # keys in the : menu: command / pane / view → one character, "" = no key; the rest follow the manifest's [[keys]]
+keys = { mounts = "M", run = "" }  # keys in the list's ?: command / pane / view → one character, "" = no key; the rest follow the manifest's [[keys]]
 hotkeys = { mounts = "M-m" }       # hotkeys inside sessions: pane → a tmux key name, "" = none; the rest follow the manifest's [[hotkeys]]
 ```
 
@@ -264,14 +274,14 @@ hotkeys = { mounts = "M-m" }       # hotkeys inside sessions: pane → a tmux ke
   **not a sandbox**: an agent with a shell can still type `aca` commands.
 - **Keys**: when two plugins want the same key, the one you wrote in plugins.toml wins; between two manifests, the
   plugin registered first wins. The loser no longer quietly disappears — `aca plugin ls`, `aca plugin key` and the
-  plugins page name it and say where to change it. `/` belongs to the `:` menu itself (to filter) and can't be given.
+  plugins page name it and say where to change it. `/` belongs to `?` itself (to filter) and can't be given.
 - **Hotkeys**: the same rules (yours first). You can also give a hotkey to a pane whose manifest doesn't — any pane of
   any plugin.
 
 ```sh
 aca plugin allow aca.tailnet             # lists what agents can get: ✓ given ○ not given (ones that need you to opt in are marked)
 aca plugin allow aca.tailnet add         # give it; deny takes it back; --reset goes back to the manifest
-aca plugin key                           # every key in the : menu; the ones that didn't get their key are named
+aca plugin key                           # every key in the list's ?; the ones that didn't get their key are named
 aca plugin key aca.tailnet mounts M      # change it to M; --none for no key; --reset back to the manifest
 aca plugin hotkey                        # every hotkey inside sessions; the ones that couldn't be bound are named
 aca plugin hotkey aca.copy pick M-y      # change it to Alt+y (switched in tmux at once); --none for none; --reset back to the manifest
@@ -279,7 +289,7 @@ aca plugin hotkey aca.copy pick M-y      # change it to Alt+y (switched in tmux 
 
 In the interface: the plugins page (`P`) shows the highlighted plugin's details on the right, and ⏎ goes in to change
 them — settings (⏎ to edit, space to toggle on/off ones, `-` back to the default), agent tools (space to toggle), and
-keys in the plugin menu (the one `:` opens on the session list: ⏎ and then the key you want, ⌫ for no key, `-` back to
+its keys in the list's `?` (⏎ and then the key you want, ⌫ for no key, `-` back to
 the manifest). Esc goes back to the list.
 
 ## Your own plugin
@@ -315,22 +325,22 @@ tools or keys, write `[plugins.user]` as usual. `aca plugin remove user` can't r
 
 ## In the interface
 
-- **The `:` plugin menu**: press `:` on the list. It shows the commands, panes and views of enabled plugins that are
-  exposed to `menu`, filtered by `contexts` for the highlighted row (`session` on a session, `group` on a group
+- **In the list's `?`**: press `?` on the list. The commands, panes and views of enabled plugins that are exposed to
+  `menu` come first, filtered by `contexts` for the highlighted row (`session` on a session, `group` on a group
   heading, `global` elsewhere; no `contexts` = anywhere). ↑↓ to pick, ⏎ to run, or press the key bound in `[[keys]]`
-  directly; `/` filters. It runs for the highlighted session: that's `ACA_SESSION_ID`.
+  directly; `/` filters. `j` `k` `g` `G` only move and `q` `?` only close there: a command bound to one of them runs with ⏎. It runs for the highlighted session: that's `ACA_SESSION_ID`.
 - **Argument form**: a command with `args` first opens a form with one field per argument (`bool` toggles with space,
   ones with `?` can stay empty), and runs only once the types check out.
 - **Output**: when a command finishes, a one-line output goes to the bottom bar and anything longer to the full-screen
-  reader; views always open in the reader (`r` reruns, `c` copies, `Esc` goes back). They all run in the background
+  reader; views always open in the reader (`Ctrl+R` reruns, `c` copies, `Esc` goes back). They all run in the background
   (up to 120 seconds) and don't block anything else.
 - **Panes**: open in a tmux popup, split or new window. When the interface isn't inside tmux (a phone that ssh'd
   straight in, say), it hands over the terminal and runs the pane in the foreground.
 - **List views** (`rows = true`): open as a page, one row per item, with the highlighted row's details below and the
   keys that row takes at the bottom. If a row lacks a field that a key's template uses (or it's empty), that key isn't
-  listed on that row, and pressing it says it can't be used there. Keys that need a second press warn first. After a key
+  listed on that row, and pressing it says it can't be used there. Keys marked `confirm` ask first; only `y` goes ahead. After a key
   runs, its output is shown under the list (for example, how to add back what you just removed) and the list reloads;
-  `r` reloads (unless the plugin took `r`).
+  `Ctrl+R` reloads.
 - **Text on a row**: text set with `aca meta set` follows the title in the list, in grey, as `[name value]`; a name starting with `_` shows only the value (for an icon or a number that speaks for itself).
 
 ### Output of a list view
@@ -386,27 +396,40 @@ One JSON object per line. Common fields: `ts` (milliseconds), `event`, `session`
 
 | Event | Its own fields | When |
 |---|---|---|
-| `session.created` | `title` `tool` `account` `dir` `group` `parent` | created (a fork adds `fork` and `fork_of`, the session it was forked from, and its `parent` is empty: nobody dispatched it; a session taken over with `aca adopt` adds `adopted` and its current session name `tmux`) |
+| `session.created` | `title` `tool` `account` `dir` `group` `parent` `by` | created. `by` is the session whose command made it (null = you did), whether or not it is the `parent`: one made with `aca new --parent -` from inside a session has no parent, and `by` still names that session (a fork adds `fork` and `fork_of`, the session it was forked from, and its `parent` is empty: nobody dispatched it; a session taken over with `aca adopt` adds `adopted` and its current session name `tmux`; neither has `by`) |
 | `session.started` | `how`: fresh / resume / fork | the agent started |
-| `session.stopped` | `idle` (when aca stopped it for idling: how many seconds it had been idle; see `[idle] stop_after` in config.toml) | `aca stop`, D in the interface; aca stopping an idle session |
+| `session.stopped` | `idle` (seconds idle when aca stopped it for inactivity, including a Claude router whose shift expired at delivery) | `aca stop`, D in the interface; aca stopping an idle session |
 | `session.renamed` | `title` `tmux` | you renamed it |
 | `session.titled` | `title` `tmux` | the agent set or changed its own title |
-| `session.moved` | `group` | moved to another group |
-| `session.rehomed` | `tool` `account` `from` (the previous `tool:account`) | carried on under another account (`aca restart --as`, or `X` in the interface): the conversation is copied to the new account and the session restarts in place |
+| `session.moved` | `group` `from` (the group it was in) `by` (the session whose `aca move` did it; null when you did) | moved to another group |
+| `session.rehomed` | `tool` `account` `from` (the previous `tool:account`) | switched accounts (`aca restart --as`, or `X` in the interface). An ordinary session resumes in place, copying its conversation to the new account as needed. A Claude router starts a new shift on the new account without copying the previous conversation |
 | `session.archived` / `session.removed` | a removal carries `title`; a session let go with `aca release` adds `released` (its tmux session is still there) | |
 | `turn.started` | `prompt` | you sent a message. Claude also starts a turn for another Claude session's message and for a background task's notice; this goes out then too, with that text, as who opened the turn is only in the conversation record once the turn ends (the session's `prompt` then goes back to what you last said) |
-| `turn.done` | `last` (the last reply) `bg` (background tasks still running) `secs` | a turn finished |
-| `turn.failed` | `error` `kind` (transient = rate limit, overload, dropped stream: continuing a bit later usually works; account = quota, login, billing; fatal = retrying won't help) | a turn failed (Codex doesn't report this hook: aca fills it in from Codex's transcript when it checks the state) |
+| `turn.done` | `last` (the last reply) `bg` (background tasks still running) `secs` `routers` (IDs of routers whose exchange shows the result, when present) `via` (channel of the user message that opened this turn, when present) | a turn finished |
+| `turn.failed` | `error` `kind` (transient = rate limit, overload, dropped stream: continuing a bit later usually works; account = quota, login, billing; fatal = retrying won't help) `routers` (IDs of routers whose exchange shows the result, when present) `via` (channel of the user message that opened this turn, when present) | a turn failed (Codex doesn't report this hook: aca fills it in from Codex's transcript when it checks the state) |
 | `turn.interrupted` | `by` (when `aca interrupt` stops Claude: who did it) | you pressed Esc (Codex reports this itself), or `aca interrupt` stopped it |
-| `agent.waiting` | `ask` `kind` (choice / permission / empty = can't tell) `options` (the choices of a multiple-choice question) | waiting for you to confirm or answer |
+| `agent.waiting` | `ask` `kind` (choice / permission / empty = can't tell) `options` (the choices of a multiple-choice question) `routers` (IDs of routers whose exchange shows the result, when present) `via` (channel of the user message that opened this turn, when present) | waiting for you to confirm or answer |
 | `agent.status` | `state` (idle / working / done / blocked / error / empty = it cleared its status) `kind` (with blocked: permission / question / auth / empty) `msg` (its own one line) | the agent reported its own state (OSC 7501; only agents that speak it, behind aca's relay); sent when it changes |
 | `agent.exited` | `reason` | the agent process exited |
 | `conversation.changed` | `conv` `from` | the conversation id changed (/clear) |
-| `message.sent` | `id` (of this message) `from` `kind` (msg / notice) `what` (what a notice is about; null for other messages) `wake` `text` `at` (when a scheduled one is due, in seconds; null otherwise) `via` (`claude` = sent with Claude's own SendMessage; null otherwise) | a message was put in this session's inbox (`aca msg`, or a notice sent automatically by a worker it dispatched). What another Claude session sent it with SendMessage is put in when its turn ends, read from its conversation record, and is delivered at once (`how` = native). A scheduled one (`aca msg --in`) sends this when it's put in; the delivered one waits until it's due |
-| `message.delivered` | `id` `how` (bell / queue / type / wait / native: Claude passed it itself) | that message reached it |
+| `message.sent` | `id` (of this message) `from` `kind` (msg / notice) `what` (worker event or ticket update, described below; otherwise null) `wake` `text` `at` (when a scheduled one is due, in seconds; null otherwise) `via` (`claude` = sent with Claude's own SendMessage; any other name = the channel outside aca the user's words came in through, as given to `aca msg --via`; null otherwise) | a message was put in this session's inbox (`aca msg`, or a notice sent automatically by a worker it dispatched). What another Claude session sent it with SendMessage is put in when its turn ends, read from its conversation record, and is delivered at once (`how` = native). A scheduled one (`aca msg --in`) sends this when it's put in; the delivered one waits until it's due |
+| `message.delivered` | `id` `how` (bell / queue / type / wait / native / handoff). Native means Claude delivered it; handoff means a Claude router acknowledged it in the opening message | that message reached it |
 | `message.throttled` | `from` `count` `secs` | one session sent messages too often; later ones are stored without waking it |
-| `ask.answered` | `by` (who answered for it; `you` = from outside) `answer` `ask` `kind` (choice / permission; a confirmation shown at startup is `gate`) | `aca answer` answered a confirmation for it |
+| `ask.answered` | `by` (who answered for it; `you` = from outside, `s` in the list included) `answer` `ask` `kind` (choice / permission; a confirmation shown at startup is `gate`) | `aca answer`, or `s` on its row in the list, answered a confirmation for it |
 | `limits.changed` | `tool` (claude / codex) `name` (the registered account name, else the directory's name without its dot) `dir` (the account's directory) `wins` (every window of that account: `label` 5h / 7d / Fable …, `used` percent, `resets` and `at` (when the number is from) in seconds) | an account's subscription quota moved: never on a refresh that brings the same numbers. Claude's come through the status line, Codex's when one of its turns ends. `session` is the session that reported it, empty when it wasn't started by aca; `aca limits --json` gives all accounts at once |
+| `task.added` | `n` (its number) `group` `title` `by` (who made it: a session id; empty = you) | a task ticket was made. `session` is the session doing it, empty while nobody is (the same below) |
+| `task.given` | `n` `group` `title` `by` (who handed it over) `say` (what they said doing so) | the ticket was handed to `session`; an empty `session` = taken back, it waits for someone again |
+| `task.done` | `n` `group` `title` `by` (who marked it) `result` (what was said of the result) `routers` (IDs of routers whose exchange shows the result, when present) | the ticket was marked done |
+| `task.changed` | `n` `group` `title` `by` | its title, completion criteria, note or watch setting changed |
+| `task.removed` | `n` `group` `title` `by` | the ticket was deleted |
+
+For ticket results, `routers` lists the project router and any router that assigned the ticket at the time of the event,
+regardless of its watch setting. A worker turn can cover several open tickets. On turn events, `via` can appear
+for any session whose turn opened with a user's channel message.
+
+In `message.sent`, `what` can be `task` for a ticket update sent to a router, or `task.done` for its completion
+message. Worker notices use `turn.done`, `agent.waiting`, `turn.failed` or `agent.exited` for a parent, and prefix
+the same event with `task.` for a watched ticket (for example, `task.agent.waiting`).
 
 Every event is in `~/.local/state/aca/events.jsonl`; `aca events -f` keeps reading it.
 
@@ -428,7 +451,9 @@ a single run on wake.
   it hasn't exited 3 seconds later); while the previous run is still going, the next one doesn't start.
 - **Switching itself during a run** (say, `off` once the work is done): aca waits for that run to finish before
   changing launchd, so the run isn't cut off halfway by its own request.
-- PATH is copied into the plist when the timer is turned on (launchd's own PATH has nothing from Homebrew in it).
+- Turning on a timer copies PATH and any of LANG, LC_ALL and LC_CTYPE set in that shell. Opening the UI or running
+  `aca plugin sync` or `aca plugin timer on` adds any of those locale keys present in the shell but missing from the
+  plist, preserving existing values. The timer reloads when a key is added. A timer's own run skips this check.
 - Tests and benchmarks (with `ACA_HOME` or `ACA_TMUX_SOCKET` set) don't touch launchd: the plist is written to
   `timers/` in aca's state directory and treated as installed.
 
@@ -541,8 +566,7 @@ load, and linking says to upgrade aca first). Within one version aca only adds t
 
 ## First-party plugins
 
-They live in the repository's [`plugins/`](../plugins), are compiled into aca and ship with it; none is installed by
-default. `aca plugin install aca.<name>` needs no path, and a bare `[plugins."aca.core"]` (with no source) in
+They live in the repository's [`plugins/`](../plugins), are compiled into aca and ship with it. The first router start registers `aca.router` automatically. `aca plugin install aca.<name>` needs no path, and a bare `[plugins."aca.core"]` (with no source) in
 plugins.toml also installs on another machine with `sync`. Installing means aca writes the compiled-in files to
 `~/.local/share/aca/first-party/<name>/` and registers them. That copy belongs to aca: when an aca upgrade changes it,
 it's rewritten the next time an agent starts, on `sync`, or when the plugins page opens (the plugins page labels
@@ -551,14 +575,24 @@ these "built-in", `aca plugin ls` "ships with aca").
 | Plugin | What it gives |
 |---|---|
 | `aca.delegate` | `/aca:delegate` (a slash command in Claude — typing `/dele` completes to it; a skill in Codex): the lead plans, dispatches workers through aca, checks their work and reports; a worker's transient failures are continued automatically. It also brings `/aca:spec`: one change from proposal to archive (`openspec/changes/<slug>/`), each task done through `/aca:delegate`, done only once verified live. Settings: `worker` (who to dispatch to, default `codex`), `language` (which language to answer you in; empty = yours), `say` (what to say for a worker), `max_continue`, `delay` |
+| `aca.router` | Twelve dispatch tools for a project router, plus `groups` for the desk. Also supplies the Claude role files. Disabling the plugin prevents router startup until you run `aca plugin enable aca.router`. |
 | `aca.core` | aca's core abilities as agent tools (for both agents): `sessions` to look at sessions, `dispatch` to dispatch a worker (under the caller, optionally on a worktree branch), `message` to pass a message, `wait` to wait (up to 240 seconds per call), `answer` to answer for it, `interrupt` to stop it, `wakeup` to wake itself later (a scheduled message to itself, `aca msg --in`). Only workers the caller dispatched itself can be answered for or stopped. Codex also gets a `wakeup` skill: end the turn instead of waiting minutes inside it, and have aca wake it to check back |
 | `aca.gateway` | the MCP gateway, see the next section |
-| `aca.remote` | remote tasks, entirely in the plugin's script (sh + jq + curl + ssh): runs a long task on another machine in the background; when it ends, the result arrives as a message in the inbox of the session that sent it. In the `:` menu: `r` sends one, `t` lists them (⏎ copies the command to read its log, `x` cancels, `r` collects now), and an entry to test the server; agents get two tools, `run` and `list`. Callbacks first land on a server that's always on ([jobhook](https://github.com/cheny-00/jobhook)); settings: `url`, `token`. A timer that collects every 5 minutes is on only while something is waiting |
-| `aca.tailnet` | tailnet mounts, entirely in the plugin's script (sh + jq; needs `jq`): `m` in the `:` menu is a list with one `tailscale serve` per row (and whether its target is listening); ⏎ copies the URL, `x` removes it (and says how to add it back), `a` mounts a local port, `p` turns publishing on or off (with tpub installed). Agents can list; mounting a port is `agent?`, given only when you opt in (`aca plugin allow aca.tailnet add`) |
+| `aca.remote` | remote tasks, entirely in the plugin's script (sh + jq + curl + ssh): runs a long task on another machine in the background; when it ends, the result arrives as a message in the inbox of the session that sent it. In the list's `?`: `r` sends one, `t` lists them (⏎ copies the command to read its log, `x` cancels, `r` collects now), and an entry to test the server; agents get two tools, `run` and `list`. Callbacks first land on a server that's always on ([jobhook](https://github.com/cheny-00/jobhook)); settings: `url`, `token`. A timer that collects every 5 minutes is on only while something is waiting |
+| `aca.tailnet` | tailnet mounts, entirely in the plugin's script (sh + jq; needs `jq`): `m` in the list's `?` is a list with one `tailscale serve` per row (and whether its target is listening); ⏎ copies the URL, `x` removes it (and says how to add it back), `a` mounts a local port, `p` turns publishing on or off (with tpub installed). Agents can list; mounting a port is `agent?`, given only when you opt in (`aca plugin allow aca.tailnet add`) |
 | `aca.bark` | pushes "finished", "waiting for you to confirm" and "error" to your phone with Bark (not while someone is attached to that session). Settings: `url` (the push URL), `workers` (push for dispatched workers too), `group`; `aca plugin run aca.bark.test` sends a test push |
-| `aca.discord` | the same three things to a Discord channel (through a webhook; not while someone is attached to that session). Settings: `url` (the webhook URL), `mention` (the user id to @ when it's waiting for you), `workers`, `username`. Outgoing only; replying from Discord into the session isn't built yet |
+| `aca.discord` | Talk to the desk in the main channel and to each session in its own thread. `Ctrl+S`, then `c`, switches the plugin and its timer together. See [Discord setup](#discord-setup). |
 | `aca.notify` | the same three things as desktop notifications on this machine (not while you're attached to that session). Settings: `command` (a different notification command, with the title and body as its two arguments; when it's empty or fails, `osascript` on macOS and `notify-send` on Linux), `workers`, `attached` (notify even while attached); `aca plugin run aca.notify.test` shows a test notification |
-| `aca.copy` | copies commands from a reply, entirely in the plugin's script (sh; needs `fzf`): press Ctrl+Alt+Y inside a session (a hotkey; `y` in the `:` menu) and it finds the code blocks and inline commands in the raw text of the last reply — a single one is copied right away, several pop up to pick by number; each command in a shell code block is listed on its own too. Copies to the tmux buffer, the outer terminal (OSC 52) and the local clipboard. Settings: `inline` (which inline `…` to include), `lines`, `copy` (a different copy command) |
+| `aca.copy` | copies commands from a reply, entirely in the plugin's script (sh; needs `fzf`): press Ctrl+Alt+Y inside a session (a hotkey; `y` in the list's `?`) and it finds the code blocks and inline commands in the raw text of the last reply — a single one is copied right away, several pop up to pick by number; each command in a shell code block is listed on its own too. Copies to the tmux buffer, the outer terminal (OSC 52) and the local clipboard. Settings: `inline` (which inline `…` to include), `lines`, `copy` (a different copy command) |
+
+## Discord setup
+
+Set `token` and `channel` to send as the bot. Bot mode uses curl and Python 3.8 or later (`python3`). Invite the bot to the server and grant it **View Channel**, **Send Messages**, **Read Message History**, **Create Public Threads**, **Send Messages in Threads** and **Manage Threads** in that channel. Public threads inherit the parent channel’s visibility, including in a restricted channel.
+
+- **Where replies go.** Write in the main channel to reach the desk. Write in a session’s thread to reach that session. Discord turns return the full event text (up to 4000 characters), split into messages of up to 2000 characters, even while someone is attached. Other notifications skip attached sessions and skip dispatched workers unless `workers` is enabled. Thread messages start with ✓ for completion, ? for a question or ✕ for an error. Set `mention` to ping one user on the first part of a question.
+- **Thread lifetime.** The first notification creates a public thread named after the session. Discord’s thread starter is its directory entry. The name follows session title changes. Archiving or removing the session archives the thread. Idle threads auto-archive after 24 hours and reopen on a new message. If a thread was deleted, the next notification creates a replacement.
+- **Taking messages in.** Enable Message Content Intent and set `user` to your Discord user ID (defaults to `mention`). Every minute the bot forwards only that person’s text, oldest first, with `aca msg … --via Discord`. A mention of the bot at the start (the bot itself or the role Discord manages for it) is removed first, and a message that was only that mention isn’t forwarded. Each channel or thread starts from the present and keeps its own read position. The bot checks the active-thread list once and reads only known threads with newer messages. Without a desk, main-channel messages count as seen. If a thread’s session is gone, the bot says so once and forgets the thread. Run `aca plugin run aca.discord.check` to check channel access, message content and active threads.
+- **Webhook only.** Set `url` alone to keep the original webhook notifications and previews (requires jq). `username` sets the webhook sender name. With both `token` and `channel` configured, the bot sends under its own Discord name. `aca plugin run aca.discord.test` posts a test message.
 
 ## MCP gateway
 
@@ -598,7 +632,7 @@ aca plugin gateway import [--apply]  # list the MCP servers set up in individual
 
 - **In the interface**: on the plugins page (`P`), press `m` on the gateway's row to go in: one row per server
   (running / idle / crashed, how many tools, calls in the last day, how many sessions use it); space moves a
-  `[mcps.*]` in or out, `r` restarts, `l` shows the log, `s` stops. The top of the `M` page lists the servers this
+  `[mcps.*]` in or out, `r` restarts, `z` shows the log, `s` stops. The top of the `M` page lists the servers this
   session can see through the gateway; space turns one off or on for this session only (Claude switches at once, Codex
   after a restart). A `[mcps.*]` moved into the gateway is no longer offered a second time under "project".
 - **Bringing in MCP servers from your accounts**: `import` reads the top-level `mcpServers` in `.claude.json` in Claude
@@ -623,7 +657,7 @@ source = "~/src/aca/plugins/delegate"   # a local directory = link; a git URL / 
 agents = ["claude:*", "codex:work"]    # which "tool[:account]" get what it brings; default: every agent the manifest names
 settings = { max_continue = 3 }        # overrides the manifest's defaults
 tools = ["dispatch"]                   # which tools agents get (see "You decide")
-keys = { tasks = "T" }                 # keys in the : menu
+keys = { tasks = "T" }                 # keys in the list's ?
 
 [plugins."owner/gh-glance"]
 source = "owner/gh-glance"
@@ -661,7 +695,7 @@ aca plugin run example.git-glance.refresh top=5 --session 3f2a   # arguments as 
 aca plugin view aca.remote.tasks     # run a view and print its output
 aca plugin setting aca.delegate [worker [codex:work]]   # list the settings / read one / change one (written to plugins.toml); --reset back to the default
 aca plugin allow | deny <id> [command…]   # which tools agents get (see "You decide")
-aca plugin key [<id> <target> <key>]      # keys in the : menu
+aca plugin key [<id> <target> <key>]      # keys in the list's ?
 aca plugin pane example.git-glance diff --session 3f2a [--placement window]
 aca plugin log example.git-glance    # event hook output; list views' stderr goes here too
 aca plugin emit turn.failed kind=transient [--session id] [--plugin id]   # fake an event; hooks run in the foreground
@@ -703,7 +737,7 @@ go in `doc/spec/<slug>/`. The repo's own checks, deploy route and live checks ar
 | `pane.report_metadata` tokens | `aca meta set` |
 | pane placement: overlay / popup / split / tab / zoomed | popup / split / window (all tmux's own) |
 | `[[startup]]` | none: there's no server to wait for. For something that runs every so often, write `[[timers]]` (aca sets up launchd for it) |
-| `[[keybindings]]` | `[[keys]]`: bound in the interface's `:` menu (`:` then that key), so they don't fight aca's own keys; they're only defaults, which you change in plugins.toml |
+| `[[keybindings]]` | `[[keys]]`: bound in the list's `?` (`?` then that key), so they don't fight aca's own keys; they're only defaults, which you change in plugins.toml |
 | | `[[views]]`: a program's output in aca's full-screen reader, so a plugin doesn't need an interface of its own |
 | `plugin install <GitHub>` | `aca plugin install owner/repo` (any git URL; `--ref` pins a version), `update`, `remove` |
 | | `[agent]`: brings a plugin directory (skills, slash commands) and an MCP server to the agents aca starts |

@@ -94,8 +94,7 @@ impl Drop for Guard {
     }
 }
 
-/// Whether the keys come from a local terminal: inside tmux, look at this client's terminal type (popup = the `--client` one);
-/// a phone connected over mosh is xterm-256color or the like; outside tmux, look at TERM; ssh sessions don't count.
+/// Whether the keys come from a local terminal (see `data::local_term`; in a popup it's the `--client` one's terminal).
 /// Tests (`ACA_TMUX_SOCKET` pointing at a server of fake sessions) don't touch the real input method. `ACA_IME=0` never
 /// manages, `=1` always manages regardless of all this;
 /// without ACA_IME, config.toml's `[ime] auto = false` (turned off on the settings page) also means not managing
@@ -111,14 +110,7 @@ fn local() -> bool {
     if std::env::var_os("ACA_TMUX_SOCKET").is_some_and(|s| !s.is_empty()) || !crate::config::ime_auto() {
         return false;
     }
-    let term = if std::env::var_os("TMUX").is_some() {
-        crate::data::client_term()
-    } else if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
-        return false;
-    } else {
-        std::env::var("TERM").unwrap_or_default()
-    };
-    ["kitty", "ghostty", "wezterm"].iter().any(|t| term.contains(t))
+    crate::data::local_term()
 }
 
 /// macOS's input method API (Carbon's TIS)

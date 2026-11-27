@@ -1,4 +1,4 @@
-//! The `n` tool menu: shell always on top; then every account registered in config.toml (named after the account, Claude
+//! The `n` tool menu: shell first by default; then every account registered in config.toml (named after the account, Claude
 //! first, then Codex; a family with no account at all is listed as itself), and the named tools (`[tools.<name>]`).
 //!
 //! The special environments' rows (`[sandbox.<name>]`, see aca-core's sandbox.rs) come last in [`load`] and have a panel of
@@ -40,9 +40,17 @@ pub struct Tool {
     pub under: String,
 }
 
-#[cfg(test)]
 impl Tool {
+    pub(crate) fn google_login(&self) -> bool {
+        self.agent == Agent::Agy && self.tool == "agy" && self.account.is_empty()
+    }
+
+    pub(crate) fn has_login(&self) -> bool {
+        self.google_login() || (!self.account.is_empty() && matches!(self.agent, Agent::Claude | Agent::Codex))
+    }
+
     /// The form passed to `aca new`: `tool` / `tool:account`
+    #[cfg(test)]
     pub fn spec(&self) -> String {
         spec(&self.tool, &self.account)
     }
@@ -131,8 +139,10 @@ pub fn menu(cfg: &Config, lay: &Layout) -> Vec<Tool> {
 }
 
 /// `installed` asks whether a program is installed (swapped out in tests)
-fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Tool> {
+pub(crate) fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Tool> {
     let families = || aca_core::agent::kinds().filter(|k| *k != "shell");
+    let agy = aca_core::agent::tool(cfg, "agy").unwrap_or_default();
+    let has_agy = installed(agy.cmd.first().map_or("agy", String::as_str));
     let bound = |fam: &str, account: &str| aca_core::sandbox::of(cfg, fam, account).map(|(n, _)| n.to_string());
     // The special environments': each one's together, a terminal in it then the accounts bound to it in built-in order
     let mut special: Vec<Tool> = vec![];
@@ -145,7 +155,7 @@ fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Too
         }
     }
     let mut out: Vec<Tool> = vec![];
-    // The other registered accounts: in built-in order (Claude, Codex, pi, opencode), each family's by name
+    // The other registered accounts: in built-in order (Claude, Codex, pi, opencode, agy), each family's by name
     for fam in families() {
         let all = cfg.accounts.get(fam);
         for n in all.into_iter().flat_map(|m| m.keys()).filter(|n| bound(fam, n).is_none()) {
@@ -156,7 +166,7 @@ fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Too
         // don't get unusable rows in the menu
         let prog = aca_core::agent::tool(cfg, fam).and_then(|t| t.cmd.first().cloned()).unwrap_or_else(|| fam.to_string());
         let wanted = matches!(fam, "claude" | "codex") || cfg.tools.contains_key(fam) || installed(&prog);
-        if all.is_none_or(|m| m.is_empty()) && wanted {
+        if (all.is_none_or(|m| m.is_empty()) || (fam == "agy" && agy.account.is_empty())) && wanted {
             out.push(entry(cfg, fam.into(), fam, "", String::new()));
         }
     }
@@ -165,8 +175,6 @@ fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Too
         out.push(entry(cfg, name.clone(), name, "", tool_note(name, t)));
     }
     out.retain(|t| !lay.hide.contains(&t.name));
-    // Ones given an order go first (stable sort: the rest keep the order above)
-    out.sort_by_key(|t| lay.menu.iter().position(|n| *n == t.name).unwrap_or(usize::MAX));
     special.retain(|t| !lay.hide.contains(&t.name));
     let shell = Tool {
         name: "shell".into(),
@@ -179,7 +187,14 @@ fn menu_with(cfg: &Config, lay: &Layout, installed: fn(&str) -> bool) -> Vec<Too
         under: String::new(),
     };
     out.insert(0, shell);
+    // Legacy menus left shell implicit at the top. Once listed, it sorts like every other name.
+    out.sort_by_key(|t| match lay.menu.iter().position(|n| *n == t.name) {
+        Some(i) => i + 1,
+        None if t.tool == "shell" => 0,
+        None => usize::MAX,
+    });
     out.extend(special);
+    out.retain(|t| t.agent != Agent::Agy || has_agy);
     out
 }
 
@@ -200,6 +215,14 @@ mod tests {
 
     fn none(_: &str) -> bool {
         false
+    }
+
+    #[test]
+    fn agy_menu_keeps_the_google_login_separate_from_configured_variants() {
+        let cfg = aca_core::config::parse("[tools.agy]\nargs = ['--mode', 'plan']\n[accounts.agy]\napi = { args = ['--other'] }");
+        let menu = menu_with(&cfg, &Layout::default(), |p| p == "agy");
+        assert_eq!(menu.iter().filter(|t| t.agent == Agent::Agy).map(Tool::spec).collect::<Vec<_>>(), ["agy:api", "agy"]);
+        assert!(menu_with(&cfg, &Layout::default(), none).iter().all(|t| t.agent != Agent::Agy));
     }
 
     #[test]
@@ -225,6 +248,14 @@ mod tests {
         let only = aca_core::config::parse("[accounts.claude]\nteam = \"~/.ct\"\n");
         assert_eq!(names(&menu_with(&only, &Layout::default(), none)), ["shell", "team", "codex"]);
         assert_eq!(names(&menu_with(&Config::default(), &Layout::default(), none)), ["shell", "claude", "codex"]);
+    }
+
+    #[test]
+    fn antigravity_is_offered_when_agy_is_installed() {
+        let menu = menu_with(&Config::default(), &Layout::default(), |p| p == "agy");
+        assert_eq!(names(&menu), ["shell", "claude", "codex", "agy"]);
+        assert_eq!(menu[3].agent, Agent::Agy);
+        assert_eq!(aca_records::words::agent_label(menu[3].agent, &menu[3].name), "Antigravity");
     }
 
     #[test]

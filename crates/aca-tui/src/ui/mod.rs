@@ -6,7 +6,7 @@
 //! its tests (bill, confirm, draft, jobs, keys, list, order, overlays, pick, reader, run, screen, settings, space, term, tools,
 //! trace).
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::stdout;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +30,7 @@ use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Padding, Pa
 use ratatui::{DefaultTerminal, Frame, Terminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use aca_core::answer;
 use aca_core::i18n::{self, Lang, Tr, noun};
 use aca_core::runtime::mark;
 use aca_core::{t, tr};
@@ -39,6 +40,8 @@ use aca_records::words;
 use aca_records::workdir::Where;
 
 use crate::ansi::{self, Styled};
+use crate::book::Book;
+use crate::tickets::Tickets;
 use crate::create::{self, DirPick, DirRow, Draft, NewReq, Picked, Removal, Src};
 use crate::data::{DEEP, Fork, Session, State, Sub, Up, collect, hangs, sort_sessions};
 use crate::diff::{self, Glance, Mode};
@@ -46,12 +49,12 @@ use crate::follow::{Follow, Place};
 use crate::groups;
 use crate::handoff::Source;
 use crate::kit::{
-    SEP, agent_style, button, clip, clip_left, dim, esc_hint, group_label, icon, key_spans, key_style, keys_line, modal_title, spread,
-    wrap_width,
+    CAP_GAP, SCRATCH, agent_style, button, cap_width, clip, clip_left, dim, esc_hint, group_label, group_shown, icon, key_cap, key_style,
+    keys_line, keys_line_help, modal_title, scratch_len, spread, wrap_width,
 };
 use crate::mcp;
 use crate::notes::{self, Notes, group_key, is_group_key};
-use crate::ops::{self, Job, Outcome, Target};
+use crate::ops::{self, Job, Outcome, Target, TaskAct};
 use crate::overlay::{Flow, Fx, Overlay, Setting};
 use crate::pins::Pins;
 use crate::reads::Reads;
@@ -61,7 +64,7 @@ use crate::theme;
 use crate::tools::Tool;
 use crate::trash::Trash;
 use crate::undo::{self, Undo};
-use crate::view::{DAYS, External, Preview, SEEN_SLACK, Scope, Split, TermReq};
+use crate::view::{External, Preview, SEEN_SLACK, Scope, Split, TermReq, WEEK};
 
 mod bill;
 mod confirm;
@@ -69,30 +72,40 @@ mod draft;
 mod jobs;
 mod keys;
 mod list;
+mod notes_page;
 mod order;
 mod overlays;
 mod pick;
+mod rail;
 mod reader;
+mod router;
 mod run;
 mod screen;
 mod settings;
 mod space;
+mod tasks_page;
 mod term;
 mod tools;
 mod trace;
 
 use bill::{BillView, draw_bill, read_bill};
-use confirm::{Ask, Batch, Confirm, GroupPick, GroupRemoval, NoteEdit, Pending, Prompt, adopt_plan, draw_confirm, draw_prompt};
+use confirm::{
+    Ask, Batch, Confirm, GroupPick, GroupRemoval, NoteEdit, Pending, Prompt, adopt_plan, draw_answer, draw_confirm, draw_prompt, reply_keys,
+};
 use draft::draw_draft;
 use jobs::{Vanish, target_of};
 use list::{
-    AGENT_SEP, Boxed, Folds, HintMatch, Jump, Row, agent_icon, agent_row, agents_line, group_keys, group_note, group_pane, jump_hints,
-    jump_targets, local_when, match_hint, menu_bar, menu_bar_in, preview_head, preview_lines, preview_name, session_icon, space_of,
-    state_word, strip_prompt,
+    AGENT_SEP, Boxed, HintMatch, Jump, Pen, TALLY_MARKS, agent_icon, agent_row, agents_line, group_letters, group_pane, hint_badge,
+    jump_hints, jump_targets, list_rows_keyed, local_when, match_hint, menu_bar, menu_bar_in, page_bar, pinned_lines, preview_head,
+    preview_lines, preview_name, row_keys, session_icon, shows_turn, space_of, split_bar, starts, state_word, strip_prompt, turn_lines,
 };
-use reader::{Clip, Reader, draw_help, draw_reader};
+use notes_page::{draw_notes, note_body, note_head, notes_bar, page_cells};
+use tasks_page::{draw_give, draw_tasks, task_block, task_head, tasks_bar};
+use rail::{RAIL_W, RailAt, RailKind, draw_rail, rail_shown};
+use reader::{Clip, Reader, draw_reader};
+use router::{RouterPane, pen_lines, router_pane};
 use run::{cant_fill, closes_popup, key_is, write_view};
-use screen::{draw, floating, input_row, input_rule, modal, modal_area, modal_chrome, modal_frame, side_panel, side_width, title_rule};
+use screen::{draw, input_row, input_rule, modal, modal_beside, side_panel, side_width, title_rule};
 use settings::{Set, Settings, ThemeMenu, draw_settings, draw_themes};
 use tools::draw_tools;
 use trace::{TraceView, below_tag, draw_trace};
@@ -138,19 +151,13 @@ const BURST_QUIET: Duration = Duration::from_millis(500);
 const SETTLE: Duration = Duration::from_millis(180);
 /// Within this long after a move, new data from background refreshes is held and the view isn't saved yet: no full-screen redraw mid-swipe
 const HOLD: Duration = Duration::from_millis(600);
-/// The one that yielded (see `App::yielded`)
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Yielded {
-    /// The ^ / % that was picked: w was pressed, entering "open ones"
-    Stopped(Pick),
-    /// "Open ones": ^ / % was picked inside it
-    Open,
-}
-
-/// Show only one state (`!` `@` `#` `&` `^`, same keys as agent-deck; `%` is aca's own): stacks with group and range, ignored while
-/// searching. Not saved; gone once turned off
+/// Show only one state, picked in `F` (its rows' keys are 0–6 top to bottom): every session in that state within the group,
+/// whatever the scope; ignored while searching. Not saved; gone once turned off
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pick {
+    /// Every session, whatever its state and however long ago it stopped: what `w` no longer reaches, kept off it so the list
+    /// only grows this long when asked for
+    Every,
     /// ● running
     Run,
     /// ◐ waiting for you: awaiting confirmation and unread both count
@@ -176,6 +183,7 @@ impl Pick {
     /// The ones recognizable from the state alone; ☾ also needs to know whether it was stopped for being idle, so not here
     fn covers(self, st: State) -> bool {
         match self {
+            Pick::Every => true,
             Pick::Run => st == State::Running,
             Pick::Wait => matches!(st, State::Ask | State::Unread),
             Pick::Idle => st == State::Idle,
@@ -185,32 +193,41 @@ impl Pick {
         }
     }
 
-    /// The two stopped kinds: "open ones" has none
-    fn stopped(self) -> bool {
-        matches!(self, Pick::Off | Pick::Reaped)
-    }
-
-    /// The key, and the line shown when the list is empty ("nothing running · ! back")
+    /// Its key in `F`, and the line shown when the list is empty ("nothing running")
     fn label(self) -> (char, &'static str) {
         match self {
-            Pick::Run => ('!', t!("暂无运行中的会话", "nothing running")),
-            Pick::Wait => ('@', t!("暂无待处理会话", "nothing to look at")),
-            Pick::Idle => ('#', t!("暂无空闲的会话", "nothing idle")),
-            Pick::Err => ('&', t!("暂无出错的会话", "no errors")),
-            Pick::Off => ('^', t!("暂无已停止的会话", "nothing stopped")),
-            Pick::Reaped => ('%', t!("暂无自动停止的会话", "nothing auto-stopped")),
+            Pick::Every => ('0', t!("没有会话", "no sessions")),
+            Pick::Run => ('1', t!("暂无运行中的会话", "nothing running")),
+            Pick::Wait => ('2', t!("暂无待处理会话", "nothing to look at")),
+            Pick::Idle => ('3', t!("暂无空闲的会话", "nothing idle")),
+            Pick::Err => ('4', t!("暂无出错的会话", "no errors")),
+            Pick::Off => ('5', t!("暂无已停止的会话", "nothing stopped")),
+            Pick::Reaped => ('6', t!("暂无自动停止的会话", "nothing auto-stopped")),
         }
     }
 }
 
-/// Order in `F`'s small list (same as the counts on the right of the top bar)
-const PICKS: [Pick; 6] = [Pick::Run, Pick::Wait, Pick::Idle, Pick::Err, Pick::Off, Pick::Reaped];
+/// Order in `F`'s small list: all first, then the states as the counts on the right of the top bar go
+const PICKS: [Pick; 7] = [Pick::Every, Pick::Run, Pick::Wait, Pick::Idle, Pick::Err, Pick::Off, Pick::Reaped];
+
+/// One item of the list as drawn: which index in the view it is (a header = None), which group's header it is (see
+/// `Row::head`), how many lines it takes
+type Drawn = (Option<usize>, Option<usize>, u16);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Side {
     Below,
     Right,
     Focus,
+}
+
+/// A group's pages, in the order Tab goes round them: its task tickets, its sessions, its notes. Outside a group there is
+/// only the list of sessions
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Page {
+    Tasks,
+    Sessions,
+    Notes,
 }
 
 /// This wide counts as a wide screen: preview on the right (list 40 columns + preview 60). Narrower is a phone (portrait / landscape)
@@ -251,9 +268,29 @@ fn layouts(narrow: bool) -> [(Preview, &'static str); 3] {
     }
 }
 
-/// Open ones (w): everything except not running (^)
+/// Open ones: everything except not running (■ in `F`)
 fn open(s: &Session) -> bool {
     !Pick::Off.covers(s.state)
+}
+
+/// Whether the scope lists this session on its own (its family and the sessions above it come along, see `rebuild`). Empty groups
+/// are only a heading, listed in every scope. One someone is attached to is listed too, even with its program gone: the popup
+/// opened from inside it highlights it
+fn in_scope(scope: Scope, s: &Session) -> bool {
+    match scope {
+        Scope::Open => s.blank || s.pinned || s.attached || open(s),
+        Scope::Week => in_scope(Scope::Open, s) || s.idle_for < WEEK,
+    }
+}
+
+/// Search: the lowercased word is in its title, group or tmux name (its family and the sessions above it come along, see `rebuild`)
+fn matches_word(s: &Session, kw: &str) -> bool {
+    format!("{} {} {}", s.title, s.group, s.name).to_lowercase().contains(kw)
+}
+
+/// What the scope counts and `F` counts are counts of: rows of sessions and their windows, not subagents or empty groups
+fn counted(s: &Session) -> bool {
+    s.subagent.is_none() && !s.blank
 }
 
 /// Stopped by aca for being idle (☾, `[idle] stop_after`); not if it came back up afterwards and you stopped it again
@@ -287,6 +324,16 @@ fn epoch() -> u64 {
 /// One bottom bar item: key, description, drop order when it doesn't fit (higher drops first, 0 = never)
 type MenuItem<'a> = (&'a str, &'a str, u8);
 
+/// `` ` ``: the cursor is on the rail with the groups' letters showing, and goes to the row of the group whose letter is
+/// pressed (see pick.rs `on_letters_key`). Where it was before, for `` ` `` or Esc to go back to: on the rail or not, what a
+/// rail laid over a narrow screen goes back to, where `a` goes back to
+#[derive(Clone, Debug, PartialEq)]
+struct Letters {
+    rail: Option<RailAt>,
+    from: Option<Option<String>>,
+    hop: Option<(Option<String>, Option<RailAt>)>,
+}
+
 /// What the preview shows when the highlight is on a group: which group, its path; when the path isn't the group's default path, which
 /// session in the group (title) it follows
 #[derive(Clone, Debug, PartialEq)]
@@ -311,32 +358,22 @@ struct Pass {
 pub struct App {
     all: Vec<Session>,
     view: Vec<usize>,
+    /// Sessions the scope leaves out (none while searching or with a state picked), for `aca ui -l`'s last line
     hidden: usize,
     /// Which one in the visible list (view) is selected; at draw time converted to a row number including section headers, kept in disp
     list: ListState,
     /// Scroll position of the list as actually drawn (with section headers)
     disp: ListState,
-    /// Each drawn item: which index in view it corresponds to (header = None), which group's header it is (see `Row::head`), how many
-    /// rows it takes. Used for clicks
-    drawn: Vec<(Option<usize>, Option<usize>, u16)>,
+    /// Each drawn item (see `Drawn`). Used for clicks, and for which rows are on screen
+    drawn: Vec<Drawn>,
     selected: Option<String>,
+    /// Which sessions are listed (`w`)
     scope: Scope,
-    /// w: only open ones, stacked with the day count and state
-    open: bool,
-    /// The range before w: w first switches to 「全部」 ("All"), and w again comes back here. None if * / a was pressed inside open ones;
-    /// on leaving, stay with what was picked
-    back: Option<Scope>,
-    /// The state picked with ! @ # & ^ %
+    /// The one state picked in `F`: while set, every session in that state is listed, whatever the scope; cleared, the scope is
+    /// back as it was
     status: Option<Pick>,
-    /// w and ^ / % don't go together (open ones has no stopped ones): the one pressed later makes the earlier pick yield; when the later
-    /// one goes away, the yielded one comes back
-    yielded: Option<Yielded>,
     /// Only this group (None = all groups)
     group: Option<String>,
-    /// Total in the current group (the top bar's denominator)
-    base_len: usize,
-    /// Nothing in "recent days", so it fell back to showing everything — the top bar must honestly say 「全部」 ("All")
-    fell_back: bool,
     /// Plugins in error (a hook, a scheduled run that failed last time, a gateway service that stopped): a ⚠ cell on the right of the top
     /// bar, P shows which one. Reread in the background along with the list
     pub plugin_alerts: Vec<aca_core::plugin::health::Problem>,
@@ -358,20 +395,20 @@ pub struct App {
     last_frame: Buffer,
     pins: Pins,
     notes: Notes,
+    /// The groups' notebooks (see book.rs)
+    book: Book,
     /// Which workspace each session is in, and the workspaces' names (see spaces.rs)
     spaces: Spaces,
     /// The workspace being viewed
     space: char,
-    /// The workspace before switching to this one: ` goes back there
-    last_space: Option<char>,
-    /// q / Q pressed, waiting for the next key (a workspace's key)
+    /// q / Q pressed, waiting for the next key (q again / a workspace's key)
     pending: Option<Pending>,
     /// The workspace list opened by S: index of the highlighted one
     space_menu: Option<usize>,
-    /// The group list opened by Tab: highlighted row (row 0 is all groups)
-    group_menu: Option<usize>,
     /// `F`'s small one-state list: highlighted row (0 = all)
     only_menu: Option<usize>,
+    /// `m` on the tasks page: whom the ticket under the cursor can go to (see tasks_page.rs)
+    give_menu: Option<tasks_page::GiveMenu>,
     /// The palette list (see `open_themes`)
     theme_menu: Option<ThemeMenu>,
     /// The `^S` settings page
@@ -383,26 +420,34 @@ pub struct App {
     pub sync_failed: Vec<String>,
     /// The settings page changed the input method: the run loop decides afresh whether to manage it
     pub ime_changed: bool,
-    /// Plugin capabilities / views / panes to run in the background (`:` menu, r in the reading page): the run loop takes them, one
+    /// Plugin capabilities / views / panes to run in the background (the list's `?`, ^R in the reading page): the run loop takes them, one
     /// thread each
     pub plugin_q: Vec<crate::caps::Req>,
-    /// What was viewed before switching to the current group (None = all groups): the group list's highlight starts on it when opened,
-    /// so Tab ⏎ switches back
-    prev_group: Option<Option<String>>,
     /// The last highlighted session in each workspace: switching back stops there
     space_sel: HashMap<char, String>,
     /// E: the note to paste into its input box before entering the session (key, content)
     pub fill: Option<(String, String)>,
     /// When the highlight last moved, and how long that was after the move before it (see SETTLE)
     moved: Option<(Instant, Duration)>,
-    /// Which session the preview is drawing now
+    /// Which session the preview is drawing now (None: a group's)
     shown: Option<String>,
+    /// The preview switches at every step, even mid-slide: the screen is a local terminal (`data::local_term`), where a switch costs
+    /// nothing; SETTLE's hold is for a phone over mosh. Off by default (tests and `--snapshot` hold as the phone does)
+    pub preview_follows: bool,
     /// ^G: the note to hand to the editor for writing
     pub edit_note: Option<NoteEdit>,
     /// Read / unread (see reads.rs): records when a session was looked at from aca; no new output since then = not ◐, and `i` skips it
     reads: Reads,
-    /// Hint letters already typed in jump mode (entered with Space); None = not in jump mode
+    /// Hint letters already typed in jump mode (entered with Space or a); None = not in jump mode
     jump: Option<String>,
+    /// The groups' letters show for `` ` `` (see `Letters`); None = they don't
+    letters: Option<Letters>,
+    /// The stops with a row on screen in the last frame, top to bottom, and the list they are positions in (`view_mark`):
+    /// the ones jump mode gives a letter. Once the list is another one, until it's drawn every stop gets one (see `jump_stops`)
+    on_screen: Option<(u64, Vec<Jump>)>,
+    /// Where a was pressed from (the group viewed, None = all groups; and whether the cursor was on the rail): a pressed on
+    /// all groups goes back there. Gone once used, and when all groups is left another way
+    hop_back: Option<(Option<String>, Option<RailAt>)>,
     /// Sessions ticked in v multi-select (registered ids), see `on_pick_key`. Both this and the range anchor empty = not multi-selecting
     picked: Vec<String>,
     /// v range select (like yazi's visual): from this session (registered id) to the highlighted row; Esc fixes it
@@ -451,14 +496,46 @@ pub struct App {
     pub insert_back: Option<(String, String)>,
     /// ⏎ pressed while picking: the text to put into `insert_to`, and the title of the session it refers to (the run loop pastes it)
     pub put: Option<(String, String)>,
+    /// The key being handled arrived together with two or more others (the run loop sets it): a paste, not typing. In the reply
+    /// box an Enter in it is a line break, not a send
+    pub burst: bool,
     /// The reference key (`[keys] ref`) as the list sees it: `prefix b` is two presses, tmux's prefix key then b (no tmux in
     /// between here); empty = none. How many of them were pressed so far
     pub ref_keys: Vec<(KeyCode, KeyModifiers)>,
     ref_got: usize,
-    /// Folded groups (saved in the view)
-    folded: BTreeSet<String>,
-    /// What this rebuild actually folded: group → (how many, how many need you); nothing folds while filtering, so it's empty
-    folds: Folds,
+    /// The cursor is on the rail, not in the list (None = in the list). A screen too narrow to keep a rail shows one over its
+    /// left for as long as this is set
+    rail: Option<RailAt>,
+    /// What the list showed (None = all groups) when the rail was called out over a narrow screen: where h / Esc go back to
+    rail_from: Option<Option<String>>,
+    /// Where the rail's rows were last drawn, and which row is at the top (zero-sized: the screen has no rail); for the mouse
+    rail_area: Rect,
+    rail_top: usize,
+    /// The router whose thread shows beside the list (the cursor is on its group's row), and up to when you had seen that
+    /// thread on getting there (see `follow_thread`)
+    thread_on: Option<(String, u64)>,
+    /// The router gone into from its group's row (`o`): back from it, the cursor is still on that row (see `came_back`)
+    stay: Option<String>,
+    /// The groups whose middle column isn't on their sessions page, each with the page it shows (Tab; see notes_page.rs,
+    /// tasks_page.rs). Kept while aca runs: a group comes back on the page it was left on, but for one with tickets not
+    /// done, which opens on its tasks (see `set_group`)
+    pages: HashMap<String, Page>,
+    /// What the last refresh read of the task tickets (see tickets.rs)
+    tickets: Tickets,
+    /// The ticket the tasks page's cursor is on (its number); none, or one that isn't listed = the first not done
+    task_at: Option<i64>,
+    /// The first ticket the tasks page draws
+    task_top: usize,
+    /// Where the last frame drew each ticket: (top row, height, its number), for clicks
+    task_hits: Vec<(u16, u16, i64)>,
+    /// The note the notes page's cursor is on (its id); none, or one that isn't listed = the first
+    note_at: Option<String>,
+    /// The first note the notes page draws
+    note_top: usize,
+    /// Where the notes page drew each note last: (first line, lines, id), for clicks
+    note_hits: Vec<(u16, u16, String)>,
+    /// The row the highlight was on in each place (None = all groups) when it was left: going back there lands on it
+    left_at: HashMap<Option<String>, String>,
     /// Sessions (keys) whose subagents `l` unfolded: each one it sent out gets a row (see subagent.rs). All folded by default,
     /// the session row just shows +N
     agents_open: HashSet<String>,
@@ -472,7 +549,7 @@ pub struct App {
     preview_up: usize,
     preview_for: String,
     preview_max: usize,
-    /// The tab at the left of the top bar: click it to open the group list
+    /// The tag at the left of the top bar (a screen with no rail of its own): click it to call the rail out
     chip_area: Rect,
     pub quit: bool,
     /// Following (`--follow`, see follow.rs): wherever the highlight goes, this client switches there
@@ -496,16 +573,19 @@ pub struct App {
     tools_loader: fn() -> Result<Vec<Tool>, String>,
     /// The accounts page (`with_accounts`, see acctpage.rs; true = open straight into adding an account); absent in unit tests,
     /// which don't touch the real config
-    accounts_page: Option<fn(bool) -> Box<dyn Overlay>>,
+    accounts_page: Option<fn(crate::acctpage::Opening) -> Box<dyn Overlay>>,
     /// The tool menu opened by `n` (or `^E`), and which entry is highlighted
     tool_menu: Option<(Vec<Tool>, usize)>,
+    router_picker: Option<(Vec<Tool>, usize)>,
     /// The special environments' rows while `n`'s are shown, for `^E` to switch to; empty = none
     tool_more: Vec<Tool>,
     /// Showing the special environments' rows (`^E`)
     tool_special: bool,
-    /// Their accounts' login state (`claude:team` → it), asked in the background each time they're shown
+    /// The menu's accounts' login state (`claude:team` → it), asked in the background; kept a while (see `LOGINS_KEPT`)
     tool_logins: Arc<std::sync::Mutex<HashMap<String, crate::accounts::Login>>>,
-    /// `l` on a logged-in Codex account among them: its row, waiting for y (Codex clears the login as it starts logging in)
+    /// When those answers were started; None = ask them all again next time
+    tool_logins_at: Option<Instant>,
+    /// `i` on a logged-in account in the menu: its row, waiting for y (the tool clears the login as it starts logging in)
     tool_relogin: Option<usize>,
     /// Where `l`'s login hands its link over (`with_login_links`: the state directory; tests a temp one)
     login_links: std::path::PathBuf,
@@ -522,7 +602,7 @@ pub struct App {
     rehome_quotas: fn(Agent) -> Vec<aca_records::usage::Quota>,
     rehome_ask: fn(Agent, &str) -> crate::accounts::Login,
     rehome_background: bool,
-    /// Waiting for y to confirm: delete (`d`) / restart (`R`) / stop / send note. Once confirmed it goes into `job`,
+    /// Waiting for y to confirm: delete (`d`) / restart (`R`) / stop / adopt. Once confirmed it goes into `job`,
     /// and the run loop runs it in the background
     confirm: Option<Confirm>,
     /// Being typed in the bottom bar: `r` new title / `G` new group name
@@ -544,8 +624,6 @@ pub struct App {
     reorder_writing: bool,
     /// m pressed: the run loop opens fzf to pick a group (gives up the terminal; not in unit tests)
     pub pick_group: Option<GroupPick>,
-    /// The number of days for "recent days" (one of DAYS)
-    days: u64,
     /// Where the hints for picking a group from a path come from when creating (`with_group_hints`); none by default,
     /// unit tests don't touch the real database
     group_hints: fn() -> crate::data::GroupHints,
@@ -554,6 +632,13 @@ pub struct App {
     adopt_planner: fn(&str) -> Result<aca_core::adopt::Plan, String>,
     /// Where `^N`'s default directory comes from (`with_new_group_dir`); ~/workspace by default, unit tests don't touch the real config
     new_group_dir: fn() -> String,
+    /// The scratch directory (`with_scratch`): where sessions that belong to no project start; empty = none set (the default),
+    /// and how the settings page makes sure a group works in the one just set (returns that group)
+    scratch_dir: fn() -> String,
+    scratch_ensure: fn(&str) -> Result<String, String>,
+    /// The scratch group: the one that works in that directory (found again on every refresh, see `apply_pins`). It sits right
+    /// under all groups on the rail, its sessions come first in the list, and it can't be deleted
+    scratch: Option<String>,
     /// What the settings page reads and writes (`with_settings`): whether the input method switch is on, config errors, changing an item,
     /// accounts; reads and writes nothing by default, unit tests don't touch the real config
     ime_auto: fn() -> bool,
@@ -562,12 +647,16 @@ pub struct App {
     accounts_lister: fn() -> Vec<crate::accounts::Account>,
     /// Feature popups (see overlay.rs), keys go to the top one; `M`'s MCP is the first
     overlays: Vec<Box<dyn Overlay>>,
+    /// `?`: the keys of the page it was pressed on, over everything; keys go to it first (see sheet.rs)
+    sheet: Option<crate::sheet::Sheet>,
     /// Rows features add to the settings page (`with_setting`); none by default, unit tests don't touch the real system
     setting_rows: Vec<Box<dyn Setting>>,
     /// Where `M` reads MCP from (`with_mcp`); empty by default, unit tests don't touch real files
     mcp_loader: fn(&Session) -> mcp::Info,
     /// The plugins page opened by `P` (`with_plugins`, see plugins.rs); absent in unit tests, which don't touch the real registry
     plugins_page: Option<fn() -> Box<dyn Overlay>>,
+    /// What enabled plugins give the `?` sheet (`aca_core::plugin::menu`); none by default, unit tests don't read this machine's
+    plugin_menu: fn() -> Vec<aca_core::plugin::MenuItem>,
     /// Where the confirm box of `d` on a group reads the registry's groups from (subgroups, archived sessions) (`with_groups`);
     /// empty by default, unit tests don't touch the real database
     groups_loader: fn() -> Vec<groups::Row>,
@@ -586,6 +675,8 @@ pub struct App {
 
 impl App {
     pub fn new(filter: String, sessions: Vec<Session>) -> Self {
+        #[cfg(test)]
+        crate::test_home();
         let mut app = App {
             all: vec![],
             view: vec![],
@@ -594,14 +685,9 @@ impl App {
             disp: ListState::default(),
             drawn: vec![],
             selected: None,
-            scope: Scope::Recent,
-            open: false,
-            back: None,
+            scope: Scope::Open,
             status: None,
-            yielded: None,
             group: None,
-            base_len: 0,
-            fell_back: false,
             plugin_alerts: vec![],
             filter,
             filtering: false,
@@ -616,27 +702,30 @@ impl App {
             last_frame: Buffer::default(),
             pins: Pins::default(),
             notes: Notes::default(),
+            book: Book::default(),
             spaces: Spaces::default(),
             space: spaces::HOME,
-            last_space: None,
             pending: None,
             space_menu: None,
-            group_menu: None,
             only_menu: None,
+            give_menu: None,
             theme_menu: None,
             settings: None,
             settings_back: None,
             sync_failed: vec![],
             ime_changed: false,
             plugin_q: vec![],
-            prev_group: None,
             space_sel: HashMap::new(),
             fill: None,
             edit_note: None,
             moved: None,
             shown: None,
+            preview_follows: false,
             reads: Reads::default(),
             jump: None,
+            letters: None,
+            on_screen: None,
+            hop_back: None,
             picked: vec![],
             anchor: None,
             unpick: false,
@@ -662,10 +751,24 @@ impl App {
             insert_to: None,
             insert_back: None,
             put: None,
+            burst: false,
             ref_keys: vec![],
             ref_got: 0,
-            folded: BTreeSet::new(),
-            folds: HashMap::new(),
+            rail: None,
+            rail_from: None,
+            rail_area: Rect::default(),
+            rail_top: 0,
+            thread_on: None,
+            stay: None,
+            pages: HashMap::new(),
+            tickets: Tickets::default(),
+            task_at: None,
+            task_top: 0,
+            task_hits: vec![],
+            note_at: None,
+            note_top: 0,
+            note_hits: vec![],
+            left_at: HashMap::new(),
             agents_open: HashSet::new(),
             reader_load: false,
             new_draft: None,
@@ -694,13 +797,14 @@ impl App {
             reorders: VecDeque::new(),
             reorder_writing: false,
             pick_group: None,
-            days: DAYS[0],
             tools_loader: || Ok(vec![]),
             accounts_page: None,
             tool_menu: None,
+            router_picker: None,
             tool_more: vec![],
             tool_special: false,
             tool_logins: Arc::default(),
+            tool_logins_at: None,
             tool_relogin: None,
             login_links: std::env::temp_dir().join(format!("aca-login-{}", std::process::id())),
             tool_back: None,
@@ -713,14 +817,19 @@ impl App {
             group_hints: crate::data::GroupHints::default,
             adopt_planner: |_| Err(t!("这里认不了", "can't recognize it here").into()),
             new_group_dir: || "~/workspace".into(),
+            scratch_dir: String::new,
+            scratch_ensure: |_| Err(t!("这里不建分组", "no group making here").into()),
+            scratch: None,
             ime_auto: || true,
             config_bad: Vec::new,
             config_set: |_, _, _| Err(t!("这里不写配置", "no config writing here").into()),
             accounts_lister: Vec::new,
             overlays: vec![],
+            sheet: None,
             setting_rows: vec![],
             mcp_loader: |_| mcp::Info::default(),
             plugins_page: None,
+            plugin_menu: Vec::new,
             groups_loader: Vec::new,
             refresh: false,
             undo: vec![],
@@ -739,7 +848,7 @@ impl App {
         self
     }
 
-    pub fn with_accounts(mut self, f: fn(bool) -> Box<dyn Overlay>) -> Self {
+    pub fn with_accounts(mut self, f: fn(crate::acctpage::Opening) -> Box<dyn Overlay>) -> Self {
         self.accounts_page = Some(f);
         self
     }
@@ -761,6 +870,14 @@ impl App {
 
     pub fn with_new_group_dir(mut self, f: fn() -> String) -> Self {
         self.new_group_dir = f;
+        self
+    }
+
+    /// Hook up the scratch directory: where it's read from, and how its group is made sure of once it's set
+    pub fn with_scratch(mut self, dir: fn() -> String, ensure: fn(&str) -> Result<String, String>) -> Self {
+        (self.scratch_dir, self.scratch_ensure) = (dir, ensure);
+        let v = std::mem::take(&mut self.all);
+        self.set_sessions(v);
         self
     }
 
@@ -788,6 +905,11 @@ impl App {
 
     pub fn with_plugins(mut self, f: fn() -> Box<dyn Overlay>) -> Self {
         self.plugins_page = Some(f);
+        self
+    }
+
+    pub fn with_plugin_menu(mut self, f: fn() -> Vec<aca_core::plugin::MenuItem>) -> Self {
+        self.plugin_menu = f;
         self
     }
 
@@ -822,6 +944,16 @@ impl App {
     /// Hook up the notes file (not hooked up = memory only)
     pub fn with_notes(mut self, notes: Notes) -> Self {
         self.notes = notes;
+        let v = std::mem::take(&mut self.all);
+        self.set_sessions(v);
+        self
+    }
+
+    /// Hook up the groups' notebooks (not hooked up = an empty one in memory)
+    pub fn with_book(mut self, book: Book) -> Self {
+        // The tickets are read from the registry the notebooks are in
+        self.tickets = Tickets::on(book.store());
+        self.book = book;
         let v = std::mem::take(&mut self.all);
         self.set_sessions(v);
         self
@@ -888,14 +1020,21 @@ impl App {
         self.anchor = self.anchor.take().filter(|id| live(id, &self.all));
         self.pins.reload(); // another aca (phone / desktop) may have just changed it
         self.notes.reload();
+        // A group's note an older interface wrote into the notes file goes into its notebook; `aca note` may have changed that too
+        self.book.adopt(&mut self.notes);
+        self.book.reload();
+        self.tickets.reload();
         self.spaces.reload();
         self.reads.reload();
         for s in &mut self.all {
             s.state = read_state(s, &self.reads);
         }
         self.apply_pins();
-        // The selected group has no sessions left (in this workspace) → back to all groups
-        if self.group.as_ref().is_some_and(|g| !self.all.iter().any(|s| &s.group == g && s.space == self.space && !s.blank)) {
+        self.recheck_answer();
+        // The group viewed has no sessions left (in this workspace) → back to all groups. With a rail an empty group stays: the
+        // rail stops on those too, and only one that is gone altogether goes back
+        let rail = self.rail_on_screen();
+        if self.group.as_ref().is_some_and(|g| !self.all.iter().any(|s| &s.group == g && s.space == self.space && (rail || !s.blank))) {
             self.group = None;
         }
         self.rebuild();
@@ -946,10 +1085,10 @@ impl App {
             }
             KeyCode::Up | KeyCode::Down => !shift,
             KeyCode::Esc | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End | KeyCode::Left | KeyCode::Right => true,
-            KeyCode::Tab | KeyCode::BackTab => true,
+            KeyCode::Tab => true,
             KeyCode::Char('z' | 'l' | 'r' | 's' | 'n') if ctrl => true,
             KeyCode::Char(_) if ctrl => false,
-            KeyCode::Char(c) => c.is_ascii_digit() || " kjJKgGi/aw!@#&^{}hloOq[]`SvV W*?$P".contains(c),
+            KeyCode::Char(c) => c.is_ascii_digit() || " kjJKgGi/awFhlqSvVW?$P".contains(c),
             _ => false,
         };
         if !pass {
@@ -974,7 +1113,8 @@ impl App {
 
     /// A popup / input box / full-screen page is open (it gets all keys; the top bar tab isn't drawn)
     fn modal_open(&self) -> bool {
-        self.bill.is_some()
+        self.sheet.is_some()
+            || self.bill.is_some()
             || self.reader.is_some()
             || self.trace.is_some()
             || self.new_draft.is_some()
@@ -982,8 +1122,8 @@ impl App {
             || self.tool_menu.is_some()
             || !self.overlays.is_empty()
             || self.space_menu.is_some()
-            || self.group_menu.is_some()
             || self.only_menu.is_some()
+            || self.give_menu.is_some()
             || self.theme_menu.is_some()
             || self.settings.is_some()
             || self.confirm.is_some()
@@ -1061,31 +1201,21 @@ impl App {
         View {
             group: self.group.clone(),
             scope: self.scope,
-            open: self.open,
-            back: self.back,
-            days: self.days,
             preview: self.preview,
             preview_narrow: self.preview_narrow,
             selected: self.selected.clone(),
-            folded: self.folded.iter().cloned().collect(),
             space: self.space,
-            last_space: self.last_space,
         }
     }
 
-    /// Restore the last view. If that group has no sessions any more, back to all groups; if that session is gone, highlight the first
+    /// Restore the last view: the scope, the layout, the workspace and the highlighted session (gone = the first one). It always
+    /// opens on all groups, whichever group was being viewed
     pub fn restore(mut self, v: View) -> Self {
-        self.group = v.group;
         self.scope = v.scope;
-        self.open = v.open;
-        self.back = v.back;
-        self.days = v.days;
         self.preview = v.preview;
         self.preview_narrow = v.preview_narrow;
         self.selected = v.selected;
-        self.folded = v.folded.into_iter().collect();
         self.space = v.space;
-        self.last_space = v.last_space;
         let all = std::mem::take(&mut self.all);
         self.set_sessions(all);
         self
@@ -1111,7 +1241,9 @@ impl App {
     /// Back from a session (name is the one gone into, left is the session id last on, see `data::go_in`): all visited count as seen.
     /// The highlight goes to the last one visited: the one switched to inside (a clicked notification, ^`), otherwise the one gone into
     /// (newly created / handed-off ones were never selected yet); already on it or its window = left alone. One not in the list yet
-    /// gets the highlight when the background reread arrives
+    /// gets the highlight when the background reread arrives. A group's router gone into from the group's row (`o`) leaves the
+    /// cursor on that row, with its thread read up to now; so does the desk gone into from the rail's row for all groups. One
+    /// gone into from one of its sessions' rows leaves the cursor on that session
     fn came_back(&mut self, name: &str, left: &str) {
         self.mark_seen(name);
         let last = self.all.iter().find(|s| !left.is_empty() && s.sub.is_none() && s.tmux == left).map(|s| s.name.clone());
@@ -1122,6 +1254,15 @@ impl App {
             }
             _ => name.to_string(),
         };
+        if self.stay.take().is_some_and(|r| r == name) && last == name {
+            if self.on_route_row() {
+                self.thread_read();
+            }
+            return;
+        }
+        // Whatever other way it was gone into (a new one made from a group's rail row, a clicked notification): the cursor is
+        // on it now
+        self.rail = None;
         if !last.starts_with('$') && self.current().is_none_or(|s| s.family() != last) {
             self.selected = Some(last);
         }
@@ -1133,7 +1274,8 @@ impl App {
         let mut keys: HashSet<String> = self.all.iter().filter(|s| s.sub.is_none() && !s.blank).map(notes::key).collect();
         let none = keys.is_empty();
         keys.extend(self.trash.ids().map(String::from));
-        move |k: &str| none || keys.contains(k)
+        // A router's thread has a mark of its own under its session's key (see `follow_thread`)
+        move |k: &str| none || keys.contains(k.strip_prefix(router::THREAD_KEY).unwrap_or(k))
     }
 
     /// u: mark unread as read, idle as unread (◐ until you go in)
@@ -1185,95 +1327,87 @@ impl App {
         })
     }
 
-    /// W: only the highlighted session's group; if already showing a single group, back to all groups
+    /// W: only the highlighted session's group; if already showing a single group, back to all groups. Either way the highlight
+    /// stays on that session
     fn toggle_own_group(&mut self) {
         let to = match (&self.group, self.current()) {
             (Some(_), _) => None,
             (None, Some(s)) if !s.blank => Some(s.group.clone()),
             (None, _) => return,
         };
+        if let Some(n) = self.selected.clone() {
+            self.left_at.insert(to.clone(), n);
+        }
+        // Into its group to see it among its own: on the sessions page, whichever page that group would show
+        let g = to.clone();
         self.set_group(to);
+        if let Some(g) = &g {
+            self.show_page(g, Page::Sessions);
+        }
     }
 
-    /// w: only open ones, again to stop; days and the picked state are kept, layered on top. Starts from all (ones open days ago
-    /// are there too), press * inside to narrow. With ^ / % picked, w makes them step aside; they come back on leaving
-    fn toggle_open(&mut self) {
-        self.set_open(!self.open);
-        match self.yielded.take() {
-            Some(Yielded::Stopped(p)) if !self.open => self.status = Some(p),
-            y => self.yielded = y,
-        }
-        if self.open && self.status.is_some_and(Pick::stopped) {
-            self.yielded = self.status.take().map(Yielded::Stopped);
-        }
+    /// w: the other scope (open ones ↔ last 7 days). With a state picked in `F`, that's cleared first and the other scope is
+    /// from the one it set aside
+    fn cycle_scope(&mut self) {
+        self.status = None;
+        self.scope = self.scope.next();
         self.rebuild();
     }
 
-    /// Turn the "open ones" layer on / off: on switches the scope to "all" first, off goes back to what it was before (or to what
-    /// was picked if * / a was pressed inside)
-    fn set_open(&mut self, on: bool) {
-        if on == self.open {
-            return;
-        }
-        self.open = on;
-        if on {
-            self.back = Some(self.scope);
-            self.scope = Scope::All;
-        } else if let Some(b) = self.back.take() {
-            self.scope = b;
+    /// The search word changed: the highlight goes to the match with the most recent activity (the shortest time since it last
+    /// printed anything; not the time on its row, which for a running one is how long it has run), the open ones first (stopped
+    /// ones only when nothing open matches). Rows stay in their order; only matches themselves count, not the relatives they
+    /// bring along
+    fn land_on_latest(&mut self) {
+        let kw = self.filter.to_lowercase();
+        let best = (0..self.view.len())
+            .filter(|&p| {
+                let s = &self.all[self.view[p]];
+                counted(s) && matches_word(s, &kw)
+            })
+            .min_by_key(|&p| {
+                let s = &self.all[self.view[p]];
+                (!open(s), s.idle_for)
+            });
+        if best.is_some() {
+            self.select(best);
         }
     }
 
-    /// a: go into "all", again goes back to recent days (days are never lost anyway). Open ones and the picked state are kept
-    fn toggle_all(&mut self) {
-        self.back = None;
-        self.scope = if self.scope == Scope::All { Scope::Recent } else { Scope::All };
-        self.rebuild();
-    }
-
-    /// ! @ # & ^ %: only this state, again cancels; scope kept. Picking ^ / % among "open ones" makes "open ones" step aside;
-    /// it comes back once they're cancelled / swapped
+    /// Picked in `F`: only this state, again (or Esc) goes back to the scope
     fn toggle_status(&mut self, p: Pick) {
         self.status = if self.status == Some(p) { None } else { Some(p) };
-        let stopped = self.status.is_some_and(Pick::stopped);
-        match self.yielded.take() {
-            Some(Yielded::Open) if stopped => self.yielded = Some(Yielded::Open),
-            Some(Yielded::Open) => self.set_open(true),
-            _ => {}
-        }
-        if self.open && stopped {
-            self.set_open(false);
-            self.yielded = Some(Yielded::Open);
-        }
         self.rebuild();
     }
 
-    /// *: 1 day → 3 days → 7 days → 1 day, days only (all is a, each key does one thing); in "all" it goes back to recent days.
-    /// Open ones and the picked state are kept: among open ones it narrows to the open ones of recent days. Which one is on lights
-    /// up in the top bar, the bottom bar doesn't say it again
-    fn cycle_days(&mut self) {
-        self.back = None;
-        if self.scope == Scope::All {
-            self.scope = Scope::Recent;
-        } else {
-            let next = DAYS.iter().position(|&d| d == self.days).map_or(0, |i| (i + 1) % DAYS.len());
-            self.days = DAYS[next];
-        }
-        self.rebuild();
+    /// Sessions of the current workspace and group (empty groups only when sectioned, they're just a heading)
+    fn in_view(&self) -> impl Iterator<Item = &Session> + '_ {
+        self.in_group(self.group.as_ref())
     }
 
-    fn rebuild(&mut self) {
+    /// Sessions of the current workspace in group g (None = all groups)
+    fn in_group<'a>(&'a self, g: Option<&'a String>) -> impl Iterator<Item = &'a Session> + 'a {
+        self.all.iter().filter(move |s| s.space == self.space && g.is_none_or(|g| &s.group == g))
+    }
+
+    /// The number after each scope in the top bar: sessions the scope lists on its own, in the current group
+    pub(super) fn scope_count(&self, scope: Scope) -> usize {
+        self.in_view().filter(|s| counted(s) && in_scope(scope, s)).count()
+    }
+
+    /// The number after the picked state in the top bar: in the current group (`F`'s own counts are the whole workspace's)
+    pub(super) fn status_count(&self, p: Pick) -> usize {
+        self.in_view().filter(|s| counted(s) && p.hit(s)).count()
+    }
+
+    /// What the list lists in group g (None = all groups) with the current scope, state picked and search; and the sessions it was
+    /// picked from
+    fn listing(&self, group: Option<&String>) -> (Vec<usize>, Vec<usize>) {
         let kw = self.filter.to_lowercase();
-        let window = self.days * 86400;
-        // Only list the current workspace's; empty groups exist only when sectioned (they're just a heading)
         let base: Vec<usize> = (0..self.all.len())
-            .filter(|&i| self.all[i].space == self.space && self.group.as_ref().is_none_or(|g| &self.all[i].group == g))
-            .filter(|&i| self.sectioned() || !self.all[i].blank)
+            .filter(|&i| self.all[i].space == self.space && group.is_none_or(|g| &self.all[i].group == g))
+            .filter(|&i| group.is_none() || !self.all[i].blank)
             .collect();
-        // The count only counts sessions (child panes and empty groups don't count)
-        let heads = |v: &[usize]| v.iter().filter(|&&i| self.all[i].sub.is_none() && !self.all[i].blank).count();
-        self.base_len = heads(&base);
-        self.fell_back = false;
         // A session and its windows come and go together: if one matches, the whole family stays (a window running while the
         // session itself is idle must still show). A child session that stays keeps its parent too, up to the top level (otherwise
         // you couldn't tell who sent it); not the reverse, or one move of a parent would dig up all its long-finished child sessions
@@ -1285,58 +1419,46 @@ impl App {
             keep.extend(ups);
             base.iter().copied().filter(|&i| keep.contains(self.all[i].family())).collect()
         };
-        // Days / all, open ones, and the status picked with ! @ # & ^ % stack in three layers; search ignores all of them. While searching,
-        // an empty group is listed only if its name matches; with a status picked or only open ones shown, it isn't listed
-        let pick = self.status;
-        let only_open = self.open;
-        let st = |s: &Session| pick.is_none_or(|p| !s.blank && p.hit(s)) && (!only_open || !s.blank && open(s));
-        let view = if !kw.is_empty() {
-            families(&|s| format!("{} {} {}", s.title, s.group, s.name).to_lowercase().contains(&kw))
-        } else {
-            match self.scope {
-                Scope::All if pick.is_none() && !only_open => base.clone(),
-                Scope::All => families(&st),
-                Scope::Recent => {
-                    let keep = families(&|s| (s.blank || s.idle_for < window || s.state == State::Ask || s.attached || s.pinned) && st(s));
-                    // Picking a status or only open ones says you want to see just those: none means empty, don't fall back to all
-                    if heads(&keep) == 0 && pick.is_none() && !only_open {
-                        self.fell_back = true;
-                        base.clone()
-                    } else {
-                        keep
-                    }
-                }
-            }
+        // Search ignores the scope and the picked state; the picked state ignores the scope. While searching, an empty group is
+        // listed only if its name matches; with a state picked, it isn't listed (with all picked it is, as in the scopes)
+        let scope = self.scope;
+        let view = match self.status {
+            _ if !kw.is_empty() => families(&|s| matches_word(s, &kw)),
+            Some(Pick::Every) => base.clone(),
+            Some(p) => families(&|s| !s.blank && p.hit(s)),
+            None => families(&|s| in_scope(scope, s)),
         };
-        self.view = view;
-        // How many more widening the days would show;
-        // with a status picked or only open ones shown, count only those (view is a subset of it, can't go negative)
-        self.hidden = if kw.is_empty() && self.scope == Scope::Recent {
-            let reach = if pick.is_some() || only_open { heads(&families(&st)) } else { self.base_len };
-            reach - heads(&self.view)
-        } else {
-            0
+        (base, view)
+    }
+
+    /// The rail's numbers for group g (None = all groups), with the current scope / state picked / search: a group's is its header's in
+    /// the list (its sessions, pinned ones aren't in it), all groups' is the top bar's. Then how many of them are ◆ ● ◐ ✕, counted
+    /// as the top bar counts them
+    pub(super) fn group_tally(&self, g: Option<&String>) -> (usize, [usize; 4]) {
+        let view = self.listing(None).1;
+        let mine: Vec<&Session> = view.iter().map(|&i| &self.all[i]).filter(|s| g.is_none_or(|g| !s.pinned && &s.group == g)).collect();
+        let n = match (g, self.status) {
+            (Some(_), _) => mine.iter().filter(|s| s.sub.is_none() && !s.blank).count(),
+            (None, _) if !self.filter.is_empty() => mine.iter().filter(|s| counted(s)).count(),
+            (None, Some(p)) => self.in_group(None).filter(|s| counted(s) && p.hit(s)).count(),
+            (None, None) => self.in_group(None).filter(|s| counted(s) && in_scope(self.scope, s)).count(),
         };
-        // Folding: each folded section keeps only its first session as a placeholder (pinned ones aren't in sections, unaffected).
-        // Everything is unfolded while filtering, so nothing is hidden from search
-        self.folds.clear();
-        if self.sectioned() && kw.is_empty() && !self.folded.is_empty() {
-            let mut kept = vec![];
-            for &i in &self.view {
-                let s = &self.all[i];
-                if !s.pinned && self.folded.contains(&s.group) {
-                    let first = !self.folds.contains_key(&s.group);
-                    let e = self.folds.entry(s.group.clone()).or_default();
-                    e.0 += usize::from(s.sub.is_none() && !s.blank);
-                    e.1 += usize::from(s.state == State::Ask);
-                    if !first {
-                        continue;
-                    }
-                }
-                kept.push(i);
+        let mut marks = [0; 4];
+        for s in mine.iter().filter(|s| counted(s)) {
+            if let Some(k) = TALLY_MARKS.iter().position(|&st| st == s.state) {
+                marks[k] += 1;
             }
-            self.view = kept;
         }
+        (n, marks)
+    }
+
+    fn rebuild(&mut self) {
+        let kw = self.filter.to_lowercase();
+        let (base, view) = self.listing(self.group.as_ref());
+        self.view = view;
+        // For `aca ui -l`'s count: sessions only (child panes and empty groups don't count)
+        let heads = |v: &[usize]| v.iter().filter(|&&i| self.all[i].sub.is_none() && !self.all[i].blank).count();
+        self.hidden = if kw.is_empty() && self.status.is_none() { heads(&base) - heads(&self.view) } else { 0 };
         // After a refresh the highlight follows the session, not the old row number
         let pos = self.selected.as_ref().and_then(|n| self.view.iter().position(|&i| &self.all[i].name == n));
         let idx = match pos {
@@ -1346,15 +1468,15 @@ impl App {
         };
         let head = self.head.take();
         self.select(idx);
-        // On a group header: still there after a refresh; if the group got folded, land on the fold row; if it's gone, follow the session
+        // On a group header: still there after a refresh; if it's gone, follow the session
         if let Some(p) = head.as_deref().and_then(|g| self.head_pos(g)) {
             self.select_head(p);
         }
     }
 
-    /// Position in the visible list of the first session under group g's unfolded header; not sectioned, folded, or not listed = None
+    /// Position in the visible list of the first session under group g's header; not sectioned or not listed = None
     fn head_pos(&self, g: &str) -> Option<usize> {
-        if !self.sectioned() || self.folds.contains_key(g) {
+        if !self.sectioned() {
             return None;
         }
         self.view.iter().position(|&i| !self.all[i].pinned && self.all[i].group == g)
@@ -1366,11 +1488,13 @@ impl App {
         self.head = Some(self.all[self.view[p]].group.clone());
     }
 
-    /// Which group the highlight is on: an unfolded group header, or a fold row. None = on a session
+    /// Which group the cursor is on: its header in the list, or its row on the rail. None = on a session, or on a rail row that
+    /// is no group (all groups, the Trash)
     fn group_row(&self) -> Option<&str> {
-        match &self.head {
-            Some(g) => Some(g),
-            None => self.on_fold_row().then(|| self.current().map(|s| s.group.as_str())).flatten(),
+        match self.rail {
+            Some(RailAt::Here) => self.group.as_deref(),
+            Some(RailAt::Trash) => None,
+            None => self.head.as_deref(),
         }
     }
 
@@ -1378,9 +1502,14 @@ impl App {
         self.group_row().is_some()
     }
 
-    /// Highlight on an empty group (unfolded header or fold row both count): return that group
+    /// The cursor on an empty group (its header in the list, its row on the rail): return that group
     fn blank_group(&self) -> Option<&str> {
-        self.group_row().filter(|_| self.current().is_some_and(|s| s.blank))
+        let g = self.group_row()?;
+        let empty = match self.rail {
+            Some(_) => !self.all.iter().any(|s| s.space == self.space && s.group == g && !s.blank),
+            None => self.current().is_some_and(|s| s.blank),
+        };
+        empty.then_some(g)
     }
 
     /// New session on an empty group that has no directory yet: go straight to fzf (same as ^N)
@@ -1390,12 +1519,10 @@ impl App {
 
     /// With the highlight on a group, things that only work on sessions just say so and do nothing: returns true
     fn on_group(&mut self, what: &str) -> bool {
-        let m = match () {
-            _ if self.head.is_some() => tr!("不能对分组{what}", "can't {what} on a group"),
-            _ if self.on_fold_row() => tr!("先展开再{what}", "unfold first, then {what}"),
-            _ => return false,
-        };
-        self.flash(&m);
+        if !self.on_group_row() {
+            return false;
+        }
+        self.flash(&tr!("不能对分组{what}", "can't {what} on a group"));
         true
     }
 
@@ -1415,10 +1542,11 @@ impl App {
         (!dir.is_empty()).then_some((s, dir, is_set))
     }
 
-    /// The group under the highlight and its path (shown in the preview). Recomputed only when the group changes or on the timed refresh
-    /// (see `glance_request`), not by reading the db every frame
+    /// The group under the highlight and its path (shown in the preview); on the rail's row for all groups, the scratch group:
+    /// the desk works there. Recomputed only when the group changes or on the timed refresh (see `glance_request`), not by
+    /// reading the db every frame
     fn spot(&mut self) -> Option<Spot> {
-        let g = self.group_row()?.to_string();
+        let g = self.route_group()?.to_string();
         if self.spot.as_ref().is_none_or(|s| s.group != g) {
             let sp = self.group_dir(&g).map(|(s, dir, set)| Spot { group: g.clone(), dir, from: (!set).then(|| s.title.clone()) });
             self.spot = sp;
@@ -1426,7 +1554,7 @@ impl App {
         self.spot.clone()
     }
 
-    /// Sessions visible now + how many "recent days" hides (for `aca -l`)
+    /// Sessions visible now + how many the scope leaves out (for `aca ui -l`)
     pub fn visible(&self) -> (Vec<&Session>, usize) {
         (self.view.iter().map(|&i| &self.all[i]).collect(), self.hidden)
     }
@@ -1434,8 +1562,8 @@ impl App {
     fn select(&mut self, idx: Option<usize>) {
         self.list.select(idx);
         self.selected = idx.map(|i| self.all[self.view[i]].name.clone());
-        // An empty group's entry draws only the header: being on it means being on the header (folded, it's still the fold row)
-        let blank = idx.filter(|&p| !self.is_fold_row(p)).map(|p| &self.all[self.view[p]]).filter(|s| s.blank);
+        // An empty group's entry draws only the header: being on it means being on the header
+        let blank = idx.map(|p| &self.all[self.view[p]]).filter(|s| s.blank);
         self.head = blank.map(|s| s.group.clone());
     }
 
@@ -1449,14 +1577,14 @@ impl App {
         if self.on_group_row() {
             return self.spot().map(|sp| sp.dir).unwrap_or_default();
         }
-        let Some(s) = self.current() else { return String::new() };
+        let Some(s) = self.current().filter(|_| !self.on_rail()) else { return String::new() };
         self.glances.get(&s.name).map(|g| g.work.dir.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| s.dir.clone())
     }
 
     /// Which registered session is highlighted (kitty's floating window is tied to it, see `tell_var`):
     /// empty for groups, plain tmux sessions, extra windows
     fn here_sid(&self) -> String {
-        if self.on_group_row() {
+        if self.on_group_row() || self.on_rail() {
             return String::new();
         }
         self.current().map(|s| s.deck_id.clone()).unwrap_or_default()
@@ -1514,7 +1642,7 @@ impl App {
         let now = Instant::now();
         let gap = self.moved.map_or(Duration::MAX, |(t, _)| now - t);
         self.moved = Some((now, gap));
-        // Step one stop at a time in screen order; an unfolded group header is a stop too
+        // Step one stop at a time in screen order; a group header is a stop too
         let stops = self.stops();
         let cur = stops.iter().position(|&t| Some(t) == self.at()).unwrap_or(0) as isize;
         match stops[(cur + d).clamp(0, stops.len() as isize - 1) as usize] {
@@ -1526,7 +1654,132 @@ impl App {
     /// Where the highlight can stop, top to bottom as on screen (see `jump_targets`)
     fn stops(&self) -> Vec<Jump> {
         let view: Vec<&Session> = self.view.iter().map(|&i| &self.all[i]).collect();
-        jump_targets(&view, self.sectioned(), &self.folds)
+        jump_targets(&view, self.sectioned())
+    }
+
+    /// What the list lists, in order, as one number: positions in the list mean the same rows while it's the same
+    fn view_mark(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.sectioned().hash(&mut h);
+        for &i in &self.view {
+            self.all[i].name.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// The stops jump mode gives a letter, top to bottom: the sessions with a row on screen in the last frame (a group's
+    /// header has the group's own letter, see `group_keys`). A list that frame didn't draw (it changed since, and a key came
+    /// before the next frame) has every session
+    fn jump_stops(&self) -> Vec<Jump> {
+        match &self.on_screen {
+            Some((mark, stops)) if *mark == self.view_mark() => stops.clone(),
+            _ => self.stops().into_iter().filter(|j| matches!(j, Jump::Row(_))).collect(),
+        }
+    }
+
+    /// Each group's letter in jump mode (letter, group), in the rail's order: every group of this workspace, the empty ones
+    /// too. What the list lists (the scope, a state picked, a search, which group or page) doesn't change them; adding,
+    /// deleting or reordering groups does
+    pub(super) fn group_keys(&self) -> Vec<(char, String)> {
+        let rows = self.rail_rows();
+        let groups: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RailKind::Group(g) => Some(g.as_str()),
+                _ => None,
+            })
+            .collect();
+        group_letters(&groups).into_iter().zip(&groups).filter_map(|(c, g)| Some((c?, g.to_string()))).collect()
+    }
+
+    /// ⇧ and a group's letter in jump mode: into that group, as Enter on its rail row goes in — on the page and the row it
+    /// was left on — with the cursor in the list, and a rail laid over a narrow screen put away. Already in that group's
+    /// list: nothing but the letters going.
+    /// A group with no session at all has no row for the cursor, and in its empty list the group's keys (a new session in
+    /// it, its note, rename, delete) wouldn't be aimed at it: the cursor is on its rail row instead. On a screen with no
+    /// rail that lays the rail over (such a group can't stay the one viewed there, see `set_sessions`)
+    pub(super) fn jump_into(&mut self, g: String) {
+        if self.group.as_deref() == Some(g.as_str()) && self.rail.is_none() {
+            return;
+        }
+        let bare = !self.all.iter().any(|s| s.group == g && s.space == self.space && !s.blank);
+        self.rail_from = None;
+        self.rail = bare.then_some(RailAt::Here);
+        self.set_group(Some(g));
+        self.hop_back = None;
+    }
+
+    /// The cursor is in the list of all groups: where `a` shows the letters, and where it comes back from
+    fn at_home(&self) -> bool {
+        self.group.is_none() && self.rail.is_none()
+    }
+
+    /// Whether group g is one the list can show: it has a session in this workspace, or with a rail it's there at all (empty)
+    fn group_listed(&self, g: &str) -> bool {
+        let rail = self.rail_on_screen();
+        self.all.iter().any(|s| s.group == g && s.space == self.space && (rail || !s.blank))
+    }
+
+    /// a: from anywhere to the list of all groups, the highlight on the row it was left on, with the jump letters showing; where
+    /// it was pressed is remembered. Pressed in all groups, it goes back there, to the row and the column the cursor was in; with
+    /// nowhere to go back to it shows the letters, as Space does
+    fn hop(&mut self) {
+        if self.at_home() {
+            if !self.hop_back.take().is_some_and(|back| self.hop_to(back)) {
+                self.start_jump();
+            }
+            return;
+        }
+        let from = (self.group.clone(), self.rail);
+        self.rail = None;
+        self.set_group(None);
+        // With no rail `set_group` says in the bottom bar where the list is now: the letters' keys are what it should show
+        if !rail_shown(self.screen) {
+            self.msg = None;
+        }
+        self.hop_back = Some(from);
+        self.start_jump();
+    }
+
+    /// Back to where `a` was pressed. False = its group is gone since (deleted, sent to another workspace): nowhere to go
+    fn hop_to(&mut self, (group, rail): (Option<String>, Option<RailAt>)) -> bool {
+        if group.as_deref().is_some_and(|g| !self.group_listed(g)) {
+            return false;
+        }
+        self.set_group(group);
+        self.rail = rail.filter(|_| rail_shown(self.screen));
+        true
+    }
+
+    /// Show the jump letters (Space, a): the sessions', and the groups' own. With no session listed the groups' still show.
+    /// With no rail the bottom bar is where it says ⇧ and a group's letter goes into it (inside a group nothing else does):
+    /// what it last said (which group the list went to) makes way
+    fn start_jump(&mut self) {
+        if !self.view.is_empty() || !self.group_keys().is_empty() {
+            self.jump = Some(String::new());
+            if !rail_shown(self.screen) {
+                self.msg = None;
+            }
+        }
+    }
+
+    /// `: the cursor onto the rail, on the row of the place the list shows, with the groups' letters showing (one is laid
+    /// over a narrow screen); the next letter puts it on that group's row. Pressed with the letters showing: back where it
+    /// was (see `on_letters_key`)
+    pub(super) fn pick_row(&mut self) {
+        self.digits.clear();
+        self.jump = None;
+        let back = Letters { rail: self.rail, from: self.rail_from.clone(), hop: self.hop_back.clone() };
+        if !self.on_rail() {
+            self.out_to_rail();
+        }
+        if !self.group_keys().is_empty() {
+            self.letters = Some(back);
+        }
+        if !rail_shown(self.screen) {
+            self.msg = None;
+        }
     }
 
     /// Where the highlight is now
@@ -1535,11 +1788,11 @@ impl App {
         Some(if self.head.is_some() { Jump::Head(p) } else { Jump::Row(p) })
     }
 
-    /// Enter: go into the session; on a group, fold / unfold
+    /// Enter: go into the session; on a group's header, into that group
     fn enter(&mut self) {
         self.digits.clear();
-        if self.on_group_row() {
-            return self.toggle_fold();
+        if let Some(g) = self.group_row().map(String::from) {
+            return self.set_group(Some(g));
         }
         // A subagent row has no pane to go into: show its record
         if self.current().is_some_and(|s| s.subagent.is_some()) {
@@ -1560,10 +1813,11 @@ impl App {
         let s = &self.all[i];
         // A registered session's row: if the agent exited (the pane and its screen are still there) or it's gone from tmux entirely, start
         // it again continuing the old conversation (`session::start`)
+        // `starts` is also what the bottom bar's 「⏎ 启动」 ("⏎ start") goes by
         let own = s.sub.is_none() && !s.deck_id.is_empty();
-        if s.state == State::Dead && !own {
+        if starts(s) && !own {
             self.respawn = Some((s.family().to_string(), self.pane_of(s)));
-        } else if own && (s.state.gone() || s.state == State::Dead) {
+        } else if starts(s) {
             self.start = Some(Target { name: s.name.clone(), title: s.title.clone(), profile: s.profile.clone(), id: s.deck_id.clone() });
         } else {
             let (focus, family) = ((!s.pane.is_empty()).then(|| s.pane.clone()), s.family().to_string());
@@ -1596,7 +1850,8 @@ impl App {
         if self.on_group(t!("插入引用", "insert a reference")) {
             return;
         }
-        let Some(s) = self.current().filter(|s| s.subagent.is_none()) else { return };
+        // On the rail no session is under the cursor
+        let Some(s) = self.current().filter(|s| s.subagent.is_none() && !self.on_rail()) else { return };
         if s.state.gone() || s.state == State::Dead {
             let m = tr!("「{}」未运行,无法插入", "“{}” isn't running; nothing to insert into", s.title);
             return self.flash(&m);
@@ -1618,14 +1873,28 @@ impl App {
     }
 
     /// C: pick one thing to copy (aca id / session id / path, see copies.rs)
-    fn open_copy_menu(&mut self) {
-        if self.on_group(t!("复制", "copy")) {
+    /// c: wait for the key saying what to copy (the bottom bar lists them)
+    pub(super) fn start_copy(&mut self) {
+        if self.on_group(t!("复制", "copy")) || self.current().is_none() {
             return;
+        }
+        self.pending = Some(Pending::Copy);
+    }
+
+    /// c then a key: c the last reply, b a reference, i s p a one thing about the session (see copies.rs); any other key does nothing
+    pub(super) fn copy_by(&mut self, key: char) {
+        match key {
+            'c' => return self.ask_copy(true),
+            'b' => return self.ask_copy(false),
+            _ => {}
         }
         let Some(s) = self.current() else { return };
         let id = if s.profile == crate::data::REGISTERED { s.deck_id.as_str() } else { "" };
-        let m = crate::copies::Menu::new(&s.title, id, &crate::data::copy_text(s));
-        self.open(Box::new(m));
+        match crate::copies::pick(key, id, &crate::data::copy_text(s)) {
+            Some(Ok(text)) => self.clip = Some(Clip::Text(text)),
+            Some(Err(why)) => self.flash(&why),
+            None => {}
+        }
     }
 
     pub fn flash(&mut self, m: &str) {
@@ -1671,6 +1940,8 @@ mod tests {
             group: group.into(),
             state,
             question: String::new(),
+            asked: None,
+            replied: String::new(),
             idle_for,
             active_at: 1_000_000 - idle_for,
             ran: 0,
@@ -1704,6 +1975,11 @@ mod tests {
             error_kind: String::new(),
             idle_stopped: 0,
             due: vec![],
+            router: false,
+            desk: false,
+            scratch: 0,
+            ticket: String::new(),
+            thread: vec![],
             blank: false,
         }
     }
@@ -1740,6 +2016,13 @@ mod tests {
         App::new(String::new(), sessions())
     }
 
+    /// The fixture with 「未读」 and 「错」 stopped, so the open ones are [fun] 问 [work] 跑 闲
+    pub(super) fn three() -> App {
+        let mut v = sessions();
+        v.iter_mut().filter(|s| s.title == "未读" || s.title == "错").for_each(|s| s.state = State::Stopped);
+        App::new(String::new(), v)
+    }
+
     /// In list order, unsorted
     pub(super) fn order(app: &App) -> Vec<String> {
         app.visible().0.iter().map(|s| s.title.clone()).collect()
@@ -1760,27 +2043,22 @@ mod tests {
     }
 
     #[test]
-    fn restore_brings_back_the_view_but_drops_what_is_gone() {
+    fn restore_brings_back_the_view_on_all_groups_and_drops_what_is_gone() {
         let v = View {
             group: Some("work".into()),
-            scope: Scope::All,
-            open: true,
-            back: Some(Scope::Recent),
-            days: 3,
+            scope: Scope::Week,
             preview: Preview::Off,
             preview_narrow: Preview::Focus,
             selected: Some("错".into()),
-            folded: vec![],
             space: spaces::HOME,
-            last_space: Some('2'),
         };
+        // It opens on all groups whichever group was being viewed, on the session that was highlighted
         let app = fixture().restore(v.clone());
-        assert_eq!(app.view_state(), v);
-        assert_eq!(app.current().unwrap().title, "错");
-        // Group gone → all groups; session gone → highlight the first
-        let gone = View { group: Some("旧分组".into()), selected: Some("没了".into()), ..v };
+        assert_eq!(app.view_state(), View { group: None, ..v.clone() });
+        assert_eq!((app.current().unwrap().title.as_str(), layout(&app)[0].as_str()), ("错", "[fun]"));
+        // Session gone → highlight the first
+        let gone = View { selected: Some("没了".into()), ..v };
         let app = fixture().restore(gone);
-        assert_eq!(app.group, None);
         assert_eq!(app.current().unwrap().title, "问");
     }
 
@@ -1850,15 +2128,15 @@ mod tests {
             assert!(rows.iter().any(|r| r.contains(want)), "缺「{want}」:{rows:#?}");
         }
         app.confirm = None;
-        // d on a fold row isn't removing a session: it asks about removing the group
+        // d on a group's header isn't removing a session: it asks about removing the group
         app = app.with_groups(deck_groups);
-        press(&mut app, KeyCode::Char('O'));
+        jump_to_group(&mut app, "work");
         press(&mut app, KeyCode::Char('d'));
         assert!(matches!(&app.confirm, Some(Confirm::Group(_))));
     }
 
     pub(super) fn select(app: &mut App, title: &str) {
-        let p = app.view.iter().position(|&i| app.all[i].title == title).unwrap();
+        let p = app.view.iter().position(|&i| app.all[i].title == title).unwrap_or_else(|| panic!("「{title}」 isn't listed"));
         app.select(Some(p));
     }
 
@@ -1938,9 +2216,14 @@ mod tests {
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('H'));
         // Same menu as n, but no shell; the title says who's handed off, mentioning it if it's running or has a note
-        let rows = reader_rows(&mut app, 60, 14);
-        shows(&rows, &["交接「跑」给", "仍在运行 · 带上便签", "1 cw  ~/.cw", "2 cx  ~/.cx", "⏎ 交接"]);
+        let rows = reader_rows(&mut app, 60, 16);
+        shows(&rows, &["交接「跑」给", "⚠ 原会话仍在运行,两边会同时修改这个目录", "带上便签", "1 cw  ~/.cw", "2 cx  ~/.cx", "⏎ 交接"]);
         assert!(!rows.iter().any(|r| r.contains("shell")), "{rows:#?}");
+        // In English on a phone: the warning wraps rather than being cut, the note stays whole
+        let rows = i18n::with(Lang::En, || reader_rows(&mut app, 46, 18));
+        let all = rows.iter().map(|r| r.trim_matches(|c: char| c == '│' || c == ' ')).collect::<Vec<_>>().join(" ");
+        assert!(all.contains("⚠ still running: both would change") && all.contains("this directory at once"), "{rows:#?}");
+        shows(&rows, &["with the draft"]);
         press(&mut app, KeyCode::Esc);
         assert!(app.tool_menu.is_none() && app.handoff.is_none() && app.job.is_none());
         assert!(app.msg.is_none());
@@ -2009,10 +2292,15 @@ mod tests {
 
     #[test]
     fn idle_stopping_says_how_many_which_and_how_to_resume() {
-        let one = |t: &str| aca_core::session::Idled { id: t.into(), title: t.into(), idle: 0 };
-        assert_eq!(idle_note(&[one("甲"), one("乙")]), "☾ 自动停止了 2 个:「甲」「乙」 · ⏎ 重新启动");
+        let one = |t: &str| aca_core::session::Idled { id: t.into(), title: t.into(), idle: 3 * 86_400 };
+        assert_eq!(idle_note(&[one("甲"), one("乙")], Scope::Week), "☾ 自动停止了 2 个:「甲」「乙」 · ⏎ 启动");
         let many: Vec<_> = ["a", "b", "c", "d", "e"].map(one).into_iter().collect();
-        assert_eq!(idle_note(&many), "☾ 自动停止了 5 个:「a」「b」「c」等 2 个 · ⏎ 重新启动");
+        assert_eq!(idle_note(&many, Scope::Week), "☾ 自动停止了 5 个:「a」「b」「c」等 2 个 · ⏎ 启动");
+        // Where they've left the list, the key is the one that shows them
+        assert_eq!(idle_note(&[one("甲")], Scope::Open), "☾ 自动停止了 1 个:「甲」 · w 近 7 天");
+        let old = aca_core::session::Idled { idle: 8 * 86_400, ..one("老") }; // idle longer than the last 7 days reach
+        assert_eq!(idle_note(&[one("甲"), old.clone()], Scope::Open), "☾ 自动停止了 2 个:「甲」「老」 · F 查看");
+        assert_eq!(idle_note(&[old], Scope::Week), "☾ 自动停止了 1 个:「老」 · F 查看");
     }
 
     #[test]
@@ -2034,7 +2322,7 @@ mod tests {
         app.set_sessions(fail("prompt is too long", "fatal"));
         let rows = reader_rows(&mut app, 100, 30);
         shows(&rows, &["✕ prompt is too long"]);
-        assert!(!rows.iter().any(|r| r.contains("X 换账号")), "{rows:#?}");
+        assert!(!rows.iter().any(|r| r.contains("X 换账号") || r.contains(&caps("X 换账号"))), "{rows:#?}");
     }
 
     #[test]
@@ -2081,7 +2369,7 @@ mod tests {
         let mut app = fixture().with_mcp(fake_mcp);
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('M'));
-        shows(&reader_rows(&mut app, 80, 20), &["MCP · 闲", "[ ] alpha", "[x] beta", "·  shared", "全局", "空格 切换", "⏎ 应用"]);
+        shows(&reader_rows(&mut app, 80, 20), &["MCP · 闲", "[ ] alpha", "[✓] beta", "·  shared", "全局", "空格 切换", "⏎ 应用"]);
         // Enter with nothing changed: does nothing
         press(&mut app, KeyCode::Enter);
         assert!(app.job.is_none() && app.overlays.is_empty());
@@ -2093,7 +2381,7 @@ mod tests {
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char(' ')); // global ones can't be changed
         assert_eq!(app.msg.as_ref().unwrap().0, "此项只读");
-        shows(&reader_rows(&mut app, 80, 20), &["[x] alpha", "[ ] beta"]);
+        shows(&reader_rows(&mut app, 80, 20), &["[✓] alpha", "[ ] beta"]);
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.job, Some(Job::Mcp { t: target("闲"), dir: "/p/work".into(), on: vec!["alpha".into()], off: vec!["beta".into()] }));
         let job = app.take_job().unwrap();
@@ -2172,7 +2460,7 @@ mod tests {
     #[test]
     fn pressing_on_at_the_edge_still_says_so_when_the_write_starts_after() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "闲");
         shift(&mut app, KeyCode::Up);
         shift(&mut app, KeyCode::Up); // both moves arrive together; only now does the run loop start writing the first
@@ -2183,7 +2471,7 @@ mod tests {
     #[test]
     fn a_failed_write_drops_the_queue_and_the_list_goes_back() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "错");
         shift(&mut app, KeyCode::Up);
         let job = app.take_job().unwrap();
@@ -2206,7 +2494,7 @@ mod tests {
             v.push(k);
         }
         let mut app = App::new(String::new(), v);
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "zsh", "子一", "子二", "错"]);
         select(&mut app, "子二");
         shift(&mut app, KeyCode::Up);
@@ -2227,7 +2515,7 @@ mod tests {
         let mut v = sessions();
         v[4].deck_id.clear(); // 「错」: a plain tmux session
         let mut app = App::new(String::new(), v);
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "错");
         shift(&mut app, KeyCode::Up);
         assert_eq!(app.msg.as_ref().unwrap().0, "普通 tmux 会话 · A 接管后才能移动");
@@ -2276,7 +2564,7 @@ mod tests {
         assert_eq!(app.current().map(|s| s.title.as_str()), Some("zsh"));
     }
 
-    /// 「闲」 spawned two child sessions: 「子跑」 running (with another window opened in it), 「子旧」 idle for three days;
+    /// 「闲」 spawned two child sessions: 「子跑」 running (with another window opened in it), 「子旧」 stopped three days ago;
     /// parent_idle = how long 「闲」 has been idle
     pub(super) fn with_children(parent_idle: u64) -> App {
         let mut v = sessions();
@@ -2290,7 +2578,7 @@ mod tests {
         let run = child("子跑", State::Running, 5, -1); // ahead of everyone in group order, still follows its parent
         v.push(sub_of(&run, 2, false, "zsh", State::Idle, 20));
         v.push(run);
-        v.push(child("子旧", State::Idle, 3 * 86400, 9));
+        v.push(child("子旧", State::Stopped, 3 * 86400, 9));
         App::new(String::new(), v)
     }
 
@@ -2301,9 +2589,12 @@ mod tests {
 
     #[test]
     fn a_kept_child_keeps_its_parent_but_not_the_other_way_round() {
-        // Parent idle for three days, child running: the parent stays too, the child hangs below it
+        // Parent stopped three days ago, child running: among the open ones the parent stays too, the child hangs below it
         let mut app = with_children(3 * 86400);
-        assert_eq!(order(&app), ["问", "跑", "闲", "子跑", "zsh"]);
+        let mut v = app.all.clone();
+        v.iter_mut().find(|s| s.title == "闲").unwrap().state = State::Stopped;
+        app.set_sessions(v);
+        assert_eq!(order(&app), ["问", "未读", "跑", "闲", "子跑", "zsh", "错"]);
         assert!(row_of(&reader_rows(&mut app, 46, 30), "子跑").contains("└ ● 子跑"));
         // Searching a child: the parent comes along; searching the parent: the children don't
         let v: Vec<Session> = app.all.clone();
@@ -2337,18 +2628,18 @@ mod tests {
         assert_eq!(order(&app)[..3], ["闲", "子跑", "zsh"]);
         // Branches connect: 子跑 has 子旧 after it, so ├; 子跑's window is prefixed with its │
         let rr = reader_rows(&mut app, 46, 30);
-        for want in ["├ ● 子跑", "│ └ ○ #2 zsh", "└ ○ 子旧"] {
+        for want in ["├ ● 子跑", "│ └ ○ #2 zsh", "└ ■ 子旧"] {
             assert!(row_of(&rr, want).contains(want), "{rr:#?}");
         }
         // p on a child that went up along with its parent: unpins the parent
         select(&mut app, "子跑");
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(app.msg.as_ref().unwrap().0, "已取消置顶「闲」");
-        assert_eq!(order(&app), ["问", "跑", "闲", "子跑", "zsh"]);
+        assert_eq!(order(&app), ["问", "未读", "跑", "闲", "子跑", "zsh", "错"]);
         // The child pinned itself: top level in the pinned block, the parent stays in its group
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(app.msg.as_ref().unwrap().0, "已置顶「子跑」");
-        assert_eq!(order(&app), ["子跑", "zsh", "问", "跑", "闲"]);
+        assert_eq!(order(&app), ["子跑", "zsh", "问", "未读", "跑", "闲", "错"]);
         let r = row_of(&reader_rows(&mut app, 46, 30), "子跑");
         assert!(r.contains("● 子跑") && !r.contains('└'), "{r}");
     }
@@ -2378,10 +2669,10 @@ mod tests {
         select(&mut app, "曾孙");
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(app.msg.as_ref().unwrap().0, "已取消置顶「闲」");
-        assert_eq!(order(&app), ["问", "跑", "闲", "子跑", "zsh", "孙", "top", "曾孙"]);
+        assert_eq!(order(&app), ["问", "未读", "跑", "闲", "子跑", "zsh", "孙", "top", "曾孙", "错"]);
         // The middle one pinned itself: top level in the pinned block with the ones below it, the ones above stay in the group
         pin(&mut app, "孙");
-        assert_eq!(order(&app), ["孙", "top", "曾孙", "问", "跑", "闲", "子跑", "zsh"]);
+        assert_eq!(order(&app), ["孙", "top", "曾孙", "问", "未读", "跑", "闲", "子跑", "zsh", "错"]);
         let rows = reader_rows(&mut app, 46, 30);
         assert!(!row_of(&rows, "● 孙").contains('└'), "{rows:#?}");
         for want in ["├ ○ #3 top", "└ ● 曾孙", "└ ● 子跑", "  └ ○ #2 zsh"] {
@@ -2399,7 +2690,7 @@ mod tests {
     #[test]
     fn shift_arrows_move_a_sub_session_with_everything_under_it() {
         let mut app = with_grandchildren();
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         // 子跑 down: skips its own levels below, swaps with its sibling (子旧), the whole family moves together
         select(&mut app, "子跑");
         shift(&mut app, KeyCode::Down);
@@ -2508,7 +2799,7 @@ mod tests {
     #[test]
     fn shift_w_jumps_to_the_sessions_group_and_back() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a')); // all: fun[问 未读] work[跑 闲 错]
+        to_scope(&mut app, Scope::Week); // 7 days: fun[问 未读] work[跑 闲 错]
         select(&mut app, "闲");
         press(&mut app, KeyCode::Char('W'));
         assert_eq!(app.group.as_deref(), Some("work"));
@@ -2516,41 +2807,9 @@ mod tests {
         press(&mut app, KeyCode::Char('j')); // switch to another in the group and back, the highlight follows
         press(&mut app, KeyCode::Char('W'));
         assert_eq!((app.group.as_deref(), at(&app).as_str()), (None, "错"));
-        press(&mut app, KeyCode::Char('}')); // group entered with }, W also goes back to all
+        app.set_group(Some("work".into())); // a group entered another way: W goes back to all from it too
         press(&mut app, KeyCode::Char('W'));
         assert_eq!(app.group, None);
-    }
-
-    #[test]
-    fn star_cycles_one_three_seven_days_and_a_toggles_all() {
-        let mut app = fixture();
-        assert_eq!(titles(&app), ["跑", "问", "闲"]);
-        press(&mut app, KeyCode::Char('*'));
-        assert_eq!(titles(&app), ["跑", "错", "问", "闲"]); // 「错」 over a day
-        assert_eq!(active_tab(&mut app), "3 天");
-        assert!(app.msg.is_none()); // lit in the top bar, nothing extra in the bottom bar
-        press(&mut app, KeyCode::Char('*'));
-        assert_eq!(titles(&app), ["未读", "跑", "错", "问", "闲"]); // 「未读」 almost six days
-        assert_eq!(active_tab(&mut app), "7 天");
-        // * only changes the days, wrapping back to 1 day; all is a
-        press(&mut app, KeyCode::Char('*'));
-        assert_eq!((app.scope, app.days), (Scope::Recent, 1));
-        press(&mut app, KeyCode::Char('a'));
-        assert_eq!(app.scope, Scope::All);
-        assert_eq!(active_tab(&mut app), "全部");
-        // * in all goes back to recent days, the days kept
-        press(&mut app, KeyCode::Char('*'));
-        assert_eq!((app.scope, app.days), (Scope::Recent, 1));
-        press(&mut app, KeyCode::Char('*'));
-        press(&mut app, KeyCode::Char('a'));
-        press(&mut app, KeyCode::Char('a'));
-        assert_eq!((app.scope, app.days), (Scope::Recent, 3));
-        assert_eq!(app.view_state().days, 3);
-        // * among open ones shows the open ones of recent days (days unchanged)
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!(app.scope, Scope::All);
-        press(&mut app, KeyCode::Char('*'));
-        assert_eq!((app.scope, app.days, app.open), (Scope::Recent, 3, true));
     }
 
     /// As tools::load gives them: this Mac's, then the special environments' (unis on this Mac, work a cage), each a terminal
@@ -2589,186 +2848,283 @@ mod tests {
     }
 
     #[test]
-    fn l_in_ctrl_e_logs_an_account_in_within_its_environment_asking_first_for_a_logged_in_codex() {
+    fn n_shows_each_accounts_login_and_a_opens_the_accounts_page_on_it() {
+        use crate::acctpage::Opening;
+        let page = |o: Opening| -> Box<dyn Overlay> {
+            Box::new(FakePage(match o {
+                Opening::At(Agent::Claude, n) if n == "sub" => 1,
+                Opening::At(Agent::Claude, n) if n == "ding" => 2,
+                Opening::First => 3,
+                _ => 0,
+            }))
+        };
+        let mut app = fixture().with_tools(sandbox_tools).with_rehome(|_| vec![], env_logins, false).with_accounts(page);
+        app.set_sessions(on_ding());
+        // n: the same row as everywhere, logged in or not included
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Down);
+        shows(&reader_rows(&mut app, 72, 16), &["2 sub    Claude  ✓", "⏎ 选择 • a 账号页 • + 添加账号 • ^E 特殊环境"]);
+        // a: the accounts page on the highlighted account, the menu closed
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.tool_menu.is_none());
+        shows(&reader_rows(&mut app, 72, 16), &["假页面 1"]);
+        press(&mut app, KeyCode::Esc);
+        // On the list a isn't the accounts page (it shows the jump letters): that's ^S then a, which opens it on the highlighted
+        // session's account; on a group, on the first account
+        select(&mut app, "跑");
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.overlays.is_empty() && app.jump.is_some());
+        press(&mut app, KeyCode::Esc);
+        ctrl(&mut app, 's');
+        press(&mut app, KeyCode::Char('a'));
+        shows(&reader_rows(&mut app, 72, 16), &["假页面 2"]);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlays.is_empty() && app.settings.is_none());
+        jump_to_group(&mut app, "work");
+        ctrl(&mut app, 's');
+        press(&mut app, KeyCode::Char('a'));
+        shows(&reader_rows(&mut app, 72, 16), &["假页面 3"]);
+    }
+
+    #[test]
+    fn an_account_row_drops_whole_windows_from_the_right_when_narrow() {
+        use aca_records::usage::{Quota, Win};
+        let now = 1_000_000;
+        let win = |label: &str, used, resets| Win { label: label.into(), used, resets: Some(resets) };
+        let wins = vec![win("5h", 100.0, now + 3600), win("7d", 73.0, now + 86_400), win("Fable", 17.0, now + 86_400)];
+        let q = Quota { agent: Agent::Claude, who: "sub".into(), plan: String::new(), updated: now - 3 * 3600, wins, note: String::new() };
+        let login = crate::accounts::Login::In(String::new());
+        let full: String = crate::rehome::account_tail(Some(Agent::Claude), Some(Some(&login)), Some(&q), (now, 0), 200)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(full.contains("5h 100% · 7d 73% · Fable 17%") && full.contains("重置") && full.trim_end().ends_with("前"), "{full}");
+        for room in 0..full.width() {
+            let text: String = crate::rehome::account_tail(Some(Agent::Claude), Some(Some(&login)), Some(&q), (now, 0), room)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect();
+            // Tool and login always; then only whole windows, each with its number
+            assert!(text.width() <= room.max(18) && text.starts_with("Claude  ✓"), "{room}: {text}");
+            assert!(full.starts_with(text.trim_end()), "{room}: {text}");
+            for (label, pct) in [("5h ", "5h 100%"), ("7d ", "7d 73%"), ("Fable ", "Fable 17%")] {
+                assert!(!text.contains(label) || text.contains(pct), "{room}: {text}");
+            }
+            assert!(!text.trim_end().ends_with('·'), "{room}: {text}");
+        }
+    }
+
+    #[test]
+    fn i_starts_the_same_login_for_an_account_wherever_it_is_listed() {
+        let dir = std::env::temp_dir().join(format!("aca-same-login-{}", std::process::id()));
+        let mut app = fixture()
+            .with_tools(sandbox_tools)
+            .with_rehome(|_| vec![], env_logins, false)
+            .with_login_links(dir.clone())
+            .with_handoff(fake_source)
+            .with_group_hints(hints);
+        app.set_sessions(on_ding());
+        let run = |app: &mut App| app.term_req.take().and_then(|r| r.run);
+        let (sub, team) = (crate::accounts::relogin_cmd(Agent::Claude, "sub"), crate::accounts::relogin_cmd(Agent::Claude, "team"));
+        // n: sub is logged in, so it asks first
+        keys(&mut app, "n↓iy");
+        assert_eq!(run(&mut app), Some(sub.clone()));
+        // H: the same; the hand off is dropped with the menu (H again once logged in)
+        select(&mut app, "跑");
+        keys(&mut app, "Hiy");
+        assert_eq!((run(&mut app), app.handoff.is_none(), app.tool_menu.is_none()), (Some(sub.clone()), true, true));
+        // X: the other Claude accounts, sub first
+        keys(&mut app, "Xiy");
+        assert_eq!(run(&mut app), Some(sub));
+        // team, in its special environment: ^E and X
+        ctrl(&mut app, 'e');
+        keys(&mut app, "↓↓↓iy");
+        assert_eq!(run(&mut app), Some(team.clone()));
+        keys(&mut app, "X↓iy");
+        assert_eq!(run(&mut app), Some(team));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn i_in_ctrl_e_logs_an_account_in_within_its_environment_asking_first_when_logged_in() {
         let dir = std::env::temp_dir().join(format!("aca-env-login-{}", std::process::id()));
         let mut app = fixture().with_tools(sandbox_tools).with_rehome(|_| vec![], env_logins, false).with_login_links(dir.clone());
         ctrl(&mut app, 'e');
-        // Each account says whether it's logged in
+        // Each account as everywhere: name, tool, login
         let rows = reader_rows(&mut app, 72, 20);
-        shows(
-            &rows,
-            &["2 team-unis   Codex   ○ 未登录", "4 team        Claude  ● 已登录", "5 team        Codex   ● 已登录", "⏎ 选择 • l 登录"],
-        );
-        // A terminal has none
-        press(&mut app, KeyCode::Char('l'));
+        shows(&rows, &["2 team-unis   Codex   未登录", "4 team        Claude  ✓", "5 team        Codex   ✓", "⏎ 选择 • a 账号页"]);
+        // A terminal has none; l doesn't log in any more
+        press(&mut app, KeyCode::Char('i'));
         assert!(app.term_req.is_none() && app.msg.as_ref().is_some_and(|m| m.0 == "终端不用登录"));
-        // Logged out: straight to its login, run for its environment's account, the link caught for the popup
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Char('l'));
+        assert!(app.term_req.is_none() && app.tool_relogin.is_none());
+        // Logged out: the bar says i; straight to its login, run for its environment's account, the link caught for the popup
+        shows(&reader_rows(&mut app, 72, 20), &["⏎ 选择 • i 登录 • a 账号页"]);
+        press(&mut app, KeyCode::Char('i'));
         let r = app.term_req.take().unwrap();
         let cmd = crate::accounts::relogin_cmd(Agent::Codex, "team-unis");
         assert_eq!((r.title.as_str(), r.run.as_deref()), ("登录 Codex · team-unis", Some(cmd.as_str())));
         assert!(r.link.is_some_and(|c| c.screen && c.file.starts_with(&dir)));
         assert!(app.tool_menu.is_none());
-        // A logged-in Codex: what it costs, and only y goes ahead
-        ctrl(&mut app, 'e');
-        for _ in 0..4 {
-            press(&mut app, KeyCode::Down);
+        // Logged in, Codex or Claude: what it costs as on the accounts page, and only y goes ahead
+        for (downs, title) in [(4, "登录 Codex · team"), (3, "登录 Claude Code · team")] {
+            ctrl(&mut app, 'e');
+            for _ in 0..downs {
+                press(&mut app, KeyCode::Down);
+            }
+            press(&mut app, KeyCode::Char('i'));
+            shows(&reader_rows(&mut app, 72, 24), &["重新登录", "账号 team?", "y 重新登录"]);
+            press(&mut app, KeyCode::Char('n'));
+            assert!(app.term_req.is_none() && app.tool_relogin.is_none() && app.tool_menu.is_some());
+            press(&mut app, KeyCode::Char('i'));
+            press(&mut app, KeyCode::Char('y'));
+            assert_eq!(app.term_req.take().map(|r| r.title).as_deref(), Some(title));
         }
-        press(&mut app, KeyCode::Char('l'));
-        shows(&reader_rows(&mut app, 72, 24), &["team 现在已登录", "y 重新登录"]);
-        press(&mut app, KeyCode::Char('n'));
-        assert!(app.term_req.is_none() && app.tool_relogin.is_none() && app.tool_menu.is_some());
-        press(&mut app, KeyCode::Char('l'));
-        press(&mut app, KeyCode::Char('y'));
-        assert_eq!(app.term_req.take().map(|r| r.title), Some("登录 Codex · team".to_string()));
-        // Claude's login replaces it only once done: no asking
-        ctrl(&mut app, 'e');
-        for _ in 0..3 {
-            press(&mut app, KeyCode::Down);
-        }
-        press(&mut app, KeyCode::Char('l'));
-        assert_eq!(app.term_req.take().map(|r| r.title), Some("登录 Claude Code · team".to_string()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn pinned_shows_in_recent_even_if_old_but_working_stays_a_filter() {
-        let mut v = sessions();
-        v[3].state = State::Stopped; // 「闲」: stopped
-        let mut app = App::new(String::new(), v);
-        press(&mut app, KeyCode::Char('a'));
-        pin(&mut app, "错"); // idle for 25 hours
-        pin(&mut app, "闲");
-        press(&mut app, KeyCode::Char('a'));
-        assert_eq!(order(&app), ["错", "闲", "问", "跑"]);
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!(order(&app), ["错", "问", "未读", "跑"]); // stopped ones aren't open, pinned ones included
+    /// Pick one state: `F`, then that state's key in its menu
+    pub(super) fn only(app: &mut App, key: char) {
+        press(app, KeyCode::Char('F'));
+        press(app, KeyCode::Char(key));
+    }
+
+    /// Press `w` until the list shows this scope
+    pub(super) fn to_scope(app: &mut App, scope: Scope) {
+        for _ in 0..=Scope::ALL.len() {
+            if app.scope == scope && app.status.is_none() {
+                return;
+            }
+            press(app, KeyCode::Char('w'));
+        }
+        panic!("w never got to {scope:?}");
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn w_shows_every_open_one_regardless_of_age() {
+    fn w_switches_between_open_and_seven_days_and_never_lists_everything() {
         let mut v = sessions();
         v.push(mk("停", "work", State::Stopped, 10));
-        v.push(mk("退", "work", State::Exited, 10));
-        v.push(mk("关", "work", State::Crashed, 10));
+        v.push(mk("老停", "work", State::Stopped, 9 * 86_400)); // stopped nine days ago
+        v.push(mk("老闲", "work", State::Idle, 9 * 86_400)); // idle nine days, still open
         let mut app = App::new(String::new(), v);
-        assert_eq!(titles(&app), ["停", "关", "跑", "退", "问", "闲"]); // 1 day: 未读 and 错 are over a day old, hidden; 问 always shows
+        // Open ones by default, however long they've been idle
+        assert_eq!((app.scope, titles(&app)), (Scope::Open, names(&["未读", "老闲", "跑", "错", "问", "闲"])));
+        assert_eq!(active_tab(&mut app), "未停止 6");
         press(&mut app, KeyCode::Char('w'));
-        assert_eq!(titles(&app), ["未读", "跑", "错", "问", "闲"]); // idle ones too; not running ones (■ and closed ✕) aren't
+        assert_eq!((app.scope, titles(&app)), (Scope::Week, names(&["停", "未读", "老闲", "跑", "错", "问", "闲"])));
+        assert_eq!(active_tab(&mut app), "近 7 天 7");
+        assert!(app.msg.is_none()); // lit in the top bar, nothing extra in the bottom bar
+        let top = reader_rows(&mut app, 120, 20)[0].clone();
+        assert!(top.contains("未停止 6   近 7 天 7") && !top.contains("全部 "), "{top}");
+        // Back to open ones: one stopped nine days ago is never listed by w, only by F's ■
         press(&mut app, KeyCode::Char('w'));
-        assert_eq!(titles(&app), ["停", "关", "跑", "退", "问", "闲"]);
+        assert_eq!(app.scope, Scope::Open);
+        only(&mut app, '5');
+        assert_eq!(titles(&app), ["停", "老停"]);
+        // Kept for next time
+        press(&mut app, KeyCode::Char('w'));
+        let again = App::new(String::new(), sessions()).restore(app.view_state());
+        assert_eq!(again.scope, Scope::Week);
+        // The keys that used to change the days and pick states on the list do nothing now
+        let mut app = App::new(String::new(), sessions());
+        for c in ['*', '!', '@', '#', '&', '^', '%'] {
+            press(&mut app, KeyCode::Char(c));
+            assert_eq!((app.scope, app.status, app.only_menu), (Scope::Open, None, None), "{c}");
+        }
     }
 
     #[test]
-    fn w_starts_from_all_and_star_narrows_it_to_recent_days() {
-        let mut v = sessions();
-        v.push(mk("老闲", "work", State::Idle, 9 * 86_400)); // idle nine days, not in the last week either
-        let mut app = App::new(String::new(), v);
-        let now = |app: &App| (app.scope, app.days, app.open);
-        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // w within 1 day: all open ones first, ones from days ago too
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!((now(&app), titles(&app)), ((Scope::All, 1, true), names(&["未读", "老闲", "跑", "错", "问", "闲"])));
-        // * inside: narrows to the open ones of the last day; the older ones are mentioned in the empty-list hint
-        press(&mut app, KeyCode::Char('*'));
-        assert_eq!((now(&app), titles(&app), app.hidden), ((Scope::Recent, 1, true), names(&["跑", "问", "闲"]), 3));
-        press(&mut app, KeyCode::Char('*'));
-        assert_eq!((now(&app), titles(&app)), ((Scope::Recent, 3, true), names(&["跑", "错", "问", "闲"])));
-        // Leaving after *: stays on the picked 3 days
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!(now(&app), (Scope::Recent, 3, false));
-        // No * / a pressed: leaving goes back to what it was before w
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!(now(&app), (Scope::Recent, 3, false));
-        press(&mut app, KeyCode::Char('a'));
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!(now(&app), (Scope::All, 3, false));
-        // a among open ones: all ↔ recent days, open stays on
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('a'));
-        assert_eq!(now(&app), (Scope::Recent, 3, true));
-        press(&mut app, KeyCode::Char('a'));
-        assert_eq!(now(&app), (Scope::All, 3, true));
-        // Off and on again still remembers where it was before w
-        press(&mut app, KeyCode::Char('*'));
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('w'));
-        let mut app = App::new(String::new(), sessions()).restore(app.view_state());
-        assert_eq!(now(&app), (Scope::All, 3, true));
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!(now(&app), (Scope::Recent, 3, false));
+    fn open_counts_what_f_counts_for_the_open_states_plus_pinned_stopped_ones() {
+        // A running child under a stopped parent, the child's window, a stopped one and a pinned stopped one
+        let mut app = with_children(3 * 86400);
+        let mut v = app.all.clone();
+        v.iter_mut().find(|s| s.title == "闲").unwrap().state = State::Stopped;
+        v.push(mk("停", "work", State::Stopped, 9 * 86_400));
+        v.push(mk("钉", "fun", State::Stopped, 9 * 86_400));
+        app.set_sessions(v);
+        only(&mut app, '5'); // 「钉」 stopped nine days ago: only ■ lists it
+        pin(&mut app, "钉");
+        to_scope(&mut app, Scope::Open);
+        let f = |p| app.pick_count(p);
+        assert_eq!(app.scope_count(Scope::Open), f(Pick::Run) + f(Pick::Wait) + f(Pick::Idle) + f(Pick::Err) + 1);
+        assert_eq!(Scope::ALL.map(|s| app.scope_count(s)), [7, 9]); // 「闲」 and 「子旧」 stopped three days ago
+        // The stopped parent comes along with its running child, but isn't counted
+        assert!(titles(&app).contains(&"闲".to_string()));
+        assert_eq!(active_tab(&mut app), "未停止 7");
+        // In one group: that group's
+        app.set_group(Some("work".into()));
+        assert_eq!(Scope::ALL.map(|s| app.scope_count(s)), [4, 6]);
     }
 
     #[test]
-    fn nothing_open_in_recent_days_says_how_many_are_older() {
+    fn nothing_open_says_so_and_w_goes_on_to_seven_days() {
+        // After a reboot nothing is open; 「问」 stopped longest ago, over a week
         let mut v = sessions();
-        v.retain(|s| s.title != "跑" && s.title != "闲" && s.title != "问");
+        v.iter_mut().for_each(|s| s.state = State::Stopped);
         let mut app = App::new(String::new(), v);
+        assert_eq!((titles(&app).len(), app.hidden), (0, 5));
+        shows(&reader_rows(&mut app, 60, 20), &["暂无未停止的会话 · w 近 7 天"]);
         press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('*'));
-        assert!(app.visible().0.is_empty() && !app.fell_back);
-        shows(&reader_rows(&mut app, 60, 20), &["暂无未停止的会话 · 还有 2 个更早的 · * 放宽"]);
-        press(&mut app, KeyCode::Char('a'));
-        press(&mut app, KeyCode::Char('!'));
-        press(&mut app, KeyCode::Char('!'));
-        assert_eq!(titles(&app), ["未读", "错"]);
+        assert_eq!(titles(&app), ["未读", "跑", "错", "闲"]);
+        // Nothing in the last week either
+        let mut v = sessions();
+        v.retain(|s| s.title == "问");
+        v[0].state = State::Stopped;
+        let mut app = App::new(String::new(), v);
+        shows(&reader_rows(&mut app, 60, 20), &["暂无未停止的会话 · F 查看已停止的"]); // w would list nothing either
+        press(&mut app, KeyCode::Char('w'));
+        shows(&reader_rows(&mut app, 60, 20), &["近 7 天暂无会话 · F 查看已停止的"]);
+        only(&mut app, '5');
+        assert_eq!(titles(&app), ["问"]);
+        // No sessions at all: no key to point at
+        let mut app = App::new(String::new(), vec![]);
+        shows(&reader_rows(&mut app, 60, 20), &["没有会话"]);
+        press(&mut app, KeyCode::Char('w'));
+        shows(&reader_rows(&mut app, 60, 20), &["没有会话"]);
+        // An empty group viewed alone: it's the group that has none
+        let mut app = App::new(String::new(), sessions());
+        app.set_group(Some("空".into()));
+        shows(&reader_rows(&mut app, 60, 20), &["这一组没有会话"]);
     }
 
     #[test]
-    fn percent_picks_the_ones_aca_stopped_for_idling() {
+    fn a_state_picked_in_f_lists_all_of_it_whatever_the_scope_and_esc_goes_back() {
         let mut v = sessions();
+        v.push(mk("停", "work", State::Stopped, 10));
+        v.push(mk("老停", "work", State::Stopped, 9 * 86_400));
         let mut reaped = mk("睡", "work", State::Stopped, 4 * 3600);
         reaped.idle_stopped = 1;
         v.push(reaped);
-        v.push(mk("停", "work", State::Stopped, 10));
         let mut app = App::new(String::new(), v);
-        press(&mut app, KeyCode::Char('%'));
-        assert_eq!((titles(&app), lit_counts(&mut app, 120)), (vec!["睡".to_string()], "☾ 1 自动停止".to_string()));
-        // ^ is all stopped ones, ☾ included
-        press(&mut app, KeyCode::Char('^'));
-        assert_eq!((titles(&app), lit_counts(&mut app, 120)), (vec!["停".to_string(), "睡".to_string()], "■ 2 已停止".to_string()));
-        // Like ^, none of it is open: the later key counts, the earlier pick steps aside
-        press(&mut app, KeyCode::Char('%'));
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!((app.status, app.open), (None, true));
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!((app.status, app.open, titles(&app)), (Some(Pick::Reaped), false, vec!["睡".to_string()]));
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('%'));
-        assert_eq!((app.status, app.open), (Some(Pick::Reaped), false));
-        // Open, once stepped aside, keeps stepping aside while switching between ^ / %; it comes back on switching to something else
-        press(&mut app, KeyCode::Char('^'));
-        assert_eq!((app.status, app.open), (Some(Pick::Off), false));
-        press(&mut app, KeyCode::Char('#'));
-        assert_eq!((app.status, app.open, titles(&app)), (Some(Pick::Idle), true, vec!["闲".to_string()]));
-    }
-
-    #[test]
-    fn status_keys_narrow_the_range_and_toggle_off() {
-        let mut app = fixture();
-        press(&mut app, KeyCode::Char('!'));
+        // ■ from open ones, which have none: every stopped one, however old; the top bar says so in place of the scopes
+        only(&mut app, '5');
+        assert_eq!((app.scope, titles(&app)), (Scope::Open, names(&["停", "睡", "老停"])));
+        assert_eq!(lit_counts(&mut app, 120), "■ 3 已停止");
+        let rows = reader_rows(&mut app, 120, 20);
+        assert!(rows[0].contains("仅 ■ 已停止 3") && !rows[0].contains("未停止"), "{}", rows[0]);
+        assert!(rows.iter().any(|r| r.trim_start().starts_with(&caps("Esc 清除"))), "{rows:#?}");
+        // ☾: only the ones aca stopped for idling
+        only(&mut app, '6');
+        assert_eq!(titles(&app), ["睡"]);
+        // The same one again, or Esc, goes back to the scope as it was
+        only(&mut app, '6');
+        assert_eq!((app.status, app.scope, titles(&app).len()), (None, Scope::Open, 5));
+        to_scope(&mut app, Scope::Week);
+        only(&mut app, '1');
         assert_eq!(titles(&app), ["跑"]);
-        press(&mut app, KeyCode::Char('!'));
-        assert_eq!(titles(&app), ["跑", "问", "闲"]);
-        // Needs you within the last day: awaiting confirmation always shows, unread over a day is hidden, with a last line
-        // saying there's one older; the state stays when * widens
-        press(&mut app, KeyCode::Char('@'));
-        assert_eq!((titles(&app), app.hidden), (vec!["问".to_string()], 1));
-        press(&mut app, KeyCode::Char('*'));
-        press(&mut app, KeyCode::Char('*'));
-        assert_eq!((titles(&app), app.hidden), (vec!["未读".to_string(), "问".to_string()], 0));
-        // One at a time: another key switches over
-        press(&mut app, KeyCode::Char('&'));
-        assert_eq!(titles(&app), ["错"]);
-        press(&mut app, KeyCode::Char('#'));
-        assert_eq!(titles(&app), ["闲"]);
-        // Esc clears the state first; pressing it again at the bottom doesn't exit (only popups do), quitting is q q
         press(&mut app, KeyCode::Esc);
-        assert_eq!(titles(&app).len(), 5);
-        assert!(!app.quit);
+        assert_eq!((app.status, app.scope), (None, Scope::Week));
+        // w with a state picked: the state goes, on to the other scope from the one it set aside
+        only(&mut app, '3');
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!((app.status, app.scope), (None, Scope::Open));
+        // Esc at the bottom doesn't quit (only popups do), quitting is q q
         press(&mut app, KeyCode::Esc);
         assert!(!app.quit);
         assert_eq!(app.msg.as_ref().unwrap().0, "q q 退出");
@@ -2777,17 +3133,105 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_status_stays_empty_and_counts_only_its_own_older_ones() {
-        let mut app = fixture();
-        press(&mut app, KeyCode::Char('&')); // 「错」 hasn't moved for over a day
-        assert!(app.visible().0.is_empty() && !app.fell_back);
-        assert_eq!(app.hidden, 1); // counts only the error one, not the separately hidden 「未读」
-        shows(&reader_rows(&mut app, 46, 20), &["暂无出错的会话 · 还有 1 个更早的 · * 放宽"]);
-        press(&mut app, KeyCode::Char('*'));
-        press(&mut app, KeyCode::Char('*'));
-        assert_eq!(titles(&app), ["错"]);
-        press(&mut app, KeyCode::Char('^'));
-        shows(&reader_rows(&mut app, 46, 20), &["暂无已停止的会话 · ^ 返回"]);
+    fn f_then_0_lists_every_session_however_long_ago_it_stopped_until_cleared() {
+        let mut v = sessions();
+        v.push(mk("停", "work", State::Stopped, 10));
+        v.push(mk("老停", "work", State::Stopped, 9 * 86_400)); // past what w reaches
+        let mut app = App::new(String::new(), v);
+        only(&mut app, '0');
+        assert_eq!((app.status, titles(&app).len()), (Some(Pick::Every), 7));
+        assert!(titles(&app).contains(&"老停".to_string()));
+        // The top bar gets a third cell, 「所有 7」, the lit one (the two scopes are still there, neither lit), and no state cell is lit
+        let top = reader_rows(&mut app, 120, 20)[0].clone();
+        assert!(top.contains("未停止 5   近 7 天 6   所有 7") && !top.contains("仅") && !top.contains("全部 7"), "{top}");
+        assert_eq!(active_tab(&mut app), "所有 7");
+        assert_eq!(lit_counts(&mut app, 120), "");
+        // With no room for all three, the lit one stays
+        let top = reader_rows(&mut app, 30, 20)[0].clone();
+        assert!(top.contains("所有 7") && !top.contains("未停止"), "{top}");
+        // In F it's row 0, highlighted and numbered like the others
+        press(&mut app, KeyCode::Char('F'));
+        assert_eq!(app.only_menu, Some(0));
+        shows(&reader_rows(&mut app, 60, 16), &["所有", "7"]);
+        // 0 again clears it, back to the scope as it was; so does Esc
+        press(&mut app, KeyCode::Char('0'));
+        assert_eq!((app.status, app.scope, titles(&app).len()), (None, Scope::Open, 5));
+        only(&mut app, '0');
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.status, titles(&app).len()), (None, 5));
+        // Not kept for next time: it opens on the scope
+        only(&mut app, '0');
+        let again = App::new(String::new(), sessions()).restore(app.view_state());
+        assert_eq!((again.status, again.scope), (None, Scope::Open));
+    }
+
+    #[test]
+    fn zero_on_the_list_lists_every_session_and_again_or_esc_goes_back() {
+        let mut v = sessions();
+        v.push(mk("停", "work", State::Stopped, 10));
+        v.push(mk("老停", "work", State::Stopped, 9 * 86_400)); // past what w reaches
+        let mut app = App::new(String::new(), v);
+        select(&mut app, "跑");
+        press(&mut app, KeyCode::Char('0'));
+        assert_eq!((app.status, titles(&app).len(), at(&app)), (Some(Pick::Every), 7, "跑".to_string()));
+        // It's a key here, not a digit: no number is being typed, and the top bar shows none
+        let top = reader_rows(&mut app, 120, 20)[0].clone();
+        assert!(app.digits.is_empty() && top.contains("所有 7") && !top.contains('#'), "{top}");
+        // Again: back to the scope as it was, so twice in a row is on and off
+        press(&mut app, KeyCode::Char('0'));
+        assert_eq!((app.status, app.scope, titles(&app).len()), (None, Scope::Open, 5));
+        keys(&mut app, "00");
+        assert_eq!(app.status, None);
+        // Esc goes back too
+        press(&mut app, KeyCode::Char('0'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.status, app.scope), (None, Scope::Open));
+        // w from there: on to the other scope from the one it set aside, as with a state picked in F
+        keys(&mut app, "0w");
+        assert_eq!((app.status, app.scope, active_tab(&mut app).as_str()), (None, Scope::Week, "近 7 天 6"));
+        // Over a state picked in F it takes that state's place
+        only(&mut app, '1');
+        press(&mut app, KeyCode::Char('0'));
+        assert_eq!(app.status, Some(Pick::Every));
+        // Not kept for next time
+        let again = App::new(String::new(), sessions()).restore(app.view_state());
+        assert_eq!(again.status, None);
+    }
+
+    #[test]
+    fn a_zero_typed_right_after_a_digit_is_the_numbers_next_digit_not_the_key() {
+        let v: Vec<Session> = (1..=12).map(|i| mk(&format!("s{i}"), "work", State::Idle, 10)).collect();
+        let mut app = App::new(String::new(), v);
+        let rows = order(&app);
+        assert_eq!(rows.len(), 12);
+        // 1 then 0 is row 10, and nothing else is listed for it
+        keys(&mut app, "10");
+        assert_eq!((app.status, at(&app)), (None, rows[9].clone()));
+        // No row 40: the 0 is dropped. The list is as it was, the highlight on row 4, and the number still 4
+        app.digits.clear();
+        keys(&mut app, "40");
+        assert_eq!((app.status, at(&app), app.digits.as_str()), (None, rows[3].clone(), "4"));
+        // Another one right after is dropped the same way; a digit that makes no number starts a new one, as before
+        press(&mut app, KeyCode::Char('0'));
+        assert_eq!((app.status, app.digits.as_str()), (None, "4"));
+        press(&mut app, KeyCode::Char('7'));
+        assert_eq!((at(&app), app.digits.as_str()), (rows[6].clone(), "7"));
+        // The number is over once the gap has passed: 0 is the key again, and leaves no number behind
+        app.digits_at = Instant::now() - DIGIT_GAP - Duration::from_millis(1);
+        press(&mut app, KeyCode::Char('0'));
+        assert_eq!((app.status, app.digits.as_str()), (Some(Pick::Every), ""));
+    }
+
+    #[test]
+    fn an_empty_state_says_so_and_esc_goes_back() {
+        let mut v = sessions();
+        v.retain(|s| s.title != "错");
+        let mut app = App::new(String::new(), v);
+        only(&mut app, '4');
+        assert!(app.visible().0.is_empty());
+        shows(&reader_rows(&mut app, 46, 20), &["暂无出错的会话 · Esc 清除"]);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(titles(&app).len(), 4);
     }
 
     #[test]
@@ -2795,83 +3239,41 @@ mod tests {
         let mut v = sessions();
         v[3].state = State::Crashed; // 「闲」: the last turn ended in an error, gone from tmux too
         let mut app = App::new(String::new(), v);
-        press(&mut app, KeyCode::Char('a'));
-        press(&mut app, KeyCode::Char('&')); // only the ones still open, stuck on an error
+        only(&mut app, '4'); // only the ones still open, stuck on an error
         assert_eq!((titles(&app), lit_counts(&mut app, 120)), (vec!["错".to_string()], "✕ 1 出错".to_string()));
-        press(&mut app, KeyCode::Char('^'));
+        only(&mut app, '5');
         assert_eq!((titles(&app), lit_counts(&mut app, 120)), (vec!["闲".to_string()], "■ 1 已停止".to_string()));
-        // w with ^ picked: the state steps aside, none of it is open
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!((app.status, titles(&app)), (None, ["未读", "跑", "错", "问"].map(String::from).to_vec()));
+        press(&mut app, KeyCode::Esc); // nor as open
+        assert!(!titles(&app).contains(&"闲".to_string()));
     }
 
     #[test]
-    fn status_inside_open_narrows_it_or_leaves_it() {
+    fn the_popup_opened_from_a_session_whose_program_exited_lands_on_it() {
         let mut v = sessions();
-        v.push(mk("停", "work", State::Stopped, 10));
+        (v[3].state, v[3].attached) = (State::Dead, true); // 「闲」: its program exited, you're in its pane
         let mut app = App::new(String::new(), v);
-        press(&mut app, KeyCode::Char('a'));
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('!'));
-        assert_eq!((titles(&app), app.open), (vec!["跑".to_string()], true));
-        press(&mut app, KeyCode::Char('#')); // idle is open too
-        assert_eq!((titles(&app), app.open), (vec!["闲".to_string()], true));
-        // None of ^'s are open: open steps aside, back to the "all" from before; ^ canceled, open comes back
-        press(&mut app, KeyCode::Char('^'));
-        assert_eq!((titles(&app), app.scope, app.open), (vec!["停".to_string()], Scope::All, false));
-        press(&mut app, KeyCode::Char('^'));
-        assert_eq!((app.status, app.open), (None, true));
-        // The other way round, w with ^ picked: ^ steps aside; w again leaves open, ^ comes back
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('^'));
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!((app.status, app.open, titles(&app).len()), (None, true, 5));
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!((app.status, app.scope, app.open, titles(&app)), (Some(Pick::Off), Scope::All, false, vec!["停".to_string()]));
+        app.highlight_here("$闲", "");
+        assert_eq!((app.scope, app.current().unwrap().title.as_str()), (Scope::Open, "闲"));
     }
 
     #[test]
-    fn range_open_and_state_stack_and_each_key_takes_off_only_its_own() {
+    fn pinned_ones_are_listed_in_every_scope_even_stopped() {
         let mut v = sessions();
-        v.push(mk("老闲", "work", State::Idle, 9 * 86_400)); // idle nine days, not in the last day
+        v[3].state = State::Stopped; // 「闲」
+        v[3].idle_for = 9 * 86_400;
         let mut app = App::new(String::new(), v);
-        let now = |app: &App| (app.scope, app.open, app.status, titles(app));
-        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // # among open ones stacks idle on top (of any age), # again goes back to open
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('#'));
-        assert_eq!(now(&app), (Scope::All, true, Some(Pick::Idle), names(&["老闲", "闲"])));
-        press(&mut app, KeyCode::Char('#'));
-        assert_eq!((app.open, app.status), (true, None));
-        // ! first, then w: stacks open on top; w again takes open off, ! stays
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('!'));
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!((app.open, app.status), (true, Some(Pick::Run)));
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!(now(&app), (Scope::Recent, false, Some(Pick::Run), names(&["跑"])));
-        // Same for a
-        press(&mut app, KeyCode::Char('#'));
-        press(&mut app, KeyCode::Char('a'));
-        assert_eq!(now(&app), (Scope::All, false, Some(Pick::Idle), names(&["老闲", "闲"])));
-        press(&mut app, KeyCode::Char('a'));
-        assert_eq!(now(&app), (Scope::Recent, false, Some(Pick::Idle), names(&["闲"])));
-        // a among open ones with @ picked: switches to recent days, again back to all; open and @ stay on throughout
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('@'));
-        press(&mut app, KeyCode::Char('a'));
-        assert_eq!((app.scope, app.open, app.status), (Scope::Recent, true, Some(Pick::Wait)));
-        press(&mut app, KeyCode::Char('a'));
-        assert_eq!((app.scope, app.open, app.status), (Scope::All, true, Some(Pick::Wait)));
-        // Esc cancels only the state
-        press(&mut app, KeyCode::Esc);
-        assert_eq!((app.scope, app.open, app.status), (Scope::All, true, None));
+        only(&mut app, '5'); // stopped nine days ago: only ■ lists it
+        pin(&mut app, "闲");
+        for scope in Scope::ALL {
+            to_scope(&mut app, scope);
+            assert_eq!(order(&app), ["闲", "问", "未读", "跑", "错"], "{scope:?}");
+        }
     }
 
     #[test]
     fn search_ignores_the_status_and_it_is_not_remembered() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('!'));
+        only(&mut app, '1');
         press(&mut app, KeyCode::Char('/'));
         typ(&mut app, "闲");
         press(&mut app, KeyCode::Enter);
@@ -2880,18 +3282,90 @@ mod tests {
         press(&mut app, KeyCode::Esc); // clears the search term first, the state stays
         assert_eq!(titles(&app), ["跑"]);
         let app = fixture().restore(app.view_state());
-        assert_eq!((app.status, titles(&app)), (None, vec!["跑".to_string(), "问".to_string(), "闲".to_string()]));
+        assert_eq!((app.status, titles(&app).len()), (None, 5));
+    }
+
+    #[test]
+    fn the_lists_keys_fit_on_a_big_screen_in_columns_and_stay_one_column_on_a_phone() {
+        let mut app = fixture();
+        keys(&mut app, "?");
+        // How far the legend's row reaches: past one column's width = other columns beside it
+        let reach = |rows: &[String]| rows.iter().find(|r| r.contains("图例")).map_or(0, |r| r.trim_end_matches(['│', '░', ' ']).width());
+        // 200×50: three columns side by side, all of it in view, no count
+        let big = reader_rows(&mut app, 200, 50);
+        let heads = ["图例", "导航", "打开", "列出哪些", "会话", "页面", "tmux 中", "新建时"];
+        assert!(heads.iter().all(|h| big.iter().any(|r| r.contains(&format!("  {h} ")))), "{big:#?}");
+        assert!(!big.iter().any(|r| r.contains("还有") || r.contains(" / 7")) && reach(&big) > 130, "{big:#?}");
+        // 120×36: two columns that still don't hold it: it says how many are left
+        let mid = reader_rows(&mut app, 120, 36);
+        assert!(mid.iter().any(|r| r.contains("↓ 还有")) && (70..120).contains(&reach(&mid)), "{mid:#?}");
+        // A phone: one column, as before
+        let phone = reader_rows(&mut app, 46, 30);
+        assert!(phone.iter().any(|r| r.contains("↓ 还有")) && reach(&phone) < 46, "{phone:#?}");
+    }
+
+    #[test]
+    fn search_lands_on_the_match_most_recently_active_without_reordering() {
+        // Stopped weeks ago (mk counts activity back from a fixed moment, so the age is set after)
+        let old = |t: &str, days: u64| Session { idle_for: days * 86_400, active_at: 0, ..mk(t, "a", State::Stopped, 0) };
+        let mut v: Vec<Session> = (0..12).map(|i| old(&format!("aca 停{i}"), 20 - i)).collect();
+        v.push(old("aca 老", 28));
+        v.push(mk("aca 闲", "b", State::Idle, 2 * 3600));
+        v.push(mk("aca 新", "c", State::Idle, 5 * 60));
+        v.push(mk("别的", "c", State::Idle, 60));
+        let mut app = App::new(String::new(), v);
+        // Scrolled down to the bottom first (stopped weeks ago: only ■ lists them)
+        only(&mut app, '5');
+        keys(&mut app, "G");
+        assert!(!reader_rows(&mut app, 46, 12).iter().any(|r| r.contains("aca 停0")));
+        keys(&mut app, "/aca");
+        // On a tall screen everything fits again: nothing is left scrolled away above
+        let tall = reader_rows(&mut app, 100, 40);
+        assert!(tall.iter().any(|r| r.contains("aca 停0")) && !tall.iter().any(|r| r.contains("还有")), "{tall:#?}");
+        // Rows keep their order (by group); the highlight is on the one 5 minutes ago, scrolled into view on a short screen
+        assert_eq!(titles(&app).first().map(String::as_str), Some("aca 停0"));
+        assert_eq!(app.current().unwrap().title, "aca 新");
+        let mut t = Terminal::new(TestBackend::new(46, 12)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let lit: Vec<String> = (0..12u16)
+            .filter(|&y| buf[(0, y)].symbol() == "▌")
+            .map(|y| (0..46u16).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        assert!(lit.len() == 1 && lit[0].contains("aca 新"), "{lit:?}");
+        // ↑ ↓ move as usual (past the next group's header to its row); ⏎ ends typing and the highlight stays put
+        keys(&mut app, "↓↓⏎");
+        assert_eq!((app.current().unwrap().title.as_str(), app.head.as_deref()), ("aca 老", None));
+        // Another word lands again; only stopped ones match: the most recent of them
+        keys(&mut app, "/");
+        typ(&mut app, " 停1");
+        assert_eq!(app.current().unwrap().title, "aca 停11");
+        // Cleared: back to the top, as before
+        for _ in 0..7 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        assert_eq!(app.list.selected(), Some(0));
+        // A running row goes by when it last printed something, not by the time on its row (how long it has run): running for 2
+        // hours and still printing beats idle for 5 minutes; running but quiet for 10 minutes doesn't
+        let v = vec![Session { ran: 2 * 3600, ..mk("aca 跑", "a", State::Running, 1) }, mk("aca 闲", "b", State::Idle, 5 * 60)];
+        let mut app = App::new(String::new(), v);
+        keys(&mut app, "/aca");
+        assert_eq!(app.current().unwrap().title, "aca 跑");
+        let v = vec![Session { ran: 60, ..mk("aca 跑", "a", State::Running, 10 * 60) }, mk("aca 闲", "b", State::Idle, 5 * 60)];
+        let mut app = App::new(String::new(), v);
+        keys(&mut app, "/aca");
+        assert_eq!(app.current().unwrap().title, "aca 闲");
     }
 
     #[test]
     fn status_keeps_families_and_parents_together() {
         // Session in error for over a day, another window running: the whole family stays
         let mut app = with_windows();
-        press(&mut app, KeyCode::Char('!'));
+        only(&mut app, '1');
         assert_eq!(order(&app), ["跑", "错", "构建"]);
         // A child running: its parent idle five days is listed too; the parent alone doesn't bring out its children
         let mut app = with_children(5 * 86400);
-        press(&mut app, KeyCode::Char('!'));
+        only(&mut app, '1');
         assert_eq!(order(&app), ["跑", "闲", "子跑", "zsh"]);
     }
 
@@ -2915,35 +3389,29 @@ mod tests {
     fn the_picked_status_is_lit_in_the_top_bar_counts() {
         let mut app = fixture();
         assert_eq!(lit_counts(&mut app, 120), "");
-        press(&mut app, KeyCode::Char('!'));
+        only(&mut app, '1');
         assert_eq!(lit_counts(&mut app, 120), "● 1 运行中");
-        press(&mut app, KeyCode::Char('@'));
-        assert_eq!(lit_counts(&mut app, 120), "◆ 1 等待回应 ◐ 0 未读");
+        only(&mut app, '2');
+        assert_eq!(lit_counts(&mut app, 120), "◆ 1 等待回应 ◐ 1 未读");
         // Idle and ■ normally aren't counted; listed only when picked, even with 0
         assert!(!reader_rows(&mut app, 120, 20)[0].contains("空闲"));
-        press(&mut app, KeyCode::Char('#'));
+        only(&mut app, '3');
         assert_eq!(lit_counts(&mut app, 120), "○ 1 空闲");
-        press(&mut app, KeyCode::Char('^'));
+        only(&mut app, '5');
         assert_eq!(lit_counts(&mut app, 120), "■ 0 已停止");
-        // On a phone the counts are shortened, still filled
-        assert_eq!(lit_counts(&mut app, 46), "■0");
+        // Narrower, the counts are shortened, still filled
+        assert_eq!(lit_counts(&mut app, 36), "■0");
     }
 
     #[test]
-    fn empty_working_stays_empty_instead_of_falling_back() {
-        let mut app = App::new(String::new(), vec![mk("停", "work", State::Stopped, 5), mk("退", "work", State::Exited, 5)]);
-        press(&mut app, KeyCode::Char('w'));
-        assert!(app.visible().0.is_empty());
-    }
-
-    #[test]
-    fn the_group_list_keeps_to_this_workspace_and_letters_come_from_names() {
+    fn the_rail_keeps_to_this_workspace() {
         let mut app = fun_in_h();
-        assert_eq!(app.group_rows(), [(' ', None), ('w', Some("work".into()))]); // the whole fun group is in h: not listed in 1
-        keys(&mut app, "qh");
-        assert_eq!(app.group_rows(), [(' ', None), ('f', Some("fun".into()))]);
-        let gs = ["work", "web", "-", "ops/qa", "中文", "Wq"].map(String::from);
-        assert_eq!(group_keys(&gs), ['w', 'e', 't', 'a', 's', 'd']); // clash: next; "Other tmux sessions" = t; never q; else jump letters
+        let groups = |app: &App| -> Vec<String> {
+            app.rail_rows().into_iter().filter(|r| matches!(r.kind, RailKind::Group(_))).map(|r| r.name).collect()
+        };
+        assert_eq!(groups(&app), ["work"]); // the whole fun group is in h: not listed in 1
+        keys(&mut app, "Sh");
+        assert_eq!(groups(&app), ["fun"]);
     }
 
     #[test]
@@ -3020,7 +3488,7 @@ mod tests {
     }
 
     #[test]
-    fn tapping_the_top_left_label_opens_the_group_list() {
+    fn tapping_the_top_left_label_calls_the_rail_out() {
         let mut app = fixture();
         reader_rows(&mut app, 80, 24);
         let (x, y, w) = (app.chip_area.x, app.chip_area.y, app.chip_area.width);
@@ -3028,27 +3496,41 @@ mod tests {
         let tap = |app: &mut App, column: u16, row: u16| {
             app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, modifiers: KeyModifiers::NONE })
         };
+        tap(&mut app, x + w + 3, y); // outside the tag: nothing
+        assert!(!app.on_rail());
         tap(&mut app, x + 1, y);
-        assert!(app.group_menu.is_some());
-        tap(&mut app, x + 1, y + 5); // while open, a click anywhere closes it
-        assert!(app.group_menu.is_none());
-        tap(&mut app, x + w + 3, y); // outside the tab doesn't open it
-        assert!(app.group_menu.is_none());
+        assert!(app.on_rail() && app.group.is_none());
+        // Laid over the list, its rows take the clicks: on a group's row the cursor goes there, a second one goes in
+        let rows = reader_rows(&mut app, 80, 24);
+        let work = rows.iter().position(|r| r.trim_start().starts_with("work")).unwrap() as u16;
+        assert_eq!(app.chip_area.width, 0);
+        tap(&mut app, x + 6, work);
+        assert_eq!((app.group.as_deref(), app.on_rail()), (Some("work"), true));
+        tap(&mut app, x + 6, work);
+        assert_eq!((app.group.as_deref(), app.on_rail()), (Some("work"), false));
+        // A click on the list beside it puts it away, the list staying on what it shows
+        keys(&mut app, "h");
+        reader_rows(&mut app, 80, 24);
+        let beside = (app.rail_area.x + app.rail_area.width + 6, app.list_area.y);
+        tap(&mut app, beside.0, beside.1);
+        assert_eq!((app.group.as_deref(), app.on_rail()), (Some("work"), false));
     }
 
     #[test]
-    fn group_and_working_combine() {
-        let mut app = fixture();
-        press(&mut app, KeyCode::Char('}'));
-        press(&mut app, KeyCode::Char('}'));
+    fn group_and_scope_combine() {
+        let mut v = sessions();
+        v[3].state = State::Stopped; // 「闲」
+        let mut app = App::new(String::new(), v);
+        app.set_group(Some("work".into()));
+        assert_eq!(titles(&app), ["跑", "错"]); // only work's open ones
         press(&mut app, KeyCode::Char('w'));
-        assert_eq!(titles(&app), ["跑", "错", "闲"]); // only work's; idle is open too
+        assert_eq!(titles(&app), ["跑", "错", "闲"]);
     }
 
     #[test]
     fn rows_stay_put_when_states_and_activity_change() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "错"]);
         let mut v = sessions();
         v[0].state = State::Idle; // 问 answered
@@ -3097,7 +3579,7 @@ mod tests {
     #[test]
     fn ctrl_z_takes_back_pin_read_workspace_and_note_one_step_at_a_time() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         ctrl(&mut app, 'z');
         assert_eq!(said(&app), "没有可撤销的操作");
         let st = |app: &App, t: &str| app.all.iter().find(|s| s.title == t).unwrap().state;
@@ -3147,7 +3629,7 @@ mod tests {
     fn d_hides_the_session_until_ctrl_z_brings_it_back() {
         let mut app = fixture();
         select(&mut app, "跑");
-        keys(&mut app, "Qwqw"); // recorded in w before the removal
+        keys(&mut app, "QwSw"); // recorded in w before the removal
         select(&mut app, "跑");
         keys(&mut app, "dy");
         let job = app.take_job().unwrap();
@@ -3160,7 +3642,7 @@ mod tests {
         app.set_sessions(sessions()); // still registered (archived), not listed
         assert!(!app.all.iter().any(|s| s.title == "跑"));
         // While waiting for the real deletion, its workspace record isn't cleared along the way
-        keys(&mut app, "q1");
+        keys(&mut app, "S1");
         select(&mut app, "闲");
         keys(&mut app, "Qw");
         assert_eq!(app.spaces.of("id-跑"), Some('w'));
@@ -3176,10 +3658,10 @@ mod tests {
         app.job_done(&job, Outcome::Done("已恢复「跑」".into()), sessions());
         assert!(!app.trash.has("default", "id-跑"));
         assert_eq!(said(&app), "已恢复「跑」");
-        keys(&mut app, "qw");
+        keys(&mut app, "Sw");
         assert_eq!(app.current().unwrap().title, "跑"); // back in its original workspace
         // Undo failed: the step is put back, still in the Trash, ^Z can be pressed again
-        keys(&mut app, "q1");
+        keys(&mut app, "S1");
         select(&mut app, "闲");
         keys(&mut app, "dy");
         let job = app.take_job().unwrap();
@@ -3210,8 +3692,15 @@ mod tests {
     /// Titles of the list rows ticked ✓ (80 columns, not the desktop margins)
     pub(super) fn ticked(app: &mut App) -> Vec<String> {
         let rows = reader_rows(app, 80, 20);
+        let mut t = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
         let titles: Vec<String> = app.all.iter().map(|s| s.title.clone()).collect();
-        rows.iter().filter(|r| r.starts_with('▌')).filter_map(|r| titles.iter().find(|t| r.contains(&format!(" {t} "))).cloned()).collect()
+        // The mark of a row selected with v is green. The cursor's bar stands in the same cell on a screen with no margin, in
+        // the accent color
+        let marked = |y: usize| buf[(0, y as u16)].symbol() == "▌" && buf[(0, y as u16)].fg == theme::pal().green;
+        let ticked = rows.iter().enumerate().filter(|(y, _)| marked(*y));
+        ticked.filter_map(|(_, r)| titles.iter().find(|t| r.contains(&format!(" {t} "))).cloned()).collect()
     }
 
     pub(super) fn many(act: fn(Target) -> Job, titles: &[&str]) -> Job {
@@ -3239,7 +3728,7 @@ mod tests {
         let win = sub_of(v.iter().find(|s| s.title == "旧窗").unwrap(), 2, false, "zsh", State::Idle, 20);
         v.push(win);
         let mut app = App::new(String::new(), v);
-        press(&mut app, KeyCode::Char('a'));
+        only(&mut app, '5'); // stopped over a week ago: only ■ lists them
         pin(&mut app, "旧顶");
         app.notes.set("id-旧签", "还要看").unwrap();
         app.notes.set("id-归档签", "还要看").unwrap();
@@ -3258,6 +3747,7 @@ mod tests {
         assert!(app.job.is_none());
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
+        assert!(["旧停", "旧退", "旧关"].iter().all(|t| order(&app).contains(&t.to_string())), "{:?}", order(&app));
         // Same as removing together: hidden from the list first, removed in the background, one entry in the Trash
         app.sweep(after, now, archived());
         let job = app.take_job().unwrap();
@@ -3286,7 +3776,7 @@ mod tests {
         plain.deck_id = String::new();
         v.push(plain);
         let mut app = App::new(String::new(), v);
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "裸");
         press(&mut app, KeyCode::Char('v'));
         assert!(!app.picking());
@@ -3308,7 +3798,7 @@ mod tests {
         let mut v = sessions();
         v.iter_mut().filter(|s| s.title == "错").for_each(|s| s.state = State::Stopped);
         let mut app = App::new(String::new(), v.clone());
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "跑");
         keys(&mut app, "vjj"); // 跑 闲 错 (错 already stopped)
         press(&mut app, KeyCode::Char('D'));
@@ -3348,7 +3838,7 @@ mod tests {
     #[test]
     fn m_on_the_selection_moves_them_together_and_ctrl_z_puts_each_back() {
         let mut app = fixture().with_group_hints(hints);
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "未读");
         press(&mut app, KeyCode::Char('v'));
         select(&mut app, "跑"); // 未读 (fun) to 跑 (work)
@@ -3361,8 +3851,14 @@ mod tests {
         app.group_picked(p, Ok(Some("work".into())));
         let all = ["Zeta", "fun", "work"].map(String::from).to_vec();
         // Ones already in work don't move
-        let job = Job::Many(vec![Job::Move { t: target("未读"), from: "fun".into(), to: "work".into(), groups: all.clone() }]);
-        assert_eq!(app.job.take(), Some(job));
+        let mv = |t: &str, from: &str, to: &str, home: &str| Job::Move {
+            t: target(t),
+            from: from.into(),
+            to: to.into(),
+            groups: all.clone(),
+            home: home.into(),
+        };
+        assert_eq!(app.job.take(), Some(Job::Many(vec![mv("未读", "fun", "work", "")])));
         assert!(!app.picking());
         // Two moved: ^Z moves them back together, each to its own original group
         let moved = |v: Vec<Session>| {
@@ -3373,18 +3869,31 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let job = Job::Many(vec![
-            Job::Move { t: target("未读"), from: "fun".into(), to: "Zeta".into(), groups: all.clone() },
-            Job::Move { t: target("跑"), from: "work".into(), to: "Zeta".into(), groups: all.clone() },
-        ]);
+        let job = Job::Many(vec![mv("未读", "fun", "Zeta", ""), mv("跑", "work", "Zeta", "")]);
         app.job_done(&job, Outcome::Many(vec![Outcome::Done(String::new()), Outcome::Done(String::new())]), moved(sessions()));
         assert_eq!(said(&app), "已将 2 个移到 Zeta");
         ctrl(&mut app, 'z');
         let back = app.take_job().unwrap();
-        let back_to = |t: &str, to: &str| Job::Move { t: target(t), from: "Zeta".into(), to: to.into(), groups: all.clone() };
-        assert_eq!(back, Job::Many(vec![back_to("未读", "fun"), back_to("跑", "work")]));
+        assert_eq!(back, Job::Many(vec![mv("未读", "Zeta", "fun", ""), mv("跑", "Zeta", "work", "")]));
         app.job_done(&back, Outcome::Many(vec![Outcome::Done(String::new()), Outcome::Done(String::new())]), sessions());
         assert_eq!(said(&app), "已撤销移动分组:2 个回到原分组");
+    }
+
+    #[test]
+    fn one_brought_back_stopped_says_which_key_shows_it_when_only_open_ones_are_listed() {
+        let mut app = fixture();
+        select(&mut app, "闲");
+        keys(&mut app, "dy");
+        let job = app.take_job().unwrap();
+        app.job_done(&job, binned("闲", "work"), sessions());
+        keys(&mut app, "b⏎");
+        let job = app.take_job().unwrap();
+        let mut fresh = sessions();
+        fresh[3].state = State::Stopped; // as it really comes back: stopped, the bringing back counting as activity
+        app.job_done(&job, Outcome::Done("已恢复「闲」".into()), fresh);
+        assert_eq!(said(&app), "已恢复「闲」 · w 近 7 天");
+        press(&mut app, KeyCode::Char('w'));
+        assert!(titles(&app).contains(&"闲".to_string()));
     }
 
     #[test]
@@ -3423,7 +3932,7 @@ mod tests {
     #[test]
     fn b_brings_back_or_deletes_several_together() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         for t in ["闲", "错"] {
             select(&mut app, t);
             keys(&mut app, "dy");
@@ -3487,14 +3996,16 @@ mod tests {
             app.job_done(&j, Outcome::Done("做完了".into()), back);
             j
         };
-        // m: moves back to the original group
-        let j = undo(
-            &mut app,
-            Job::Move { t: target("闲"), from: "work".into(), to: "fun".into(), groups: vec![] },
-            with(&|s| s.group = "fun".into()),
-            sessions(),
-        );
-        assert_eq!(j, Job::Move { t: target("闲"), from: "fun".into(), to: "work".into(), groups: vec![] });
+        // m: moves back to the original group (a group made on the way, and its directory, stay)
+        let mv = |from: &str, to: &str, home: &str| Job::Move {
+            t: target("闲"),
+            from: from.into(),
+            to: to.into(),
+            groups: vec![],
+            home: home.into(),
+        };
+        let j = undo(&mut app, mv("work", "fun", "/p/work/fun"), with(&|s| s.group = "fun".into()), sessions());
+        assert_eq!(j, mv("fun", "work", ""));
         assert_eq!(said(&app), "已撤销移动分组:「闲」回到 work");
         // r: renamed back; unlocked if it wasn't locked before
         let renamed = || with(&|s| (s.title, s.locked) = ("新名".into(), true));
@@ -3518,11 +4029,7 @@ mod tests {
         let j = undo(&mut app, mcp, sessions(), sessions());
         assert_eq!(j, Job::Mcp { t: target("闲"), dir: "/p".into(), on: vec!["b".into()], off: vec!["a".into()] });
         // Failed ones and restarts aren't recorded
-        app.job_done(
-            &Job::Move { t: target("闲"), from: "work".into(), to: "fun".into(), groups: vec![] },
-            Outcome::Failed("x".into()),
-            sessions(),
-        );
+        app.job_done(&mv("work", "fun", ""), Outcome::Failed("x".into()), sessions());
         app.job_done(&Job::Restart { t: target("闲"), force: false }, Outcome::Done(String::new()), sessions());
         ctrl(&mut app, 'z');
         assert_eq!(said(&app), "没有可撤销的操作");
@@ -3536,7 +4043,7 @@ mod tests {
     #[test]
     fn children_of_a_deleted_parent_stay_listed() {
         let mut app = with_children(10);
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "闲");
         keys(&mut app, "dy");
         let job = app.take_job().unwrap();
@@ -3571,6 +4078,7 @@ mod tests {
                 '↓' => KeyCode::Down,
                 '↑' => KeyCode::Up,
                 '⇥' => KeyCode::Tab,
+                '⇤' => KeyCode::BackTab,
                 c => KeyCode::Char(c),
             };
             press(app, code);
@@ -3612,7 +4120,7 @@ mod tests {
         select(&mut app, "生活");
         keys(&mut app, "Ql");
         assert_eq!(titles(&app), ["工作", "生活二", "私"]); // The child session and its own child went along
-        keys(&mut app, "ql");
+        keys(&mut app, "Sl");
         assert_eq!(titles(&app), ["zsh", "子", "孙", "生活"]);
         // The middle one was sent on its own: it stays where it is, the ones below follow it, not the one further up
         select(&mut app, "子");
@@ -3620,9 +4128,9 @@ mod tests {
         assert_eq!(titles(&app), ["zsh", "生活"]);
         select(&mut app, "生活");
         keys(&mut app, "Q1");
-        keys(&mut app, "q1");
+        keys(&mut app, "S1");
         assert_eq!(titles(&app), ["zsh", "工作", "生活", "生活二", "私"]);
-        keys(&mut app, "qh");
+        keys(&mut app, "Sh");
         assert_eq!(titles(&app), ["子", "孙"]);
         app.set_sessions(v); // Same after a refresh
         assert_eq!(titles(&app), ["子", "孙"]);
@@ -3648,35 +4156,33 @@ mod tests {
         app.all.iter().find(|s| s.title == title && s.sub.is_none()).unwrap().space
     }
 
-    /// The whole fun group (on its fold row) sent to h
+    /// The whole fun group (on its header) sent to h
     pub(super) fn fun_in_h() -> App {
         let mut app = App::new(String::new(), life_and_work());
-        select(&mut app, "生活二");
-        keys(&mut app, "oQh");
-        app.folded.clear();
-        app.rebuild();
+        jump_to_group(&mut app, "fun");
+        keys(&mut app, "Qh");
         app
     }
 
     #[test]
     fn one_session_out_of_a_hidden_group_is_remembered_and_the_rest_stay() {
         let mut app = fun_in_h();
-        keys(&mut app, "qh");
+        keys(&mut app, "Sh");
         select(&mut app, "私");
         keys(&mut app, "Q1"); // Group in h: sending one back to 1 needs its own record, or it goes back with the group again
         assert_eq!(app.spaces.of("id-私"), Some('1'));
         app.set_sessions(life_and_work());
         assert_eq!(space(&app, "私"), '1');
         // In 1, send the whole fun group (only "私" here) to 2: the group is now recorded as 2, the ones left in h stay in h
-        keys(&mut app, "q1");
-        select(&mut app, "私");
-        keys(&mut app, "oQ2");
+        keys(&mut app, "S1");
+        jump_to_group(&mut app, "fun");
+        keys(&mut app, "Q2");
         assert_eq!(app.spaces.group_of("default", "fun"), Some('2'));
         assert_eq!((space(&app, "私"), space(&app, "生活"), space(&app, "生活二"), space(&app, "子")), ('2', 'h', 'h', 'h'));
         assert_eq!(app.spaces.of("id-私"), None); // Follows the group
         // Sent back to 1: the group is no longer recorded
-        keys(&mut app, "q2");
-        select(&mut app, "私");
+        keys(&mut app, "S2");
+        jump_to_group(&mut app, "fun");
         keys(&mut app, "Q1");
         assert_eq!((space(&app, "私"), space(&app, "生活"), app.spaces.group_of("default", "fun")), ('1', 'h', None));
     }
@@ -3717,6 +4223,7 @@ mod tests {
                 gone("子", "fun", false),
                 gone("旧", "fun/old", true),
             ],
+            note: None,
         };
         Outcome::Binned { msg: "已删除分组 fun 和里面 4 个会话 · ^Z 撤销".into(), item: Box::new(item) }
     }
@@ -3770,23 +4277,22 @@ mod tests {
         keys(&mut app, "/w/work/⏎");
         let job = app.take_job().unwrap();
         assert_eq!(job, edit_group("work", "my-job", None));
-        // Done: the group being viewed and the folded ones (child groups included) move along; one undo step recorded
+        // Done: the group being viewed moves along; one undo step recorded
         app.group = Some("work".into());
-        app.folded.insert("work/sub".into());
         let moved = |g: &str| {
             let mut v = life_and_work();
             v[0].group = g.into();
             v
         };
         app.job_done(&job, Outcome::Done("分组 work 改名为 my-job".into()), moved("my-job"));
-        assert_eq!((app.group.as_deref(), app.folded.contains("my-job/sub")), (Some("my-job"), true));
+        assert_eq!(app.group.as_deref(), Some("my-job"));
         assert_eq!(titles(&app), ["工作"]);
         ctrl(&mut app, 'z');
         let back = app.take_job().unwrap();
         assert_eq!(back, edit_group("my-job", "work", None));
         app.job_done(&back, Outcome::Done(String::new()), moved("work"));
         assert_eq!(app.msg.as_ref().unwrap().0, "已撤销修改分组:my-job 改回 work");
-        assert_eq!((app.group.as_deref(), app.folded.contains("work/sub")), (Some("work"), true));
+        assert_eq!(app.group.as_deref(), Some("work"));
         // Directory only: cleared = not recorded; undo records the old one again
         app.group = None;
         jump_to_group(&mut app, "work");
@@ -3816,8 +4322,8 @@ mod tests {
         press(&mut app, KeyCode::Char('r'));
         assert!(app.prompt.is_none());
         assert_eq!(app.msg.as_ref().unwrap().0, "「未分组」不是已登记的分组:用 m 移到分组");
-        select(&mut app, "裸");
-        keys(&mut app, "or");
+        jump_to_group(&mut app, "-");
+        press(&mut app, KeyCode::Char('r'));
         assert_eq!(app.msg.as_ref().unwrap().0, "这些是普通 tmux 会话,没有可修改的分组");
         // r on a session still edits the session's title
         select(&mut app, "生活");
@@ -3882,20 +4388,20 @@ mod tests {
         press(&mut app, KeyCode::Char('d'));
         assert!(app.confirm.is_none());
         assert_eq!(said(&app), "「未分组」不是已登记的分组");
-        // Same on a fold row; the plain tmux sessions section has no group to delete
-        select(&mut app, "裸");
-        keys(&mut app, "od");
+        // The plain tmux sessions section has no group to delete
+        jump_to_group(&mut app, "-");
+        press(&mut app, KeyCode::Char('d'));
         assert!(app.confirm.is_none());
         assert_eq!(said(&app), "这些是普通 tmux 会话,没有可删除的分组");
-        select(&mut app, "生活");
-        keys(&mut app, "od");
+        jump_to_group(&mut app, "fun");
+        press(&mut app, KeyCode::Char('d'));
         assert!(matches!(&app.confirm, Some(Confirm::Group(g)) if g.group == "fun"));
     }
 
     #[test]
     fn a_deleted_group_kept_in_h_goes_back_to_h() {
         let mut app = fun_in_h().with_groups(deck_groups);
-        keys(&mut app, "qh");
+        keys(&mut app, "Sh");
         jump_to_group(&mut app, "fun");
         keys(&mut app, "dy");
         let job = app.take_job().unwrap();
@@ -3948,7 +4454,7 @@ mod tests {
     #[test]
     fn shift_j_k_jump_between_sections() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a')); // All: fun[问 未读] work[跑 闲 错]
+        to_scope(&mut app, Scope::Week); // 7 days: fun[问 未读] work[跑 闲 错]
         press(&mut app, KeyCode::Char('J'));
         assert_eq!(at(&app), "跑");
         press(&mut app, KeyCode::Char('J')); // No next section → the last one
@@ -3966,7 +4472,7 @@ mod tests {
         assert_eq!(at(&app), "闲");
         press(&mut app, KeyCode::Char('J'));
         assert_eq!(at(&app), "问");
-        press(&mut app, KeyCode::Char('}')); // Only fun: no sections, J/K = to the bottom / top
+        press(&mut app, KeyCode::Char('W')); // Only fun: no sections, J/K = to the bottom / top
         press(&mut app, KeyCode::Char('J'));
         assert_eq!(at(&app), "未读");
         press(&mut app, KeyCode::Char('K'));
@@ -3974,7 +4480,7 @@ mod tests {
     }
 
     #[test]
-    fn h_from_a_window_or_sub_session_goes_to_its_session_and_out_of_a_single_group() {
+    fn h_from_a_window_or_sub_session_goes_to_its_session_then_out_of_the_list() {
         let mut v = sessions();
         let idle = v[3].clone(); // 闲 (idle)
         v.push(sub_of(&idle, 2, false, "zsh", State::Idle, 20));
@@ -3982,7 +4488,7 @@ mod tests {
         k.slot.1 = 10;
         v.push(k);
         let mut app = App::new(String::new(), v);
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         assert_eq!(order(&app), ["问", "未读", "跑", "闲", "zsh", "子", "错"]);
         select(&mut app, "zsh");
         press(&mut app, KeyCode::Left); // ← same as h: window → the session it belongs to
@@ -3990,9 +4496,15 @@ mod tests {
         select(&mut app, "子");
         press(&mut app, KeyCode::Char('h')); // Child session → parent session
         assert_eq!(at(&app), "闲");
-        press(&mut app, KeyCode::Char('W')); // Only work: no header, h goes back to all groups, highlight stays
+        // A top-level session is the list's outermost level. This screen has no rail of its own: one is laid over its left
+        press(&mut app, KeyCode::Char('W'));
         press(&mut app, KeyCode::Char('h'));
-        assert_eq!((app.group.as_deref(), at(&app)), (None, "闲".to_string()));
+        assert!(app.on_rail() && app.group.as_deref() == Some("work"));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.on_rail() && app.group.as_deref() == Some("work"));
+        // Esc inside a group: back to all groups, on the row left there
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.group.as_deref(), at(&app), app.quit), (None, "闲".to_string(), false));
     }
 
     #[test]
@@ -4001,9 +4513,12 @@ mod tests {
         app.ref_keys = list_keys("prefix b", "C-b");
         let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
         select(&mut app, "跑");
-        // After the prefix key another key does nothing (not even b's trash once it's a different one)
+        // After the prefix key the bottom bar says what's next; another key does nothing (not even b's trash once it's a
+        // different one)
         app.on_key(ctrl_b);
+        shows(&reader_rows(&mut app, 100, 20), &[&caps("b 插入引用 • Esc 取消")]);
         press(&mut app, KeyCode::Char('x'));
+        assert!(!reader_rows(&mut app, 100, 20).iter().any(|r| r.contains("插入引用")));
         assert!(app.insert_to.is_none() && !app.modal_open());
         app.on_key(ctrl_b);
         press(&mut app, KeyCode::Char('b'));
@@ -4038,15 +4553,10 @@ mod tests {
         assert!(list_keys("prefix b", "").is_empty() && list_keys("Space", "").is_empty());
     }
 
-    /// After Space, press a group header's letter: the highlight stops on the header, doesn't enter a session
+    /// The highlight onto a group's header in the list (where j / k stop on the way past it): on the header, not in a session
     pub(super) fn jump_to_group(app: &mut App, group: &str) {
-        press(app, KeyCode::Char(' '));
-        let view = app.visible().0;
-        let rows = list_rows(&view, true, 46, Some(""), app.fold_info(), 0, false);
-        let pos = view.iter().position(|s| s.group == group).unwrap();
-        let row = rows.iter().find(|r| r.head == Some(pos)).unwrap();
-        let hint: String = row.lines[0][0].0.trim().into();
-        hint.chars().for_each(|c| press(app, KeyCode::Char(c)));
+        let pos = app.visible().0.iter().position(|s| s.group == group).unwrap();
+        app.select_head(pos);
     }
 
     /// One more, empty group lab, sorted after work
@@ -4062,24 +4572,24 @@ mod tests {
 
     #[test]
     fn an_empty_group_is_just_its_header_and_the_highlight_stops_on_it() {
-        let mut app = with_blank(); // 1 day: [fun] 问 [work] 跑 闲 [lab]
+        let mut app = with_blank(); // [fun] 问 未读 [work] 跑 闲 错 [lab]
         let view = app.visible().0;
-        let rows = list_rows(&view, true, 46, None, &Folds::new(), 0, false);
+        let rows = list_rows(&view, true, 46, None, 0, false);
         let text: Vec<String> = rows.iter().map(|r| r.lines.concat().iter().map(|(t, _)| t.as_str()).collect()).collect();
         let heads: Vec<&str> = text.iter().map(|t| t.trim_end()).filter(|t| t.contains('▾')).collect();
         // Looks like any other group, with no rows below
-        assert_eq!(heads, [" ▾ fun  1", " ▾ work  2", " ▾ lab  0"]);
-        assert_eq!(text.len(), 6);
-        assert!(text[5].contains("lab"));
+        assert_eq!(heads, [" ▾ fun  2", " ▾ work  3", " ▾ lab  0"]);
+        assert_eq!(text.len(), 8);
+        assert!(text[7].contains("lab"));
         press(&mut app, KeyCode::Char('G'));
         assert_eq!(spot(&app), "[lab]");
         press(&mut app, KeyCode::Char('k'));
-        assert_eq!(spot(&app), "闲");
+        assert_eq!(spot(&app), "错");
         press(&mut app, KeyCode::Char('J'));
         assert_eq!(spot(&app), "[lab]");
         // Numbers go to sessions only
-        press(&mut app, KeyCode::Char('3'));
-        assert_eq!(spot(&app), "闲");
+        press(&mut app, KeyCode::Char('5'));
+        assert_eq!(spot(&app), "错");
         press(&mut app, KeyCode::Char('j'));
         // Still on it after a refresh; it gets a jump hint letter too
         app.set_sessions(app.all.clone());
@@ -4087,20 +4597,14 @@ mod tests {
         press(&mut app, KeyCode::Char('g'));
         jump_to_group(&mut app, "lab");
         assert_eq!(spot(&app), "[lab]");
-        // Folded it's a fold row of 0; unfolding goes back to the header
-        press(&mut app, KeyCode::Char('o'));
-        assert!(app.on_fold_row() && app.head.is_none());
-        assert_eq!(app.fold_info().get("lab"), Some(&(0, 0)));
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(spot(&app), "[lab]");
         // Session-only keys leave it alone
         press(&mut app, KeyCode::Char('Z'));
         press(&mut app, KeyCode::Char('W'));
         assert!(app.trace.is_none() && app.group.is_none());
-        // Not counted by the top bar's counts, Tab's group list or keyword lookup
+        // Not counted by the top bar's counts, the rail's rows or keyword lookup
         assert_eq!(app.groups(), ["fun", "work"]);
         assert!(app.matching("lab").is_empty());
-        assert_eq!(app.numbered(4), None);
+        assert_eq!(app.numbered(6), None);
     }
 
     #[test]
@@ -4108,17 +4612,19 @@ mod tests {
         let mut app = with_blank();
         let has = |app: &App| app.visible().0.iter().any(|s| s.blank);
         assert!(has(&app));
-        // Nothing active in recent days: still falls back to all as before; it doesn't stop the fallback
+        // Listed in every scope (a new group has nothing in it yet), even with nothing else open
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('w'));
+            assert!(has(&app), "{:?}", app.scope);
+        }
         app.all.retain(|s| s.blank || s.title == "未读");
+        app.all.iter_mut().for_each(|s| s.state = if s.blank { s.state } else { State::Stopped });
         app.rebuild();
-        assert!(app.fell_back && has(&app));
+        assert!(has(&app));
         let mut app = with_blank();
-        press(&mut app, KeyCode::Char('w')); // Not stopped
+        only(&mut app, '3'); // A state picked
         assert!(!has(&app));
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('#')); // A state picked
-        assert!(!has(&app));
-        press(&mut app, KeyCode::Char('#'));
+        press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char('/'));
         typ(&mut app, "la");
         assert!(has(&app));
@@ -4202,7 +4708,7 @@ mod tests {
 
     #[test]
     fn j_k_stop_on_group_headers_too() {
-        let mut app = fixture(); // 1 day: [fun] 问 [work] 跑 闲
+        let mut app = three(); // [fun] 问 [work] 跑 闲
         let spot = |app: &App| app.head.clone().map_or_else(|| at(app), |g| format!("[{g}]"));
         let walk = |app: &mut App, k: char, n: usize| -> Vec<String> {
             (0..n)
@@ -4221,15 +4727,7 @@ mod tests {
         assert_eq!(spot(&app), "[fun]");
         press(&mut app, KeyCode::Char('2')); // Numbers are sessions as usual
         assert_eq!(spot(&app), "跑");
-        // A folded group is just its one fold row; unfolded, the highlight is still on the group
-        press(&mut app, KeyCode::Char('o'));
-        assert!(app.on_fold_row());
-        assert_eq!(walk(&mut app, 'k', 2), ["问", "[fun]"]);
-        assert_eq!(walk(&mut app, 'j', 2), ["问", "跑"]);
-        assert!(app.on_fold_row());
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(spot(&app), "[work]");
-        // J / K still land on sessions
+        // J / K land on sessions
         press(&mut app, KeyCode::Char('K'));
         assert_eq!(spot(&app), "问");
         press(&mut app, KeyCode::Char('J'));
@@ -4240,8 +4738,8 @@ mod tests {
     fn on_a_group_the_preview_reads_and_shows_the_groups_dir() {
         let mut app = fixture();
         jump_to_group(&mut app, "work");
-        let (key, w) = app.glance_request(false).unwrap();
-        assert_eq!((key.as_str(), w.dir.as_str(), w.pid), ("group:work", "/p/work", 0));
+        let (key, w, turn) = app.glance_request(false).unwrap();
+        assert_eq!((key.as_str(), w.dir.as_str(), w.pid, turn), ("group:work", "/p/work", 0, None));
         assert!(app.glance_request(false).is_none()); // The same group isn't read twice
         let files = diff::Files { dirs: vec!["src".into()], files: vec!["Cargo.toml".into()], ..Default::default() };
         app.set_glance(key, Glance { files: Some(files), ..Default::default() });
@@ -4255,9 +4753,99 @@ mod tests {
         // Back on a session: reads the session's
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.glance_request(false).map(|r| r.0).as_deref(), Some("跑"));
-        // A fold row is a group too
-        press(&mut app, KeyCode::Char('o'));
-        assert_eq!(app.glance_request(false).map(|r| r.0).as_deref(), Some("group:work"));
+    }
+
+    #[test]
+    fn a_session_with_nothing_on_screen_shows_its_last_turn() {
+        let mut v = sessions();
+        v[2].screen = vec!["⏺ 还在跑".into()];
+        (v[3].state, v[3].screen) = (State::Stopped, vec![]); // 「闲」: gone from tmux
+        let mut app = App::new(String::new(), v);
+        to_scope(&mut app, Scope::Week);
+        select(&mut app, "闲");
+        let (key, _, turn) = app.glance_request(false).unwrap();
+        assert_eq!(turn.as_deref(), Some(app.current().unwrap().deck_id.as_str()));
+        // Before it's read: nothing in the body yet
+        assert!(!reader_rows(&mut app, 120, 20).iter().any(|r| r.contains('❯')));
+        let said = diff::Turn {
+            prompt: "把计费页改成一行一个账号".into(), reply: "改好了。\n\n- 宽时三个窗口并排\n- 窄时照旧".into()
+        };
+        app.set_glance(key.clone(), Glance { turn: Some(said), ..Default::default() });
+        let rows = reader_rows(&mut app, 120, 20);
+        shows(&rows, &["❯ 把计费页改成一行一个账号", "⏺ 改好了。", "宽时三个窗口并排"]);
+        let at = |t: &str| rows.iter().position(|r| r.contains(t)).unwrap();
+        assert!(at("❯ 把计费页") < at("⏺ 改好了"));
+        // Never talked to: says so
+        app.set_glance(key, Glance { turn: Some(diff::Turn::default()), ..Default::default() });
+        shows(&reader_rows(&mut app, 120, 20), &["没有对话"]);
+        // Something on screen: the screen as before, no turn read
+        select(&mut app, "跑");
+        assert_eq!(app.glance_request(false).map(|r| r.2), Some(None));
+        shows(&reader_rows(&mut app, 120, 20), &["⏺ 还在跑"]);
+        // Running with nothing on screen yet (just starting): no old turn either
+        let i = app.all.iter().position(|s| s.title == "跑").unwrap();
+        app.all[i].screen.clear();
+        app.glance_for = None;
+        assert_eq!(app.glance_request(false).map(|r| r.2), Some(None));
+    }
+
+    #[test]
+    fn a_list_that_does_not_fit_says_how_many_more_above_and_below() {
+        let v: Vec<Session> = (0..12).map(|i| mk(&format!("会话{i:02}"), "work", State::Idle, 10 + i)).collect();
+        let mut app = App::new(String::new(), v);
+        let count = |rows: &[String], arrow: char| {
+            rows.iter().find_map(|r| r.trim().strip_prefix(arrow)?.trim().strip_prefix("还有 ")?.strip_suffix(" 个")?.parse::<usize>().ok())
+        };
+        // At the top: only below, and it counts sessions not lines (the shown ones plus the rest make 12). The cursor's row
+        // has its bar in the first cell
+        let listed = |rows: &[String]| rows.iter().filter(|r| r.starts_with("  ○ 会话") || r.starts_with("▌ ○ 会话")).count();
+        press(&mut app, KeyCode::Char('g'));
+        let rows = reader_rows(&mut app, 46, 20);
+        let shown = listed(&rows);
+        assert_eq!((count(&rows, '↑'), count(&rows, '↓')), (None, Some(12 - shown)), "{rows:#?}");
+        // In the middle: both
+        for _ in 0..9 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        let rows = reader_rows(&mut app, 46, 20);
+        let (up, down) = (count(&rows, '↑').unwrap(), count(&rows, '↓').unwrap());
+        assert_eq!(up + down + listed(&rows), 12, "{rows:#?}");
+        // The highlight is never under a hint: it's on a row that shows
+        assert!(rows.iter().any(|r| r.contains(&app.current().unwrap().title)), "{rows:#?}");
+        // At the bottom: only above
+        press(&mut app, KeyCode::Char('G'));
+        let rows = reader_rows(&mut app, 46, 20);
+        assert!(count(&rows, '↓').is_none() && count(&rows, '↑').is_some(), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("会话11")), "{rows:#?}");
+        // All fits: no hints
+        assert!(!reader_rows(&mut app, 120, 40).iter().any(|r| r.contains("还有")));
+    }
+
+    #[test]
+    fn a_jump_that_shows_or_hides_the_line_of_more_above_draws_the_settled_frame_at_once() {
+        // Several groups: the blank line before a group's header is where the first layout used to show through (the row above it
+        // drawn twice), until the next frame put it right
+        let v: Vec<Session> = (0..15).map(|i| mk(&format!("会话{i:02}"), ["a", "b", "c"][(i / 5) as usize], State::Idle, 10 + i)).collect();
+        let mut app = App::new(String::new(), v);
+        reader_rows(&mut app, 46, 20);
+        for key in ['G', 'g', 'G'] {
+            press(&mut app, KeyCode::Char(key));
+            let first = reader_rows(&mut app, 46, 20);
+            // Drawn again with nothing changed: the same frame
+            assert_eq!(first, reader_rows(&mut app, 46, 20), "after {key}");
+        }
+    }
+
+    #[test]
+    fn the_last_turn_keeps_three_lines_of_what_you_said_and_cuts_the_reply_at_the_bottom() {
+        let t = diff::Turn {
+            prompt: "一\n二\n三\n四".into(),
+            reply: (1..=30).map(|i| format!("第 {i} 行")).collect::<Vec<_>>().join("\n\n"),
+        };
+        let text: Vec<String> = turn_lines(&t, 40, 10).iter().map(|l| l.to_string()).collect();
+        assert_eq!(text[..4], ["❯ 一", "  二", "  三…", ""]);
+        assert_eq!(text[4], "⏺ 第 1 行");
+        assert_eq!(text.len(), 10);
     }
 
     #[test]
@@ -4278,19 +4866,26 @@ mod tests {
         shift(&mut app, KeyCode::Down); // ⇧↑ ⇧↓ on a group move the group; work is already at the bottom
         assert!(app.msg.is_none() && before == order(&app));
         assert!(app.reorders.is_empty());
-        // ⏎ = fold, highlight lands on the fold row
+        // ⏎ = into the group: only its sessions are listed, and no session was gone into
         press(&mut app, KeyCode::Enter);
-        assert!(app.on_fold_row() && app.head.is_none() && app.attach.is_none());
-        press(&mut app, KeyCode::Enter);
-        assert!(!app.on_fold_row() && app.attach.is_none());
+        assert_eq!((app.group.as_deref(), app.attach.is_none()), (Some("work"), true));
+    }
+
+    /// Whether a group's header saying it has n sessions is among these screen rows: " ▾ work  3", or on the desktop the name
+    /// with its number further right
+    pub(super) fn has_head(rows: &[String], group: &str, n: usize) -> bool {
+        rows.iter().any(|r| {
+            let Some(at) = r.find(group) else { return false };
+            let lead = r[..at].trim().trim_start_matches('▾');
+            lead.is_empty() && r[at + group.len()..].split_whitespace().next() == Some(n.to_string().as_str())
+        })
     }
 
     pub(super) fn layout(app: &App) -> Vec<String> {
         let view = app.visible().0;
-        list_rows(&view, app.sectioned(), 46, None, app.fold_info(), app.who_width(), false)
+        list_rows(&view, app.sectioned(), 46, None, app.who_width(), false)
             .iter()
             .map(|r| match r.pos {
-                Some(p) if app.is_fold_row(p) => format!("[▸ {}{}{}]", r.lines[0][2].0, r.lines[0][3].0, r.lines[0][4].0),
                 Some(p) => view[p].title.clone(),
                 None => format!("[{}]", r.lines[0][1].0), // Group name on a header row (the pinned block's is 「置顶」, "Pinned")
             })
@@ -4298,37 +4893,13 @@ mod tests {
     }
 
     #[test]
-    fn o_folds_the_current_section_and_enter_unfolds() {
-        let mut app = fixture();
-        press(&mut app, KeyCode::Char('a')); // All
-        assert_eq!(layout(&app), ["[fun]", "问", "未读", "[work]", "跑", "闲", "错"]);
-        pin(&mut app, "闲");
-        pin(&mut app, "闲"); // Select 闲 (pin then unpin, position unchanged)
-        press(&mut app, KeyCode::Char('o'));
-        assert_eq!(layout(&app), ["[fun]", "问", "未读", "[▸ work  3]"]);
-        assert!(app.on_fold_row()); // Highlight lands on the fold row
-        press(&mut app, KeyCode::Char('z')); // A fold row can't be read
-        assert!(app.reader.is_none());
-        press(&mut app, KeyCode::Enter); // ⏎ = unfold, not enter a session
-        assert!(app.attach.is_none());
-        assert_eq!(layout(&app), ["[fun]", "问", "未读", "[work]", "跑", "闲", "错"]);
-        press(&mut app, KeyCode::Char('g'));
-        press(&mut app, KeyCode::Char('o')); // fun has a !, visible even folded
-        assert_eq!(layout(&app), ["[▸ fun  2 ◆1]", "[work]", "跑", "闲", "错"]);
-        press(&mut app, KeyCode::Char('i')); // Everything that needs you is folded: doesn't go in
-        assert!(app.attach.is_none());
-        press(&mut app, KeyCode::Char('c')); // No copying on a fold row
-        assert!(app.clip.is_none());
-        press(&mut app, KeyCode::Char('o')); // On a fold row, o = unfold
-        assert_eq!(layout(&app)[0], "[fun]");
-    }
-
-    #[test]
     fn desktop_has_margins_one_line_a_session_and_no_dim_or_terminal_yellow() {
-        let mut v = sessions();
-        v[0].question = "Allow edit?".into();
-        v[2].who = "team".into();
-        v[2].dir = "/p/somewhere".into();
+        let mut v = three().all;
+        let at = |v: &[Session], t: &str| v.iter().position(|s| s.title == t).unwrap();
+        let (ask, run) = (at(&v, "问"), at(&v, "跑"));
+        v[ask].question = "Allow edit?".into();
+        v[run].who = "team".into();
+        v[run].dir = "/p/somewhere".into();
         let mut app = App::new(String::new(), v);
         let (w, h) = (120u16, 36u16);
         let rows = reader_rows(&mut app, w, h);
@@ -4336,8 +4907,11 @@ mod tests {
         // above the bottom bar
         let hh = h as usize;
         assert!(rows[0].is_empty() && rows[1].starts_with("    全部分组 ") && rows[2].is_empty(), "{rows:#?}");
-        assert!(rows[3].starts_with("    ▾ fun"), "{rows:#?}");
-        assert!(rows[hh - 1].is_empty() && rows[hh - 2].contains("? 快捷键") && rows[hh - 3].is_empty(), "{rows:#?}");
+        // A group's header: its name, and how many sessions ending under their times
+        assert!(rows[3].starts_with("      fun ") && rows[3].split('◆').next().unwrap().trim_end().ends_with(" 1"), "{rows:#?}");
+        let end = |y: usize, t: &str| rows[y][..rows[y].find(t).unwrap() + t.len()].width();
+        assert_eq!(end(3, " 1"), end(4, "11天"), "{rows:#?}");
+        assert!(rows[hh - 1].is_empty() && rows[hh - 2].contains(&caps("? 快捷键")) && rows[hh - 3].is_empty(), "{rows:#?}");
         // One session per row: the account right after the (longest) title, no directory in the list; one asking you gets a line
         // below with what it asks, aligned with the title
         let at = |t: &str| rows.iter().position(|r| r.contains(t)).unwrap_or_else(|| panic!("{t}: {rows:#?}"));
@@ -4347,16 +4921,20 @@ mod tests {
         assert!(!rows.iter().any(|r| r.contains("/p/somewhere")), "{rows:#?}");
         let (ask, q) = (at("1 ◆ 问"), at("Allow edit?"));
         assert_eq!((q, col(q, "Allow")), (ask + 1, col(ask, "问")));
-        assert_eq!((at("▾ work"), at("3 ○ 闲")), (q + 2, run + 1));
+        // A group's header: its name alone, no mark before it
+        let work = rows.iter().position(|r| r.trim_start().starts_with("work")).unwrap_or_else(|| panic!("{rows:#?}"));
+        assert_eq!((work, at("3 ○ 闲")), (q + 2, run + 1));
         assert_eq!(run, q + 3);
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
         let buf = t.backend().buffer();
-        // The preview's box is faint, the title on it dark
-        let corner = (0..w).find(|&x| buf[(x, 3)].symbol() == "╭").unwrap();
-        assert_eq!(buf[(corner, 3)].fg, theme::pal().faint);
-        let title = (corner..w).find(|&x| buf[(x, 3)].symbol() == "问").unwrap();
-        assert_eq!(buf[(title, 3)].fg, Color::Reset);
+        // The column beside the list has no frame: it's off the ground (the list is on it), its title dark, a faint rule
+        // under its head
+        let pre = app.preview_area;
+        assert!(!rows.iter().any(|r| r.contains('╭') || r.contains('│')), "{rows:#?}");
+        let title = (pre.x..w).find(|&x| buf[(x, 3)].symbol() == "问").unwrap();
+        assert_eq!((buf[(title, 3)].fg, buf[(title, 3)].bg, buf[(pre.x - 1, 3)].bg), (Color::Reset, Color::Reset, theme::pal().back));
+        assert_eq!((buf[(pre.x + 2, 5)].symbol(), buf[(pre.x + 2, 5)].fg), ("─", theme::pal().rule));
         for y in 0..h {
             for x in 0..w {
                 let c = &buf[(x, y)];
@@ -4376,7 +4954,7 @@ mod tests {
 
     #[test]
     fn click_on_a_section_header_stops_on_the_group() {
-        let mut app = fixture();
+        let mut app = three();
         let mut t = Terminal::new(TestBackend::new(46, 20)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
         // Row 0 top bar, 1 [fun], 2 问, 3 [work], 4 跑
@@ -4390,9 +4968,9 @@ mod tests {
         click(&mut app, 4); // Highlight on a header, click a session below it: selects, doesn't enter
         assert!(app.head.is_none() && app.attach.is_none());
         click(&mut app, 3);
-        click(&mut app, 3); // Click the header again = fold
-        assert!(app.on_fold_row() && app.attach.is_none());
-        press(&mut app, KeyCode::Enter);
+        click(&mut app, 3); // Click the header again = into the group
+        assert_eq!((app.group.as_deref(), app.attach.is_none()), (Some("work"), true));
+        app.set_group(None);
         t.draw(|f| draw(f, &mut app)).unwrap();
         click(&mut app, 2);
         assert_eq!(app.current().unwrap().title, "问");
@@ -4417,7 +4995,7 @@ mod tests {
     #[test]
     fn shift_l_cycles_what_this_screen_can_show_and_phone_and_desk_keep_their_own() {
         use Preview::*;
-        let mut app = fixture();
+        let mut app = three();
         app.screen = Rect::new(0, 0, 46, 30); // Phone
         let mut seen = vec![];
         for _ in 0..3 {
@@ -4456,6 +5034,30 @@ mod tests {
         assert_eq!(wrap_lines(v(&["x yyyyyyyyy"]), 6), ["x yyyy", "yyyyy"]); // A space too near the start isn't used as the break
     }
 
+    /// The bottom bar's text for keys written "⏎ 打开 • s 回话" ("⏎ open • s reply"): each item a key cap (`kit::key_cap`),
+    /// `CAP_GAP` between them, from the first key to the last description
+    pub(super) fn caps(keys: &str) -> String {
+        caps_apart(keys, CAP_GAP)
+    }
+
+    /// `caps` with the caps `gap` apart
+    fn caps_apart(keys: &str, gap: usize) -> String {
+        let mut spans = vec![];
+        for (i, item) in keys.split(" • ").enumerate() {
+            let (k, d) = item.split_once(' ').unwrap_or((item, ""));
+            if i > 0 {
+                spans.push(Span::raw(" ".repeat(gap)));
+            }
+            spans.extend(key_cap(k, d, None));
+        }
+        Line::from(spans).to_string().trim_start().to_string()
+    }
+
+    /// The bar has these keys (written as for `caps`), its caps the usual room apart or closed up for want of it
+    pub(super) fn has_caps(bar: &str, keys: &str) -> bool {
+        bar.contains(&caps(keys)) || bar.contains(&caps_apart(keys, CAP_GAP - 1))
+    }
+
     /// Every one is on screen (each appearing in some row, in order)
     pub(super) fn shows(rows: &[String], wants: &[&str]) {
         for w in wants {
@@ -4463,12 +5065,21 @@ mod tests {
         }
     }
 
-    /// The current scope on the top bar (the accented, underlined one)
+    /// The current scope on the top bar: its name (the underlined cells, in the accent color) and the count after it (not
+    /// underlined, minor)
     fn active_tab(app: &mut App) -> String {
         let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
         t.draw(|f| draw(f, app)).unwrap();
         let buf = t.backend().buffer();
-        (0..80u16).map(|x| &buf[(x, 0)]).filter(|c| c.modifier.contains(Modifier::UNDERLINED)).map(|c| c.symbol().to_string()).collect()
+        let row: Vec<&ratatui::buffer::Cell> = (0..80u16).map(|x| &buf[(x, 0)]).collect();
+        let lit: Vec<usize> = (0..80).filter(|&x| row[x].modifier.contains(Modifier::UNDERLINED)).collect();
+        let Some(&end) = lit.last() else { return String::new() };
+        assert!(lit.iter().all(|&x| row[x].underline_color == theme::pal().accent && row[x].modifier.contains(Modifier::BOLD)));
+        // After the name (the second half of a wide last character, then a space): the count
+        let at = (end + 1..80).find(|&x| !row[x].symbol().trim().is_empty()).unwrap();
+        assert!(row[at].fg == theme::pal().minor && !row[at].modifier.intersects(Modifier::BOLD | Modifier::UNDERLINED), "{:?}", row[at]);
+        let count: String = row[at..].iter().map(|c| c.symbol()).take_while(|s| *s != " ").collect();
+        format!("{} {count}", lit.iter().map(|&x| row[x].symbol()).collect::<String>())
     }
 
     /// Subagents in the list (matching the three in the `with_subs` record): Explore running, the one it started running too, the
@@ -4521,7 +5132,7 @@ mod tests {
         let mut v = sessions();
         v.iter_mut().find(|s| s.title == "跑").unwrap().subagents = agents;
         let mut app = App::new(String::new(), v);
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('l'));
         press(&mut app, KeyCode::Char('l'));
@@ -4538,7 +5149,7 @@ mod tests {
     #[test]
     fn l_unfolds_a_sessions_subagents_into_rows_under_it_and_h_folds_them_back() {
         let mut app = App::new(String::new(), with_agents());
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "跑");
         // Folded: that row says how many are running, plus a line atop the preview; they take no rows
         let rows = reader_rows(&mut app, 120, 30);
@@ -4596,14 +5207,11 @@ mod tests {
         }
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.current().unwrap().title, "细看 ui.rs");
-        // h: back to its session; h again: folds them (the group isn't folded); only another h folds the group
+        // h: back to its session; h again: folds them
         press(&mut app, KeyCode::Char('h'));
         assert_eq!(app.current().unwrap().title, "跑");
         press(&mut app, KeyCode::Char('h'));
         assert_eq!(order(&app), ["问", "未读", "跑", "zsh", "闲", "错"]);
-        assert!(app.folded.is_empty());
-        press(&mut app, KeyCode::Char('h'));
-        assert!(app.folded.contains("work"));
     }
 
     #[test]
@@ -4614,7 +5222,7 @@ mod tests {
         run.subagents[0].screen = long("派给它的");
         (run.subagents[2].screen, run.subagents[2].reported) = (long("交回来的"), true);
         let mut app = App::new(String::new(), v);
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('l'));
         press(&mut app, KeyCode::Char('l'));
@@ -4635,7 +5243,7 @@ mod tests {
     #[test]
     fn subagent_rows_follow_the_refresh_and_go_back_under_cover_when_none_are_left() {
         let mut app = App::new(String::new(), with_agents());
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "跑");
         press(&mut app, KeyCode::Char('l'));
         press(&mut app, KeyCode::Char('l'));
@@ -4663,6 +5271,27 @@ mod tests {
         assert_eq!(order(&app), ["问", "未读", "跑", "zsh", "闲", "错"]);
     }
 
+    /// What's drawn on the selected background, row by row (rows with none left out): the highlight is only a background
+    pub(super) fn lit_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let (mut line, mut x) = (String::new(), 0);
+                while x < w {
+                    let c = &buf[(x, y)];
+                    if c.bg == theme::pal().sel {
+                        line.push_str(c.symbol());
+                    }
+                    x += c.cell_width().max(1);
+                }
+                line.trim().to_string()
+            })
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
     pub(super) fn reader_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw(f, app)).unwrap();
@@ -4681,12 +5310,32 @@ mod tests {
             .collect()
     }
 
+    /// The column beside the list as drawn on a screen this size: its rows from the title's down, each without the blank
+    /// cells around it
+    pub(super) fn beside(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let p = app.preview_area;
+        (p.y..p.y + p.height)
+            .map(|y| {
+                let (mut line, mut x) = (String::new(), p.x);
+                while x < p.x + p.width {
+                    let cell = &buf[(x, y)];
+                    line.push_str(&ansi::strip_osc8(cell.symbol()));
+                    x += cell.cell_width().max(1);
+                }
+                line.trim().to_string()
+            })
+            .collect()
+    }
+
     #[test]
     fn preview_holds_still_while_sliding_and_catches_up_after() {
         let mut app = fixture();
-        press(&mut app, KeyCode::Char('a'));
+        to_scope(&mut app, Scope::Week);
         select(&mut app, "跑"); // The next two down are both sessions, no group header in between
-        let border = |app: &mut App| reader_rows(app, 100, 24).into_iter().find(|r| r.contains('╭')).unwrap();
+        let border = |app: &mut App| beside(app, 100, 24).remove(0);
         let cur = |app: &App| app.current().unwrap().title.clone();
         border(&mut app);
         press(&mut app, KeyCode::Down); // A single move: switches at once
@@ -4704,6 +5353,43 @@ mod tests {
     }
 
     #[test]
+    fn a_group_header_passed_mid_slide_keeps_the_held_preview() {
+        let mut app = fixture(); // [fun] 问 未读 [work] 跑 闲 错
+        to_scope(&mut app, Scope::Week);
+        select(&mut app, "问");
+        let border = |app: &mut App| beside(app, 100, 24).remove(0);
+        border(&mut app);
+        press(&mut app, KeyCode::Down); // 未读, a single move: switches at once
+        assert!(border(&mut app).contains("未读"));
+        press(&mut app, KeyCode::Down); // The work header, mid-slide: still 未读, no flash of the group's preview
+        assert!(app.on_group_row());
+        let b = border(&mut app);
+        assert!(b.contains("未读") && !b.contains("▸ work"), "{b}");
+        press(&mut app, KeyCode::Down); // 跑
+        assert!(border(&mut app).contains("未读"));
+        // Stopped on the header: its group's preview
+        press(&mut app, KeyCode::Up);
+        app.moved = app.moved.map(|(_, gap)| (Instant::now() - SETTLE * 2, gap));
+        assert!(border(&mut app).contains("▸ work"));
+    }
+
+    #[test]
+    fn on_a_local_terminal_the_preview_follows_every_step_of_a_slide() {
+        let mut app = fixture();
+        app.preview_follows = true;
+        to_scope(&mut app, Scope::Week);
+        select(&mut app, "问");
+        let border = |app: &mut App| beside(app, 100, 24).remove(0);
+        border(&mut app);
+        for want in ["未读", "▸ work", "跑", "闲"] {
+            press(&mut app, KeyCode::Down);
+            assert!(border(&mut app).contains(want), "{want}: {}", border(&mut app));
+        }
+        // Still sliding (follow mode waits for it), only the preview doesn't
+        assert!(app.settle_left().is_some());
+    }
+
+    #[test]
     fn preview_title_and_list_show_vendor_and_account() {
         let mut v = sessions();
         v[0].who = "team".into(); // 问, the first one highlighted
@@ -4713,30 +5399,34 @@ mod tests {
         let rows = reader_rows(&mut app, 46, 20);
         // On a phone the preview is below: the title sits in the divider, followed by vendor·account
         assert!(rows.iter().any(|r| r.starts_with("─ ◆ 问 ─") && r.ends_with(" Claude·team ─")), "{rows:#?}");
-        // Account names in the list are colored by vendor
+        // Account names in the list are gray like the time; the ▪ in the cell before each is colored by vendor
         select(&mut app, "闲");
         let mut t = Terminal::new(TestBackend::new(46, 20)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
         let buf = t.backend().buffer().clone();
-        let fg_of = |word: &str| {
+        let fg_of = |word: &str, before: u16| {
             let y = rows.iter().position(|r| r.contains(word) && !r.contains('·')).unwrap() as u16;
             let x = (0..46u16).find(|&x| buf[(x, y)].symbol() == &word[..1]).unwrap();
-            buf[(x, y)].fg
+            assert_eq!(buf[(x - 1, y)].symbol(), "▪", "{word}: {rows:#?}");
+            buf[(x - before, y)].fg
         };
-        assert_eq!(fg_of("team"), theme::pal().claude);
-        assert_eq!(fg_of("alt"), theme::pal().codex);
-        // The highlighted row: a pale purple background across the whole row, each span keeping its own color
+        assert_eq!((fg_of("team", 0), fg_of("team", 1)), (dim().fg.unwrap(), theme::pal().claude));
+        assert_eq!((fg_of("alt", 0), fg_of("alt", 1)), (dim().fg.unwrap(), theme::pal().codex));
+        // The highlighted row: off the ground across the whole row (the terminal's own background), a bar in the accent
+        // color in its first cell, each span keeping its own color; the rows around it are on the ground
         let y = rows.iter().position(|r| r.contains(" 闲")).unwrap() as u16;
         let (mut x, mut bad) = (0u16, vec![]);
         while x < 46 {
             let c = &buf[(x, y)];
-            if c.bg != theme::pal().sel {
+            if c.bg != Color::Reset {
                 bad.push(x);
             }
             x += c.cell_width().max(1); // The cell after a wide character is a placeholder, covered by the one before in a terminal
         }
         assert_eq!(buf[(2, y)].fg, theme::pal().muted, "图标 ○ 是灰的,不是反色");
         assert!(bad.is_empty(), "{:?} {bad:?}", rows[y as usize]);
+        assert_eq!((buf[(0, y)].symbol(), buf[(0, y)].fg), ("▌", theme::pal().accent));
+        assert_eq!((buf[(4, y - 1)].bg, buf[(4, y + 1)].bg), (theme::pal().back, theme::pal().back));
     }
 
     /// A row a feature adds has its name and value asked when the settings page opens: a language change (the run loop calls
@@ -4800,6 +5490,58 @@ mod tests {
         fn typing(&self) -> bool {
             self.0 == 1
         }
+        fn sheet(&self) -> Option<Vec<crate::sheet::Key>> {
+            (self.0 != 1).then(|| vec![crate::sheet::key("f", "说一句"), crate::sheet::key("n", "再开一页")])
+        }
+    }
+
+    #[test]
+    fn every_page_answers_question_mark_with_its_keys_except_where_you_type_or_answer() {
+        i18n::with(Lang::Zh, || {
+            let sheet = |app: &mut App| {
+                let open = app.sheet.is_some();
+                let rows = reader_rows(app, 100, 40);
+                press(app, KeyCode::Esc);
+                (open, rows)
+            };
+            let mut app = fixture().with_tools(sandbox_tools);
+            select(&mut app, "跑");
+            // Pages and popups: billing, n, S, F, the trace page
+            for (open, want) in [("$", "重新读取"), ("n", "添加账号"), ("S", "重命名"), ("F", "只看这一种"), ("Z", "切换轮次")] {
+                keys(&mut app, open);
+                press(&mut app, KeyCode::Char('?'));
+                let (on, rows) = sheet(&mut app);
+                assert!(on && rows.iter().any(|r| r.contains(want)), "{open}: {rows:#?}");
+                // Esc closed only the sheet; the page is still there, its own Esc closes it
+                assert!(app.modal_open(), "{open}");
+                press(&mut app, KeyCode::Esc);
+                assert!(!app.modal_open() && !app.quit, "{open}");
+            }
+            // The trace page's ? also has what its wide bar leaves out: paging, and O for all of them
+            keys(&mut app, "Z?");
+            shows(&reader_rows(&mut app, 100, 40), &["翻页", "全部全文"]);
+            keys(&mut app, "⎋⎋");
+            // A key picked in billing's sheet goes to billing: m shows more
+            keys(&mut app, "$?m");
+            assert!(app.sheet.is_none() && app.bill.is_some());
+            shows(&reader_rows(&mut app, 80, 10), &["m 收起"]);
+            press(&mut app, KeyCode::Esc);
+            // A confirm box: ? is "any other key", it cancels and opens nothing
+            press(&mut app, KeyCode::Char('d'));
+            assert!(app.confirm.is_some());
+            press(&mut app, KeyCode::Char('?'));
+            assert!(app.confirm.is_none() && app.sheet.is_none());
+            // After q (waiting for the next key): ? cancels, no sheet
+            keys(&mut app, "q?");
+            assert!(app.pending.is_none() && app.sheet.is_none() && !app.quit);
+            // Typing a search: ? is a character
+            keys(&mut app, "/?");
+            assert!(app.sheet.is_none() && app.filter == "?");
+            press(&mut app, KeyCode::Esc);
+            // The letter jump: ? ends it and opens the list's keys
+            keys(&mut app, "'?");
+            assert!(app.jump.is_none() && app.sheet.is_some());
+        });
     }
 
     #[test]

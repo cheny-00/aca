@@ -9,31 +9,43 @@ description_en = "Your Claude or Codex plans, dispatches workers, checks their w
 # Change it in plugins.toml: [plugins."aca.delegate"] settings = { worker = "codex:work", max_continue = 3 }
 # or with aca plugin setting aca.delegate worker codex:work
 [settings.worker]
+label = "派给谁"
+label_en = "Worker"
 default = "codex"
-desc = "派给谁:aca new 支持的工具(可带 :账号),例如 codex、codex:work、claude:work"
-desc_en = "Who gets the work: a tool that aca new accepts (with :account), such as codex, codex:work, claude:work."
+desc = "没说派给谁时,选单里排第一的那个:aca new 支持的工具(可带 :账号),例如 codex、codex:work、claude:work"
+desc_en = "First in the menu when you don't say who gets the work: a tool that aca new accepts (with :account), such as codex, codex:work, claude:work."
 
 [settings.auto]
+label = "自行使用"
+label_en = "Use on its own"
 default = true
 desc = "agent 能否自行使用 /aca:delegate:开启 = 你说「用 delegate 派出去」时它就按这份执行;关闭 = 只有你输入这个斜杠命令时才使用(仅对 Claude 有效,修改后对新启动、重启的会话生效)"
 desc_en = "Whether the agent may use /aca:delegate on its own: on = when you say \"delegate this\" it follows it; off = only when you type the slash command yourself (Claude only; applies to sessions started or restarted after the change)."
 
 [settings.language]
+label = "回复语言"
+label_en = "Language"
 default = ""
 desc = "主导的会话回复你、编写报告和计划时使用的语言(例如 简体中文);留空 = 跟随你使用的语言"
 desc_en = "The language the lead answers you and writes reports and plans in (English, for example); empty = whatever you write in."
 
 [settings.say]
+label = "代发的话"
+label_en = "What to say"
 default = "continue"
 desc = "worker 临时失败时代为发送的内容"
 desc_en = "What is said to a worker, in your place, after a temporary failure."
 
 [settings.max_continue]
+label = "最多代发次数"
+label_en = "Max retries"
 default = 5
 desc = "worker 的一轮因限流 / 过载失败时,最多代为发送几次「继续」"
 desc_en = "How many times at most to say \"carry on\" to a worker whose turn failed on a rate limit or overload."
 
 [settings.delay]
+label = "等待秒数"
+label_en = "Wait (seconds)"
 default = 30
 desc = "第 n 次代为发送前等待 n × 该秒数"
 desc_en = "Before the nth time, wait n × this many seconds."

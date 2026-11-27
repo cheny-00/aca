@@ -23,9 +23,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
-use serde_json::json;
-
-use crate::{event, paths, runtime};
+use crate::{paths, runtime};
 
 const PREFIX: &[u8] = b"\x1b]7501;";
 /// The answer to the feature query: supported, with the default states and kinds
@@ -180,19 +178,12 @@ pub fn record(id: &str, pid: u32, r: &Report) {
         return;
     }
     let state = if r.state == "clear" { "" } else { r.state.as_str() };
-    let mut changed = false;
-    runtime::update(id, |run| {
-        let same = run.ps.as_ref().is_some_and(|p| p.pid == pid && p.state == state && p.kind == r.kind && p.msg == r.msg);
-        if !same {
-            run.ps = Some(runtime::Program { pid, state: state.into(), kind: r.kind.clone(), msg: r.msg.clone(), at: paths::now() });
-            changed = true;
-        }
-    });
-    if changed {
-        event::emit("agent.status", id, json!({ "state": state, "kind": r.kind, "msg": r.msg }));
-        // Inside a sandbox this is all there is: it stands in for the hooks too
-        crate::hook::reported(id, state, &r.kind, &r.msg);
+    if runtime::load(id).ps.is_some_and(|p| p.pid == pid && p.state == state && p.kind == r.kind && p.msg == r.msg) {
+        return;
     }
+    let ps =
+        runtime::Program { pid, state: state.into(), kind: r.kind.clone(), msg: r.msg.clone(), at: paths::now(), ..Default::default() };
+    crate::hook::record(id, ps);
 }
 
 /// The master side, for the SIGWINCH handler

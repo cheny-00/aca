@@ -204,25 +204,20 @@ impl App {
         // A session / group deleted with d went to the trash: record the entry (no longer listed), ^Z brings it back
         if let Outcome::Binned { item, .. } = &mut out {
             let mut item = *std::mem::take(item);
-            // The group's recorded workspace and its note: restored as before when brought back
-            self.notes.reload();
+            // The group's recorded workspace: restored as before when brought back (its notes went with this entry in the
+            // registry, see `groups::job`)
             for g in &mut item.groups {
                 g.space = self.spaces.group_of(&item.profile, &g.path);
-                g.note = self.notes.get(&group_key(&g.path)).unwrap_or_default().to_string();
             }
             let u = Undo::Bin { id: item.id.clone(), label: item.name(), start: running };
             let gone = item.groups.clone();
             match self.trash.add(item) {
                 Ok(()) => {
                     self.remember(u);
-                    // The group's records and note are cleared: a later group of the same
-                    // name shouldn't land in the old place or carry the old note
+                    // The group's records are cleared: a later group of the same name shouldn't land in the old place
                     if !gone.is_empty() {
                         let profile = crate::data::REGISTERED;
                         let _ = self.spaces.forget_groups(&|p, g| p == profile && gone.iter().any(|x| x.path == g));
-                    }
-                    for g in gone.iter().filter(|g| !g.note.is_empty()) {
-                        let _ = self.notes.set(&group_key(&g.path), "");
                     }
                 }
                 Err(e) => out = Outcome::Failed(tr!("已删除,但未能记入回收站:{e}", "deleted, but the trash didn't record it: {e}")),
@@ -254,6 +249,7 @@ impl App {
                         let follow = self.selected.as_deref() == Some(t.name.as_str());
                         self.restarted(t, &fresh, follow);
                     }
+                    Job::Restore { item, .. } if item.note.is_some() => item.note.iter().for_each(|n| self.note_back(n)),
                     Job::Restore { item, .. } => {
                         self.unbin(item);
                         if landed.is_none() {
@@ -292,6 +288,7 @@ impl App {
             self.select_head(p);
         }
         self.reload_overlays();
+        self.reload_settings();
         match out {
             Outcome::Done(m) | Outcome::Failed(m) | Outcome::Binned { msg: m, .. } if !m.is_empty() => self.flash(&m),
             Outcome::Done(_) | Outcome::Failed(_) | Outcome::Binned { .. } => {}
@@ -328,6 +325,8 @@ impl App {
         let name = self.all.iter().find(|s| !id.is_empty() && s.deck_id == id && s.sub.is_none()).map(|s| s.name.clone());
         if let Some(p) = name.and_then(|n| self.view.iter().position(|&i| self.all[i].name == n)) {
             self.select(Some(p));
+            // The highlight is on a session: a group showing its notes page turns to its sessions
+            self.show_sessions();
         }
         self.flash(msg);
     }
@@ -340,15 +339,46 @@ impl App {
     /// An entry in the trash was brought back (⏎ on b's page, ^Z): the group's recorded workspace as before, no longer hidden,
     /// the highlight on it (a group: on its heading)
     fn restored(&mut self, item: &crate::trash::Item, fresh: Vec<Session>, msg: &str) {
+        // A note: back in its notebook
+        if let Some(n) = &item.note {
+            self.note_back(n);
+            self.set_sessions(fresh);
+            self.reload_overlays();
+            return self.flash(msg);
+        }
         self.unbin(item);
         self.land(item, &fresh);
+        let want = self.selected.clone();
         self.set_sessions(fresh);
         self.land_on_group(item);
         self.reload_overlays();
-        self.flash(msg);
+        // Brought back stopped: listing only open ones it isn't there, so say which key shows it (bringing it back counts as
+        // activity, so the last 7 days have it). Not when it's in another workspace or group, where w wouldn't show it either
+        let ours = |s: &Session| match item.group.as_str() {
+            "" => want.as_ref() == Some(&s.name),
+            g => s.group == g,
+        };
+        let shown = |s: &Session| self.view.iter().any(|&i| self.all[i].name == s.name);
+        let waiting = self.all.iter().any(|s| {
+            ours(s) && s.space == self.space && self.group.as_ref().is_none_or(|g| &s.group == g) && in_scope(Scope::Week, s) && !shown(s)
+        });
+        let m = if self.scope == Scope::Open && self.status.is_none() && !self.all.iter().any(|s| ours(s) && shown(s)) && waiting {
+            tr!("{msg} · w 近 7 天", "{msg} · w 7 days")
+        } else {
+            msg.to_string()
+        };
+        self.flash(&m);
     }
 
-    /// An entry brought back: removed from the trash, the group's recorded workspace and note as before, no longer hidden
+    /// A note deleted on its own was brought back: in the group being looked at, the notes page's cursor goes to it
+    fn note_back(&mut self, n: &crate::trash::GoneNote) {
+        if self.group.as_deref() == Some(n.group.as_str()) {
+            self.note_at = Some(n.id.clone());
+        }
+    }
+
+    /// An entry brought back: removed from the trash, the group's recorded workspace as before, no longer hidden (its notes came
+    /// back in the registry, see `ops::restore`)
     fn unbin(&mut self, item: &crate::trash::Item) {
         let _ = self.trash.forget(&item.id);
         let spaces: Vec<(spaces::Group, Option<char>)> =
@@ -356,16 +386,6 @@ impl App {
         if !spaces.is_empty() {
             let keep = self.keep_marks();
             let _ = self.spaces.assign(&[], &spaces, &keep);
-        }
-        // A group of the same name was created and a note written in the meantime: the one brought back is appended, both kept
-        self.notes.reload();
-        for g in item.groups.iter().filter(|g| !g.note.is_empty()) {
-            let key = group_key(&g.path);
-            let text = match self.notes.get(&key) {
-                Some(now) if now != g.note => format!("{now}\n\n{}", g.note),
-                _ => g.note.clone(),
-            };
-            let _ = self.notes.set(&key, &text);
         }
         self.vanish.retain(|v| !v.undone_by(item));
     }
@@ -461,9 +481,14 @@ impl App {
                 self.rebuild();
             }
             Undo::Note { key, title, text } => {
-                let m = match self.notes.set(&key, &text) {
-                    Ok(()) => tr!("已撤销修改便签「{}」", "undid the note change on “{}”", short(&title)),
-                    Err(e) => tr!("便签保存失败:{e}", "note not saved: {e}"),
+                let m = match (self.put_note(&key, &text), notes::note_of(&key)) {
+                    // One in a notebook: rewritten, deleted or just written; the notes page's cursor goes to it
+                    (Ok(()), Some(id)) => {
+                        self.note_at = Some(id.to_string());
+                        tr!("已撤销 · 笔记「{}」", "undid · note “{}”", short(&title))
+                    }
+                    (Ok(()), None) => tr!("已撤销修改便签「{}」", "undid the draft change on “{}”", short(&title)),
+                    (Err(e), _) => tr!("保存失败:{e}", "not saved: {e}"),
                 };
                 self.flash(&m);
                 self.apply_pins();
@@ -497,7 +522,7 @@ impl App {
                 }
                 let m = tr!("已撤销移动分组:「{}」回到 {from}", "undid the move: “{}” is back in {from}", short(&t.title));
                 self.stay_on_move(&t.name, &from);
-                self.revert(Job::Move { t, from: now, to: from, groups }, u, Some(m));
+                self.revert(Job::Move { t, from: now, to: from, groups, home: String::new() }, u, Some(m));
             }
             Undo::Rename { t, from, unlock } => {
                 let Some((t, _)) = self.still_here(&t) else { return };
@@ -567,7 +592,7 @@ impl App {
                     {
                         let now = s.group.clone();
                         self.stay_on_move(&t.name, &from);
-                        jobs.push(Job::Move { t, from: now, to: from, groups });
+                        jobs.push(Job::Move { t, from: now, to: from, groups, home: String::new() });
                     }
                 }
                 _ => {}

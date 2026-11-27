@@ -42,7 +42,7 @@ aca setup                                    # 在那个页面里按 +
 aca new claude:work ~/code/app
 aca run claude:work                       # 新建的目录需要登录一次:这条命令会启动 Claude,让你完成登录
 aca run codex:work -- login               # Codex 的登录
-aca account status                        # 各个账号是否已登录(是向工具本身查询的,aca 从不读取凭据)
+aca account status                        # 各个账号是否已登录(Claude 账号看它存下的登录在不在,其余向工具本身查询;aca 从不读取凭据的内容)
 ```
 
 几点说明:
@@ -128,10 +128,16 @@ team-unis = { sandbox = "unis" }
 两种在界面里都是特殊环境:按 `^E` 单独列出(`n` 里没有),每个环境一块,标题写它在哪跑、时区和代理,
 每个账号写着登录没有;列表里显示成 `team@work`、`team-unis@unis`。
 
-在 `^E` 里选中账号按 `l` 登录:下方开一个终端,在它的环境里运行登录(笼子里的在笼子里,unis 的带着它的变量)。
+在 `^E` 里选中账号按 `i` 登录:下方开一个终端,在它的环境里运行登录(笼子里的在笼子里,unis 的带着它的变量)。
 已经登录的 Codex 账号会先问一句,因为 Codex 一开始登录就清掉原来的登录。登录链接弹出来时选「在别的电脑登录」:
 链接复制好了,拿到别的电脑上打开、登录,浏览器最后会跳到一个打不开的 `http://localhost:1455/auth/callback?code=…`,
 把这个地址粘贴回 aca,按 ⏎,aca 替那台浏览器把它送给这里等着的登录。`code` 几分钟就过期,要尽快贴回来。
+
+## Antigravity 的 Google 登录和额度
+
+装好 agy 后，账号页会显示 **Antigravity**。选中这一栏可以看当前 Google 登录的邮箱、最近记录的方案和额度使用情况。按 ⏎ 打开 agy 登录，按 `p` 编辑 `[tools.agy] args`。`aca account status` 也会显示这个登录。
+
+额度只在开着不带账号的 `aca new agy` 会话时更新。账号页、`n` 菜单和计费页显示 Gemini 的 5 小时和 7 天额度已用百分比，用过第三方模型后还会显示 `3p 5h` 和 `3p 7d`。`aca limits --json` 和 `limits.changed` 中的 `used` 是已用百分比。
 
 ## Claude 的订阅额度和状态栏
 

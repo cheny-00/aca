@@ -40,6 +40,12 @@ pub struct New {
     pub notify: String,
     /// Start in a git worktree on this branch (see [`crate::worktree`]); empty = right in `dir`
     pub worktree: String,
+    /// Started by the person at the interface. The interface may itself run in some session's pane: that session isn't the
+    /// one starting this, so `ACA_SESSION_ID` says nothing here
+    pub by_you: bool,
+    pub router: bool,
+    /// The ticket, assignment message and optional watch change to record before the worker can emit a hook.
+    pub ticket: Option<(i64, String, Option<bool>)>,
 }
 
 pub(crate) fn fresh_id(store: &Store) -> String {
@@ -74,31 +80,26 @@ pub fn create_saying(store: &Store, cfg: &Config, n: New, text: &str) -> Res<(Se
             agent::OPENING_MAX
         ));
     }
-    let hold = n.hold;
-    let (s, said) = make(store, cfg, n, Some(text))?;
-    let unsaid = match (hold, said) {
-        (true, _) => Some(t!("仅登记,未启动", "only registered, not started; not carried").to_string()),
-        (false, true) => None,
-        (false, false) => send_fresh(store, cfg, &s.id, text, Duration::from_secs(60)).err(),
-    };
-    Ok((s, unsaid))
+    make(store, cfg, n, Some(text))
 }
 
-/// The second value = the opening prompt was passed as a launch argument
-fn make(store: &Store, cfg: &Config, n: New, say: Option<&str>) -> Res<(Session, bool)> {
+fn make(store: &Store, cfg: &Config, n: New, say: Option<&str>) -> Res<(Session, Option<String>)> {
     let agent::Pick { tool, account, agent, .. } = agent::pick(cfg, &n.tool)?;
     let dir = Path::new(&paths::expand(&n.dir)).canonicalize().map_err(|e| format!("{}:{e}", n.dir))?;
     if !dir.is_dir() {
         return Err(tr!("{} 不是目录", "{} is not a directory", dir.display()));
     }
-    // A cage is closed (see crate::sandbox): no session in it is started by another session, unless it takes work in
+    // Whose command this is: the session it is run in, whatever parent it names for the new one (none, when it is the
+    // person at the interface)
+    let by = if n.by_you { None } else { std::env::var("ACA_SESSION_ID").ok().filter(|p| store.get(p).is_ok()) };
+    // A cage is closed (see crate::sandbox): no session in it is started by another session, unless it takes work in.
+    // A session that says the new one has no parent (`--parent -`) is starting it all the same
     if let Some((name, _)) = crate::sandbox::cage_of(cfg, agent.name(), &account).filter(|(_, b)| !b.delegate) {
-        let from = match n.parent.as_str() {
-            "" => std::env::var("ACA_SESSION_ID").ok().filter(|p| store.get(p).is_ok()),
-            "-" => None,
+        let named = match n.parent.as_str() {
+            "" | "-" => None,
             p => Some(p.to_string()),
         };
-        if let Some(from) = from {
+        if let Some(from) = by.clone().or(named) {
             return Err(tr!(
                 "账号 {account} 只在沙箱 {name} 中使用,沙箱是封闭的:不从别的会话({from})往里派活([sandbox.{name}] 写 delegate = true 打开)",
                 "account {account} is only used inside sandbox {name}, which is closed: no work goes in from another session ({from}) (delegate = true in [sandbox.{name}] opens it)"
@@ -108,8 +109,9 @@ fn make(store: &Store, cfg: &Config, n: New, say: Option<&str>) -> Res<(Session,
     let dir = if n.worktree.is_empty() { dir } else { crate::worktree::make(&dir, n.worktree.trim())? };
     // Created from inside a session: becomes its child and joins the same group
     let parent = match n.parent.as_str() {
-        "" => std::env::var("ACA_SESSION_ID").ok().and_then(|p| store.get(&p).ok()),
-        // Created from the interface: even if the interface runs in some session's pane, it isn't that session's child
+        "" => by.as_ref().and_then(|p| store.get(p).ok()),
+        // Nobody's child: created from the interface, or by a session that hands the work on and won't look after it (a
+        // router). What it does then comes back to you, not to that session
         "-" => None,
         p => Some(store.get(p)?),
     };
@@ -139,25 +141,59 @@ fn make(store: &Store, cfg: &Config, n: New, say: Option<&str>) -> Res<(Session,
         created: paths::now(),
         archived: 0,
     };
+    let _shift = (n.router && agent.name() == "claude").then(|| crate::router::lock_shift(&s.id)).transpose()?;
     store.insert(&s)?;
+    if n.router
+        && let Err(e) = store.claim_router(&s)
+    {
+        store.remove(&s.id)?;
+        return Err(e);
+    }
     runtime::update(&s.id, |r| {
         r.locked = s.title_locked;
         r.notify = n.notify.clone();
     });
+    // `by`: which session's command made it (null = nobody's, you did), whether or not it is the parent
+    let me = by.as_ref().and_then(|id| store.get(id).ok());
+    let say = say.map(|text| crate::inbox::forward(store, me.as_ref(), &s.id, text));
+    let by = by.map_or(serde_json::Value::Null, |b| json!(b));
     event::emit(
         "session.created",
         &s.id,
-        json!({ "title": s.title, "tool": s.tool, "account": s.account, "dir": s.dir, "group": s.group, "parent": s.parent }),
+        json!({ "title": s.title, "tool": s.tool, "account": s.account, "dir": s.dir, "group": s.group, "parent": s.parent, "by": by }),
     );
-    if n.hold {
-        return Ok((s, false));
+    let mut previous = None;
+    if let Some((n, words, watch)) = n.ticket {
+        match crate::task::start_with(store, cfg, me.as_ref(), n, &s.id, &words, watch) {
+            Ok(old) => previous = Some((old, watch)),
+            Err(e) => {
+                remove(store, &s.id)?;
+                return Err(e);
+            }
+        }
     }
-    match launch_saying(cfg, &s, None, How::Fresh, say) {
-        Ok(said) => Ok((s, said)),
+    if n.hold {
+        let unsaid = say.map(|_| t!("仅登记,未启动", "only registered, not started; not carried").to_string());
+        return Ok((s, unsaid));
+    }
+    match launch_saying(cfg, &s, None, How::Fresh, say.as_deref()) {
+        Ok(said) => {
+            let unsaid = say.filter(|_| !said).and_then(|text| send_fresh(store, cfg, &s.id, &text, Duration::from_secs(60)).err());
+            Ok((s, unsaid))
+        }
         Err(e) => {
             // Never started at all (the program isn't on PATH and the like): take back the registration, clean up the just-created
             // clean worktree too, and leave no row in the list that can't start
             if tmux::find(&s.id).is_none() {
+                if let Some((old, watch)) = previous
+                    && store.undo_task_start(&old, &s.id, watch)?
+                {
+                    event::emit(
+                        "task.changed",
+                        &old.session,
+                        json!({ "n": old.n, "group": old.group, "title": old.title, "by": by.as_str().unwrap_or_default() }),
+                    );
+                }
                 let _ = remove(store, &s.id);
             }
             Err(e)
@@ -227,9 +263,20 @@ fn launch(cfg: &Config, s: &Session, pane: Option<&Pane>, how: How) -> Res<()> {
     launch_saying(cfg, s, pane, how, None).map(drop)
 }
 
-/// [`launch`], with the opening prompt. Returns whether it was passed as a launch argument (see [`crate::launch::launch`])
+/// [`launch`], with the opening prompt. Returns whether the launch has already sent it.
 fn launch_saying(cfg: &Config, s: &Session, pane: Option<&Pane>, how: How, say: Option<&str>) -> Res<bool> {
     let l = crate::launch::launch(cfg, s, &how, say)?;
+    // A previous agy process may have exited mid-turn; its final redraw is not part of this launch.
+    if runtime::load(&s.id).agy.is_some() {
+        runtime::update(&s.id, |r| {
+            r.agy = None;
+            r.agy_quota = None;
+            if matches!(r.status.as_str(), "running" | "waiting") {
+                r.status = "idle".into();
+                r.clear_ask();
+            }
+        });
+    }
     let argv: Vec<String> = l.argv.iter().map(|a| tmux::arg(a)).collect();
     match pane {
         Some(p) => {
@@ -267,6 +314,11 @@ fn launch_saying(cfg: &Config, s: &Session, pane: Option<&Pane>, how: How, say: 
         }
     }
     runtime::update(&s.id, |r| {
+        // A fast router may already have connected its bell or reported a question.
+        if r.shift == s.conv && !r.shift.is_empty() {
+            r.idle_stopped = 0;
+            return;
+        }
         r.clear_error();
         r.clear_ask();
         // The doorbell waits for the agent started this time to connect it itself (Claude's SessionStart)
@@ -289,15 +341,70 @@ fn launch_saying(cfg: &Config, s: &Session, pane: Option<&Pane>, how: How, say: 
         How::Fork(_) => "fork",
     };
     event::emit("session.started", &s.id, json!({ "how": how }));
+    if let Some(text) = l.handoff {
+        submit_handoff(cfg, s, &text)?;
+        return Ok(true);
+    }
     Ok(l.said)
 }
 
-/// Starts it if not running (resuming the old conversation); returns what was done
+/// The caller owns the shift lock until Enter. The MCP writer takes only the runtime lock.
+fn submit_handoff(cfg: &Config, s: &Session, text: &str) -> Res<()> {
+    let start = Instant::now();
+    let listed = loop {
+        if runtime::load(&s.id).tools_listed {
+            break true;
+        }
+        if start.elapsed() >= Duration::from_secs(15) {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let outcome = if listed { "ready" } else { "timeout" };
+    crate::plugin::log_line("aca.router", &format!("{} {} tools/list {outcome} after {} ms", s.id, s.conv, start.elapsed().as_millis()));
+    let file = paths::state_dir().join("opening").join(&s.id);
+    let sent = paths::write_private(&file, text)
+        .map_err(|e| e.to_string())
+        .and_then(|()| send_when_ready(cfg, s, tmux::Paste::File(&file), Duration::from_secs(60)));
+    let _ = std::fs::remove_file(file);
+    if let Err(e) = sent {
+        runtime::update(&s.id, |r| {
+            r.opening_mail = None;
+            r.router_input = None;
+        });
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Start one new conversation in the existing registration. The caller holds the shift lock.
+fn new_shift(cfg: &Config, s: &Session, pane: Option<&Pane>) -> Res<()> {
+    let conv = agent::of(cfg, s)?.0.new_conv();
+    launch(cfg, &Session { conv, ..s.clone() }, pane, How::Fresh)
+}
+
+/// A delivery holds the shift lock through the paste and Enter in the new pane.
+pub(crate) fn wake_shift(cfg: &Config, s: &Session, pane: Option<&Pane>) -> Res<bool> {
+    if let Some(p) = pane.filter(|p| !p.dead) {
+        let Some(idle) = expired_shift(cfg, s) else { return Ok(false) };
+        halt(p);
+        event::emit("session.stopped", &s.id, json!({ "idle": idle }));
+    }
+    new_shift(cfg, s, pane)?;
+    Ok(true)
+}
+
+/// Starts it if not running; returns what was done
 pub fn start(store: &Store, cfg: &Config, key: &str) -> Res<&'static str> {
     let s = store.get(key)?;
+    let shift = crate::router::shift_lock(store, cfg, &s)?;
     let pane = tmux::find(&s.id);
     if pane.as_ref().is_some_and(|p| !p.dead) {
         return Ok(t!("已在运行", "already running"));
+    }
+    if shift.is_some() {
+        new_shift(cfg, &s, pane.as_ref())?;
+        return Ok(t!("已启动,开始新对话", "started, with a new conversation"));
     }
     let (how, conv) = how_to_resume(cfg, &s, &runtime::load(&s.id));
     let said = match how {
@@ -362,6 +469,7 @@ fn sync_conv(store: &Store, s: &Session) {
 
 pub fn stop(store: &Store, key: &str) -> Res<()> {
     let s = store.get(key)?;
+    let _shift = crate::router::shift_lock(store, &crate::config::load(), &s)?;
     let p = tmux::find(&s.id).ok_or(t!("未运行", "not running"))?;
     halt(&p);
     sync_conv(store, &s);
@@ -390,13 +498,18 @@ pub struct Idled {
 /// compacting the conversation, or couldn't resume it on restart (shell, tools that can't resume, ones never spoken to)
 /// are not stopped; each one is looked at again from scratch before stopping (see [`idle_for`]). `spare`: ones the
 /// caller also wants kept
-pub fn stop_idle(store: &Store, cfg: &Config, after: u64, spare: &dyn Fn(&str) -> bool) -> Res<Vec<Idled>> {
+pub fn stop_idle(store: &Store, cfg: &Config, after: Option<u64>, spare: &dyn Fn(&str) -> bool) -> Res<Vec<Idled>> {
     let rows = status::collect(store, cfg, true)?;
+    let routers: HashSet<String> = store.routers()?.into_iter().map(|(_, id)| id).collect();
     let mut out = vec![];
-    for row in candidates(&rows, paths::now(), after).into_iter().filter(|r| !spare(&r.id)) {
+    for (row, after) in candidates(&rows, paths::now(), after, &routers, cfg) {
         let Ok(s) = store.get(&row.id) else { continue };
-        let Some(idle) = idle_for(cfg, &s, after) else { continue };
-        if how_to_resume(cfg, &s, &runtime::load(&s.id)).0 == How::Fresh {
+        let shift = crate::router::shift_lock(store, cfg, &s)?;
+        if shift.is_none() && (spare(&s.id) || how_to_resume(cfg, &s, &runtime::load(&s.id)).0 == How::Fresh) {
+            continue;
+        }
+        let Some(idle) = idle_for(cfg, &s, after, shift.is_some()) else { continue };
+        if shift.is_some() && crate::inbox::wants_wake(&s.id) {
             continue;
         }
         let Some(p) = tmux::find(&s.id).filter(|p| !p.dead) else { continue };
@@ -414,16 +527,36 @@ pub fn stop_idle(store: &Store, cfg: &Config, after: u64, spare: &dyn Fn(&str) -
 
 /// Rows in the list that look stoppable (they still have to pass [`idle_for`]): idle, nobody attached, no background
 /// tasks, no delegated sessions open, and last touched / last hook event `after` seconds or more ago (the real "how long
-/// nothing has happened" also counts screen output and the conversation record, in [`idle_for`])
-fn candidates(rows: &[status::Row], now: u64, after: u64) -> Vec<&status::Row> {
+/// nothing has happened" also counts screen output and the conversation record, in [`idle_for`]). Claude routers have their own timeout.
+fn candidates<'a>(
+    rows: &'a [status::Row],
+    now: u64,
+    after: Option<u64>,
+    routers: &HashSet<String>,
+    cfg: &Config,
+) -> Vec<(&'a status::Row, u64)> {
     let open_kids: HashSet<&str> =
         rows.iter().filter(|r| !matches!(r.state, State::Exited | State::Stopped)).map(|r| r.parent.as_str()).collect();
-    rows.iter().filter(|r| quiet(r) && now.saturating_sub(r.active) >= after && !open_kids.contains(r.id.as_str())).collect()
+    rows.iter()
+        .filter_map(|r| {
+            let router = routers.contains(&r.id);
+            let limit = if router {
+                agent::tool(cfg, &r.tool).filter(|t| t.kind == "claude")?;
+                cfg.router.idle()?
+            } else {
+                if open_kids.contains(r.id.as_str()) {
+                    return None;
+                }
+                after?
+            };
+            (quiet(r, router) && now.saturating_sub(r.active) >= limit).then_some((r, limit))
+        })
+        .collect()
 }
 
 /// The state read from the screen is idle (not running, not asking, no error), nobody is attached, no background tasks
-fn quiet(r: &status::Row) -> bool {
-    r.state == State::Idle && r.attached == 0 && r.bg == 0
+fn quiet(r: &status::Row, router: bool) -> bool {
+    (r.state == State::Idle || (router && r.state == State::Unread)) && r.attached == 0 && r.bg == 0
 }
 
 /// How many seconds it has been idle; None if under `after`, or if any one thing makes it unclear it's really idle. Read
@@ -436,14 +569,17 @@ fn quiet(r: &status::Row) -> bool {
 /// - The last time anything happened (see [`stirred`]) is `after` seconds or more ago
 /// - It has nothing scheduled for itself that's still due (Claude's CronCreate, the next `/loop`, see
 ///   [`crate::schedule`]): those live only in its process and would be lost on stop
-/// - Its inbox has no scheduled message that isn't due yet ([`crate::inbox::scheduled`]): once stopped, it couldn't be
-///   delivered when due
+/// - Ordinary sessions have no future inbox message ([`crate::inbox::scheduled`]); Claude routers can restart when it is due
 /// - It isn't compacting the conversation ([`compacting`]). An idle Claude compacts by itself after nearly an hour (before
 ///   the prompt cache expires), and then the hook state is still "finished"
-fn idle_for(cfg: &Config, s: &Session, after: u64) -> Option<u64> {
+fn idle_for(cfg: &Config, s: &Session, after: u64, router: bool) -> Option<u64> {
     let p = tmux::find(&s.id).filter(|p| !p.dead)?;
     let r = runtime::load(&s.id);
-    if !matches!(r.status.as_str(), "" | "idle" | "done") || compacting(&r, paths::now()) || !quiet(&status::one(cfg, s, true)) {
+    if paths::now().saturating_sub(r.started.max(r.hook_at()).max(s.created)) < after
+        || !matches!(r.status.as_str(), "" | "idle" | "done")
+        || compacting(&r, paths::now())
+        || !quiet(&status::one(cfg, s, true), router)
+    {
         return None;
     }
     let (agent, _) = agent::of(cfg, s).ok()?;
@@ -454,7 +590,11 @@ fn idle_for(cfg: &Config, s: &Session, after: u64) -> Option<u64> {
     }
     let now = paths::now();
     let idle = now.saturating_sub(stirred(&p, &r, s.created, now));
-    (idle >= after && !crate::schedule::pending(&r, now) && crate::inbox::scheduled(&s.id).is_empty()).then_some(idle)
+    (idle >= after && !crate::schedule::pending(&r, now) && (router || crate::inbox::scheduled(&s.id).is_empty())).then_some(idle)
+}
+
+fn expired_shift(cfg: &Config, s: &Session) -> Option<u64> {
+    idle_for(cfg, s, cfg.router.idle()?, true)
 }
 
 /// After a PreCompact with no finish ever seen (compaction failed, the process is gone), stop treating it as compacting
@@ -503,9 +643,13 @@ fn written(r: &Run) -> (u64, u64) {
 /// Restarts in place, resuming the old conversation; `fresh` = start a new one
 pub fn restart(store: &Store, cfg: &Config, key: &str, fresh: bool) -> Res<()> {
     let s = store.get(key)?;
+    let shift = crate::router::shift_lock(store, cfg, &s)?;
     let pane = tmux::find(&s.id);
     if let Some(p) = &pane {
         halt(p);
+    }
+    if shift.is_some() {
+        return new_shift(cfg, &s, pane.as_ref());
     }
     let (how, conv) = how_to_resume(cfg, &s, &runtime::load(&s.id));
     let (how, conv) = if fresh { (How::Fresh, agent::of(cfg, &s)?.0.new_conv()) } else { (how, conv) };
@@ -552,6 +696,7 @@ fn rehome_spec(cfg: &Config, s: &Session, to: &str) -> String {
 pub fn rehome(store: &Store, cfg: &Config, key: &str, to: &str) -> Res<Rehomed> {
     let s = store.get(key)?;
     let (agent, _) = agent::of(cfg, &s)?;
+    let shift = crate::router::shift_lock(store, cfg, &s)?;
     let p = agent::pick(cfg, &rehome_spec(cfg, &s, to))?;
     if p.agent.name() != agent.name() {
         return Err(tr!(
@@ -576,7 +721,7 @@ pub fn rehome(store: &Store, cfg: &Config, key: &str, to: &str) -> Res<Rehomed> 
     }
     let (from, dest) = (agent::home(cfg, &s.tool, &s.account)?, agent::home(cfg, &p.tool, &p.account)?);
     let r = runtime::load(&s.id);
-    let (how, conv) = how_to_resume(cfg, &s, &r);
+    let (how, conv) = if shift.is_some() { (How::Fresh, String::new()) } else { how_to_resume(cfg, &s, &r) };
     let carry = match &how {
         How::Resume(c) | How::Fork(c) => c.clone(),
         How::Fresh => String::new(),
@@ -634,7 +779,12 @@ pub fn rehome(store: &Store, cfg: &Config, key: &str, to: &str) -> Res<Rehomed> 
         });
     }
     event::emit("session.rehomed", &s.id, json!({ "tool": p.tool, "account": p.account, "from": label(&s.tool, &s.account) }));
-    launch(cfg, &Session { tool: p.tool.clone(), account: p.account.clone(), args, conv, ..s }, pane.as_ref(), how)?;
+    let moved = Session { tool: p.tool, account: p.account, args, conv, ..s };
+    if shift.is_some() {
+        new_shift(cfg, &moved, pane.as_ref())?;
+    } else {
+        launch(cfg, &moved, pane.as_ref(), how)?;
+    }
     Ok(Rehomed { to: target, copied, note })
 }
 
@@ -753,7 +903,12 @@ pub fn rename(store: &Store, key: &str, title: &str) -> Res<String> {
     }
     let s = store.get(key)?;
     store.set_title(&s.id, title, true)?;
-    runtime::update(&s.id, |r| r.locked = true);
+    runtime::update(&s.id, |r| {
+        r.locked = true;
+        if r.agy.is_some() {
+            r.named = title.to_string();
+        }
+    });
     let name = tmux::sync_name(&s.id, title).unwrap_or_default();
     event::emit("session.renamed", &s.id, json!({ "title": title, "tmux": name }));
     Ok(name)
@@ -774,13 +929,59 @@ pub fn unlock(store: &Store, key: &str) -> Res<()> {
 /// Returns which group it went into
 pub fn move_to(store: &Store, key: &str, group: &str) -> Res<String> {
     let s = store.get(key)?;
-    let group = match group.trim_matches('/') {
+    let group = group_named(store, &s, group)?;
+    place(store, &s, &group, "")?;
+    Ok(group)
+}
+
+/// The group `aca move` names for this session: as written, or the one its directory decides
+fn group_named(store: &Store, s: &Session, group: &str) -> Res<String> {
+    Ok(match group.trim_matches('/') {
         BY_DIR => store.group_claim(&s.dir)?.0,
         g => g.to_string(),
-    };
-    store.set_group(&s.id, &group)?;
-    event::emit("session.moved", &s.id, json!({ "group": group }));
-    Ok(group)
+    })
+}
+
+/// Puts the session last in `group` and says so in the event stream: where it was, and which session's command moved it
+/// (`by`; empty = nobody's, you did)
+fn place(store: &Store, s: &Session, group: &str, by: &str) -> Res<()> {
+    store.set_group(&s.id, group)?;
+    let by = if by.is_empty() { serde_json::Value::Null } else { json!(by) };
+    event::emit("session.moved", &s.id, json!({ "group": group, "from": s.group, "by": by }));
+    Ok(())
+}
+
+/// Moves several sessions to another group (`aca move a b c GROUP`), in the order given. `tree`: what each one sent out
+/// goes along, however many levels down, parents first — the ones that share its group, that is: one already somewhere
+/// else was put there on purpose. One already in the group stays where it is in it. A key that finds no session moves
+/// nothing at all. `by`: the session the command was run in (empty = none). Returns each session looked at with the group
+/// it is in now
+pub fn move_all(store: &Store, keys: &[String], group: &str, tree: bool, by: &str) -> Res<Vec<(String, String)>> {
+    let heads: Vec<Session> = keys.iter().map(|k| store.get(k)).collect::<Res<_>>()?;
+    let all = if tree { store.sessions(true)? } else { vec![] };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = vec![];
+    for head in heads {
+        let to = group_named(store, &head, group)?;
+        let mut batch = vec![head.clone()];
+        let mut i = 0;
+        while i < batch.len() {
+            let up = batch[i].id.clone();
+            let kids = all.iter().filter(|k| k.parent == up && k.group == head.group && !batch.iter().any(|b| b.id == k.id));
+            batch.extend(kids.cloned().collect::<Vec<_>>());
+            i += 1;
+        }
+        for s in batch {
+            if !seen.insert(s.id.clone()) {
+                continue;
+            }
+            if s.group != to {
+                place(store, &s, &to, by)?;
+            }
+            out.push((s.id, to.clone()));
+        }
+    }
+    Ok(out)
 }
 
 fn kill_tmux(s: &Session) {
@@ -884,12 +1085,41 @@ pub fn send(store: &Store, cfg: &Config, key: &str, text: &str, wait: Option<Dur
             _ => break row.pane,
         }
     };
-    type_in(&pane, text)
+    type_in(&pane, tmux::Paste::Text(text))
+}
+
+/// Why [`say`] didn't type it in: the interface words it, with the key to press next
+#[derive(Debug, PartialEq)]
+pub enum Unsent {
+    /// It's waiting for a confirmation: Enter might pick the default option
+    Asking,
+    /// Its agent isn't running
+    Stopped,
+    Failed(String),
+}
+
+/// What a person wrote in the interface. Connected Claude sessions use inbox delivery so a busy pane or a draft gets
+/// the doorbell. For direct typing, check again in case a confirmation appeared while the user wrote the reply.
+pub fn say(store: &Store, cfg: &Config, key: &str, text: &str) -> Result<(), Unsent> {
+    let s = store.get(key).map_err(Unsent::Failed)?;
+    let shift = crate::router::shift_lock(store, cfg, &s).map_err(Unsent::Failed)?;
+    let row = status::one(cfg, &s, true);
+    let stopped = matches!(row.state, State::Stopped | State::Exited);
+    let bell = !stopped && crate::inbox::connected_bell(cfg, &s);
+    match row.state {
+        State::Ask if !bell => Err(Unsent::Asking),
+        _ if bell || (shift.is_some() && (stopped || expired_shift(cfg, &s).is_some() || runtime::load(&s.id).opening_mail.is_some())) => {
+            drop(shift);
+            crate::inbox::send_as(store, cfg, None, &s.id, text, 0, "").map(drop).map_err(Unsent::Failed)
+        }
+        State::Stopped | State::Exited => Err(Unsent::Stopped),
+        _ => type_in(&row.pane, tmux::Paste::Text(text)).map_err(Unsent::Failed),
+    }
 }
 
 /// Pastes into the input box, then presses Enter
-fn type_in(pane: &str, text: &str) -> Res<()> {
-    tmux::paste(pane, text)?;
+fn type_in(pane: &str, source: tmux::Paste<'_>) -> Res<()> {
+    tmux::paste_from(pane, source)?;
     // Enter needs a short pause: Claude swallows an Enter right after a bracketed paste as part of the paste
     std::thread::sleep(Duration::from_millis(150));
     tmux::run(&["send-keys", "-t", pane, "Enter"]).map(|_| ())
@@ -902,14 +1132,21 @@ fn type_in(pane: &str, text: &str) -> Res<()> {
 /// longer asking but the interface isn't up yet, so anything typed then reaches no one
 pub fn send_fresh(store: &Store, cfg: &Config, key: &str, text: &str, wait: Duration) -> Res<()> {
     let s = store.get(key)?;
+    send_when_ready(cfg, &s, tmux::Paste::Text(text), wait)
+}
+
+fn send_when_ready(cfg: &Config, s: &Session, source: tmux::Paste<'_>, wait: Duration) -> Res<()> {
     let t = Instant::now();
     let mut last: Vec<String> = vec![];
     let pane = loop {
         let p = tmux::find(&s.id).filter(|p| !p.dead).ok_or(t!("会话未运行", "the session isn't running"))?;
         let now = tmux::capture(&p.pane);
         let settled = now.iter().any(|l| !l.trim().is_empty()) && now == last;
-        let busy = matches!(status::one(cfg, &s, true).state, State::Running | State::Ask);
-        if settled && !busy {
+        let busy = matches!(status::one(cfg, s, true).state, State::Running | State::Ask);
+        if settled
+            && !busy
+            && (!matches!(source, tmux::Paste::File(_)) || crate::inbox::draft('❯', &tmux::capture_ansi(&p.pane)) == Some(false))
+        {
             break p.pane;
         }
         if t.elapsed() > wait {
@@ -922,7 +1159,7 @@ pub fn send_fresh(store: &Store, cfg: &Config, key: &str, text: &str, wait: Dura
         last = now;
         std::thread::sleep(Duration::from_millis(500));
     };
-    type_in(&pane, text)
+    type_in(&pane, source)
 }
 
 /// Marks it as read
@@ -994,9 +1231,19 @@ mod tests {
         rows[8].bg = 2;
         rows[10].parent = "boss".into();
         rows[12].parent = "boss2".into();
-        let ids = |after| candidates(&rows, now, after).iter().map(|r| r.id.clone()).collect::<Vec<_>>();
-        assert_eq!(ids(3600), ["old", "boss2"]);
-        assert_eq!(ids(60), ["old", "new", "boss2"]);
+        let none = HashSet::new();
+        let cfg = crate::config::parse("[router]\nidle='never'");
+        let ids = |after, keep: &HashSet<String>| {
+            candidates(&rows, now, Some(after), keep, &cfg).iter().map(|(r, _)| r.id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(3600, &none), ["old", "boss2"]);
+        assert_eq!(ids(60, &none), ["old", "new", "boss2"]);
+        // An explicit never keeps a router up regardless of the ordinary timeout.
+        assert_eq!(ids(3600, &HashSet::from(["old".to_string()])), ["boss2"]);
+        let routers = ["old", "new", "asks", "watched", "boss2"].map(String::from).into_iter().collect();
+        rows[11].tool = "codex".into();
+        let shifts = candidates(&rows, now, None, &routers, &Config::default());
+        assert_eq!(shifts.iter().map(|(r, limit)| (r.id.as_str(), *limit)).collect::<Vec<_>>(), [("old", 3600)]);
     }
 
     #[test]

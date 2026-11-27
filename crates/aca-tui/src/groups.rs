@@ -1,6 +1,6 @@
 //! Creating a group: `^N`, type a name, ⏎ creates it (`Act::Create`); its title is in the list right away, then you pick a
 //! directory to open a session; Esc midway still keeps the group.
-//! Deleting a group: on a group in the list (title / fold row / empty group) press `d`; the confirm box says what goes with it;
+//! Deleting a group: on a group (its title in the list / its rail row / an empty group) press `d`; the confirm box says what goes with it;
 //! `y` deletes (`Act::Delete`).
 //! Editing a group: on a group press `r`: rename first (a parent may be included: `fun/aca`), then change the default directory
 //! (`Act::Edit`, see `rename_all`).
@@ -8,7 +8,8 @@
 //! Deleting a group = its subgroups and the sessions in them (including those in subgroups, and archived ones) go to the trash
 //! together (see trash.rs):
 //! - sessions are archived (running ones stopped, all waited on together to exit cleanly); the group's registration is deleted
-//!   and recorded as it was (order, default directory) in that trash entry
+//!   and recorded as it was (order, default directory) in that trash entry; the notes in its notebook are deleted along with
+//!   that entry (kept in the registry, marked with the entry's key)
 //! - within 1 day, `^Z` / `⏎` on the `b` page brings the whole entry back; only after 1 day are the sessions really deleted
 //! - sessions already archived before the delete (including ones `d` deleted that are still in the trash) are recorded as
 //!   archived and come back archived
@@ -62,6 +63,43 @@ pub fn rename_all(store: &Store, from: &str, to: &str) -> Res<usize> {
         }
     }
     Ok(n)
+}
+
+/// The scratch group: where sessions that belong to no project go. It's whichever group works in `dir` (`[scratch] dir`), under
+/// whatever name it has. `groups`: every group with its default directory. None = the setting is empty, or no group works there
+pub fn scratch_in(groups: &[(String, String)], dir: &str) -> Option<String> {
+    if dir.is_empty() {
+        return None;
+    }
+    let real = aca_core::paths::real(dir);
+    groups.iter().find(|(_, d)| !d.is_empty() && aca_core::paths::real(d) == real).map(|(g, _)| g.clone())
+}
+
+/// The scratch group as the registry and config.toml have it now (the command line asks before removing a group)
+pub fn scratch(store: &Store) -> Option<String> {
+    let groups: Vec<(String, String)> = store.groups().ok()?.into_iter().map(|g| (g.path, g.default_path)).collect();
+    scratch_in(&groups, &crate::config::scratch_dir())
+}
+
+/// Make sure the scratch directory has its group: the directory is made if it's missing, and when no group works in it one is
+/// created that does. It's named 随手问 (scratch), unless a group of that name already works somewhere else: then after the
+/// directory, as `aca group add` names one. Returns the group
+pub fn ensure_scratch(store: &Store, dir: &str) -> Res<String> {
+    let groups: Vec<(String, String)> = store.groups()?.into_iter().map(|g| (g.path, g.default_path)).collect();
+    if let Some(g) = scratch_in(&groups, dir) {
+        return Ok(g);
+    }
+    std::fs::create_dir_all(dir).map_err(|e| tr!("无法创建目录 {}:{e}", "can't make directory {}: {e}", aca_records::words::tilde(dir)))?;
+    let real = aca_core::paths::real(dir);
+    let name = t!("随手问", "scratch");
+    match groups.iter().find(|(g, _)| g.eq_ignore_ascii_case(name)) {
+        Some((_, d)) if !d.is_empty() => Ok(store.group_claim(&real)?.0),
+        there => {
+            let name = there.map_or(name, |(g, _)| g.as_str());
+            store.group_create_in(name, &real)?;
+            Ok(name.to_string())
+        }
+    }
 }
 
 /// What to do
@@ -169,6 +207,7 @@ fn delete(profile: &str, group: &str) -> Outcome {
                 archived: s.archived > 0,
             })
             .collect(),
+        note: None,
     };
     if let Some((_, e)) = stuck.first() {
         item.groups.clear();
@@ -178,6 +217,8 @@ fn delete(profile: &str, group: &str) -> Outcome {
     if let Err(e) = store.group_drop(group) {
         return failed(e);
     }
+    // Its notes go with this entry, and come back with it
+    let _ = store.notes_bin_group(group, &item.id);
     let n = item.taken();
     let msg = if n > 0 {
         tr!("已删除分组 {group} 和里面 {n} 个会话 · ^Z 撤销", "deleted group {group} and its {n} sessions · ^Z undoes")
@@ -273,6 +314,40 @@ mod tests {
     }
 
     #[test]
+    fn the_scratch_group_is_whichever_works_in_the_scratch_directory_and_is_made_when_none_does() {
+        let store = Store::memory();
+        let root = std::env::temp_dir().join(format!("aca-scratch-{}-{}", std::process::id(), aca_core::paths::short_id()));
+        let at = |p: &str| root.join(p).to_string_lossy().into_owned();
+        let default = |g: &str| store.groups().unwrap().into_iter().find(|x| x.path == g).map(|x| x.default_path);
+        // None works there yet: the directory is made, and a group named for what it's for
+        assert_eq!(ensure_scratch(&store, &at("home")).unwrap(), "随手问");
+        assert!(root.join("home").is_dir());
+        assert_eq!(default("随手问"), Some(aca_core::paths::real(&at("home"))));
+        // Asked again, or with the directory written another way: the same one, nothing new
+        assert_eq!(ensure_scratch(&store, &format!("{}/", at("home"))).unwrap(), "随手问");
+        assert_eq!(store.groups().unwrap().len(), 1);
+        // It goes by the directory, not by the name: renamed, it's still the one
+        store.group_rename("随手问", "loose").unwrap();
+        assert_eq!(ensure_scratch(&store, &at("home")).unwrap(), "loose");
+        // The directory moved elsewhere and the name is taken by a group that works somewhere: named after the directory
+        store.group_create_in("随手问", &at("home")).unwrap_err();
+        store.group_create("随手问", "").unwrap();
+        std::fs::create_dir_all(root.join("taken")).unwrap();
+        store.group_set_dir("随手问", &at("taken")).unwrap();
+        assert_eq!(ensure_scratch(&store, &at("other/asks")).unwrap(), "asks");
+        assert_eq!(default("asks"), Some(aca_core::paths::real(&at("other/asks"))));
+        // A group of that name with no directory yet becomes it
+        store.group_set_dir("随手问", "").unwrap();
+        assert_eq!(ensure_scratch(&store, &at("third")).unwrap(), "随手问");
+        // Found from the list of groups: by directory; nothing set, or nobody there = none
+        let groups: Vec<(String, String)> = store.groups().unwrap().into_iter().map(|g| (g.path, g.default_path)).collect();
+        assert_eq!(scratch_in(&groups, &at("home")).as_deref(), Some("loose"));
+        assert_eq!(scratch_in(&groups, ""), None);
+        assert_eq!(scratch_in(&groups, &at("nowhere")), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_rename_reaches_subgroups_only() {
         assert_eq!(renamed("fun", "fun", "play").as_deref(), Some("play"));
         assert_eq!(renamed("fun/app/old", "fun/app", "deck").as_deref(), Some("deck/old"));
@@ -297,10 +372,9 @@ mod tests {
         assert_eq!((again.group_of("default", "deck"), again.group_of("default", "fun/app")), (Some('h'), None));
         assert_eq!((again.group_of("default", "fun/apple"), again.group_of("", "-")), (Some('2'), Some('3')));
         let _ = std::fs::remove_dir_all(dir);
-        let mut v =
-            crate::state::View { group: Some("fun/app/old".into()), folded: vec!["fun".into(), "fun/app".into()], ..Default::default() };
+        let mut v = crate::state::View { group: Some("fun/app/old".into()), ..Default::default() };
         assert!(v.rename_group("fun/app", "deck"));
-        assert_eq!((v.group.as_deref(), v.folded.as_slice()), (Some("deck/old"), &["fun".to_string(), "deck".to_string()][..]));
+        assert_eq!(v.group.as_deref(), Some("deck/old"));
         assert!(!v.rename_group("nope", "x"));
     }
 

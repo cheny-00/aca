@@ -12,5 +12,8 @@ aca-records.workspace = true
 aca-tui.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+rusqlite.workspace = true
+
 [lints]
 workspace = true

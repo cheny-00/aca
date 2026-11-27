@@ -44,7 +44,7 @@ Then use it as `claude:work`:
 aca new claude:work ~/code/app
 aca run claude:work                       # a new directory needs one login: this starts Claude so you can log in
 aca run codex:work -- login               # the same for Codex
-aca account status                        # which accounts are logged in (asked from the tools; aca never reads credentials)
+aca account status                        # which accounts are logged in (Claude: whether its stored login is there; the rest asked from the tools; aca never reads what a login holds)
 ```
 
 Good to know:
@@ -150,12 +150,18 @@ In the interface both kinds are special environments: `^E` lists them apart (the
 under a heading saying where it runs, its time zone and proxy, each account saying whether it's logged in; the list
 shows them as `team@work`, `team-unis@unis`.
 
-In `^E`, `l` on an account logs it in: a terminal opens below running the login in its environment (inside the cage
+In `^E`, `i` on an account logs it in: a terminal opens below running the login in its environment (inside the cage
 for a cage's, with unis's variables for unis's). A logged-in Codex account asks first, since Codex clears the old login
 as soon as it starts. When the login link pops up, pick 「在别的电脑登录」 (log in on another computer): the link is
 copied; open it on the other computer and log in, and that browser ends up on an address that doesn't load,
 `http://localhost:1455/auth/callback?code=…`. Paste that address back into aca and press ⏎: aca makes the request that
 browser would have made to the login waiting here. The `code` expires within minutes, so paste it back soon.
+
+## Antigravity's Google login and quotas
+
+With agy installed, select **Antigravity** on the accounts page to see the active Google email, the last recorded plan, and quota usage. Press Enter to open agy for login or `p` to edit `[tools.agy] args`. The login also appears in `aca account status`.
+
+Quotas update only while an `aca new agy` session with no named account is open. The accounts page, the `n` menu, and billing show the percentage used in each Gemini window (5 hours and 7 days). After use, third-party models also show `3p 5h` and `3p 7d`. In `aca limits --json` and `limits.changed`, `used` is the percentage consumed.
 
 ## Claude's subscription limits and status bar
 

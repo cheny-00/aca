@@ -74,9 +74,35 @@ pub struct Draft {
     pub base: Option<String>,
     /// ^T switched to a shell: open a shell, cd and start cc / codex yourself (not the carried-over tool / the one picked from the menu)
     pub shell: bool,
+    /// The new session is to be its group's router (`o` on a group that has none): it stays in that group whatever the path,
+    /// and is never a shell
+    pub router: bool,
+    /// That group is the scratch group, so the router is the desk: the box is called after it
+    pub desk: bool,
 }
 
 impl Draft {
+    /// `o` on a group without a router: this draft, as that group's router. The group is fixed (see `router`)
+    pub fn for_router(mut self, group: &str) -> Self {
+        self.router = true;
+        self.shell = false;
+        let cfg = aca_core::config::load();
+        if !self.tool.is_empty() && !aca_core::agent::tool(&cfg, &self.tool).is_some_and(|t| matches!(t.kind.as_str(), "claude" | "codex"))
+        {
+            (self.tool, self.account, self.label) = Default::default();
+        }
+        if let Err(reason) = self.check_router_account(&cfg) {
+            self.hint = reason;
+        }
+        self.group_override = Some(group.to_string());
+        self
+    }
+
+    /// `o` with no desk yet: this draft, as the router of the scratch group `group`
+    pub fn for_desk(self, group: &str) -> Self {
+        Self { desk: true, ..self.for_router(group) }
+    }
+
     /// `hints` fetches the "path → group" clues (read from the db at run time, faked in unit tests)
     pub fn from(s: Option<&Session>, hints: fn() -> GroupHints) -> Self {
         let text = match s {
@@ -102,6 +128,8 @@ impl Draft {
             group_override: None,
             base: None,
             shell: false,
+            router: false,
+            desk: false,
         }
     }
 
@@ -127,12 +155,33 @@ impl Draft {
         d
     }
 
+    /// N / n with no project under the cursor: the path is filled with the scratch directory `dir`, unchanged means into the
+    /// scratch group (a changed one goes by the path, as always); tool and account carry over from s when there is one
+    pub fn in_scratch(s: Option<&Session>, group: &str, dir: &str, hints: fn() -> GroupHints) -> Self {
+        let mut d = Draft::from(s, hints);
+        d.text = tilde(dir);
+        d.origin = Some((d.text.clone(), group.to_string()));
+        d
+    }
+
     /// The directory doesn't exist yet (Enter will create it)
     pub fn is_new_dir(&self) -> bool {
         !self.text.trim().is_empty() && !std::path::Path::new(&expand(&self.text)).exists()
     }
 
+    fn check_router_account(&self, cfg: &aca_core::config::Config) -> Result<(), String> {
+        let tool = if self.tool.is_empty() { "claude" } else { self.tool.as_str() };
+        if let Some(def) = aca_core::agent::tool(cfg, tool) {
+            let account = if self.account.is_empty() { &def.account } else { &self.account };
+            aca_core::router::check_account(cfg, &def.kind, account)?;
+        }
+        Ok(())
+    }
+
     pub fn finish(&self) -> Result<NewReq, String> {
+        if self.router {
+            self.check_router_account(&aca_core::config::load())?;
+        }
         if self.text.trim().is_empty() {
             return Err(t!("路径不能为空", "the path is empty").into());
         }
@@ -144,8 +193,10 @@ impl Draft {
             tool,
             account,
             create_dir: self.is_new_dir(),
-            bind: self.binds_dir(),
+            // A router's group is the one it was asked for on: there already, whatever directory the router works in
+            bind: self.binds_dir() && !self.router,
             by_dir,
+            router: self.router,
         })
     }
 
@@ -616,11 +667,17 @@ pub fn pick_dir(p: &DirPick) -> Result<Option<Picked>, String> {
 
 /// Run a single-select fzf once; extra goes after the common args (on duplicate args the later one wins)
 pub fn fzf(cands: &[String], extra: &[&str]) -> Result<Option<String>, String> {
+    fzf_with(cands, extra, &[])
+}
+
+/// The same, with `env` added to fzf's environment: the commands its bindings run see it
+pub fn fzf_with(cands: &[String], extra: &[&str], env: &[(&str, String)]) -> Result<Option<String>, String> {
     let mut child = Command::new("fzf")
         // The input line is fixed at the bottom (near the phone keyboard), so up = next; Tab does nothing in single-select, so it cycles
         // candidates
         .args(["--tiebreak=index", "--no-multi", "--layout=default", "--bind=tab:up,btab:down"])
         .args(extra)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -717,6 +774,9 @@ pub struct NewReq {
     /// The group was inferred from the path: let core claim it by directory (`-g .`), recording this directory on a group with no default
     /// directory; when a same-named group records another directory, number onward, and the same directory goes into it next time
     pub by_dir: bool,
+    /// The new session is its group's router: named after the group, told what a router does as it starts, and recorded as
+    /// the group's router. The scratch group's is the desk: it has its own name and is told what the desk does
+    pub router: bool,
 }
 
 impl NewReq {
@@ -738,22 +798,68 @@ pub(crate) fn first_line(b: &[u8]) -> String {
     String::from_utf8_lossy(b).lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string()
 }
 
-/// Register + start, returns the session id
-pub fn create(req: &NewReq) -> Result<String, String> {
+/// What `create` made
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Created {
+    pub id: String,
+    /// A router whose opening message didn't reach it: the message, and why. It is still the group's router
+    pub unsaid: Option<(String, String)>,
+}
+
+/// Register + start
+pub fn create(req: &NewReq) -> Result<Created, String> {
+    let cfg = aca_core::config::load();
+    let router = if req.router {
+        let p = aca_core::agent::pick(&cfg, &req.spec())?;
+        if !matches!(p.agent.name(), "claude" | "codex") {
+            return Err(t!("router 需要 Claude 或 Codex", "a router needs Claude or Codex").into());
+        }
+        aca_core::router::check_account(&cfg, p.agent.name(), &p.account)?;
+        Some(p.agent)
+    } else {
+        None
+    };
     if req.create_dir {
         std::fs::create_dir_all(&req.dir).map_err(|e| tr!("无法创建 {}:{e}", "can't create {}: {e}", tilde(&req.dir)))?;
     }
     let store = Store::open()?;
-    let cfg = aca_core::config::load();
+    if let Some(agent) = router {
+        let scratch = crate::groups::scratch(&store).unwrap_or_default();
+        // The scratch group's router is the desk: it has a name and a brief of its own
+        let desk = scratch == req.group;
+        let title = if desk { aca_core::router::desk_title() } else { aca_core::router::title(&req.group) };
+        let n = session::New {
+            tool: req.spec(),
+            dir: req.dir.clone(),
+            title,
+            group: req.group.clone(),
+            parent: "-".into(),
+            by_you: true,
+            router: true,
+            ..Default::default()
+        };
+        if agent.name() == "claude" {
+            let s = session::create(&store, &cfg, n)?;
+            return Ok(Created { id: s.id, unsaid: None });
+        }
+        let brief = if desk {
+            aca_core::router::desk_brief(&req.group, &crate::config::scratch_dir())
+        } else {
+            aca_core::router::brief(&req.group, &scratch)
+        };
+        let (s, why) = session::create_saying(&store, &cfg, n, &brief)?;
+        return Ok(Created { id: s.id, unsaid: why.map(|w| (brief, w)) });
+    }
     let group = if req.by_dir { session::BY_DIR.to_string() } else { req.group.clone() };
-    let n = session::New { tool: req.spec(), dir: req.dir.clone(), group, parent: "-".into(), ..Default::default() };
+    // Started by you, even when this interface runs in some session's pane: nobody's child, and not that session's doing
+    let n = session::New { tool: req.spec(), dir: req.dir.clone(), group, parent: "-".into(), by_you: true, ..Default::default() };
     let s = session::create(&store, &cfg, n)?;
     if req.bind {
         // Failing to bind (the directory is already another group's default) doesn't stop the session; N here just won't go into this group
         // automatically later
         let _ = store.group_set_dir(&s.group, &req.dir);
     }
-    Ok(s.id)
+    Ok(Created { id: s.id, unsaid: None })
 }
 
 /// Start a registered session (⏎ after stopping it with D): if the pane is still there, start in place, continuing the old conversation
@@ -775,6 +881,7 @@ mod tests {
             create_dir: false,
             bind: false,
             by_dir: false,
+            router: false,
         };
         assert_eq!(r.spec(), "claude"); // nothing to carry over: the default tool
         assert_eq!(NewReq { tool: "codex".into(), account: "team".into(), ..r.clone() }.spec(), "codex:team");
@@ -808,6 +915,8 @@ mod tests {
             group_override: None,
             base: None,
             shell: false,
+            router: false,
+            desk: false,
         }
     }
 

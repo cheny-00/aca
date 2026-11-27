@@ -123,6 +123,7 @@ impl Down {
         self.note(&tr!("启动:{} {}", "starting: {} {}", self.spec.command, self.spec.args.join(" ")));
         let mut c = Command::new(&self.spec.command);
         c.args(&self.spec.args).envs(self.spec.env.iter().map(|(k, v)| (k, v)));
+        c.env("ACA_GATEWAY_TOOLS", "1");
         if !self.session.is_empty() {
             c.env("ACA_SESSION_ID", &self.session);
         } else {

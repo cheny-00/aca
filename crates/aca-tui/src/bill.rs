@@ -335,7 +335,7 @@ fn family_spans(name: &str, agent: Option<Agent>, rest: Style) -> Vec<Span<'stat
 /// The account's full name in the quota block (the one colors are looked up by)
 fn quota_name(q: &Quota) -> String {
     match q.agent {
-        Agent::Claude | Agent::Codex => aca_records::usage::account_name(q.agent, &q.who),
+        Agent::Claude | Agent::Codex | Agent::Agy => aca_records::usage::account_name(q.agent, &q.who),
         _ => q.who.clone(),
     }
 }
@@ -425,14 +425,131 @@ fn label_width(qs: &[Quota]) -> usize {
     qs.iter().flat_map(|q| &q.wins).map(|w| w.label.width()).max().unwrap_or(0).max(3)
 }
 
-fn quota_block(r: &Report, w: usize) -> Vec<Line<'static>> {
-    if r.quotas.is_empty() && r.quota_note.is_empty() {
-        return vec![];
+/// When a window resets, short enough for one row per account: the time today, the weekday this week, else the date
+fn short_when(ts: i64, now: i64, off: i64) -> String {
+    let (d, h, m) = local(ts, off);
+    match d - local(now, off).0 {
+        0 => format!("{h:02}:{m:02}"),
+        1..=6 => WEEK[weekday(d)].to_string(),
+        _ => {
+            let (_, mo, dd) = civil_from_days(d);
+            format!("{mo}/{dd}")
+        }
     }
+}
+
+/// Bars in the one-row layout
+const ROW_BAR: usize = 6;
+
+/// One account on one row, its windows side by side: "■ Claude ding    5h ▄▄▖    36% 19:40   7d ▄▄     34% 周三", how old
+/// the numbers are at the right end once stale; below it, a line for each window that runs out before it resets at this pace.
+/// name_w / label_w / when_w: the widest name, window name and reset time across the block; cols: every window in the block, in
+/// order, each in its own column (one this account doesn't have is left blank), so the columns line up
+fn quota_row(
+    q: &Quota,
+    swatch: Color,
+    (now, off): (i64, i64),
+    (name_w, label_w, when_w): (usize, usize, usize),
+    cols: &[String],
+    w: usize,
+) -> Vec<Line<'static>> {
+    let p = theme::pal();
+    let name = aca_records::usage::account_shown(&quota_name(q)).to_string();
+    let mut v = vec![Span::raw(" "), Span::styled("■ ", Style::new().fg(swatch))];
+    v.extend(family_spans(&name, Some(q.agent), Style::new().add_modifier(Modifier::BOLD)));
+    v.push(Span::raw(" ".repeat(name_w.saturating_sub(name.width()) + 4)));
+    let indent = 3 + name_w + 4;
+    let mut below = vec![];
+    // Blank columns at the end are left out (the age goes to the right end anyway)
+    let last = cols.iter().rposition(|c| q.wins.iter().any(|x| &x.label == c)).map_or(0, |i| i + 1);
+    for (i, label) in cols.iter().take(last).enumerate() {
+        if i > 0 {
+            v.push(Span::raw("   "));
+        }
+        let Some(win) = q.wins.iter().find(|x| &x.label == label) else {
+            v.push(Span::raw(" ".repeat(label_w + 1 + ROW_BAR + 6 + when_w)));
+            continue;
+        };
+        v.push(Span::raw(format!("{} ", rpad(&win.label, label_w))));
+        if win.resets.is_some_and(|r| r <= now) {
+            v.push(Span::styled(lpad(t!("已重置", "reset"), ROW_BAR + 6 + when_w), Style::new().fg(p.green)));
+            continue;
+        }
+        let status = match win.used {
+            u if u >= 90.0 => Some(p.red),
+            u if u >= 70.0 => Some(p.amber),
+            _ => None,
+        };
+        let (bar, track) = meter(win.used.clamp(0.0, 100.0), ROW_BAR);
+        v.push(Span::styled(bar, Style::new().fg(status.unwrap_or(p.total))));
+        v.push(Span::styled(track, Style::new().fg(p.track)));
+        v.push(Span::styled(
+            format!(" {}", rpad(&format!("{:.0}%", win.used), 4)),
+            status.map_or(Style::new(), |c| Style::new().fg(c)).add_modifier(Modifier::BOLD),
+        ));
+        let at = win.resets.map(|r| short_when(r, now, off)).unwrap_or_default();
+        v.push(Span::styled(format!(" {}", lpad(&at, when_w)), dim()));
+        let base = if q.updated > 0 { q.updated } else { now };
+        let len = window_secs(&win.label).or((q.agent == Agent::Claude).then_some(7 * 86400));
+        if let (Some(r), Some(len)) = (win.resets, len)
+            && let Some(t) = runs_out(win.used, r, len, base).filter(|&t| t > now)
+        {
+            let s = tr!("{}{} 按当前速度 {} 用完", "{}{} at this pace, used up {}", " ".repeat(indent), win.label, when(t, now, off));
+            below.push(Line::styled(s, Style::new().fg(if win.used >= 70.0 { p.red } else { p.amber })));
+        }
+    }
+    if q.wins.is_empty() && !q.note.is_empty() {
+        v.push(Span::styled(q.note.clone(), dim()));
+    }
+    // How old the numbers are, at the right end, only once they're stale and only when there's room
+    let used: usize = v.iter().map(|s| s.content.width()).sum();
+    let age = (q.updated > 0 && now - q.updated > STALE).then(|| ago(q.updated, now));
+    if let Some(age) = age.filter(|a| used + 2 + a.width() <= w) {
+        v.push(Span::raw(" ".repeat(w.saturating_sub(used + age.width()).max(2))));
+        v.push(Span::styled(age, dim()));
+    }
+    let mut out = vec![Line::from(v)];
+    out.extend(below);
+    out
+}
+
+/// The quota block's heading and the note under it
+fn quota_head(r: &Report, w: usize) -> Vec<Line<'static>> {
     let mut out = vec![head(t!("订阅额度", "Subscription quotas"), "", w)];
     if !r.quota_note.is_empty() {
         out.push(Line::from(Span::styled(format!("   {}", r.quota_note), dim())));
     }
+    out
+}
+
+/// The quota block with one row per account, windows side by side; None when w is too narrow for it (76 columns or less, or a
+/// row doesn't fit)
+fn quota_rows(r: &Report, w: usize) -> Option<Vec<Line<'static>>> {
+    if w <= 76 || r.quotas.is_empty() {
+        return None;
+    }
+    let (pal, label_w) = (account_palette(r), label_width(&r.quotas));
+    let name_w = r.quotas.iter().map(|q| aca_records::usage::account_shown(&quota_name(q)).width()).max().unwrap_or(0);
+    let when_w =
+        r.quotas.iter().flat_map(|q| &q.wins).filter_map(|x| x.resets).map(|t| short_when(t, r.now, r.off).width()).max().unwrap_or(0);
+    let cols = crate::rehome::Cols::of(&r.quotas, r.now).names();
+    let rows: Vec<Line<'static>> = r
+        .quotas
+        .iter()
+        .flat_map(|q| quota_row(q, color_of(&pal, &quota_name(q)), (r.now, r.off), (name_w, label_w, when_w), &cols, w))
+        .collect();
+    rows.iter().all(|l| l.width() <= w).then(|| [quota_head(r, w), rows].concat())
+}
+
+fn quota_block(r: &Report, w: usize) -> Vec<Line<'static>> {
+    if r.quotas.is_empty() && r.quota_note.is_empty() {
+        return vec![];
+    }
+    // Wide enough: one row per account; otherwise (a phone) each window on its own line
+    if let Some(rows) = quota_rows(r, w) {
+        return rows;
+    }
+    let mut out = quota_head(r, w);
     let (pal, label_w) = (account_palette(r), label_width(&r.quotas));
     for q in &r.quotas {
         quota_lines(&mut out, q, color_of(&pal, &quota_name(q)), (r.now, r.off), w, label_w);
@@ -1009,7 +1126,9 @@ pub fn lines(r: &Report, sel: usize, more: bool, w: usize) -> Vec<Line<'static>>
     let dirs = |w| if more { rows_block(t!("按目录", "By directory"), &g.by_dir, g.cost, TOP_DIRS, Kind::Dir, &[], w) } else { vec![] };
     if w >= TWO_COL {
         let cw = ((w - GAP) / 2).min(COL_W);
-        let quota = quota_block(r, cw);
+        // One row per account needs more than a column: across both columns on top, when it fits there
+        let across = quota_rows(r, 2 * cw + GAP);
+        let quota = if across.is_some() { vec![] } else { quota_block(r, cw) };
         let (tl, tr) = if quota.is_empty() {
             (totals_block(r, sel, cw), usage(cw))
         } else {
@@ -1028,7 +1147,11 @@ pub fn lines(r: &Report, sel: usize, more: bool, w: usize) -> Vec<Line<'static>>
             rows_block(t!("按账号", "By account"), &g.by_src, g.cost, usize::MAX, Kind::Src, &pal, cw),
             rows_block(t!("按会话", "By session"), &g.by_session, g.cost, TOP_SESSIONS, Kind::Session, &pal, cw),
         ]);
-        let mut out = side_by_side(tl, tr, cw);
+        let mut out = across.unwrap_or_default();
+        if !out.is_empty() {
+            out.push(Line::default());
+        }
+        out.extend(side_by_side(tl, tr, cw));
         out.push(Line::default());
         out.extend(side_by_side(left, right, cw));
         return out;
@@ -1051,6 +1174,18 @@ pub fn lines(r: &Report, sel: usize, more: bool, w: usize) -> Vec<Line<'static>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_billing_quota_shows_used_on_wide_and_phone_screens() {
+        let r = Report { quotas: vec![crate::rehome::test_agy_quota()], ..Default::default() };
+        for w in [160, 40] {
+            let block = text(&quota_block(&r, w)).join("\n");
+            assert!(block.contains("Antigravity") && !block.contains("剩余"), "{block}");
+            assert_eq!(block.matches(" 1%").count(), 2, "{block}");
+            assert_eq!(block.matches('▖').count(), 2, "{block}");
+            println!("billing {w}\n{block}");
+        }
+    }
     use aca_records::usage::Win;
 
     fn text(ls: &[Line]) -> Vec<String> {
@@ -1133,6 +1268,65 @@ mod tests {
         assert_eq!(t.len(), 5, "{t:#?}");
         assert!(t[1].starts_with("      5h ") && t[2].starts_with("      7d ") && t[3].starts_with("   Fable "), "{t:#?}");
         assert!(t[4].contains("按当前速度"), "{t:#?}");
+    }
+
+    #[test]
+    fn wide_each_account_is_one_row_with_its_windows_side_by_side() {
+        let (day, now) = (86400, 1_000_000);
+        let win = |label: &str, used, resets| Win { label: label.into(), used, resets: Some(resets) };
+        let acct = |who: &str, agent, wins: Vec<Win>, updated| Quota {
+            agent,
+            who: who.into(),
+            plan: "max".into(),
+            updated,
+            wins,
+            note: String::new(),
+        };
+        let mut quotas: Vec<Quota> = (0..5)
+            .map(|i| {
+                acct(
+                    &format!("c{i}"),
+                    Agent::Claude,
+                    vec![win("5h", 30.0, now + 3600), win("7d", 40.0, now + 3 * day), win("Fable", 17.0, now + 3 * day)],
+                    now,
+                )
+            })
+            .collect();
+        // One whose 5h window already reset, numbers two hours old; one Codex all reset; the first runs out before the reset
+        quotas[1].wins[0].resets = Some(now - 60);
+        quotas[1].updated = now - 2 * 3600;
+        quotas[0].wins[2].used = 80.0;
+        quotas.push(acct("cx", Agent::Codex, vec![win("5h", 0.0, now - 60), win("7d", 0.0, now - 60)], now - 5 * day));
+        quotas.push(acct("c9", Agent::Claude, vec![win("5h", 95.0, now + 3600)], now));
+        let r = Report { quotas, now, off: 0, ..Default::default() };
+        let t = text(&quota_block(&r, 200));
+        // Seven accounts, one line of heading, one warning: not more than ten lines
+        assert!(t.len() <= 10, "{t:#?}");
+        let row = |who: &str| t.iter().find(|l| l.contains(&format!(" {who} "))).unwrap_or_else(|| panic!("{who}: {t:#?}")).clone();
+        let c0 = row("c0");
+        assert!(c0.contains("5h ") && c0.contains("7d ") && c0.contains("Fable ") && c0.contains("30%"), "{c0}");
+        assert!(row("c1").contains("已重置") && row("c1").trim_end().ends_with("2 小时前"), "{}", row("c1"));
+        assert!(t.iter().any(|l| l.contains("Fable 按当前速度")), "{t:#?}");
+        // The windows start in the same column on every row
+        let col = |l: &str| l.find("7d ").map(|i| l[..i].width());
+        assert_eq!(col(&c0), col(&row("c2")));
+        // Narrow (a phone): as before, each window on its own line
+        let narrow = text(&quota_block(&r, 46));
+        assert!(narrow.len() > 20 && narrow.iter().any(|l| l.trim_start().starts_with("5h ")), "{narrow:#?}");
+        // Through the page: across the top (on a wide page the columns are too narrow for it), still ten lines at most
+        let mut page = report();
+        let shift = page.now - now;
+        page.quotas = r.quotas.clone();
+        for q in &mut page.quotas {
+            q.updated += shift;
+            q.wins.iter_mut().for_each(|w| w.resets = w.resets.map(|t| t + shift));
+        }
+        for w in [200, 120, 100] {
+            let t = text(&lines(&page, 1, false, w));
+            let top = t.iter().position(|l| l.contains("订阅额度")).unwrap_or_else(|| panic!("{w}: {t:#?}"));
+            let n = t[top..].iter().position(|l| l.trim().is_empty()).unwrap_or(t.len() - top);
+            assert!(n <= 10 && t[top + 1].contains("7d "), "{w}: {t:#?}");
+        }
     }
 
     fn report() -> Report {
@@ -1450,9 +1644,40 @@ mod tests {
     }
 
     #[test]
+    fn one_row_per_account_keeps_each_window_in_its_own_column() {
+        let mut r = report();
+        let now = r.now;
+        // work has 5h and 7d, cx only 7d; another with 7d and Fable but no 5h
+        r.quotas.push(Quota {
+            agent: Agent::Claude,
+            who: "sub".into(),
+            plan: String::new(),
+            wins: vec![
+                Win { label: "Fable".into(), used: 31.0, resets: Some(now + 3 * 86400) },
+                Win { label: "7d".into(), used: 57.0, resets: Some(now + 2 * 86400) },
+            ],
+            updated: now - 180,
+            note: String::new(),
+        });
+        let t = text(&quota_rows(&r, 160).expect("wide enough for one row each"));
+        let at = |who: &str, label: &str| {
+            let (_, l) = find(&t, who);
+            l.find(&format!(" {label} ")).map(|i| l[..i].width())
+        };
+        assert!(at("work", "7d").is_some() && at("work", "7d") == at("cx", "7d") && at("cx", "7d") == at("sub", "7d"), "{t:#?}");
+        assert_eq!((at("work", "Fable"), at("cx", "5h"), at("sub", "5h")), (None, None, None));
+        assert!(at("sub", "Fable") > at("sub", "7d"), "{t:#?}");
+        // Narrower than the columns need: each window on a line of its own, as on a phone
+        assert!(quota_rows(&r, 80).is_none());
+    }
+
+    #[test]
     fn a_wide_screen_puts_two_columns_side_by_side() {
         let t = text(&lines(&report(), 1, false, 140));
-        assert!(t[0].starts_with(" 订阅额度") && t[0].contains("按 API 价"));
+        // The quotas one row per account across the top, the totals and the trend in two columns below
+        assert!(t[0].starts_with(" 订阅额度") && !t[0].contains("按 API 价"), "{t:#?}");
+        let (_, l) = find(&t, "按 API 价");
+        assert!(l.trim_start().starts_with("按 API 价") || l.starts_with(" 按 API 价"), "{l}");
         let (_, l) = find(&t, "按天");
         assert!(l.contains("按账号"), "走势和按账号并排:{l}");
         // Narrow means one column

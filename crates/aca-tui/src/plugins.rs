@@ -1,5 +1,5 @@
 //! Plugin manager: `P` on the list opens this page (like a vim plugin manager, lazy.nvim's `:Lazy`). The box has a fixed size
-//! (most of the screen on a desktop). On the left, one plugin per row (on ● / off ○ / broken ✕, name), with aca's bundled ones not
+//! (most of the screen on a desktop). On the left, one plugin per row (on [✓] / off [ ] / broken ✕, name), with aca's bundled ones not
 //! yet installed listed below under "Available"; on the right, details of the highlighted one: name and version, where it's from
 //! (a word or two), on or off, description, and below that what can be changed (settings, tools for the agent, keys in the plugin
 //! menu, see plugtune.rs).
@@ -197,10 +197,10 @@ pub enum Act {
     AfterEdit,
     /// Give / don't give the agent a capability as a tool: (plugin, capability, give or not)
     Tool(String, String, bool),
-    /// A key in the `:` menu: (plugin, capability / pane / view, Some(key) / Some("") no key / None back to the manifest's)
+    /// A key in the list's `?`: (plugin, capability / pane / view, Some(key) / Some("") no key / None back to the manifest's)
     Key(String, String, Option<String>),
-    /// Change a setting: (plugin, name, Some(value) / None back to the default)
-    Setting(String, String, Option<String>),
+    /// Change a setting: (plugin, name, Some(value) / None back to the default, what the interface calls it)
+    Setting(String, String, Option<String>, String),
 }
 
 impl Act {
@@ -220,7 +220,7 @@ impl Act {
             Act::Tool(id, tool, true) => tr!("正在将「{}」提供给 agent…", "giving agents “{}”…", called(id, Some(tool))),
             Act::Tool(id, tool, false) => tr!("正在收回「{}」…", "withholding “{}”…", called(id, Some(tool))),
             Act::Key(id, target, _) => tr!("正在修改「{}」的按键…", "changing the key for “{}”…", called(id, Some(target))),
-            Act::Setting(_, name, _) => tr!("正在修改 {name}…", "changing {name}…"),
+            Act::Setting(_, _, _, label) => tr!("正在修改 {label}…", "changing {label}…"),
         }
     }
 }
@@ -278,9 +278,9 @@ pub fn job(a: &Act) -> Outcome {
             }
             Err(e) => Outcome::Failed(e),
         },
-        Act::Setting(id, name, value) => match plugin::set_setting(id, name, value.as_deref()) {
-            Ok(()) if value.is_some() => Outcome::Done(tr!("{name} 已修改", "{name} saved")),
-            Ok(()) => Outcome::Done(tr!("{name} 已恢复默认", "{name} is back to its default")),
+        Act::Setting(id, name, value, label) => match plugin::set_setting(id, name, value.as_deref()) {
+            Ok(()) if value.is_some() => Outcome::Done(tr!("{label} 已修改", "{label} saved")),
+            Ok(()) => Outcome::Done(tr!("{label} 已恢复默认", "{label} is back to its default")),
             Err(e) => Outcome::Failed(e),
         },
     }
@@ -514,7 +514,9 @@ impl Page {
         self.edited = edit_file(id.as_deref(), mine.as_deref(), fx);
     }
 
-    /// The left list: one per row (on ● / off ○ / broken ✕, name), "Available" ones below. Also returns which row is highlighted
+    /// The left list: one per row (on [✓] / off [ ] / broken ✕ / not installed +, name), "Available" ones below; the highlighted row
+    /// on the selected background, or, while the right pane has the keys, its name in the accent color. Also returns which row is
+    /// highlighted
     fn list(&self, w: usize) -> (Vec<Line<'static>>, Option<usize>) {
         let mut out = vec![];
         let mut at = None;
@@ -533,10 +535,10 @@ impl Page {
                 at = Some(out.len());
             }
             let (mark, mark_st) = match (r.available, &r.problem, r.enabled) {
-                (true, ..) => ("+", theme::accent()),
-                (_, Some(_), _) => ("✕", theme::warn()),
-                (_, None, true) => ("●", theme::accent()),
-                (_, None, false) => ("○", kit::dim()),
+                (true, ..) => (" + ", theme::accent()),
+                (_, Some(_), _) => (" ✕ ", theme::warn()),
+                (_, None, true) => ("[✓]", theme::accent()),
+                (_, None, false) => ("[ ]", kit::dim()),
             };
             let (tag, tag_st) = match (r.available, &r.problem, r.enabled) {
                 (true, ..) => ("", kit::dim()),
@@ -546,15 +548,16 @@ impl Page {
                 _ => ("", kit::dim()),
             };
             let name_st = match (r.available, r.enabled) {
+                // Whose settings the right pane is showing
+                _ if on && self.focus != Focus::List => theme::accent().add_modifier(Modifier::BOLD),
                 (true, _) => Style::new(),
                 (false, true) => Style::new().add_modifier(Modifier::BOLD),
                 (false, false) => kit::dim(),
             };
-            let bar = if on { Span::styled("▌", theme::accent()) } else { Span::raw(" ") };
-            let room = w.saturating_sub(4 + if tag.is_empty() { 0 } else { tag.width() + 1 });
+            let room = w.saturating_sub(6 + if tag.is_empty() { 0 } else { tag.width() + 1 });
             let name = kit::clip(&title(r), room).trim_end().to_string();
             let line = kit::spread(
-                vec![bar, Span::styled(mark, mark_st), Span::raw(" "), Span::styled(name, name_st)],
+                vec![Span::raw(" "), Span::styled(mark, mark_st), Span::raw(" "), Span::styled(name, name_st)],
                 vec![Span::styled(tag.to_string(), tag_st)],
                 w,
             );
@@ -568,8 +571,8 @@ impl Page {
         let (state, st) = match (r.available, &r.problem, r.enabled) {
             (true, ..) => (t!("未安装", "not installed"), kit::dim()),
             (_, Some(_), _) => (t!("✕ 清单有问题", "✕ manifest problem"), theme::warn()),
-            (_, None, true) => (t!("● 已开启", "● on"), theme::accent()),
-            (_, None, false) => (t!("○ 已关闭", "○ off"), kit::dim()),
+            (_, None, true) => (t!("[✓] 已开启", "[✓] on"), theme::accent()),
+            (_, None, false) => (t!("[ ] 已关闭", "[ ] off"), kit::dim()),
         };
         let room = w.saturating_sub(state.width() + 2);
         let name = kit::clip(&title(r), room).trim_end().to_string();
@@ -732,7 +735,7 @@ impl Page {
             return vec![("⏎", t!("安装", "install")), ("^U", t!("清空", "clear")), ("Esc", t!("取消", "cancel"))];
         }
         if self.armed {
-            return vec![("x", t!("删除", "remove")), ("Esc", t!("取消", "keep"))];
+            return vec![("y", t!("删除", "remove")), ("Esc", t!("取消", "keep"))];
         }
         if let (Focus::Detail, Some(d)) = (self.focus, &self.detail) {
             let mut keys = d.keys();
@@ -758,11 +761,11 @@ impl Page {
                     (t!("空格", "space"), t!("开/关", "on/off")),
                     ("i", t!("从其他来源安装", "install other")),
                     ("u", t!("更新", "update")),
-                    ("x", t!("删除", "remove")),
+                    ("d", t!("删除", "remove")),
                     ("e", t!("编辑", "edit")),
                 ]);
                 if self.detail.as_ref().is_some_and(|d| d.data.log) {
-                    keys.push(("l", t!("日志", "log")));
+                    keys.push(("z", t!("日志", "log")));
                 }
                 keys
             }
@@ -781,7 +784,7 @@ impl Overlay for Page {
 
     /// Height follows the content: title, the longer of the two columns (the right by the longest of all plugins, see `measure`),
     /// notices, rule, keys. Moving the highlight doesn't change it, only installing / removing plugins does; a bit taller while the
-    /// two-line remove question from x is up
+    /// two-line remove question from d is up
     fn fill_rows(&self) -> Option<u16> {
         let w = self.width() as usize - 6;
         let (lw, _) = self.split(w);
@@ -800,7 +803,11 @@ impl Overlay for Page {
         let mut out = vec![kit::modal_title(t!("插件", "Plugins"), theme::accent(), kit::esc_hint(esc), w), Line::raw("")];
         let mut foot = self.banners(w);
         foot.push(Line::styled("─".repeat(w), theme::faint()));
-        foot.push(kit::keys_line(&self.keys(), vec![], w));
+        // ? is there unless typing or asking first
+        foot.push(match self.typing() || self.armed {
+            true => kit::keys_line(&self.keys(), vec![], w),
+            false => crate::kit::keys_line_help(&self.keys(), vec![], w),
+        });
         let bh = h.saturating_sub(out.len() + foot.len());
         if w >= SPLIT_W {
             let (lw, rw) = self.split(w);
@@ -855,12 +862,12 @@ impl Overlay for Page {
             }
             return Flow::Stay;
         }
-        // Highlight in the right column: keys go to it; e and l still work
+        // Highlight in the right column: keys go to it; e and z still work
         if self.focus == Focus::Detail {
             let typing = self.detail.as_ref().is_some_and(Detail::typing);
             match k.code {
                 KeyCode::Char('e') if !typing => self.edit(fx),
-                KeyCode::Char('l') if !typing => {
+                KeyCode::Char('z') if !typing => {
                     if let Some(r) = self.cur() {
                         show_log(&r.id, &title(r), fx);
                     }
@@ -873,7 +880,15 @@ impl Overlay for Page {
             }
             return Flow::Stay;
         }
-        let armed = std::mem::take(&mut self.armed);
+        // Asked whether to remove (see `banners`): only y removes; Esc says nothing, any other key (d again included) says it wasn't
+        if std::mem::take(&mut self.armed) {
+            match (k.code, self.cur()) {
+                (KeyCode::Char('y'), Some(r)) => fx.job = Some(Job::Plugins(Act::Remove(r.id.clone()))),
+                (KeyCode::Esc, _) => {}
+                _ => fx.say(t!("未删除", "not removed")),
+            }
+            return Flow::Stay;
+        }
         let n = self.rows.len();
         // Under "Available": ⏎ / Space installs; update, remove and log don't apply yet
         if let Some(r) = self.cur().filter(|r| r.available) {
@@ -882,7 +897,7 @@ impl Overlay for Page {
                     fx.job = Some(Job::Plugins(Act::Install(r.id.clone())));
                     return Flow::Stay;
                 }
-                KeyCode::Char('u' | 'x' | 'd' | 'l') => {
+                KeyCode::Char('u' | 'd' | 'z') => {
                     fx.say(tr!("{} 未安装 · ⏎ 安装", "{} isn't installed · ⏎ installs it", title(r)));
                     return Flow::Stay;
                 }
@@ -890,12 +905,7 @@ impl Overlay for Page {
             }
         }
         match k.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                if armed {
-                    fx.say(t!("未删除", "not removed"));
-                }
-                return Flow::Close;
-            }
+            KeyCode::Esc | KeyCode::Char('q' | 'P') => return Flow::Close,
             KeyCode::Down | KeyCode::Char('j') if n > 0 => {
                 self.sel = (self.sel + 1) % n;
                 self.follow();
@@ -904,7 +914,7 @@ impl Overlay for Page {
                 self.sel = (self.sel + n - 1) % n;
                 self.follow();
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Tab => match (self.cur(), &self.detail) {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => match (self.cur(), &self.detail) {
                 (Some(_), Some(d)) if d.rows() > 0 => self.focus = Focus::Detail,
                 (Some(r), _) => fx.say(tr!("{} 没有可修改的设置", "{} has nothing to change", title(r))),
                 (None, _) => {}
@@ -926,20 +936,19 @@ impl Overlay for Page {
             KeyCode::Char('U') => fx.job = Some(Job::Plugins(Act::Update(None))),
             KeyCode::Char('S') => fx.job = Some(Job::Plugins(Act::Sync)),
             KeyCode::Char('e') => self.edit(fx),
-            KeyCode::Char('l') => {
+            KeyCode::Char('z') => {
                 if let Some(r) = self.cur() {
                     show_log(&r.id, &title(r), fx);
                 }
             }
-            KeyCode::Char('x' | 'd') => match self.cur() {
+            KeyCode::Char('d') => match self.cur() {
                 None => {}
                 Some(r) if r.from == Origin::Mine => {
                     fx.say(t!("无法删除你自己的插件 · 空格 关闭", "your own can't be removed · space switches it off"))
                 }
-                Some(_) if !armed => self.armed = true,
-                Some(r) => fx.job = Some(Job::Plugins(Act::Remove(r.id.clone()))),
+                Some(_) => self.armed = true,
             },
-            KeyCode::Char('r') => self.reload(),
+            KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => self.reload(),
             _ => {}
         }
         Flow::Stay
@@ -966,6 +975,33 @@ impl Overlay for Page {
 
     fn typing(&self) -> bool {
         self.typing.is_some() || (self.focus == Focus::Detail && self.detail.as_ref().is_some_and(Detail::typing))
+    }
+
+    /// The bottom bar's keys, then the ones it has no room for. Typing, asking whether to remove, waiting for a key to bind: ? is
+    /// a character / "any other key" there
+    fn sheet(&self) -> Option<Vec<crate::sheet::Key>> {
+        use crate::sheet::{key, more};
+        if self.typing() || self.armed {
+            return None;
+        }
+        let mut keys: Vec<crate::sheet::Key> = self.keys().into_iter().map(|(k, w)| key(k, w)).collect();
+        if self.focus == Focus::Detail {
+            // z only when there is a log, as the list's bar has it
+            if self.detail.as_ref().is_some_and(|d| d.data.log) {
+                keys.push(more("z", t!("日志", "log")));
+            }
+            keys.push(more("h", t!("返回列表", "back to the list")));
+        } else {
+            keys.extend([
+                more("U", t!("全部更新", "update all")),
+                more("S", t!("同步", "sync")),
+                more("^R", t!("重新读取", "reload")),
+                more("l", t!("进入右栏", "into the details")),
+                more("Esc", t!("关闭", "close")),
+            ]);
+        }
+        keys.push(more("↑↓", t!("选择", "select")));
+        Some(keys)
     }
 }
 
@@ -1056,6 +1092,21 @@ mod tests {
         text_in(p, w, 30)
     }
 
+    /// The words on the selected background, and the color of a word (the highlight is only a background now)
+    fn lit(p: &Page, w: usize) -> Vec<String> {
+        let spans: Vec<Span> = p.lines_in(w, 30).into_iter().flat_map(flat).collect();
+        spans
+            .iter()
+            .filter(|s| s.style.bg == Some(theme::pal().sel))
+            .map(|s| s.content.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    fn fg_of(p: &Page, w: usize, word: &str) -> Option<ratatui::style::Color> {
+        p.lines_in(w, 30).into_iter().flat_map(flat).find(|s| s.content.trim() == word).and_then(|s| s.style.fg)
+    }
+
     fn press(p: &mut Page, code: KeyCode) -> (Fx, Flow) {
         let mut fx = Fx::default();
         let f = p.on_key(KeyEvent::from(code), &mut fx);
@@ -1072,9 +1123,9 @@ mod tests {
             set(rows);
             let p = page();
             let t = text_in(&p, 110, 30).join("\n");
-            assert!(t.contains("出错") && t.contains("钩子 turn.done 退出码 3 · 5m 前") && t.contains("l 日志"), "{t}");
+            assert!(t.contains("出错") && t.contains("钩子 turn.done 退出码 3 · 5m 前") && t.contains("z 日志"), "{t}");
             // The off one (my.local) is still marked 「关着」 ("off") as before
-            assert!(t.lines().any(|l| l.contains(" ○ Local") && !l.contains("已关闭")), "{t}");
+            assert!(t.lines().any(|l| l.contains(" [ ] Local") && !l.contains("已关闭")), "{t}");
         });
     }
 
@@ -1087,11 +1138,13 @@ mod tests {
             let t = lines.join("\n");
             assert_eq!(lines.len(), 30);
             assert!(lines.iter().all(|l| l.width() <= 110), "{t}");
-            // Left: on or off, name; an off one only draws ○, without writing 「关着」 ("off") again
-            assert!(t.contains("▌● Delegate") && t.contains(" ○ Local"), "{t}");
-            assert!(!t.lines().any(|l| l.contains(" ○ Local") && l.contains("已关闭")), "{t}");
+            // Left: on or off, name; an off one only draws [ ], without writing 「关着」 ("off") again; the highlighted one only on
+            // the selected background, no mark before it
+            assert!(t.contains(" [✓] Delegate") && t.contains(" [ ] Local") && !t.contains('▌'), "{t}");
+            assert!(lit(&p, 110).contains(&"Delegate".to_string()), "{:?}", lit(&p, 110));
+            assert!(!t.lines().any(|l| l.contains(" [ ] Local") && l.contains("已关闭")), "{t}");
             // Right: name, version and where it's from (a word or two), on, description, what can be changed; no id or source URL
-            assert!(t.contains("Delegate  0.1.0 · git") && t.contains("● 已开启"), "{t}");
+            assert!(t.contains("Delegate  0.1.0 · git") && t.contains("[✓] 已开启"), "{t}");
             assert!(!t.contains("aca.delegate") && !t.contains("github.com"), "{t}");
             assert!(
                 t.contains("派活给别的 agent") && t.contains("设置") && t.contains("say  continue") && t.contains("agents  skills"),
@@ -1099,7 +1152,7 @@ mod tests {
             );
             // A setting's description isn't squeezed into its row
             assert!(!t.contains("what to say"), "{t}");
-            assert!(t.contains("⏎ 进入") && t.contains("e 编辑") && t.contains("l 日志") && t.contains("Esc 关闭"), "{t}");
+            assert!(t.contains("⏎ 进入") && t.contains("e 编辑") && t.contains("z 日志") && t.contains("Esc 关闭"), "{t}");
             // The highlight background covers only the left column, not spilling right
             let row = &p.lines_in(110, 30)[2];
             let div = row.spans.iter().position(|s| s.content == DIVIDER).unwrap();
@@ -1110,17 +1163,17 @@ mod tests {
             let t = lines.join("\n");
             assert_eq!(lines.len(), 30);
             assert!(
-                t.contains("Local  0.0.1 · 本地") && t.contains("○ 已关闭") && !t.contains("say  continue") && !t.contains("⏎ 进入"),
+                t.contains("Local  0.0.1 · 本地") && t.contains("[ ] 已关闭") && !t.contains("say  continue") && !t.contains("⏎ 进入"),
                 "{t}"
             );
             // Narrow screen (phone): stacked, within bounds, also exactly that tall
             let narrow = text_in(&p, 40, 24);
             assert!(narrow.len() == 24 && narrow.iter().all(|l| l.width() <= 40), "{narrow:?}");
-            assert!(narrow.join("\n").contains("○ Local") && narrow.join("\n").contains("○ 已关闭"), "{narrow:?}");
+            assert!(narrow.join("\n").contains("[ ] Local") && narrow.join("\n").contains("[ ] 已关闭"), "{narrow:?}");
             // A broken manifest is flagged
             set(vec![Row { id: "bad".into(), problem: Some("清单读不懂".into()), ..Default::default() }]);
             let t = text(&page(), 110).join("\n");
-            assert!(t.contains("✕ bad") && t.contains("有问题") && t.contains("清单有问题:清单读不懂"), "{t}");
+            assert!(t.contains(" ✕  bad") && t.contains("有问题") && t.contains("清单有问题:清单读不懂"), "{t}");
             // A needed program is missing on this machine: flagged in the list
             set(vec![Row { id: "x".into(), name: "X".into(), enabled: true, lacks: vec!["jq".into()], ..Default::default() }]);
             assert!(text(&page(), 110).join("\n").contains("缺少程序"));
@@ -1157,7 +1210,7 @@ mod tests {
         i18n::with(Lang::En, || {
             set(two());
             let t = text(&page(), 120).join("\n");
-            assert!(t.contains("Plugins") && t.contains("● on") && t.contains("Settings") && t.contains("⏎ change"), "{t}");
+            assert!(t.contains("Plugins") && t.contains("[✓] on") && t.contains("Settings") && t.contains("⏎ change"), "{t}");
             assert!(!t.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c) && !"派活给别的".contains(c)), "{t}");
         });
     }
@@ -1167,12 +1220,18 @@ mod tests {
         i18n::with(Lang::Zh, || {
             set(two());
             let mut p = page();
-            assert!(!text(&p, 110).join("\n").contains("▌ say"));
+            assert!(!lit(&p, 110).iter().any(|s| s.starts_with("say")));
             press(&mut p, KeyCode::Enter);
             let t = text(&p, 110).join("\n");
-            // Highlight moved right: the setting row is marked, its description at the bottom of this column, its keys below,
-            // the left row no longer has a background
-            assert!(t.contains("▌ say") && t.contains("⏎ 修改") && t.contains("- 默认") && t.contains("Esc 返回列表"), "{t}");
+            // Highlight moved right: the setting row is on the selected background, its description at the bottom of this column,
+            // its keys below; the left row no longer has a background, its name in the accent color says whose settings these are
+            assert!(
+                lit(&p, 110).iter().any(|s| s.starts_with("say")) && !lit(&p, 110).contains(&"Delegate".to_string()),
+                "{:?}",
+                lit(&p, 110)
+            );
+            assert_eq!(fg_of(&p, 110, "Delegate"), Some(theme::pal().accent));
+            assert!(t.contains("⏎ 修改") && t.contains("- 默认") && t.contains("Esc 返回列表") && !t.contains('▌'), "{t}");
             assert!(!t.contains("空格 开/关"), "{t}");
             let lines = text(&p, 110);
             let at = lines.iter().position(|l| l.contains("say:what to say")).expect("说明");
@@ -1190,9 +1249,17 @@ mod tests {
             assert!(p.typing());
             assert_eq!(press(&mut p, KeyCode::Char('q')).1, Flow::Stay);
             let (fx, _) = press(&mut p, KeyCode::Enter);
-            assert_eq!(fx.job, Some(Job::Plugins(Act::Setting("aca.delegate".into(), "say".into(), Some("continueq".into())))));
+            assert_eq!(
+                fx.job,
+                Some(Job::Plugins(Act::Setting("aca.delegate".into(), "say".into(), Some("continueq".into()), "say".into())))
+            );
             assert_eq!(press(&mut p, KeyCode::Esc).1, Flow::Stay);
             assert!(text(&p, 110).join("\n").contains("Esc 关闭"));
+            // l is a direction like →: into the details; h back out
+            press(&mut p, KeyCode::Char('l'));
+            assert_eq!(p.focus, Focus::Detail);
+            press(&mut p, KeyCode::Char('h'));
+            assert_eq!(p.focus, Focus::List);
             assert_eq!(press(&mut p, KeyCode::Esc).1, Flow::Close);
             // Nothing to change: ⏎ says so, the highlight stays in the list
             let mut p = page();
@@ -1204,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_turn_into_background_jobs_and_removing_asks_twice() {
+    fn keys_turn_into_background_jobs_and_removing_asks_first() {
         i18n::with(Lang::Zh, || {
             set(two());
             let mut p = page();
@@ -1215,15 +1282,25 @@ mod tests {
             // On the paused one: Space turns it on
             press(&mut p, KeyCode::Char('j'));
             assert_eq!(press(&mut p, KeyCode::Char(' ')).0.job, Some(Job::Plugins(Act::Enable("my.local".into(), true))));
-            // First x only warns, saying what will happen; the second removes; anything else in between cancels
-            assert_eq!(press(&mut p, KeyCode::Char('x')).0.job, None);
+            // d asks, saying what will happen; only y removes
+            assert_eq!(press(&mut p, KeyCode::Char('d')).0.job, None);
             let t = text(&p, 110).join("\n");
-            assert!(t.contains("删除 Local?仅取消登记,保留目录") && t.contains("x 删除 • Esc 取消"), "{t}");
-            assert_eq!(press(&mut p, KeyCode::Char('x')).0.job, Some(Job::Plugins(Act::Remove("my.local".into()))));
-            press(&mut p, KeyCode::Char('x'));
+            assert!(t.contains("删除 Local?仅取消登记,保留目录") && t.contains("y 删除 • Esc 取消"), "{t}");
+            assert_eq!(press(&mut p, KeyCode::Char('y')).0.job, Some(Job::Plugins(Act::Remove("my.local".into()))));
+            // d again (or any other key) keeps it and says so, and does nothing else: k doesn't move
+            press(&mut p, KeyCode::Char('d'));
+            let (fx, _) = press(&mut p, KeyCode::Char('d'));
+            assert_eq!((fx.job, fx.flash.as_deref()), (None, Some("未删除")));
+            press(&mut p, KeyCode::Char('d'));
             press(&mut p, KeyCode::Char('k'));
-            assert_eq!(press(&mut p, KeyCode::Char('x')).0.job, None);
-            assert_eq!(press(&mut p, KeyCode::Esc).1, Flow::Close);
+            assert_eq!(p.cur().map(|r| r.id.as_str()), Some("my.local"));
+            // x no longer removes; Esc while asked only cancels, the page stays
+            assert!(press(&mut p, KeyCode::Char('x')).0.job.is_none() && !p.armed);
+            press(&mut p, KeyCode::Char('d'));
+            let (fx, flow) = press(&mut p, KeyCode::Esc);
+            assert_eq!((flow, fx.flash), (Flow::Stay, None));
+            // P opened it: P closes it too
+            assert_eq!(press(&mut p, KeyCode::Char('P')).1, Flow::Close);
         });
     }
 
@@ -1280,7 +1357,7 @@ mod tests {
             set(rows);
             let mut p = page();
             let t = text(&p, 110).join("\n");
-            assert!(t.contains("可安装") && t.contains("+ MCP Gateway"), "{t}");
+            assert!(t.contains("可安装") && t.contains(" +  MCP Gateway"), "{t}");
             // Installed ones first, available ones under the "Available" row
             assert!(t.find("Local").unwrap() < t.find("可安装").unwrap(), "{t}");
             press(&mut p, KeyCode::Char('j'));
@@ -1290,7 +1367,7 @@ mod tests {
             assert!(t.contains("所有 agent 共用的 MCP") && t.contains("安装后将添加") && t.contains("给 agent  一个 MCP 服务"), "{t}");
             assert!(t.contains("设置      servers") && t.contains(" ⏎ 安装 ") && t.contains("i 从其他来源安装"), "{t}");
             // Not installed yet: remove, update and log all say install first; ⏎ / Space installs
-            let (fx, _) = press(&mut p, KeyCode::Char('x'));
+            let (fx, _) = press(&mut p, KeyCode::Char('d'));
             assert_eq!(fx.job, None);
             assert!(fx.flash.unwrap().contains("MCP Gateway 未安装"));
             assert_eq!(press(&mut p, KeyCode::Enter).0.job, Some(Job::Plugins(Act::Install("aca.gateway".into()))));
@@ -1300,7 +1377,7 @@ mod tests {
             // Only available ones: the left says no plugins are installed yet
             set(vec![Row { id: "aca.bark".into(), from: Origin::Bundled, available: true, ..Default::default() }]);
             let t = text(&page(), 110).join("\n");
-            assert!(t.contains("尚未安装插件") && t.contains("+ aca.bark"), "{t}");
+            assert!(t.contains("尚未安装插件") && t.contains(" +  aca.bark"), "{t}");
         });
     }
 
@@ -1366,15 +1443,32 @@ mod tests {
             press(&mut p, KeyCode::Char('j'));
             let t = text(&p, 120).join("\n");
             // Named 「你自己的」 ("Your own"), no version or path
-            assert!(t.contains("▌● 你自己的") && !t.contains("/c/aca/user") && !t.contains("你自己的  0"), "{t}");
+            assert!(t.contains(" [✓] 你自己的") && !t.contains("/c/aca/user") && !t.contains("你自己的  0"), "{t}");
             assert!(t.contains("e 编辑"), "{t}");
-            let (fx, _) = press(&mut p, KeyCode::Char('x'));
+            let (fx, _) = press(&mut p, KeyCode::Char('d'));
             assert!(fx.job.is_none() && fx.flash.unwrap().contains("无法删除你自己的插件"));
             assert!(!p.armed);
             // e: your own one opens its manifest
             let (fx, _) = press(&mut p, KeyCode::Char('e'));
             assert_eq!(fx.external, Some(crate::view::External::Edit { path: "/c/aca/user/aca-plugin.toml".into(), line: 1 }));
         });
+    }
+
+    #[test]
+    fn question_mark_in_the_details_lists_the_log_only_when_there_is_one() {
+        fn no_log(id: &str) -> Tune {
+            Tune { log: false, ..fake_tune(id) }
+        }
+        let keys = |p: &Page| p.sheet().unwrap().iter().map(|k| k.key.clone()).collect::<Vec<_>>();
+        set(two());
+        let mut p = page();
+        press(&mut p, KeyCode::Enter);
+        assert_eq!(p.focus, Focus::Detail);
+        assert!(keys(&p).contains(&"z".to_string()), "{:?}", keys(&p));
+        let mut p = Page::with(fake, fake_stale, fake_drift, no_log);
+        press(&mut p, KeyCode::Enter);
+        assert_eq!(p.focus, Focus::Detail);
+        assert!(!keys(&p).contains(&"z".to_string()) && keys(&p).contains(&"h".to_string()), "{:?}", keys(&p));
     }
 
     #[test]

@@ -32,9 +32,13 @@ impl App {
         if g == "-" {
             return self.flash(t!("这些是普通 tmux 会话,没有可删除的分组", "these are ordinary tmux sessions; no group to delete"));
         }
+        // The scratch group stays (deleting a group above it would take it along)
+        if self.scratch.as_deref().is_some_and(|s| groups::within(s, &g)) {
+            return self.flash(t!("无法删除随手问所在的分组", "the scratch group can't be deleted"));
+        }
         let rows: Vec<groups::Row> = (self.groups_loader)().into_iter().filter(|r| groups::within(&r.path, &g)).collect();
         if !rows.iter().any(|r| r.path == g) {
-            return self.flash(&tr!("「{}」不是已登记的分组", "“{}” isn't a registered group", group_label(&g)));
+            return self.flash(&tr!("「{}」不是已登记的分组", "“{}” isn't a registered group", self.shown(&g)));
         }
         let archived = rows.iter().flat_map(|r| &r.archived).filter(|id| !self.trash.ids().any(|x| x == id.as_str())).count();
         let mine = |s: &&Session| s.sub.is_none() && !s.blank && !s.deck_id.is_empty() && groups::within(&s.group, &g);
@@ -53,7 +57,8 @@ impl App {
 
     /// b: the trash (see trash.rs)
     pub(super) fn open_trash(&mut self) {
-        self.open(Box::new(crate::trash::Page::new(self.trash.clone(), epoch)));
+        let page = crate::trash::Page::new(self.trash.clone(), epoch).with_notes(self.book.gone()).with_scratch(self.scratch.clone());
+        self.open(Box::new(page));
     }
 
     /// Open a feature's own popup (see overlay.rs)
@@ -61,17 +66,52 @@ impl App {
         self.overlays.push(o);
     }
 
-    /// `:`: the command palette (aca's actions + plugins'), aimed at the highlighted row (session / group; plain tmux sessions and
-    /// extra windows count as elsewhere)
-    pub(super) fn open_caps(&mut self) {
-        let target = match (&self.head, self.current()) {
-            (Some(g), _) => crate::caps::Target { on: "group", session: String::new(), label: g.clone() },
-            (None, Some(s)) if !self.on_fold_row() && s.sub.is_none() && !s.deck_id.is_empty() => {
+    /// `?` on the list: its keys by section, the plugins' commands first, aimed at the highlighted row (session / group; plain
+    /// tmux sessions and extra windows count as elsewhere)
+    pub(super) fn open_main_sheet(&mut self) {
+        let row = self.current().filter(|_| !self.on_rail());
+        let target = match (self.group_row(), row) {
+            (Some(g), _) => crate::caps::Target { on: "group", session: String::new(), label: g.to_string() },
+            (None, Some(s)) if s.sub.is_none() && !s.deck_id.is_empty() => {
                 crate::caps::Target { on: "session", session: s.deck_id.clone(), label: s.title.clone() }
             }
             _ => crate::caps::Target { on: "global", ..Default::default() },
         };
-        self.open(Box::new(crate::caps::Menu::new(aca_core::plugin::menu(), target)));
+        let asks = !self.on_group_row() && row.is_some_and(|s| s.state == State::Ask);
+        let mut sheet = crate::sheet::main((self.plugin_menu)(), target, self.on_all_row());
+        // The scratch group's router is the desk: called that on its row, its sessions' rows and the row for all groups
+        let group = self.route_group().or(row.map(|s| s.group.as_str()));
+        if self.on_all_row() || group.is_some_and(|g| self.is_scratch(g)) {
+            sheet.rename("o", t!("打开 / 新建总台", "open / start the desk"));
+        }
+        if self.row_router().or(row).is_some_and(list::wakes_on_send) {
+            sheet.rename("s", t!("发话唤醒灰色 @", "send to wake the gray @"));
+            if self.on_route_row() {
+                sheet.rename("o", t!("启动新一班", "start a new shift"));
+            } else {
+                sheet.rename("⏎", t!("启动新一班", "start a new shift"));
+            }
+        }
+        // On a row waiting for you, s answers it
+        if asks {
+            sheet.rename("s", t!("回答", "answer"));
+        }
+        self.sheet = Some(sheet);
+    }
+
+    /// `?` on any other page: that page's keys
+    pub(super) fn open_sheet(&mut self, keys: &[crate::sheet::Key]) {
+        self.sheet = Some(crate::sheet::Sheet::page(keys));
+    }
+
+    /// A key while `?` is open: a row picked closes it and its key goes to the page below, as if pressed there
+    pub(super) fn on_sheet_key(&mut self, k: KeyEvent) {
+        let Some(s) = self.sheet.as_mut() else { return };
+        let mut fx = Fx::default();
+        if s.on_key(k, &mut fx) == Flow::Close {
+            self.sheet = None;
+        }
+        self.apply(fx);
     }
 
     /// A plugin finished: views and long output go into the full-screen reader page; short output goes in the bottom bar
@@ -120,10 +160,8 @@ impl App {
                     wrapped: vec![],
                     wrap_w: 0,
                     dirty: true,
-                    help: false,
                     view_h: 0,
                     diff: None,
-                    hit: None,
                     plugin: Some(req),
                 });
             }
@@ -134,6 +172,13 @@ impl App {
     /// settings page: back to the settings page)
     pub(super) fn on_overlay_key(&mut self, k: KeyEvent) {
         let Some(top) = self.overlays.last_mut() else { return };
+        // ?: this page's keys, unless it's typing or asking right now (then ? is its own key)
+        if k.code == KeyCode::Char('?')
+            && !k.modifiers.contains(KeyModifiers::CONTROL)
+            && let Some(keys) = top.sheet()
+        {
+            return self.open_sheet(&keys);
+        }
         let mut fx = Fx::default();
         if top.on_key(k, &mut fx) == Flow::Close {
             self.overlays.pop();
@@ -204,7 +249,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::tests::{fixture, press, reader_rows, shows};
+    use crate::ui::tests::{ctrl, fixture, keys, press, reader_rows, shows};
 
     fn plugin_req(id: &str, kind: aca_core::plugin::ItemKind) -> crate::caps::Req {
         crate::caps::Req {
@@ -222,15 +267,71 @@ mod tests {
     }
 
     #[test]
-    fn colon_opens_the_plugin_menu_on_the_highlighted_session() {
+    fn question_mark_on_a_page_lists_its_keys_and_a_key_there_goes_to_that_page() {
         i18n::with(Lang::Zh, || {
             let mut app = fixture();
-            app.selected = Some("闲".into());
-            app.rebuild();
-            press(&mut app, KeyCode::Char(':'));
-            shows(&reader_rows(&mut app, 100, 30), &["命令 · 对「闲」", "n  新建", "aca"]);
+            app.open(Box::new(crate::ui::tests::FakePage(0)));
+            press(&mut app, KeyCode::Char('?'));
+            assert!(app.sheet.is_some() && app.overlays.len() == 1);
+            shows(&reader_rows(&mut app, 100, 30), &["快捷键", "f  说一句", "n  再开一页"]);
+            // f in the sheet: the sheet closes, the page gets f (and stays)
+            press(&mut app, KeyCode::Char('f'));
+            assert!(app.sheet.is_none() && app.overlays.len() == 1);
+            assert_eq!(app.msg.as_ref().map(|m| m.0.as_str()), Some("说一句"));
+            // ⏎ on the second row: n opens another page over it
+            press(&mut app, KeyCode::Char('?'));
+            keys(&mut app, "j");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.overlays.len(), 2);
+            // A page that's typing takes ? as its own key
+            app.overlays.clear();
+            app.open(Box::new(crate::ui::tests::FakePage(1)));
+            press(&mut app, KeyCode::Char('?'));
+            assert!(app.sheet.is_none());
             press(&mut app, KeyCode::Esc);
             assert!(app.overlays.is_empty());
+        });
+    }
+
+    #[test]
+    fn every_page_ends_its_bottom_bar_with_esc_back_and_keys_and_popups_with_keys() {
+        use aca_core::plugin::ItemKind;
+        i18n::with(Lang::Zh, || {
+            let mut app = fixture().with_tools(crate::ui::tests::rehome_tools);
+            crate::ui::tests::select(&mut app, "跑");
+            let last = |app: &mut App, w: u16| -> String {
+                app.msg = None;
+                reader_rows(app, w, 20).last().unwrap().trim_end().to_string()
+            };
+            // Output, diff, record, billing, a plugin's output: the page's keys on the left, Esc and ? at the right end
+            for open in ["z", "x", "Z", "$", "plugin"] {
+                match open {
+                    "plugin" => app.plugin_done(plugin_req("ci", ItemKind::View), true, "build  ok".into()),
+                    _ => keys(&mut app, open),
+                }
+                for w in [200, 46] {
+                    let bar = last(&mut app, w);
+                    assert!(bar.ends_with("Esc 返回 • ? 快捷键") && bar.width() <= w as usize, "{open} {w}: {bar}");
+                    // Some of the page's own keys on the left, named as its ? names them
+                    assert!(bar.split("Esc 返回").next().unwrap().trim().len() > 4, "{open} {w}: {bar}");
+                }
+                keys(&mut app, "⎋");
+            }
+            // Back on the list: its own bar, the keys as caps
+            assert!(last(&mut app, 200).contains(&crate::ui::tests::caps("? 快捷键")));
+            // Popups with a ?: their key line ends with it; short of room it goes first
+            for open in ["F", "S", "n"] {
+                keys(&mut app, open);
+                let rows = reader_rows(&mut app, 120, 30);
+                assert!(
+                    rows.iter().any(|r| r.trim_end().trim_end_matches(['│', '░']).trim_end().ends_with("? 快捷键")),
+                    "{open}: {rows:#?}"
+                );
+                keys(&mut app, "⎋");
+            }
+            keys(&mut app, "F");
+            let narrow = reader_rows(&mut app, 24, 20);
+            assert!(!narrow.iter().any(|r| r.contains("快捷键")) && narrow.iter().any(|r| r.contains("⏎ 筛选")), "{narrow:#?}");
         });
     }
 
@@ -244,13 +345,15 @@ mod tests {
             app.plugin_done(plugin_req("ci", ItemKind::Command), false, String::new());
             assert_eq!(app.msg.as_ref().map(|m| m.0.as_str()), Some("✕ PX · 看 CI 出错"));
             assert!(app.reader.is_none());
-            // A view: opens the reading page even for a single line; r reruns, c copies all, Esc comes back
+            // A view: opens the reading page even for a single line; ^R reruns, c copies all, Esc comes back
             app.plugin_done(plugin_req("ci", ItemKind::View), true, "build  ok\ntest   ok".into());
             app.msg = None;
             let rows = reader_rows(&mut app, 100, 20);
-            shows(&rows, &["build  ok", "test   ok", "r 重新运行", "c 复制"]);
+            shows(&rows, &["build  ok", "test   ok", "^R 重新运行", "c 复制"]);
             assert!(!rows[0].contains("1/") && rows[0].contains("✓ PX · 看 CI"), "{}", rows[0]);
             press(&mut app, KeyCode::Char('r'));
+            assert!(app.plugin_q.is_empty());
+            ctrl(&mut app, 'r');
             assert_eq!(app.plugin_q.len(), 1);
             press(&mut app, KeyCode::Char('c'));
             assert_eq!(app.clip, Some(Clip::Text("build  ok\ntest   ok".into())));

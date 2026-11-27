@@ -53,7 +53,7 @@ pub const GROUPS: &[(Tr, &[Cmd])] = &[
   --client 客户端    在 tmux 弹窗里使用:回车把这个客户端切换过去,打开时高亮它当前所在的会话
   --follow           弹窗只占屏幕一侧时使用(配合 --client):高亮移到哪,这个客户端就切换到哪,弹窗不关闭;
                      ⏎ 留在这里,Esc 返回打开时所在的会话,Ctrl+\\ 关闭。绑定按键的写法:aca help keys
-  --ref              在 tmux 里弹出列表,⏎ 把选中会话的引用(B 复制的两行)插到窗格的输入框里(粘贴,不回车),
+  --ref              在 tmux 里弹出列表,⏎ 把选中会话的引用(c b 复制的两行)插到窗格的输入框里(粘贴,不回车),
                      Esc 取消。列表在右侧打开,窗口不足 120 列时全屏。在 aca 的会话里按前缀键再按 b 就是它:
                      aca 把这个键绑定在 tmux 上(和 Ctrl+Q 一样),记在 config.toml 的 [keys] ref,换键:aca tmux key ref <键>
   --pane 窗格        --ref 插到哪个窗格(按键时由 tmux 填入);不写时:运行命令的这个
@@ -70,7 +70,7 @@ Press ? inside for the keys; every key in detail: aca help keys
   --follow           when the popup covers one side of the screen (with --client): the client follows the highlight
                      and the popup stays open; ⏎ stays there, Esc goes back where you started, Ctrl+\\ closes it.
                      How to bind it: aca help keys
-  --ref              inside tmux, pops up the list; ⏎ puts the picked session's reference (the two lines B copies)
+  --ref              inside tmux, pops up the list; ⏎ puts the picked session's reference (the two lines c b copies)
                      into the pane's input box (pasted, no Enter), Esc cancels. It opens on the right, full screen on a
                      window under 120 columns. The prefix key then b inside aca's sessions does this: aca binds the key in
                      tmux (the way Ctrl+Q is), kept as [keys] ref in config.toml; another key: aca tmux key ref <key>
@@ -93,8 +93,8 @@ Press ? inside for the keys; every key in detail: aca help keys
   aca completion zsh > ~/.zsh/completions/_aca   放进 fpath 里的某个目录,删除 compinit 的缓存(.zcompdump)后重开 shell
   eval \"$(aca completion zsh)\"                   写进 ~/.zshrc,放在 compinit 之后
 
-补全内容按每条命令的用法来:<id> 补全会话(最近有动静的在前,说明是标题和分组)、-g 分组 补全分组和 .(按目录定)、
-[目录] 补全目录、子命令按原样补全;输入 - 后才列出选项。候选项每次都实时向 aca 查询,会话、分组、命令变了都不用重新生成。
+补全内容按每条命令的用法来:<id> 补全会话(最近有动静的在前,说明是标题和分组)、-g 补全分组(支持按目录定组时也补全 .),
+[目录] 补全目录,子命令按原样补全;输入 - 后才列出选项。候选项每次都实时向 aca 查询,会话、分组、命令变了都不用重新生成。
 装了 fzf-tab 时,在 fzf 里输入标题或组名就能找到会话。要预览会话,在 ~/.zshrc 里加一行
   zstyle ':fzf-tab:complete:aca:*' fzf-preview '[[ $group == *会话* ]] && aca show $word'",
                     "  zsh    print the zsh completion function (zsh is the only one so far)
@@ -104,9 +104,9 @@ Install it one of two ways:
   eval \"$(aca completion zsh)\"                   in ~/.zshrc, after compinit
 
 What it completes follows each command's usage: <id> completes sessions (most recently active first, described by
-title and group), -g GROUP completes groups and . (decided by directory), [DIR] completes directories, subcommands
-as written; options show only after you type -. Candidates come fresh from aca on every Tab: nothing to regenerate
-when sessions, groups or commands change.
+title and group), -g completes groups, including . where directory-based selection is supported,
+[DIR] completes directories, subcommands as written; options show only after you type -.
+Candidates come fresh from aca on every Tab: nothing to regenerate when sessions, groups or commands change.
 With fzf-tab, type a title or a group name in fzf to find a session. To preview sessions, add to ~/.zshrc
   zstyle ':fzf-tab:complete:aca:*' fzf-preview '[[ $group == *session* ]] && aca show $word'",
                 ),
@@ -121,8 +121,8 @@ With fzf-tab, type a title or a group name in fzf to find a session. To preview 
                 short: Tr::new("new <工具[:账号]> [目录]", "new <TOOL[:ACCOUNT]> [DIR]"),
                 brief: Tr::new("新建会话并启动(tmux 会话名即标题)", "create a session and start it (tmux session name = title)"),
                 usage: &[Tr::new(
-                    "new <工具[:账号]> [目录] [-t 标题] [-g 分组] [-w 分支] [--parent id] [--notify 哪些] [--hold] [--say 话] [-- 给 agent 的参数…]",
-                    "new <TOOL[:ACCOUNT]> [DIR] [-t TITLE] [-g GROUP] [-w BRANCH] [--parent id] [--notify WHICH] [--hold] [--say TEXT] [-- AGENT-ARGS…]",
+                    "new <工具[:账号]> [目录] [-t 标题] [-g 分组] [-w 分支] [--parent id] [--notify 哪些] [--hold] [--say 话] [--task 单号] [--watch] [--no-watch] [-- 给 agent 的参数…]",
+                    "new <TOOL[:ACCOUNT]> [DIR] [-t TITLE] [-g GROUP] [-w BRANCH] [--parent id] [--notify WHICH] [--hold] [--say TEXT] [--task N] [--watch] [--no-watch] [-- AGENT-ARGS…]",
                 )],
                 more: Tr::new(
                     "\
@@ -137,12 +137,17 @@ With fzf-tab, type a title or a group name in fzf to find a session. To preview 
   -w 分支        在这个分支的 git worktree 里启动:仓库的 .worktrees/<分支>(已写入 .git/info/exclude,主仓库的
                  git status 里看不到)。分支不存在时从目录当前的 HEAD 创建,存在就直接使用;worktree 的路径写到标准错误。
                  aca rm 时干净的 worktree 一起删除,分支保留;有改动或未跟踪文件的保留。也可以写 --worktree
-  --parent id    作为哪个会话的子会话。不写时:在某个会话里运行这条命令就挂在它下面;写 - 表示不挂
+  --parent id    作为哪个会话的子会话。不写时:在某个会话里运行这条命令就挂在它下面;写 - 表示不挂:
+                 它算你的会话(结果通知你,不回到运行命令的那个会话),也不跟着进那个会话的组,要进哪个组用 -g 写
   --notify 哪些  在哪些事件上通知 parent(唤醒它):从 done failed exited waiting 中选(逗号分隔),all = 全部,
                  none = 都不通知。不写时按 config.toml 的 [inbox] notify,那里也没写就都不通知(aca help msg)
   --hold         只登记,不启动(之后用 aca start 启动)
-  --say 话       开场的第一句话。Claude、Codex、pi、opencode 作为启动参数传入:启动后由它自己发送,这条命令不等待;
-                 其他工具等它启动并空闲后再输入(最多等一分钟)
+  --say 话       开场的第一句话。Claude、Codex、pi、opencode 和 Antigravity 可用启动参数接收,启动后自行发送。
+                 其他工具等到空闲后输入(最多等一分钟)。Antigravity 的消息有多行或以 - 开头时也这样输入。
+  --task 单号    它一启动就做这张任务单(aca help task):单子的内容排在开场话最前面,--say 的话算交的时候说的;
+                 没写 -g 时进任务单所在的组。只有你和 router 可以这样交
+  --watch        配合 --task,从第一轮起盯这张单。两个盯单开关只能选一个
+  --no-watch     配合 --task,取消盯单。不写这两个开关就沿用单上的设置
   -- …           每次启动都原样传给 agent 的参数
 
 例:
@@ -164,14 +169,21 @@ Prints the new session's id (the only line on standard output).
                   current HEAD, an existing one is used; which worktree goes to standard error. aca rm removes a clean
                   worktree with the session and keeps the branch; one with changes or untracked files stays.
                   Also --worktree
-  --parent id     which session it's a child of. Default: run inside a session, that one; - for none
+  --parent id     which session it's a child of. Default: run inside a session, that one; - for none: it is
+                  yours (you are told what it does, not the session that ran the command), and it doesn't follow
+                  that session into its group: name one with -g
   --notify WHICH  what it tells its parent about (waking it): pick from done failed exited waiting (comma-separated),
                   all = everything, none = nothing. Default: [inbox] notify in config.toml, and if that's unset
                   nothing (aca help msg)
   --hold          register only, don't start (aca start later)
-  --say TEXT      the opening message. Claude, Codex, pi and opencode get it as a launch argument: they send
-                  it once they're up, and this command doesn't wait; other tools get it typed in once up and idle
-                  (waits up to a minute)
+  --say TEXT      the opening message. Claude, Codex, pi, opencode and Antigravity can take it as a launch argument.
+                  Other tools receive it once idle (waits up to a minute). Antigravity also uses this fallback for
+                  multiline messages and messages starting with a dash.
+  --task N        it starts on this task ticket (aca help task): the ticket leads its opening message, and what
+                  --say gives counts as said handing it over; with no -g it goes into the ticket's group. Only
+                  you and routers hand one over this way
+  --watch         with --task, watch the ticket from the first turn. Choose at most one watch option
+  --no-watch      with --task, turn watching off. Omit both options to keep the ticket's setting
   -- …            arguments handed to the agent as they are on every start
 
 Examples:
@@ -200,7 +212,7 @@ Examples:
 接管会做三件事:登记一行、在那个 tmux 会话上加标记、把会话名改成标题。里面的进程照常运行,不会往里发送任何按键。
 之后它就是普通的 aca 会话:可以重命名、移动分组、停止、原地重启、分叉。不想再管了:aca release <id> 把它移出 aca,进程保留。
 
-  不带参数         列出可直接接管的会话(未登记、第一个窗格中运行着能识别的 claude / codex / pi / opencode),只列出,不改动
+  不带参数         列出可直接接管的会话(未登记、第一个窗格中运行着能识别的 claude / codex / pi / opencode / agy),只列出,不改动
   tmux 会话        会话名、名字中的一段(只匹配到一个时)、$会话号;agent 不在第一个窗格时用 %窗格号 指定。可以给多个
   --all            接管列出的全部会话
   -t 标题          不写时:agent-deck 启动的用它那边的标题,其他的用当前的 tmux 会话名(你自己起的名字会被锁定)
@@ -221,7 +233,7 @@ keep running untouched; not a single key is sent in.
 From then on it's an ordinary aca session: rename, move, stop, restart in place, fork. Don't want it any more:
 aca release <id> lets go, and the processes keep running.
 
-  (no arguments)       list what can be adopted as is (unregistered, a recognizable claude / codex / pi / opencode in the first pane);
+  (no arguments)       list what can be adopted as is (unregistered, a recognizable claude / codex / pi / opencode / agy in the first pane);
                        only looks
   TMUX-SESSION         session name, part of a name (when only one matches), or $session-number; when the agent isn't
                        in the first pane, %pane-number says which pane. Several are fine
@@ -247,23 +259,26 @@ agent-deck's are the exception: its own hooks still report, and \"finished, unre
             },
             Cmd {
                 names: &["ls"],
-                short: Tr::same("ls"),
+                short: Tr::new("ls [-g 分组]", "ls [-g GROUP]"),
                 brief: Tr::new("列表:状态、id、标题、工具:账号、空闲时长", "the list: state, id, title, tool:account, idle time"),
-                usage: &[Tr::same("ls [--json] [--no-screen]")],
+                usage: &[Tr::new("ls [-g 分组名] [--json] [--no-screen]", "ls [-g GROUP-NAME] [--json] [--no-screen]")],
                 more: Tr::new(
-                    "  --json         输出 JSON(供脚本读取)
+                    "  -g 分组名      只列这个分组。每个会话一行,附上未完成的单号、与项目不同的目录,以及 router 标记
+  --json         输出 JSON(供脚本读取)
   --no-screen    不读屏幕,只用 hook 上报的状态(几毫秒;hook 不上报的事看不出来,比如按 Esc 中断)
 
 状态:● 运行中  ◆ 等待回应  ◐ 未读  ○ 空闲  ✕ 出错  ■ 已停止  ☾ 自动停止(因空闲被停止)。等待回应的下面多一行它的提问。
-在终端里排版并着色:id 只显示前 8 位,输入加粗的那几位就够了(aca attach 3f);最后一行是总数。
+不带 -g 时,在终端里排版并着色:id 只显示前 8 位,输入加粗的那几位就够了(aca attach 3f);最后一行是总数。
 输出到管道或文件时不带颜色,id 是完整的。",
-                    "  --json         print as JSON (for scripts)
+                    "  -g GROUP-NAME  list this exact group. Each row includes its open ticket numbers
+                 and a router mark where applicable. A directory is shown when it differs from the project's
+  --json         print as JSON (for scripts)
   --no-screen    don't read screens, only the state hooks report (milliseconds; misses what hooks don't report,
                  like an Esc interrupt)
 
 States: ● running  ◆ needs you  ◐ unread  ○ idle  ✕ error  ■ stopped  ☾ auto-stopped (for idling). One that needs you
 gets an extra line with what it asked.
-In a terminal it's laid out and colored: ids show their first 8 characters, the bold ones are enough to type
+Without -g, terminal output is laid out and colored: ids show their first 8 characters, the bold ones are enough to type
 (aca attach 3f); the last line is the total. Piped or redirected it's plain, with full ids.",
                 ),
             },
@@ -339,8 +354,8 @@ kept as [keys] next in config.toml; to change it: aca tmux key next <key>.
                 names: &["start", "stop"],
                 short: Tr::same("start | stop <id>"),
                 brief: Tr::new(
-                    "启动(继续原来的对话)/ 停止(agent 退出,窗格和登记保留)",
-                    "start, resuming the conversation / stop: the agent exits",
+                    "启动已停的会话 / 停止(agent 退出,窗格和登记保留)",
+                    "start a stopped session / stop: the agent exits",
                 ),
                 usage: &[Tr::same("start <id>"), Tr::same("stop <id>"), Tr::new("stop --idle <时长>", "stop --idle <DURATION>")],
                 more: Tr::new(
@@ -349,12 +364,15 @@ kept as [keys] next in config.toml; to change it: aca tmux key next <key>.
   --idle 时长    不写 id:停止空闲超过这个时长的会话(30m、3h、1d、1h30m),列表里显示 ☾,与逐个停止的 ■ 区分。
                  空闲时长从最后一次有动静算起:hook 上报一轮开始 / 结束、有人进入过、子代理的记录有写入;屏幕有输出
                  (工作时的转圈和计时会一直刷新)、对话记录有写入只算一分钟以内的,更早的多半是空闲时的一次重绘
-                 (从未上报过 hook 的,比如 shell,多久以前的都算)。以下不会停止:本轮未结束的(hook 只报了开始,屏幕看起来再空闲也不停)、未读的、
+                 (从未上报过 hook 的,比如 shell,多久以前的都算)。普通会话以下情况不会停止:本轮未结束的(hook 只报了开始,屏幕看起来再空闲也不停)、未读的、
                  等待回应的、出错的、有人连着的、有后台任务的、输入框里有未发送文字的、派出去的会话仍未停止的、
                  自己设了定时且还没到点的(Claude 的 CronCreate、/loop 的下一次:只存在于它的进程里,停止后就没了)、
                  收件箱里有还没到点的定时消息的(aca msg --in:停止了到点就送不进去)、
                  重新启动后无法恢复原来对话的。会打印停止了哪些
-  start          未运行时在原地重新启动,继续原来的对话(启动后没说过话的会开始新的一段);tmux 里整个不存在了(电脑重启过)就重新创建
+                 Claude router 单独按 [router] idle 判闲(默认 1h,never 关闭),未读结果或未到点的收件箱消息不拦换班。
+                 等回答或有人连着时不停。Codex router 不因空闲停止
+  start          未运行时在原地启动,窗格不存在就重建。Claude router 每次启动都是新对话,第一句话是交接;
+                 其他会话能恢复时继续原对话
 
 自动停止:在 config.toml 里写
   [idle]
@@ -367,14 +385,16 @@ aca 界面打开时每 5 分钟按 stop --idle 3h 执行一次(你连接在某�
                  a turn starting or finishing, someone attaching, a write to a subagent's record; output on screen (a
                  working agent's spinner and timer keep redrawing) and writes to its conversation record count only
                  within the last minute, as an older one is most likely an idle redraw (all of them count for one that
-                 never reported a hook, like a shell). Never stopped: a turn that hasn't finished (the hook reported
+                 never reported a hook, like a shell). Ordinary sessions are kept running for an unfinished turn (the hook reported
                  only its start, however idle the screen looks), finished-unread, waiting for you, failed, attached,
                  background tasks, unsent text in its input box, dispatched sessions still open, a schedule of its own
                  not yet due (Claude's CronCreate, /loop's next wakeup: they live only in its process), a scheduled
                  message not yet due in its inbox (aca msg --in: stopped, it couldn't be delivered on time), or one
                  that can't resume its conversation. Prints the ones it stopped
-  start          not running: start it again in place, resuming the conversation (one that never talked starts fresh);
-                 gone from tmux entirely (after a reboot): create it again
+                 Claude routers use [router] idle (default 1h, never disables it). Unread results and scheduled inbox
+                 messages allow a shift change. Waiting for an answer or attached, they stay up. Codex routers stay up when idle
+  start          start a stopped session in place, recreating its pane if needed. A Claude router opens a new
+                 conversation with a handoff on every start. Other sessions resume when possible
 
 To stop them automatically, put in config.toml
   [idle]
@@ -386,20 +406,24 @@ and while the aca interface is open it does a stop --idle 3h every 5 minutes (al
                 names: &["restart"],
                 short: Tr::same("restart <id>"),
                 brief: Tr::new(
-                    "原地重启并继续对话;--fresh 开始新对话;--as 换账号继续",
-                    "restart in place, resuming; --fresh anew, --as other account",
+                    "原地重启;--fresh 开始新对话;--as 换账号",
+                    "restart in place; --fresh anew, --as another account",
                 ),
                 usage: &[Tr::new("restart <id> [--fresh] [--as 工具[:账号]]", "restart <id> [--fresh] [--as TOOL[:ACCOUNT]]")],
                 more: Tr::new(
-                    "  --fresh          不恢复原来的对话,开始新的对话
-  --as 工具[:账号] 换一个账号继续这段对话(一个账号额度用完了、任务还没做完):对话记录从原账号的配置目录复制到
+                    "Claude router 每次重启都以交接开始新对话。其他会话默认继续原来的对话。
+
+  --fresh          开始新的对话
+  --as 工具[:账号] 换一个账号重启。Claude router 在新账号上开新对话。其他会话继续原对话时,对话记录从原账号的配置目录复制到
                    新账号的相同位置,上下文完整带过去,列表行、tmux 会话、标题都不变;原账号的那份保留,之前几轮
                    的费用仍算在原账号上。只写一个词时:是这个工具的账号就当账号,否则当工具名(用它的默认账号)。
                    只能在同一种工具内切换(Claude 和 Codex 的对话记录不互通,换工具请用界面里的 H 交接)。
                    Codex 各账号默认模型不同时会带上原来的 -m。新账号的缓存是空的:第一轮会重新写入整段上下文",
-                    "  --fresh              don't resume the conversation, start a new one
-  --as TOOL[:ACCOUNT]  carry this conversation over to another account (one ran out of quota mid-task): its
-                       record is copied from the old account's config directory to the same place in the new
+                    "A Claude router opens a new conversation with a handoff on every restart. Other sessions resume by default.
+
+  --fresh              don't resume the conversation, start a new one
+  --as TOOL[:ACCOUNT]  restart on another account. A Claude router starts a fresh shift. For a session resuming its conversation,
+                       the record is copied from the old account's config directory to the same place in the new
                        one, so the context comes along whole and the row, tmux session and title stay; the old
                        account keeps its copy and the earlier turns still bill to it. A single word is an
                        account of this tool if there is one, otherwise a tool (with its default account).
@@ -444,12 +468,19 @@ Once renamed the name is locked and no longer follows the agent's own title.",
             },
             Cmd {
                 names: &["move"],
-                short: Tr::new("move <id> <分组>", "move <id> <GROUP>"),
+                short: Tr::new("move <id>… <分组>", "move <id>… <GROUP>"),
                 brief: Tr::new("移到另一个分组(不存在时自动创建),排在该组最后", "move to another group (created if missing), at its end"),
-                usage: &[Tr::new("move <id> <分组>", "move <id> <GROUP>")],
+                usage: &[Tr::new("move [--tree] <id>… <分组>", "move [--tree] <id>… <GROUP>")],
                 more: Tr::new(
-                    "分组写 '' 表示移出分组;写 . 表示按它的目录定的组(见 aca help group),会打印移到了哪个组。",
-                    "GROUP '' moves it out of any group; . is the group its directory decides (see aca help group), printed.",
+                    "可以一次写几个会话,最后一个词是分组;已经在那个组里的不动。
+  --tree    每个会话派出去的(不管几层、和它在同一个分组里的)一起移,谁派的谁不变
+
+分组写 '' 表示移出分组;写 . 表示按它的目录定的组(见 aca help group),会打印移到了哪个组。",
+                    "Several sessions can go at once; the last word is the group. One already in it stays where it is.
+  --tree    what each one sent out goes along (however many levels down, the ones in its own group);
+            who sent out whom stays as it is
+
+GROUP '' moves it out of any group; . is the group its directory decides (see aca help group), printed.",
                 ),
             },
             Cmd {
@@ -471,9 +502,10 @@ Once renamed the name is locked and no longer follows the agent's own title.",
                     Tr::new("group dir <路径> [目录 | '']", "group dir <PATH> [DIR | '']"),
                     Tr::new("group rm <路径>", "group rm <PATH>"),
                     Tr::new("group order <路径> <位置>", "group order <PATH> <POS>"),
+                    Tr::new("group router <路径> [id | '']", "group router <PATH> [id | '']"),
                 ],
                 more: Tr::new(
-                    "  ls        全部分组:顺序、路径、默认目录
+                    "  ls        全部分组:顺序、路径、默认目录,有 router 的后面是 @它的 id
   --json    输出 JSON(供脚本读取)
   add       把目录(默认为当前目录)登记为分组,组名按目录定(见下文),并打印组名;已有对应的组时只打印组名
   create    自己起名,上级分组一并创建。默认目录:在界面里往这个组新建会话时预先填入的路径
@@ -482,6 +514,9 @@ Once renamed the name is locked and no longer follows the agent's own title.",
   dir       查看 / 修改默认目录,'' 表示清除。一个目录只能作为一个组的默认目录
   rm        子分组一并删除;组内的会话不会被停止或删除,而是移到上一级
   order     分组的顺序(一个数,小的在前)
+  router    这个分组的 router(替你把这个分组的事分给会话的那个会话,界面左栏上的 @):只写分组 = 打印它的 id,
+            没有就什么都不打印、退出码 1;写 id = 指定,必须是这个分组里的会话;'' = 取消。
+            它被删除、移到别的分组以后不再算数,放回来又算。Claude router 按 [router] idle 自动换班
 
 按目录定组(group add,以及 new / adopt / move 里的 -g . 或分组写 .;在界面里按 N 改了路径时也按这套规则):
   1. 某个组的默认目录就是它 → 那个组
@@ -492,7 +527,7 @@ Once renamed the name is locked and no longer follows the agent's own title.",
   名字不合适:用 aca group rename 修改
 
 把会话放进分组:aca new … -g <路径>、aca move <id> <路径>。",
-                    "  ls        all groups: position, path, default directory
+                    "  ls        all groups: position, path, default directory, and @<id> after one that has a router
   --json    print as JSON (for scripts)
   add       register a directory (default: the current one) as a group named by the rules below, print its name;
             if a group already has it, just print that one
@@ -504,6 +539,10 @@ Once renamed the name is locked and no longer follows the agent's own title.",
   dir       show / change the default directory; '' = forget it. A directory is the default of one group at most
   rm        deletes subgroups too; sessions inside aren't stopped or deleted, they move up a level
   order     group position (a number, smaller first)
+  router    the group's router (the session that hands the group's work to sessions for you; the @ on the
+            interface's rail): the group alone prints its id, or nothing and exit 1 when it has none; an id names
+            it, one of the group's own sessions; '' = nobody. Deleted or moved to another group it no longer
+            counts, put back it does again. Claude routers change shifts after [router] idle
 
 Groups by directory (group add, and -g . or GROUP . in new / adopt / move; N in the list with a
 changed path follows the same rules):
@@ -515,6 +554,120 @@ changed path follows the same rules):
   default directory, this one is recorded. Don't like the name: aca group rename
 
 Putting sessions in a group: aca new … -g <PATH>, aca move <id> <PATH>.",
+                ),
+            },
+            Cmd {
+                names: &["note"],
+                short: Tr::same("note ls | add | show | …"),
+                brief: Tr::new("分组的笔记(一个分组一本)", "a group's notes (one notebook per group)"),
+                usage: &[
+                    Tr::new("note ls [-g 分组] [--json]", "note ls [-g GROUP] [--json]"),
+                    Tr::new("note add [-g 分组] [话]", "note add [-g GROUP] [TEXT]"),
+                    Tr::new("note show <笔记 id> [--json]", "note show <NOTE-ID> [--json]"),
+                    Tr::new("note pin <笔记 id>", "note pin <NOTE-ID>"),
+                    Tr::new("note unpin <笔记 id>", "note unpin <NOTE-ID>"),
+                    Tr::new("note rm <笔记 id>", "note rm <NOTE-ID>"),
+                ],
+                more: Tr::new(
+                    "  ls        这个分组的笔记,一条一行:id、★(置顶)、名字(第一行)、谁写的、多久前改的。置顶的在前,其余新改的在前
+  add       写一条,第一行是它的名字;不带内容时从标准输入读。打印它的 id。在会话里运行时,记为那个会话写的
+  show      全文
+  pin       置顶
+  unpin     取消置顶
+  rm        删除(保留 1 天,界面的回收站 b 可恢复)
+  -g 分组   哪个分组的笔记;写 . 表示按当前目录定的组(见 aca help group)。不写时是你所在会话的分组
+  --json    输出 JSON(供脚本和 agent 读取):id、group、text、by(写它的会话 id,空 = 你)、created、updated、pinned
+  笔记 id   写开头几位即可(只匹配到一条时)
+
+和界面里在分组上按 e 写的是同一本。分组重命名时笔记随之移动。",
+                    "  ls        the group's notes, one a line: id, ★ (pinned), name (its first line), who wrote it, how long since
+            it changed. Pinned ones first, then the most recently changed
+  add       write one; its first line is its name. No TEXT = read standard input. Prints its id. Run inside a
+            session, it's recorded as written by that session
+  show      the whole text
+  pin       pin it
+  unpin     unpin it
+  rm        delete it (kept a day: b, the interface's trash, brings it back)
+  -g GROUP  which group's notes; . is the group the current directory decides (see aca help group). Default: the
+            group of the session you're in
+  --json    print as JSON (for scripts and agents): id, group, text, by (the session that wrote it; empty = you),
+            created, updated, pinned
+  NOTE-ID   its first few characters will do (when they match only one)
+
+The same notebook as e on a group in the interface writes. Notes follow their group when it's renamed.",
+                ),
+            },
+            Cmd {
+                names: &["task"],
+                short: Tr::same("task ls | add | give | done | …"),
+                brief: Tr::new("分组的任务单(一件交给一个会话做的事)", "a group's task tickets (a thing handed to one session to do)"),
+                usage: &[
+                    Tr::new(
+                        "task add [-g 分组] -t <名字> [--criteria 标准] [--note 话] [--to id] [--watch] [--no-watch] [话…]",
+                        "task add [-g GROUP] -t <TITLE> [--criteria TEXT] [--note TEXT] [--to id] [--watch] [--no-watch] [TEXT…]",
+                    ),
+                    Tr::new("task ls [-g 分组] [--all] [--json]", "task ls [-g GROUP] [--all] [--json]"),
+                    Tr::new("task show <单号> [--json]", "task show <N> [--json]"),
+                    Tr::new("task give <单号> <id> [--watch] [--no-watch] [话…]", "task give <N> <id> [--watch] [--no-watch] [TEXT…]"),
+                    Tr::new("task done [单号] [话…]", "task done [N] [TEXT…]"),
+                    Tr::new("task set <单号> [-t 名字] [--criteria 标准] [--note 话] [--watch] [--no-watch]", "task set <N> [-t TITLE] [--criteria TEXT] [--note TEXT] [--watch] [--no-watch]"),
+                    Tr::new("task rm <单号>", "task rm <N>"),
+                ],
+                more: Tr::new(
+                    "  add       新建一张,打印它的单号(#9)。最后的话是交的时候说的(和 --to 一起用)。没交给谁时,这个分组的 router 会收到一句
+  ls        没完成的任务单,一张一行:单号、状态(· 待办  ● 在做  ✓ 完成)、名字、分组、做它的会话、多久前
+  show      一张单的全部
+  give      交给一个会话:它收到这张单、你说的话、以及做完该运行的命令;原来在做的会话收到一句「不用再做」。
+            id 写 - = 取回(变回待办)。交出一张已完成的 = 重新打开
+  done      标成完成,后面的话是结果。在做它的会话里可以不写单号。结果进往来;
+            盯着这张单或同组还有待交单时,另通知分组 router(没有则通知交单的会话)
+  set       改名字、完成标准、那一行字
+  rm        删除(无法恢复)
+  -g 分组   哪个分组;写 . 表示按当前目录定的组。add 不写时是你所在会话的分组;ls 不写时列所有分组的
+  -t 名字   任务单的名字
+  --criteria 标准  完成标准:做到什么算完成
+  --note 话  单子上的一行字:它在等什么、眼下最要紧的是什么。只保存和显示;'' = 清空
+  --watch   盯这张单:一轮结束、等回答、出错、退出或标成完成时通知分组 router,没有则通知交单的会话
+  --no-watch  取消盯单。两个开关只能选一个;不写时新单默认不盯,已有单沿用原设置
+  --to id   新建时当场交给这个会话
+  --all     连完成的一起列
+  --json    输出 JSON(供脚本和 agent 读取):n、group、title、criteria、note、state(todo / doing / done)、session(做它的会话)、
+            by(谁新建的,空 = 你)、given_by、given、say、result、watch、created、done
+  单号      9 或 #9。整个 aca 一串号,删除的号不再使用
+
+谁能做什么:你(在会话外运行)都可以;router(任何分组的)可以新建、交给、取回、改;做它的会话可以把自己那张标成完成、
+改自己那张的那一行字;删除只有你可以。先后顺序、谁等谁由 router 决定,aca 只保存、显示和传话。
+新建一个会话来做:aca new … --task <单号>。",
+                    "  add       make one and print its number (#9). The TEXT at the end is what's said handing it over (with --to).
+            Handed to nobody, the group's router is told
+  ls        the tickets not done, one a line: number, state (· todo  ● doing  ✓ done), title, group, the session
+            doing it, how long ago
+  show      all of one ticket
+  give      hand it to a session: it gets the ticket, what you said, and the command to run when it's done; the
+            session that had it is told to stop. - for the id = take it back (it waits again). Handing over a done
+            one opens it again
+  done      mark it done; the TEXT after is the result. The session doing it may leave the number out.
+            The result appears in the exchange. If it's watched or the group has another ticket to assign,
+            aca also tells the group router, or the dispatcher if there is no router
+  set       rewrite its title, what counts as done, its line
+  rm        delete it (for good)
+  -g GROUP  which group; . is the group the current directory decides. add: default, the group of the session
+            you're in; ls: default, every group's
+  -t TITLE  the ticket's title
+  --criteria TEXT  what counts as done
+  --note TEXT  a line on the ticket: what it waits for, what matters most now. Only kept and shown; '' clears it
+  --watch   notify the group router (or the dispatcher if there is no router) on turn end, question, error, exit or completion
+  --no-watch  turn watching off. Choose at most one switch. Omit both to keep the setting; new tickets default to off
+  --to id   hand the new ticket to this session at once
+  --all     list the done ones too
+  --json    print as JSON (for scripts and agents): n, group, title, criteria, note, state (todo / doing / done),
+            session (the one doing it), by (who made it; empty = you), given_by, given, say, result, watch, created, done
+  N         9 or #9. One sequence for all of aca; a deleted ticket's number isn't used again
+
+Who may do what: you (run outside a session), anything; a router (any group's) makes, hands over, takes back and
+rewrites; the session doing one marks its own done and rewrites its own line; only you delete. What comes first and
+what waits for what is the router's to decide: aca keeps, shows and passes word.
+To start a session on one: aca new … --task <N>.",
                 ),
             },
             Cmd {
@@ -576,8 +729,8 @@ Only Claude's and Codex's conversation records can be read.",
                 ),
                 usage: &[Tr::same("archive <id>"), Tr::same("unarchive <id>")],
                 more: Tr::new(
-                    "恢复后处于已停止状态:aca start <id> 启动并继续原来的对话。",
-                    "Restored it's stopped: aca start <id> brings it up resuming the conversation.",
+                    "恢复后处于已停止状态,用 aca start <id> 启动。",
+                    "Restored sessions are stopped. Use aca start <id> to start one.",
                 ),
             },
             Cmd {
@@ -613,57 +766,75 @@ Only Claude's and Codex's conversation records can be read.",
         &[
             Cmd {
                 names: &["msg"],
-                short: Tr::new("msg <id | parent> <话>", "msg <id | parent> <TEXT>"),
+                short: Tr::new("msg <id | parent | desk> <话>", "msg <id | parent | desk> <TEXT>"),
                 brief: Tr::new(
                     "给别的会话传一句话:放进它的收件箱,在它方便时送达",
                     "pass a message: into its inbox, delivered when it's convenient",
                 ),
-                usage: &[Tr::new("msg [--in 时长] <id | parent> [话…]", "msg [--in DURATION] <id | parent> [TEXT…]")],
+                usage: &[Tr::new(
+                    "msg [--in 时长] [--via 渠道] <id | parent | desk> [话…]",
+                    "msg [--in DURATION] [--via CHANNEL] <id | parent | desk> [TEXT…]",
+                )],
                 more: Tr::new(
                     "\
   id             发给谁:会话 id 或名字
   parent         派你出来的那个会话(在某个会话里发送时)
+  desk           总台:随手问那个分组的 router(aca help keys 的「总台」)。还没有时报错,退出码 3
   话             不写时读标准输入
   --in 时长      过这么久再送(90s、10m、1h30m,最长 7 天);定时的可以发给自己,到点叫醒自己。
-                 没到点的在 aca inbox 里是 [定时],列表上标 ◷;有它的闲着也不会被自动停
+                 没到点的在 aca inbox 里是 [定时],列表上标 ◷;普通会话会等它送达再自动停,Claude router 可以先停、到点再起
+  --via 渠道     这句话是从 aca 外面的哪个渠道来的(比如 Discord),给替你转话的脚本用:记在消息上,
+                 router 的往来里那一行右端写出来。只能在会话外使用;名称最长 16 个字符,不含空白
 在某个会话里发送的,发件人是那个会话;在外面发送的,发件人是「你」。
 
-送达方式取决于对方的工具,都不动它的输入框:
-  Claude    按门铃:它自己监视一个文件,文件一变就取走消息,作为系统提示交给模型。空闲时立即开始一轮,
+发给停着的 Claude router 会启动新对话,交接里带上待送的话;投递时发现已经闲满时限也会先换班。
+停着的 Codex router 暂存或排队,下次手动启动后继续原对话。
+送达方式取决于对方的工具:
+  Claude    它空闲、输入框为空且你没有正在输入时,把你的话和 router 附了你原话的消息打进输入框。
+            其余情况按门铃:它自己监视一个文件,文件一变就取走消息,作为系统提示交给模型。空闲时立即开始一轮,
             运行中就并入这一轮,等待确认时等确认完再送达
   Codex     放进它自己的队列(codex queue):空闲时 10 秒内自己开始一轮,运行中就等这一轮结束。
             你刚按 Esc 中断它时不去催,等你的下一轮结束后再送达
   输入      以上两种都用不了时(接管来的、没接上门铃的 Claude;还没说过话的 Codex;其他 agent):
             只在它空闲、你没在那一格输入、输入框里没有你未发送的文字时才输入,否则过一会儿再试
 暂时无法送达的先保存,等它这一轮结束或重新启动时再送达。shell 会话不接收消息。
-放进队列或输入进去的就是那句话:你发的保持原样,别的会话发的前面多一行「[aca] 来自会话 …」,不会往 agent 里加别的内容。
+放进队列或输入进去的话,你发的保持原样,别的会话发的前面多一行「[aca] 来自会话 …」,
+router 转交你这轮说的话时,aca 会替它给每个收件会话附一次你的原话。
 
 派出会话时要求了通知(aca new --notify done,或 config.toml 的 [inbox] notify)的,被派出的会话在一轮结束、
-出错、退出、等待确认时,它自己的 hook 会给 parent 发一条通知,不需要有人一直盯着。没要求就不发:不会唤醒任何会话。
+出错、退出、等待确认时,它自己的 hook 会给 parent 发一条通知,不需要有人一直盯着。盯单通知另按单上的设置(aca help task)。
 同一个会话 10 分钟内给同一个会话发了超过 20 条,之后的只保存、不唤醒。",
                     "\
   id             who to: a session id or a name
   parent         the one that dispatched you (when sent from inside a session)
+  desk           the desk: the scratch group's router (“Desk” in aca help keys). With none yet: an error, exit code 3
   TEXT           default: read standard input
   --in DURATION  deliver it after this long (90s, 10m, 1h30m; 7 days at most); a scheduled one can go to
                  yourself, to wake you up then. Until then it's [scheduled] in aca inbox and ◷ in the list,
-                 and the session isn't stopped for being idle
+                 and keeps ordinary sessions from idling out. A Claude router can stop and wake when it is due
+  --via CHANNEL  which channel outside aca these words came in through (Discord, say), for a script that relays
+                 them for you: kept on the message, and written at the right end of its line in a router's
+                 exchange. Only from outside a session; a name of at most 16 characters, no whitespace
 Sent from inside a session, the sender is that session; from outside it's \"you\".
 
-How it gets in depends on the agent; none of them touch its input box:
-  Claude    rings a doorbell: it watches a file itself and picks the message up as a system note for the model.
+A message to a stopped Claude router starts a fresh conversation with pending mail in the handoff. Delivery also
+checks for an expired idle shift. A stopped Codex router holds or queues mail until you start it and resume.
+How it gets in depends on the agent:
+  Claude    when idle with an empty input box and you aren't typing, receives your words directly in the box.
+            This includes router messages quoting you. Otherwise it watches a doorbell file and picks up a system note.
             Idle: a turn starts right away; running: it joins this turn; waiting for a confirmation: after that
   Codex     goes into its own queue (codex queue): idle, it starts a turn within 10 seconds; running, after this turn.
             Right after you press Esc to interrupt it, no nudging: delivered after your next turn finishes
   typing    when neither works (an adopted Claude without the doorbell; a Codex that hasn't talked yet; other agents):
             only typed when it's idle, you're not typing in that pane and its input box has nothing unsent
 What can't be delivered is kept and delivered when this turn ends or it starts again. Shell sessions don't take any.
-Queued or typed, it's that text and nothing else: yours as written, another session's with a line
-\"[aca] from session …\" in front. Nothing else is added to the agent.
+Queued or typed messages carry your words as written.
+Another session's message gets a line \"[aca] from session …\" in front.
+When a router dispatches during a turn you opened, aca includes your words once per recipient.
 
 When asked for at dispatch (aca new --notify done, or [inbox] notify in config.toml), a dispatched session's own
 hooks notify its parent when a turn finishes, fails, it exits or it waits for a confirmation, so nobody has to keep
-watching. Not asked for: nothing is sent, nobody is woken.
+watching. Watched tickets have their own notifications (aca help task).
 More than 20 from one session to another within 10 minutes: the rest are kept, nobody is woken.",
                 ),
             },
@@ -812,7 +983,8 @@ Called from inside a session, it can only stop the ones it dispatched.",
                 ],
                 more: Tr::new(
                     "  ls              已登记的账号:工具:名字、配置目录(不带参数时也是它)。顺序与界面账号页里的排列一致
-  status          各账号是否已登录:询问工具自己(claude auth status / codex login status),aca 不读取凭据;
+  status          各账号是否已登录:本机的 Claude 账号看它存下的登录在不在(不启动 Claude),其余询问工具自己
+                  (claude auth status / codex login status);aca 不读取凭据的内容。
                   配置目录不存在、目录其实属于另一种工具(把 ~/.codex 登记成了 Claude 的账号)也会在这里提示。
                   不指定账号时用的那个(已安装工具自己的 ~/.claude、~/.codex)也会列出
   add             登记一个账号:在 config.toml 的 [accounts.claude] / [accounts.codex] 下加一行「名字 = 目录」,
@@ -822,6 +994,7 @@ Called from inside a session, it can only stop the ones it dispatched.",
   --force         rm:有会话在用、是默认账号也删除
   claude          Claude 的账号(启动会话时这个目录作为它的 CLAUDE_CONFIG_DIR)
   codex           Codex 的账号(这个目录作为它的 CODEX_HOME)
+  agy             安装后列出 Antigravity 的 Google 登录。额度只在开着不带账号的 agy 会话时更新
   名字            自己起(字母、数字、- 和 _),启动会话时写成「claude:名字」
   目录            它的配置目录;默认为 ~/.claude-<名字> / ~/.codex-<名字>
   --statusline    仅限 Claude 账号:登记后顺便接上它的状态栏(不写就不接)
@@ -833,10 +1006,11 @@ aca 不扫描、不猜测有哪些账号,也不动登录:新建的目录需要�
 想在一张表里选:aca setup。界面里是设置页(^S)的 a:登录状态、添加、删除、⇧↑ ⇧↓ 排序都在那一页。",
                     "  ls              registered accounts: tool:name, config directory (also with no arguments), in the order
                   set on the interface's accounts page
-  status          whether each account is logged in: asks the tool itself (claude auth status / codex login status),
-                  aca reads no credentials; also says when a config directory is missing or belongs to the other
-                  tool (~/.codex registered as a Claude account). The one used when you name no account (an
-                  installed tool's own ~/.claude or ~/.codex) is listed too
+  status          whether each account is logged in: a Claude account on this Mac by whether the login it keeps is
+                  there (Claude isn't started), the rest by asking the tool itself (claude auth status / codex login
+                  status); aca never reads what a login holds. Also says when a config directory is missing or
+                  belongs to the other tool (~/.codex registered as a Claude account). The one used when you name no
+                  account (an installed tool's own ~/.claude or ~/.codex) is listed too
   add             register one: adds a \"name = directory\" line under [accounts.claude] / [accounts.codex] in
                   config.toml, leaving everything else and the comments alone; creates the directory if missing.
                   A directory that is the other tool's config directory is refused
@@ -846,6 +1020,7 @@ aca 不扫描、不猜测有哪些账号,也不动登录:新建的目录需要�
   --force         rm: remove even when sessions use it or it's a default account
   claude          a Claude account (the directory is its CLAUDE_CONFIG_DIR when sessions start)
   codex           a Codex account (the directory is its CODEX_HOME)
+  agy             lists the Google login when Antigravity is installed. Quotas update only while a bare agy session is open
   NAME            yours to choose (letters, digits, - and _); start sessions with \"claude:NAME\"
   DIR             its config directory; default ~/.claude-<NAME> / ~/.codex-<NAME>
   --statusline    Claude accounts only: wire up its status bar right after registering (default: don't)
@@ -874,7 +1049,7 @@ ordering (⇧↑ ⇧↓) are all on that page.",
 运行登录(claude 的 auth login、codex login)时不会替你打开默认浏览器:
 链接由工具自己打印在屏幕上,复制到要用的浏览器里;你自己设置了 BROWSER 时,Claude 会使用它。
 通过 SSH 连接时改用能在其他设备上完成的登录方式:Claude 给出需要把验证码粘贴回终端的链接,Codex 加上 --device-auth。
-在界面的账号页按 ⏎ 登录,出现链接时会弹出一张表:复制链接,或选择一个浏览器打开。
+在界面的账号页按 i 登录,出现链接时会弹出一张表:复制链接,或选择一个浏览器打开。
 
 例:
   aca run codex:team -- login
@@ -887,7 +1062,7 @@ A login (claude's auth login, codex login) doesn't open your default browser: th
 into the browser you want; if you set BROWSER yourself, Claude uses yours.
 Over SSH it switches to a login you can finish on another device: Claude gives the link whose page shows a code to
 paste back, Codex gets --device-auth.
-⏎ on the accounts page in the interface pops up a list once the link comes: copy it, or pick a browser to open it.
+i on the accounts page in the interface pops up a list once the link comes: copy it, or pick a browser to open it.
 
 Examples:
   aca run codex:team -- login
@@ -970,6 +1145,7 @@ Same as $ in the interface. Reads local conversation records only, no network.",
 供菜单栏这类程序使用(都不联网):
   --json    当前每个账号的额度,输出一个 JSON:{\"now\", \"accounts\": [{\"tool\", \"name\", \"dir\", \"wins\": [{\"label\", \"used\", \"resets\", \"at\"}]}]}。
             Claude 的是记录下来并合并后的(与计费页相同),Codex 的读取它最近的对话记录;name 是登记的账号名,未登记的是去掉点的目录名
+            Antigravity 的 tool 和 name 都是 agy。额度只在开着不带账号的 agy 会话时更新。
 数字有变化时还会往事件流写一条 limits.changed(字段与上面单个账号的相同),订阅它就不用定期查询:aca events -f,
 或者在插件清单里写 on = \"limits.changed\"。Codex 的在它一轮结束时检查。",
                     "\
@@ -986,6 +1162,7 @@ For programs such as a menu bar (no network either way):
   --json    every account's quota now, as one JSON: {\"now\", \"accounts\": [{\"tool\", \"name\", \"dir\", \"wins\": [{\"label\", \"used\", \"resets\", \"at\"}]}]}.
             Claude's are the recorded ones merged (as in the billing panel), Codex's are read from its latest conversation records;
             name is the registered account name, else the directory's name without its dot
+            Antigravity uses agy for both tool and name. Quotas update only while a bare agy session is open.
 When the numbers move, a limits.changed line (fields as one account above) goes into the event stream, so nothing has to keep
 asking: aca events -f, or on = \"limits.changed\" in a plugin manifest. Codex's are looked at when one of its turns ends.",
                 ),
@@ -1252,7 +1429,7 @@ Which events there are and their fields: https://github.com/cheny-00/aca/blob/ma
   install        git 地址的克隆到 ~/.local/share/aca/plugins/<id>;owner/repo 指 GitHub 上的仓库;本地目录等同于 link;
                  aca.名字 是 aca 自带的插件(aca.delegate、aca.core、aca.gateway、aca.remote、aca.tailnet、aca.bark、
                  aca.discord、aca.notify、aca.copy;列在界面 P 页的「可安装」里),随 aca 一起升级。
-                 安装后列出它提供的内容:给 agent 的、插件菜单里的(会话列表上按 :)、订阅的事件、设置
+                 安装后列出它提供的内容:给 agent 的、会话列表 ? 里的、订阅的事件、设置
   --ref          固定在某个标签 / 分支 / 提交上(update 不会更新它)
   update         更新 git 安装的插件(只快进);不给 id 时更新全部。新的提交记入 plugins.lock
   sync           让本机与 plugins.toml 一致:安装缺少的(git 的按 plugins.lock 里的提交)、删除没写的、按它设置开关
@@ -1295,9 +1472,9 @@ Which events there are and their fields: https://github.com/cheny-00/aca/blob/ma
   allow          把这几个能力作为工具提供给 agent(写入 plugins.toml 的 tools);不写能力时列出可提供的(✓ 表示已提供)。
                  清单里写 agent? 的(会改动你机器上内容的)默认不提供,需在这里明确允许。已打开的会话重启后生效
   deny           不再提供
-  key            : 菜单里的键:不给插件时列出全部(没分到键的会标出);给了就把这一项(能力 / 窗格 / 视图)改成这个键
+  key            会话列表 ? 里的键:不给插件时列出全部(没分到键的会标出);给了就把这一项(能力 / 窗格 / 视图)改成这个键
                  (写入 plugins.toml 的 keys)。两个插件要用同一个键时,你指定的优先
-  --none         不绑定键(在 : 菜单里选)
+  --none         不绑定键(在会话列表的 ? 里选)
   hotkey         会话里的热键(不用前缀,像 Ctrl+Q;往上翻看历史时也能按):按下打开插件的某个窗格。aca 把它绑定在 tmux 上,
                  只在 aca 的会话里拦截,在其他会话里按键照常发给里面的程序;插件关闭或删除后自动解除,不用改 tmux.conf。
                  不给插件时列出全部(没绑定上的会标出);给了就把这个窗格改成这个键(tmux 的键名:C-]、M-y、C-M-y、F5;
@@ -1318,8 +1495,8 @@ No plugin to make: write ~/.config/aca/user/aca-plugin.toml and it's there (its 
 
   install        git ones are cloned to ~/.local/share/aca/plugins/<id>; owner/repo is on GitHub; a local directory is a
                  link; aca.NAME is one that ships with aca (aca.delegate, aca.core, aca.gateway, aca.remote,
-                 aca.tailnet, aca.bark, aca.discord, aca.notify, aca.copy; listed under “Available” on the P page) and upgrades with it. Afterwards it lists what the plugin brings: for agents, the plugin menu (press :
-                 on the session list), events it subscribes to, settings
+                 aca.tailnet, aca.bark, aca.discord, aca.notify, aca.copy; listed under “Available” on the P page) and upgrades with it. Afterwards it lists what the plugin brings: for agents, in the session list's ?,
+                 events it subscribes to, settings
   --ref          pin to a tag / branch / commit (update leaves it alone)
   update         pull git ones (fast-forward only); no id = all of them. The new commit goes into plugins.lock
   sync           make this machine match plugins.toml: install what's missing (git ones at the commit in
@@ -1371,9 +1548,9 @@ No plugin to make: write ~/.config/aca/user/aca-plugin.toml and it's there (its 
                  give (✓ given). Commands marked agent? in the manifest (ones that change things on your machine) aren't
                  given until you allow them here. Running sessions change after a restart
   deny           stop giving them
-  key            keys in the : menu: no plugin lists them all (naming any that lost a key); otherwise gives this one
+  key            keys in the list's ?: no plugin lists them all (naming any that lost a key); otherwise gives this one
                  (command / pane / view) that key (written to keys in plugins.toml). When two plugins want one key, yours wins
-  --none         no key (pick it in the : menu)
+  --none         no key (pick it in the list's ?)
   hotkey         hotkeys inside a session (no prefix, like Ctrl+Q; they work while scrolled back too): pressing one opens a
                  pane of the plugin. aca binds it in tmux, only for aca's sessions; elsewhere the key still reaches the
                  program. Disable or remove the plugin and it is unbound; tmux.conf isn't touched. No plugin lists them
@@ -1454,7 +1631,7 @@ const CONFIG: &str = "\
   两种都是界面里的特殊环境:^E 单独列出(n 里没有),列表里显示成 team@work、team-unis@unis
 
 工具
-  [tools.claude]                   # 内置工具(claude / codex / pi / opencode / shell)的默认值
+  [tools.claude]                   # 内置工具(claude / codex / pi / opencode / agy / shell)的默认值
   account = \"work\"                 # 不指定账号时用哪个
   args = [\"--dangerously-skip-permissions\"]                   # 每次启动都带的参数
   env = { ANTHROPIC_BASE_URL = \"https://…\" }
@@ -1479,7 +1656,13 @@ const CONFIG: &str = "\
   folder = true                    # 替你回答「是否信任这个目录」(Claude、Codex 第一次进入一个目录时都会问;不写:不替你回答,
                                    # 会话停在那里等你;也可在界面 ^S 里按 f 开关)。之后那个目录自带的配置无需询问就能运行
 
-空闲的会话(aca help stop;有误时只忽略这一节)
+Claude router 的每一班(以下为默认值)
+  [router]
+  model = \"sonnet\"
+  effort = \"high\"
+  idle = \"1h\"                      # never 关闭空闲换班
+
+普通会话的空闲停止和会话清理(aca help stop;有误时只忽略这一节)
   [idle]
   stop_after = \"3h\"                # 空闲这么久就停止,列表里显示 ☾(30m、3h、1d、1h30m;never 或不写 = 不自动停止)。aca 界面打开时每 5 分钟检查一次;
                                    # 本轮未结束的、未读的、等待回应的、有人连着的、有后台任务的、输入框里有未发送文字的、
@@ -1493,7 +1676,7 @@ aca 绑定在 tmux 上的键(只在 aca 的会话里拦截;不写入你的 tmux.
   next = \"C-M-n\"                   # 进入下一个待处理的会话(aca help next)。不写时就是它;\"\" = 不绑定;aca tmux key next <键> 也是修改这里
   ref = \"prefix b\"                 # 选一个会话、把引用插到输入框(aca help ui 的 --ref)。不写时就是它;\"\" = 不绑定;aca tmux key ref <键> 也是修改这里
 
-登录(账号页的 ⏎、aca run … login:不替你打开默认浏览器,弹出链接供选择;有误时只忽略这一节)
+登录(账号页的 i、aca run … login:不替你打开默认浏览器,弹出链接供选择;有误时只忽略这一节)
   [login]
   browsers = [\"Firefox\", { name = \"Chrome 工作\", cmd = [\"google-chrome\", \"--profile-directory=Profile 1\"] }]
                                    # 不写:自动查找(Mac 上找 .app,Linux 上找 .desktop);写了就只列出这些。
@@ -1510,7 +1693,7 @@ aca 绑定在 tmux 上的键(只在 aca 的会话里拦截;不写入你的 tmux.
   args = [\"-y\", \"web-mcp\"]
   description = \"搜网页\"
   scope = \"session\"                # 在 gateway 里每个会话一份(有状态的,比如浏览器);不写 = 所有会话共用一份
-  [theme] name · [ime] auto · [new_group] default_path · [hooks] url / token
+  [theme] name · [ime] auto · [new_group] default_path · [scratch] dir · [hooks] url / token
                                    # 这几项在界面的 ^S 设置页里修改,不用手写
 
 当前可用的名字:aca names。账号的每个选项、防止账号混用的规则:https://github.com/cheny-00/aca/blob/main/docs/accounts.zh-CN.md";
@@ -1553,7 +1736,7 @@ Sandboxes (a cage reached over ssh, directories of this Mac mounted at the same 
   Both are the interface's special environments: listed apart under ^E (not in n), shown as team@work, team-unis@unis
 
 Tools
-  [tools.claude]                   # defaults for the built-ins (claude / codex / pi / opencode / shell)
+  [tools.claude]                   # defaults for the built-ins (claude / codex / pi / opencode / agy / shell)
   account = \"work\"                 # which account when none is given
   args = [\"--dangerously-skip-permissions\"]                   # arguments for every start
   env = { ANTHROPIC_BASE_URL = \"https://…\" }
@@ -1579,14 +1762,20 @@ Startup gates
                                    # a folder; unset: not answered, the session waits for you; f in ^S toggles it).
                                    # The folder's own config then runs without asking
 
-Idle sessions (aca help stop; a mistake drops only this)
+Claude router shifts (defaults shown)
+  [router]
+  model = \"sonnet\"
+  effort = \"high\"
+  idle = \"1h\"                      # never disables idle shift changes
+
+Idle stops for ordinary sessions and session cleanup (aca help stop; a mistake drops only this)
   [idle]
   stop_after = \"3h\"                # stop sessions idle this long, drawn ☾ in the list (30m, 3h, 1d, 1h30m; never or unset = never).
                                    # Checked every 5 minutes while the aca interface is open; never mid-turn, finished-unread,
                                    # waiting for you, attached, with background tasks or unsent text, with dispatched
                                    # sessions still open, or with a schedule of its own not yet due (aca help stop). ⏎ resumes
   remove_after = \"30d\"             # delete sessions stopped (■ ☾, archived ones too) this long, into the trash like d: ^Z / b
-                                   # brings them back within a day (never or unset = never). Not pinned ones, ones with a note,
+                                   # brings them back within a day (never or unset = never). Not pinned ones, ones with a draft,
                                    # or ones with dispatched sessions still open. Claude keeps its own records 30 days by
                                    # default, so one stopped longer can't resume its conversation anyway
 
@@ -1597,7 +1786,7 @@ Keys aca binds in tmux (only inside aca's sessions; nothing written to your tmux
   ref = \"prefix b\"                 # pick a session and put its reference where you type (aca ui --ref). Unset: this;
                                    # \"\" = not bound; aca tmux key ref <key> edits this
 
-Logins (⏎ on the accounts page, aca run … login: no default browser, the link pops up to pick; a mistake drops only this)
+Logins (i on the accounts page, aca run … login: no default browser, the link pops up to pick; a mistake drops only this)
   [login]
   browsers = [\"Firefox\", { name = \"Work Chrome\", cmd = [\"google-chrome\", \"--profile-directory=Profile 1\"] }]
                                    # unset: found by itself (.app on a Mac, .desktop files on Linux); set: only these.
@@ -1616,7 +1805,7 @@ Interface
   args = [\"-y\", \"web-mcp\"]       # agent through the gateway (aca help plugin)
   description = \"web search\"
   scope = \"session\"                # one per session in the gateway (stateful ones, a browser); default: one shared
-  [theme] name · [ime] auto · [new_group] default_path · [hooks] url / token
+  [theme] name · [ime] auto · [new_group] default_path · [scratch] dir · [hooks] url / token
                                    # these are set in the interface's ^S settings page, no need to write them
 
 Which names work now: aca names. Every account option and the rules that keep accounts apart: https://github.com/cheny-00/aca/blob/main/docs/accounts.md";
@@ -1702,8 +1891,8 @@ pub fn overview() -> String {
         }
     }
     out += &tr!(
-        "\n<id> 可以只写开头几位,也可以写标题。ls / show / new / adopt / group ls 加 --json 供程序读取。\n",
-        "\n<id>: first few characters, or the title. --json for programs: ls / show / new / adopt / group ls\n"
+        "\n<id> 可以只写开头几位或标题。ls / show / new / adopt / group ls / note ls 加 --json 供程序读取。\n",
+        "\n<id>: its start, or the title. --json for programs: ls / show / new / adopt / group ls / note ls\n"
     );
     out += &tr!(
         "输出到终端时排版并着色(配色跟随界面主题,设置了 NO_COLOR 时不着色);输出到管道时是不带颜色的原文。\n",
@@ -1757,7 +1946,7 @@ mod tests {
         for l in [Lang::Zh, Lang::En] {
             with(l, || {
                 let o = overview();
-                assert!(o.lines().count() <= 60, "{l:?}:总览有 {} 行,一屏看不完了", o.lines().count());
+                assert!(o.lines().count() <= 62, "{l:?}:总览有 {} 行,一屏看不完了", o.lines().count());
                 // No wrapping in a 100-column terminal
                 assert!(o.lines().all(|l| width(l) <= 100), "{l:?}:{:#?}", o.lines().filter(|l| width(l) > 100).collect::<Vec<_>>());
                 for c in GROUPS.iter().flat_map(|g| g.1.iter()) {
@@ -1818,7 +2007,9 @@ mod tests {
                     // Both have notes to add, or neither does
                     assert_eq!(c.more.zh.is_empty(), c.more.en.is_empty(), "{}", c.names[0]);
                 }
-                for name in ["group", "ls", "send", "events", "fork", "rename", "import", "cost", "meta", "plugin", "hook", "completion"] {
+                for name in
+                    ["group", "note", "task", "ls", "send", "events", "fork", "rename", "import", "cost", "meta", "plugin", "hook", "completion"]
+                {
                     let page = of(name).unwrap();
                     let rows: Vec<&str> = page.lines().skip_while(|l| !l.is_empty()).filter(|l| l.starts_with(' ')).collect();
                     assert!(!rows.is_empty() && rows.iter().all(|l| l.starts_with("  ")), "{l:?} {name}:{rows:?}");
@@ -1834,7 +2025,7 @@ mod tests {
         assert_eq!(guess("rest"), Some("restart"));
         assert_eq!(guess("adop"), Some("adopt"));
         // A start that matches several, or one too far off: no guess
-        assert_eq!((guess("s"), guess("xyzzy"), guess(""), guess("nope")), (None, None, None, None));
+        assert_eq!((guess("s"), guess("xyzzy"), guess(""), guess("qqqq")), (None, None, None, None));
         assert_eq!(guess("l"), None);
         assert_eq!((distance("kitten", "sitting"), distance("", "ab"), distance("ls", "ls")), (3, 2, 0));
     }

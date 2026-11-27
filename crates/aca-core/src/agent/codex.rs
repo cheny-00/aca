@@ -275,7 +275,7 @@ fn last_turn_end(text: &str, since: u64) -> Option<serde_json::Value> {
     }
     if p["error"].is_null() {
         let reply = p["last_agent_message"].as_str().unwrap_or("");
-        return Some(serde_json::json!({ "hook_event_name": "Stop", "last_assistant_message": reply, "at": at? }));
+        return Some(serde_json::json!({ "hook_event_name": "Stop", "last_assistant_message": reply, "at": at?, "turn_id": p["turn_id"] }));
     }
     let message = p["error"]["message"].as_str().filter(|m| !m.trim().is_empty()).unwrap_or("本轮出错");
     // Kind: without data it's a string ("server_overloaded"), with data an object with a single key
@@ -304,7 +304,9 @@ fn last_turn_end(text: &str, since: u64) -> Option<serde_json::Value> {
         ("" | "other", _) => super::lifecycle::error_kind(message),
         _ => "fatal",
     };
-    Some(serde_json::json!({ "hook_event_name": "StopFailure", "error": message, "error_kind": kind, "codex_error": key, "at": at }))
+    Some(
+        serde_json::json!({ "hook_event_name": "StopFailure", "error": message, "error_kind": kind, "codex_error": key, "at": at, "turn_id": p["turn_id"] }),
+    )
 }
 
 /// Which conversation a running Codex is on now: (conversation id, record, title). It leaves no "which conversation this
@@ -526,6 +528,7 @@ impl Agent for Codex {
     ///   and the hook still says running, the hook didn't run
     fn unreported_end(&self, r: &Run) -> Option<serde_json::Value> {
         last_turn_end(&tail(&r.transcript, 256 * 1024)?, r.turn)
+            .filter(|end| r.prompt_id.is_empty() || end["turn_id"].is_null() || end["turn_id"] == r.prompt_id)
     }
 
     fn last_reply(&self, r: &Run) -> Option<String> {

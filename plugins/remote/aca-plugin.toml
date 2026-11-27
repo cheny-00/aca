@@ -11,11 +11,15 @@ needs = ["jq", "curl", "ssh"]
 # its address and token are the two settings below.
 
 [settings.url]
+label = "服务地址"
+label_en = "Server URL"
 default = ""
 desc = "server 的地址(https://…):远端回调和获取结果都使用它"
 desc_en = "The server's address (https://…): the remote side calls back to it and results are fetched from it."
 
 [settings.token]
+label = "管理口令"
+label_en = "Admin token"
 default = ""
 secret = true
 desc = "server 的管理口令,与它的 JOBHOOK_TOKEN 相同"

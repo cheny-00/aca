@@ -84,7 +84,7 @@ pub fn changes(rows: &[Row]) -> (Vec<String>, Vec<String>) {
     (pick(true), pick(false))
 }
 
-/// The `M` popup: one MCP per row, "[x] name  project / global  description", space attaches / detaches, ⏎ applies.
+/// The `M` popup: one MCP per row, "[✓] name  project / global  description", space attaches / detaches, ⏎ applies.
 /// Editable ones get a box, read-only ones a dot; names changed but not applied yet are in the accent color
 pub struct View {
     t: Target,
@@ -100,13 +100,34 @@ impl View {
     }
 }
 
+impl View {
+    /// Its keys, for `?`; the bottom bar shows Space (and ⏎ as the button). Nothing here to switch: no bar, only moving and closing
+    fn keys(&self) -> Vec<crate::sheet::Key> {
+        use crate::sheet::{key, more};
+        if !self.editable() {
+            return vec![more("↑↓", t!("选择", "select")), more("Esc", t!("关闭", "close"))];
+        }
+        vec![
+            key(t!("空格", "space"), t!("切换", "toggle")),
+            key("⏎", t!("应用", "apply")),
+            more("↑↓", t!("选择", "select")),
+            more("Esc", t!("不保存", "don't save")),
+        ]
+    }
+
+    /// Has a row Space can switch (project and gateway ones; the rest are read-only)
+    fn editable(&self) -> bool {
+        self.rows.iter().any(|r| matches!(r.kind, Kind::Project | Kind::Gateway))
+    }
+}
+
 impl Overlay for View {
     fn width(&self) -> u16 {
         72
     }
 
     fn lines(&self, w: usize) -> Vec<Line<'static>> {
-        let edit = self.rows.iter().any(|r| matches!(r.kind, Kind::Project | Kind::Gateway));
+        let edit = self.editable();
         let title = format!("MCP · {}", self.t.title);
         let mut out = vec![
             kit::modal_title(&title, theme::accent(), kit::esc_hint(if edit { t!("取消", "cancel") } else { t!("关闭", "close") }), w),
@@ -118,8 +139,8 @@ impl Overlay for View {
         let name_w = self.rows.iter().map(|r| r.name.width()).max().unwrap_or(0).min(16);
         for (i, r) in self.rows.iter().enumerate() {
             let (mark, tag) = match r.kind {
-                Kind::Gateway => (if r.want { "[x]" } else { "[ ]" }, "gateway"),
-                Kind::Project => (if r.want { "[x]" } else { "[ ]" }, t!("项目", "project")),
+                Kind::Gateway => (if r.want { "[✓]" } else { "[ ]" }, "gateway"),
+                Kind::Project => (if r.want { "[✓]" } else { "[ ]" }, t!("项目", "project")),
                 Kind::Extra => (" · ", t!("项目", "project")),
                 Kind::Global => (" · ", t!("全局", "global")),
             };
@@ -139,13 +160,15 @@ impl Overlay for View {
         }
         if edit {
             out.push(Line::raw(""));
-            out.push(kit::keys_line(
-                &[(t!("空格", "space"), t!("切换", "toggle"))],
-                vec![kit::button(t!("⏎ 应用", "⏎ apply"), theme::pal().accent)],
-                w,
-            ));
+            let keys = self.keys();
+            let keys: Vec<(&str, &str)> = crate::sheet::foot(&keys).into_iter().filter(|(k, _)| *k != "⏎").collect();
+            out.push(crate::kit::keys_line_help(&keys, vec![kit::button(t!("⏎ 应用", "⏎ apply"), theme::pal().accent)], w));
         }
         out
+    }
+
+    fn sheet(&self) -> Option<Vec<crate::sheet::Key>> {
+        Some(self.keys())
     }
 
     fn on_key(&mut self, k: KeyEvent, fx: &mut Fx) -> Flow {
@@ -176,7 +199,8 @@ impl Overlay for View {
                 }
                 return Flow::Close;
             }
-            KeyCode::Esc | KeyCode::Char('q') => return Flow::Close,
+            // M opened it: pressing it again closes, like Esc (without applying)
+            KeyCode::Esc | KeyCode::Char('q' | 'M') => return Flow::Close,
             _ => {}
         }
         Flow::Stay
@@ -465,6 +489,20 @@ mod tests {
             ]
         );
         assert_eq!(r[1].desc, "B");
+    }
+
+    #[test]
+    fn question_mark_lists_space_and_apply_only_when_a_row_can_be_switched() {
+        aca_core::i18n::with(aca_core::i18n::Lang::Zh, || {
+            let t = Target { name: "c".into(), title: "c".into(), profile: "default".into(), id: "c".into() };
+            let what = |v: &View| v.sheet().unwrap().iter().map(|k| k.key.to_string()).collect::<Vec<_>>();
+            let v = View::new(t.clone(), "/p".into(), rows(Agent::Claude, &cat(), &[], &[]));
+            assert_eq!(what(&v), ["空格", "⏎", "↑↓", "Esc"]);
+            // Codex: every row read-only, no bar; ? has only moving and closing
+            let v = View::new(t, "/p".into(), rows(Agent::Codex, &cat(), &[], &["alpha".into()]));
+            assert_eq!(what(&v), ["↑↓", "Esc"]);
+            assert!(v.sheet().unwrap()[1].what.contains("关闭"));
+        });
     }
 
     #[test]

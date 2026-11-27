@@ -14,8 +14,8 @@ prints nothing, use the language the user writes to you in.
 - **You = orchestrator**: break the request down, write the plan, hand it off, **verify
   independently**, report. Don't write the implementation yourself except for trivial tweaks. A
   worker that looks stuck is **not** a reason to take over — see "When a worker looks stuck".
-- **The worker = implementer / tester** (`aca plugin setting aca.delegate worker` says which tool and
-  account, Codex by default): lands the code and writes and runs tests against the spec you give it.
+- **The worker = implementer / tester** (which tool and account: see "Channel" under Phase 2; the
+  plugin's `worker` setting is the default, Codex): lands the code and writes and runs tests against the spec you give it.
   It runs as an **aca session** under yours: the user can watch it live in aca's list
   (`aca attach <id>`), and nothing about it lives inside your context.
 
@@ -42,9 +42,21 @@ Run the five phases in order; finish one before starting the next.
 
 ## 2. Hand off
 
+### Channel — settle it before the first dispatch
+Who gets the work is a tool plus an account (`codex`, `codex:work`, `claude:work`); another account
+means another home, provider and quota.
+- The user named it in the request: use that. The user told you to pick: pick, and say which and why
+  in the report. Either way, don't ask.
+- Otherwise ask once, with a menu (Claude Code: `AskUserQuestion`; with no menu tool, ask in plain
+  text and wait). Options: the coding-agent rows of `aca names` (leave out `shell…`), at most four,
+  `aca plugin setting aca.delegate worker` first and marked as recommended; the rest stay
+  reachable through the free-text answer.
+- The answer covers every worker of this task. Never switch to another account on your own later,
+  not even when one fails — that goes back to the user.
+
 ### Dispatch — then arm the wake-up, every time
 ```bash
-SLUG=<kebab>    W=$(aca plugin setting aca.delegate worker)
+SLUG=<kebab>    W=<the channel settled above>
 aca new "$W" <repo> -w delegate/$SLUG -t "$SLUG" --say "$(cat doc/<area>/$SLUG-plan.md)" \
   -- -c model_reasoning_effort=xhigh
 ```
@@ -54,8 +66,6 @@ aca new "$W" <repo> -w delegate/$SLUG -t "$SLUG" --say "$(cat doc/<area>/$SLUG-p
   name you passed.
 - **The brief goes in as text (`--say`), not as a path.** A worktree starts from the committed
   HEAD, so a plan doc you just wrote and didn't commit is not in it.
-- **Channel**: `$W`, the plugin's `worker` setting. Another account (`aca names` lists them) means
-  another home, provider and quota — that's the user's call, never yours.
 - **Model**: leave it out to use the account's default. Otherwise only the newest model or the one
   just below it (`-- -m <slug>`; read the account's `config.toml` and the catalog it points at to
   see which those are). Say which one you used, and why, in the report.

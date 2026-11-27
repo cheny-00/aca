@@ -103,7 +103,7 @@ mark in front of each session tells you its state:
 | Mark | Meaning | What to do |
 |---|---|---|
 | `●` | The agent is working | Nothing. Let it run |
-| `◆` | Needs you: a question or a permission prompt | Go in and answer. `i` takes you to the next one to look at |
+| `◆` | Needs you: a question or a permission prompt | Go in and answer, or press `s` to answer it from the list. `i` takes you to the next one to look at |
 | `◐` | Unread: it finished and you haven't read the result | Go in and look |
 | `○` | Idle, and you have seen its last reply | |
 | `✕` | Something went wrong | Go in and look |

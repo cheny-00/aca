@@ -25,7 +25,9 @@
 //! 0~255, or "reset" (the terminal's default text color).
 //! A running aca switches within a second of saving; a wrong name or color counts as not written (one bad entry in series /
 //! parts and the whole list counts as not written), and `aca theme` lists them.
-//! The background and body text aren't handled here; they're the terminal's own.
+//! Body text isn't handled here; it's the terminal's own. The screen has two grounds: the terminal's own background (the
+//! column beside the list, the row the cursor is on) and `back`, laid under everything else; `back = "reset"` leaves
+//! the whole screen on the terminal's background.
 //!
 //! The two built-ins: the terminal's 16 colors have nothing like a "pale purple background", so RGB is hard-coded; state,
 //! minor text, hints and accounts are hard-coded too: the terminal's own yellow and green have contrast of only 2~3 on a light
@@ -49,10 +51,12 @@ pub struct Pal {
     pub on_accent: Color,
     pub sel: Color,
     pub pick: Color,
+    pub back: Color,
     pub fade: Color,
     pub shadow: Color,
     pub minor: Color,
     pub faint: Color,
+    pub rule: Color,
     pub warn: Color,
     pub hint: Color,
     pub hint_typed: Color,
@@ -66,6 +70,7 @@ pub struct Pal {
     pub codex: Color,
     pub pi: Color,
     pub opencode: Color,
+    pub agy: Color,
     pub total: Color,
     pub other: Color,
     pub track: Color,
@@ -100,7 +105,7 @@ pub struct Pal {
 }
 
 /// (category, name, where it's used, the field). `aca theme` lists them in this order; changing a color looks it up by name
-fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color); 32] {
+fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color); 35] {
     [
         (
             t!("界面", "Interface"),
@@ -114,8 +119,17 @@ fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color
         (t!("界面", "Interface"), "on_accent", t!("强调色背景上的文字", "text on the accent color"), &mut p.on_accent),
         (t!("界面", "Interface"), "sel", t!("选中项的背景色", "background of the selected item"), &mut p.sel),
         (t!("界面", "Interface"), "pick", t!("多选(v)选中行的背景色", "background of the rows selected with v"), &mut p.pick),
+        (
+            t!("界面", "Interface"),
+            "back",
+            t!(
+                "左栏、列表、顶栏、底栏的背景色(reset = 不铺)",
+                "background of the rail, the list, the top and bottom bars (reset = none)"
+            ),
+            &mut p.back,
+        ),
         (t!("界面", "Interface"), "fade", t!("弹窗打开时底层的文字", "text of the layer under an open popup"), &mut p.fade),
-        (t!("界面", "Interface"), "shadow", t!("弹窗的阴影", "popup shadow"), &mut p.shadow),
+        (t!("界面", "Interface"), "shadow", t!("弹窗的阴影(不再使用)", "popup shadow (no longer drawn)"), &mut p.shadow),
         (
             t!("界面", "Interface"),
             "minor",
@@ -130,8 +144,14 @@ fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color
         ),
         (
             t!("界面", "Interface"),
+            "rule",
+            t!("栏间的竖线和整条的横线", "the line between columns and the rules across one"),
+            &mut p.rule,
+        ),
+        (
+            t!("界面", "Interface"),
             "warn",
-            t!("提示和警告文字、便签和置顶标记", "hint / warning text, the marks for notes and pins"),
+            t!("提示和警告文字、便签和置顶标记", "hint / warning text, the marks for drafts and pins"),
             &mut p.warn,
         ),
         (
@@ -169,6 +189,7 @@ fn tokens(p: &mut Pal) -> [(&'static str, &'static str, &'static str, &mut Color
         (t!("账号", "Accounts"), "codex", t!("列表中 Codex 的账号名", "Codex account names in the list"), &mut p.codex),
         (t!("账号", "Accounts"), "pi", t!("列表中 Pi 的账号名", "Pi account names in the list"), &mut p.pi),
         (t!("账号", "Accounts"), "opencode", t!("列表中 OpenCode 的账号名", "OpenCode account names in the list"), &mut p.opencode),
+        (t!("账号", "Accounts"), "agy", t!("列表中 Antigravity 的账号名", "Antigravity account names in the list"), &mut p.agy),
         (
             t!("计费", "Billing"),
             "total",
@@ -217,10 +238,12 @@ const LIGHT: Pal = Pal {
     on_accent: Color::Rgb(0xFF, 0xFF, 0xFF),
     sel: Color::Rgb(0xE2, 0xD8, 0xF6),
     pick: Color::Rgb(0xD4, 0xEC, 0xD0),
+    back: Color::Rgb(0xE6, 0xE9, 0xEF),
     fade: Color::Rgb(0xBC, 0xC0, 0xCC),
     shadow: Color::Rgb(0xC9, 0xCD, 0xD8),
     minor: Color::Rgb(0x6C, 0x6F, 0x85),
     faint: Color::Rgb(0x8C, 0x8F, 0xA1),
+    rule: Color::Rgb(0xBC, 0xC0, 0xCC),
     warn: Color::Rgb(0x9A, 0x5B, 0x00),
     hint: Color::Yellow,
     hint_typed: Color::DarkGray,
@@ -234,6 +257,7 @@ const LIGHT: Pal = Pal {
     codex: Color::Rgb(0x25, 0x63, 0xEB),
     pi: Color::Rgb(0x0F, 0x76, 0x6E),
     opencode: Color::Rgb(0xBE, 0x18, 0x5D),
+    agy: Color::Rgb(0x0E, 0x74, 0x90),
     series: &[
         Color::Rgb(0x59, 0x92, 0xE7),
         Color::Rgb(0xF0, 0x93, 0x62),
@@ -267,10 +291,12 @@ const DARK: Pal = Pal {
     on_accent: Color::Rgb(0x1E, 0x1E, 0x2E),
     sel: Color::Rgb(0x3B, 0x34, 0x52),
     pick: Color::Rgb(0x2B, 0x45, 0x32),
+    back: Color::Rgb(0x18, 0x18, 0x25),
     fade: Color::Rgb(0x58, 0x5B, 0x70),
     shadow: Color::Rgb(0x11, 0x11, 0x1B),
     minor: Color::Rgb(0xA6, 0xAD, 0xC8),
     faint: Color::Rgb(0x7F, 0x84, 0x9C),
+    rule: Color::Rgb(0x45, 0x47, 0x5A),
     warn: Color::Rgb(0xF9, 0xE2, 0xAF),
     hint: Color::Yellow,
     hint_typed: Color::DarkGray,
@@ -284,6 +310,7 @@ const DARK: Pal = Pal {
     codex: Color::Rgb(0x89, 0xB4, 0xFA),
     pi: Color::Rgb(0x94, 0xE2, 0xD5),
     opencode: Color::Rgb(0xF4, 0x72, 0xB6),
+    agy: Color::Rgb(0x67, 0xE8, 0xF9),
     series: &[
         Color::Rgb(0x58, 0x8C, 0xDA),
         Color::Rgb(0xCA, 0x77, 0x4A),
@@ -651,6 +678,22 @@ pub fn faint() -> Style {
     Style::new().fg(pal().faint)
 }
 
+/// The line between columns and the rules across one: fainter than the separators, a line only has to part two things
+pub fn rule() -> Style {
+    Style::new().fg(pal().rule)
+}
+
+/// The ground the rail, the list and the bars lie on. What stands out from it (the column beside the list, the row the
+/// cursor is on) is on the terminal's own background
+pub fn ground() -> Style {
+    Style::new().bg(pal().back)
+}
+
+/// What stands out from the ground: the terminal's own background
+pub fn raised() -> Style {
+    Style::new().bg(Color::Reset)
+}
+
 /// Hint / warning
 pub fn warn() -> Style {
     Style::new().fg(pal().warn)
@@ -783,7 +826,7 @@ fn show(t: &Theme, now: &str, color: bool) {
     }
 }
 
-/// All themes, one per line: the one in use marked ●, then a row of swatches (accent, state, account colors)
+/// All themes, one per line: the one in use marked ✓, then a row of swatches (accent, state, account colors)
 fn show_list(v: &[Theme], now: &str, color: bool) {
     println!(
         "{}",
@@ -794,7 +837,7 @@ fn show_list(v: &[Theme], now: &str, color: bool) {
     );
     let w = v.iter().map(|t| t.name.width()).max().unwrap_or(0);
     for t in v {
-        let dot = if t.name == now { "●" } else { " " };
+        let dot = if t.name == now { "✓" } else { " " };
         let chips = if color {
             let p = &t.pal;
             let block = |c: Color| swatch(c).replace("      ", "  ");
@@ -1119,6 +1162,21 @@ mod tests {
         let mut p = LIGHT;
         let code: Vec<&str> = tokens(&mut p).iter().filter(|x| x.0 == "代码").map(|x| x.1).collect();
         assert_eq!(code, ["syn_kw", "syn_str", "syn_num", "syn_fn", "syn_ty", "syn_com", "add_bg", "del_bg"]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_ground_and_the_rules_are_tokens_and_reset_leaves_the_ground_off() {
+        let d = dir("back", &[("flat.toml", "back = \"reset\"\nrule = \"#010203\"\n"), ("dim.toml", "base = \"mocha\"\n")]);
+        let mut bad = vec![];
+        let t = resolve("flat", &d, &mut vec![], &mut bad).unwrap();
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!((t.pal.back, t.pal.rule, t.pal.faint), (Color::Reset, Color::Rgb(1, 2, 3), LIGHT.faint));
+        // Not written: as the base has them. The ground is darker than the terminal's own in both built-ins, the rules
+        // fainter than the separators
+        let t = resolve("dim", &d, &mut vec![], &mut bad).unwrap();
+        assert_eq!((t.pal.back, t.pal.rule), (Color::Rgb(0x18, 0x18, 0x25), Color::Rgb(0x45, 0x47, 0x5A)));
+        assert_eq!((LIGHT.back, LIGHT.rule), (Color::Rgb(0xE6, 0xE9, 0xEF), Color::Rgb(0xBC, 0xC0, 0xCC)));
         std::fs::remove_dir_all(&d).unwrap();
     }
 

@@ -1,10 +1,11 @@
 //! How a session is put in words, the same in the interface and on the command line: its vendor and account, its state, how
 //! long, where.
 
-use aca_core::status::State;
 use aca_core::{t, tr};
 
 use crate::agent::Agent;
+
+pub const ANTIGRAVITY: &str = "Antigravity";
 
 /// "Claude·work": the vendor and who (the account, or the tool name); just one of them when the other is empty or they're
 /// the same
@@ -14,11 +15,13 @@ pub fn agent_label(agent: Agent, who: &str) -> String {
         Agent::Codex => "Codex",
         Agent::Pi => "Pi",
         Agent::Opencode => "OpenCode",
+        Agent::Agy => ANTIGRAVITY,
         Agent::None | Agent::Other => "",
     };
     match (name, who) {
         (n, "") => n.to_string(),
         ("", w) => w.to_string(),
+        (n, "agy") if agent == Agent::Agy => n.to_string(),
         (n, w) if n.eq_ignore_ascii_case(w) => n.to_string(),
         (n, w) => format!("{n}·{w}"),
     }
@@ -35,17 +38,7 @@ pub fn dur(sec: u64) -> String {
     }
 }
 
-/// What a state is called
-pub fn state_name(s: State) -> &'static str {
-    match s {
-        State::Running => t!("运行中", "running"),
-        State::Ask => t!("等待回应", "needs you"),
-        State::Unread => t!("未读", "unread"),
-        State::Idle => t!("空闲", "idle"),
-        State::Error => t!("出错", "error"),
-        State::Exited | State::Stopped => t!("已停止", "stopped"),
-    }
-}
+pub use aca_core::status::state_name;
 
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|v| !v.is_empty())

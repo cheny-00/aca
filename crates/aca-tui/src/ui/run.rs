@@ -1,6 +1,8 @@
 //! Running the interface: setting the terminal up and giving it back, the event loop, external programs it hands the screen
 //! to, and `aca ui --snapshot`.
 
+use ratatui::crossterm::queue;
+
 use super::*;
 
 /// How long the startup quiet period is. by_hand = opened by your own keypress (in a tmux popup, ^L restart): no Moshi is connecting then,
@@ -101,37 +103,41 @@ fn tell_var(name: &str, value: &str) {
     let _ = write!(out, "\x1b]1337;SetUserVar={name}{v}\x07").and_then(|_| out.flush());
 }
 
-/// Whether a note can be filled into its input box (E takes it in, s sends it): only Claude / Codex (other programs like vim would take
-/// pasted text as commands); not while it waits for you to choose (!) — the text would be taken as a choice
+/// Whether text can be filled into its input box (E takes the note in, s replies): only the built-in agents (other programs like vim
+/// would take pasted text as commands); not while it waits for you to choose (◆) — the text would be taken as a choice
 pub(super) fn cant_fill(s: &Session) -> Option<&'static str> {
     match s.state {
         State::Ask => Some(t!("正在等待回应", "it's waiting for your choice")),
         State::Error | State::Exited | State::Stopped | State::Crashed | State::Dead => Some(t!("未运行", "it isn't running")),
-        _ if !matches!(s.agent, Agent::Claude | Agent::Codex | Agent::Pi | Agent::Opencode) => {
+        _ if !matches!(s.agent, Agent::Claude | Agent::Codex | Agent::Pi | Agent::Opencode | Agent::Agy) => {
             Some(t!("不是内置 agent", "not a built-in agent"))
         }
         _ => None,
     }
 }
 
-/// l / e in the diff view, y in the list: hand over the terminal to run lazygit / an editor / yazi, return what went wrong when back
+/// The shell command opening path in $EDITOR at this line. Each editor writes "open at line N" differently: the VS Code family
+/// uses -g file:line, helix / zed / sublime use file:line, the rest +line file
+fn edit_at(path: &str, line: usize) -> String {
+    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let ed = notes::editor();
+    match notes::editor_name().as_str() {
+        "code" | "code-insiders" | "cursor" | "windsurf" => format!("{ed} -g {}", q(&format!("{path}:{line}"))),
+        "hx" | "helix" | "zed" | "subl" => format!("{ed} {}", q(&format!("{path}:{line}"))),
+        _ => format!("{ed} +{line} {}", q(path)),
+    }
+}
+
+/// y / e in the diff view, y in the list: hand over the terminal to run lazygit / an editor / yazi, return what went wrong when back
 fn run_external(x: &External) -> Option<String> {
     let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     let (name, st) = match x {
         External::Lazygit(dir) => ("lazygit".to_string(), std::process::Command::new("lazygit").arg("-p").arg(dir).status()),
         External::Edit { path, line } => {
-            let ed = notes::editor();
             let name = notes::editor_name();
-            // Each editor writes "open at line N" differently:
-            // the VS Code family uses -g file:line, helix / zed / sublime use file:line, the rest +line file
-            let cmd = match name.as_str() {
-                "code" | "code-insiders" | "cursor" | "windsurf" => format!("{ed} -g {}", q(&format!("{path}:{line}"))),
-                "hx" | "helix" | "zed" | "subl" => format!("{ed} {}", q(&format!("{path}:{line}"))),
-                _ => format!("{ed} +{line} {}", q(path)),
-            };
-            (name, std::process::Command::new("sh").arg("-c").arg(cmd).status())
+            (name, std::process::Command::new("sh").arg("-c").arg(edit_at(path, *line)).status())
         }
-        External::Config { path, template } => {
+        External::Config { path, template, section } => {
             let p = std::path::Path::new(path);
             if !p.exists() {
                 let made = p.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(p, template));
@@ -139,7 +145,20 @@ fn run_external(x: &External) -> Option<String> {
                     return Some(tr!("无法写入 {}:{e}", "can't write {}: {e}", words::tilde(path)));
                 }
             }
-            let cmd = format!("{} {}", notes::editor(), q(path));
+            let cmd = match section {
+                None => format!("{} {}", notes::editor(), q(path)),
+                Some(s) => {
+                    let text = std::fs::read_to_string(p).unwrap_or_default();
+                    let (new, line) = crate::config::open_at(&text, s);
+                    // The heading wasn't there: added at the end first, to write under
+                    if let Some(all) = new
+                        && let Err(e) = std::fs::write(p, all)
+                    {
+                        return Some(tr!("无法写入 {}:{e}", "can't write {}: {e}", words::tilde(path)));
+                    }
+                    edit_at(path, line)
+                }
+            };
             (notes::editor_name(), std::process::Command::new("sh").arg("-c").arg(cmd).status())
         }
         External::View { path, line, temp } => {
@@ -245,7 +264,8 @@ fn yazi_blocked(dir: &str) -> Option<String> {
 /// (ime::Guard switches back on exit)
 fn release_terminal() -> std::io::Result<()> {
     kbd(false);
-    let _ = execute!(stdout(), DisableFocusChange, DisableMouseCapture);
+    // A frame cut short by the error never sent its end of sync (see `frame`): end it, or the terminal keeps the screen frozen
+    let _ = execute!(stdout(), EndSynchronizedUpdate, DisableFocusChange, DisableMouseCapture);
     ratatui::try_restore()
 }
 
@@ -276,6 +296,15 @@ fn resume(t: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     t.hide_cursor()?;
     let area = t.size()?.into();
     t.resize(area)?;
+    t.draw(|f| draw(f, app))?;
+    execute!(stdout(), EndSynchronizedUpdate)
+}
+
+/// Draw one frame inside a synchronized update: the terminal shows it only once all of it has arrived. Paging rewrites nearly every
+/// cell, about 9 KB on a 200×50 screen (more with links: each link cell is wrapped in OSC 8); without this the terminal can show a
+/// frame it has only half read, half old page and half new, seen as a smear while paging. tmux 3.8 holds the pane's redraw the same way
+fn frame(t: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
+    queue!(stdout(), BeginSynchronizedUpdate)?;
     t.draw(|f| draw(f, app))?;
     execute!(stdout(), EndSynchronizedUpdate)
 }
@@ -359,12 +388,12 @@ fn idle_watch(tx: mpsc::Sender<IdleTick>) {
         wait = IDLE_EVERY;
         let cfg = aca_core::config::load();
         let Ok(store) = aca_core::store::Store::open() else { continue };
-        let stopped = match cfg.idle.stop_after() {
-            Ok(Some(after)) => {
-                let reads = Reads::open(Reads::default_path());
-                aca_core::session::stop_idle(&store, &cfg, after, &|id| reads.unread(id)).unwrap_or_default()
-            }
-            _ => vec![],
+        let after = cfg.idle.stop_after().ok().flatten();
+        let stopped = if after.is_some() || cfg.router.idle().is_some() {
+            let reads = Reads::open(Reads::default_path());
+            aca_core::session::stop_idle(&store, &cfg, after, &|id| reads.unread(id)).unwrap_or_default()
+        } else {
+            vec![]
         };
         let remove = cfg.idle.remove_after().ok().flatten().map(|after| (after, archived_sessions(&store)));
         if tx.send(IdleTick { stopped, remove }).is_err() {
@@ -394,22 +423,41 @@ fn archived_sessions(store: &aca_core::store::Store) -> Vec<(Target, u64)> {
         .collect()
 }
 
-/// The bottom bar's line after auto-stopping some idle sessions: which ones (only the first three if many), how to start them again
-pub(super) fn idle_note(v: &[aca_core::session::Idled]) -> String {
+/// The bottom bar's line after auto-stopping some idle sessions: which ones (only the first three if many), and the next key: ⏎ starts
+/// them again where they're still listed; where they've left the list, the key that shows them (the last 7 days go by how long
+/// each was idle)
+pub(super) fn idle_note(v: &[aca_core::session::Idled], scope: Scope) -> String {
     let mut names: Vec<String> = v.iter().take(3).map(|s| tr!("「{}」", "“{}”", clip(&s.title, 16).trim_end())).collect();
     if v.len() > 3 {
         names.push(tr!("等 {} 个", "and {} more", v.len() - 3));
     }
+    let week = v.iter().all(|s| s.idle < WEEK);
+    let next = match scope {
+        Scope::Week if week => t!("⏎ 启动", "⏎ resumes"),
+        Scope::Open if week => t!("w 近 7 天", "w 7 days"),
+        _ => t!("F 查看", "F shows them"),
+    };
     tr!(
-        "{} 自动停止了 {} 个:{} · ⏎ 重新启动",
-        "{} auto-stopped {}: {} · ⏎ resumes",
+        "{} 自动停止了 {} 个:{} · {next}",
+        "{} auto-stopped {}: {} · {next}",
         aca_core::status::IDLE_STOPPED,
         v.len(),
         names.join(t!("", ", "))
     )
 }
 
+/// The scratch directory's group, made sure of: by the settings page once the directory is set, and when the interface opens
+/// (the setting may have been written into config.toml by hand)
+fn scratch_group(dir: &str) -> Result<String, String> {
+    aca_core::store::Store::open().and_then(|s| crate::groups::ensure_scratch(&s, dir))
+}
+
 pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
+    // Before the first read, so its group is in it. Not having one is no reason not to open: the list just has no scratch group
+    let scratch = crate::config::scratch_dir();
+    if !scratch.is_empty() {
+        let _ = scratch_group(&scratch);
+    }
     // Draw the first screen once read (~20ms), to avoid flashing an empty list first; read in the background while switching the input
     // method here (~40ms the first time)
     let first = thread::spawn(crate::data::collect_first);
@@ -424,28 +472,32 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     let mut app = App::new(filter, sessions)
         .with_pins(Pins::open(Pins::default_path()))
         .with_notes(Notes::open(Notes::default_path()))
+        .with_book(crate::book::Book::open())
         .with_marks(Reads::open(Reads::default_path()), Spaces::open(Spaces::default_path()))
         .with_trash(Trash::open(Trash::default_path()))
         .with_group_hints(crate::data::group_hints)
         .with_adopt(adopt_plan)
         .with_new_group_dir(crate::config::new_group_dir)
+        .with_scratch(crate::config::scratch_dir, scratch_group)
         .with_tools(|| Ok(crate::tools::load()))
-        .with_accounts(|adding| Box::new(crate::acctpage::Page::real(adding)))
+        .with_accounts(|o| Box::new(crate::acctpage::Page::real(o)))
         .with_login_links(aca_core::paths::state_dir())
         .with_settings(crate::config::ime_auto, config_bad, crate::config::set, crate::accounts::all)
         .with_mcp(crate::mcp::load)
         .with_groups(crate::groups::load)
         .with_handoff(crate::handoff::source)
         .with_rehome(crate::rehome::quotas, crate::accounts::login, true);
-    // The remote tasks server is set in the settings page; P is the plugins page (mounts and remote tasks are plugins now, in the : menu)
-    app = app.with_plugins(|| Box::new(crate::plugins::Page::new(crate::plugins::load)));
+    // The remote tasks server is set in the settings page; P is the plugins page (mounts and remote tasks are plugins now, in the list's ?)
+    app = app.with_plugins(|| Box::new(crate::plugins::Page::new(crate::plugins::load))).with_plugin_menu(aca_core::plugin::menu);
     // Whether Claude starts with aca's mod (quota doesn't rely on the status bar)
     app = app.with_setting(Box::new(crate::modrow::ModRow::real()));
     app = app.with_setting(Box::new(crate::trust::TrustRow::real()));
+    app = app.with_setting(Box::new(crate::channels::Channels::real()));
     // Sessions a killed / crashed interface deleted but didn't get to really delete
     thread::spawn(crate::trash::purge);
     // Upgraded without running install.sh (brew and the like): rewrite aca's tmux settings for this version
     thread::spawn(crate::tmuxconf::refresh);
+    thread::spawn(aca_core::plugin::timer::refresh_locales);
     if let (true, Some(p)) = (restore, &view_file) {
         app = app.restore(View::load(p));
     }
@@ -458,6 +510,9 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
         }
     }
     app.insert_to = crate::data::insert_to().map(String::from);
+    // On this machine's terminal the preview keeps up with the highlight; a phone over mosh keeps SETTLE's hold. Read once: a popup
+    // belongs to one client
+    app.preview_follows = crate::data::local_term();
     // The reference key works in the list too (no tmux in between: its prefix key arrives here as is)
     if let Ok(Some(k)) = aca_core::config::load().keys.ref_key() {
         let prefix = aca_core::tmux::run(&["show-options", "-gv", "prefix"]).unwrap_or_default();
@@ -519,6 +574,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     let (job_tx, job_rx) = mpsc::channel::<(Job, Outcome, Vec<Session>)>();
     // Background refreshes held back while sliding
     let mut pending: Option<Vec<Session>> = None;
+    let mut plugins_stamp = None;
     // Diff view: git diff finished in the background
     let (diff_tx, diff_rx) = mpsc::channel::<(String, Mode, diff::Diff)>();
     let (plug_tx, plug_rx) = mpsc::channel::<(crate::caps::Req, bool, String)>();
@@ -590,7 +646,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
             }
             while let Ok(t) = idle_rx.try_recv() {
                 if !t.stopped.is_empty() {
-                    app.flash_for(&idle_note(&t.stopped), NOTICE);
+                    app.flash_for(&idle_note(&t.stopped, app.scope), NOTICE);
                     let _ = req_tx.send(());
                 }
                 if let Some((after, archived)) = t.remove {
@@ -643,14 +699,11 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 glance_busy = false;
                 app.set_glance(name, g);
             }
-            if !glance_busy && let Some((name, w)) = app.glance_request(refreshed) {
+            if !glance_busy && let Some((name, w, turn)) = app.glance_request(refreshed) {
                 glance_busy = true;
                 let tx = glance_tx.clone();
-                // A group's preview also lists what's in the directory
-                let group = is_group_key(&name);
                 thread::spawn(move || {
-                    let g = if group { diff::glance_dir(&w) } else { diff::glance(&w) };
-                    let _ = tx.send((name, g));
+                    let _ = tx.send((name.clone(), read_glance(&name, &w, turn.as_deref())));
                 });
             }
             while let Ok(r) = bill_rx.try_recv() {
@@ -676,11 +729,18 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                 i18n::reload();
                 app.reload_settings();
             }
+            if refreshed && app.settings.is_some() {
+                let stamp = std::fs::metadata(aca_core::plugin::decl::decl_file()).and_then(|m| m.modified()).ok();
+                if stamp != plugins_stamp {
+                    plugins_stamp = stamp;
+                    app.reload_settings();
+                }
+            }
             if i18n::lang() != lang {
                 lang = i18n::lang();
                 app.lang_changed();
             }
-            terminal.draw(|f| draw(f, &mut app))?;
+            frame(&mut terminal, &mut app)?;
             if tell {
                 let here = (app.here_dir(), app.here_sid());
                 if here.0 != told.0 {
@@ -732,6 +792,8 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                         quiet_until = quiet_until.max(now + BURST_QUIET);
                     }
                 }
+                // Kept while typing: three or more keys together are a paste
+                app.burst = keys.len() >= 3;
                 for e in batch {
                     match e {
                         Event::Key(k) if k.kind == KeyEventKind::Press && !drop => app.on_key(k),
@@ -741,6 +803,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
                         _ => {}
                     }
                 }
+                app.burst = false;
             }
             if std::mem::take(&mut app.refresh) {
                 let _ = req_tx.send(());
@@ -817,11 +880,12 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
             }
             if let Some(req) = app.create.take() {
                 app.flash(t!("正在新建…", "creating…"));
-                terminal.draw(|f| draw(f, &mut app))?;
+                frame(&mut terminal, &mut app)?;
                 match create::create(&req) {
-                    Ok(id) => {
-                        app.adopt(&id);
-                        app.attach = Some(id); // go on to the attach below
+                    Ok(made) => {
+                        app.adopt(&made.id);
+                        app.created(&req, &made);
+                        app.attach = Some(made.id); // go on to the attach below
                     }
                     Err(e) => app.flash(&tr!("新建失败:{e}", "creating failed: {e}")),
                 }
@@ -833,7 +897,7 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
             }
             if let Some(t) = app.start.take() {
                 app.flash(&tr!("正在启动「{}」…", "starting “{}”…", clip(&t.title, 16).trim_end()));
-                terminal.draw(|f| draw(f, &mut app))?;
+                frame(&mut terminal, &mut app)?;
                 match create::start(&t.id) {
                     Ok(()) => app.attach = Some(t.name),
                     Err(e) => app.flash(&tr!("启动失败:{e}", "start failed: {e}")),
@@ -884,8 +948,11 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
             if let Some(p) = app.pick_group.take() {
                 paused.store(true, Ordering::Relaxed);
                 suspend()?;
-                let got = ops::pick_group(&p.rows, &p.what(), &p.here);
-                app.group_picked(p, got);
+                match ops::pick_group(&p.rows, &p.what(), &p.here, &p.under, &p.dirs) {
+                    // Tab on a new name: its directory is asked before anything is created
+                    Ok(Some((name, true))) => app.ask_move_home(p, &name),
+                    got => app.group_picked(p, got.map(|g| g.map(|(g, _)| g))),
+                }
                 resume(&mut terminal, &mut app)?;
                 paused.store(false, Ordering::Relaxed);
             }
@@ -1034,6 +1101,14 @@ pub fn run(filter: String, restarted: Option<String>) -> anyhow::Result<()> {
     res
 }
 
+/// What `glance_request` asked for: a group's preview also lists what's in the directory; `turn` = also the last turn of the session
+/// with this aca id
+fn read_glance(name: &str, w: &Where, turn: Option<&str>) -> Glance {
+    let mut g = if is_group_key(name) { diff::glance_dir(w) } else { diff::glance(w) };
+    g.turn = turn.map(diff::last_turn);
+    g
+}
+
 /// For debugging: render one frame of the given size in memory, feed the keys in keys in order, print it as text (CJK counted as two
 /// cells). Draws a frame per key like the interface: some state (which steps of the record can unfold) is only computed while drawing
 pub fn snapshot(w: u16, h: u16, keys: &str) -> anyhow::Result<String> {
@@ -1041,18 +1116,31 @@ pub fn snapshot(w: u16, h: u16, keys: &str) -> anyhow::Result<String> {
     let mut app = App::new(String::new(), collect())
         .with_pins(Pins::open(Pins::default_path()).detached())
         .with_notes(Notes::open(Notes::default_path()).detached())
+        // The notebooks as they are, copied: writing a note here changes memory only
+        .with_book(crate::book::Book::copy())
         .with_marks(Reads::open(Reads::default_path()).detached(), Spaces::open(Spaces::default_path()).detached())
         .with_trash(Trash::open(Trash::default_path()).detached())
         .with_group_hints(crate::data::group_hints)
         .with_adopt(adopt_plan)
         .with_new_group_dir(crate::config::new_group_dir)
+        // Read only: a scratch directory with no group yet doesn't get one made here
+        .with_scratch(crate::config::scratch_dir, |_| Err(t!("快照不建分组", "a snapshot makes no group").into()))
         .with_tools(|| Ok(crate::tools::load()))
         .with_mcp(crate::mcp::load)
         .with_groups(crate::groups::load)
         .with_handoff(crate::handoff::source)
-        .with_rehome(crate::rehome::quotas, crate::accounts::login, true);
+        .with_rehome(crate::rehome::quotas, crate::accounts::login, true)
+        .with_plugin_menu(aca_core::plugin::menu);
     let mut t = Terminal::new(TestBackend::new(w, h))?;
+    // The top of the preview is read in the background in the interface; here on the spot, before each frame
+    let glance = |app: &mut App| {
+        if let Some((name, w, turn)) = app.glance_request(false) {
+            let g = read_glance(&name, &w, turn.as_deref());
+            app.set_glance(name, g);
+        }
+    };
     t.draw(|f| draw(f, &mut app))?;
+    glance(&mut app);
     for c in keys.chars() {
         let code = match c {
             '↓' => KeyCode::Down,
@@ -1072,6 +1160,7 @@ pub fn snapshot(w: u16, h: u16, keys: &str) -> anyhow::Result<String> {
             app.set_trace(&s.name, crate::trace::load(&s));
         }
         t.draw(|f| draw(f, &mut app))?;
+        glance(&mut app);
     }
     // The frame handed out is drawn on a clean screen: the in-memory screen updates only diffs, so drawing several frames in a row leaves
     // half a wide char from the previous frame
@@ -1119,6 +1208,9 @@ pub fn snapshot(w: u16, h: u16, keys: &str) -> anyhow::Result<String> {
         }
         if r.create_dir {
             flags += " (先建目录)";
+        }
+        if r.router {
+            flags += " (router)";
         }
         out.push_str(&format!("[新建 → aca new {} {}{flags}]\n", r.spec(), words::tilde(&r.dir)));
     }

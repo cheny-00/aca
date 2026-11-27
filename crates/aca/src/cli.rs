@@ -18,8 +18,8 @@ use aca_core::plugin::{self, Context};
 use aca_core::runtime::{self, Token};
 use aca_core::session::{self, New};
 use aca_core::status::{self, Row};
-use aca_core::store::Store;
-use aca_core::{adopt, agent, answer, config, gateway, hook, import, inbox, t, tmux, tr};
+use aca_core::store::{Store, Task, TaskState};
+use aca_core::{adopt, agent, answer, config, gateway, hook, import, inbox, t, task, tmux, tr};
 use aca_tui::print;
 
 use crate::help;
@@ -37,7 +37,20 @@ const POS: Tr = Tr::new("位置", "a position");
 
 struct Args(Vec<String>);
 
+fn router_tool() -> bool {
+    std::env::var("ACA_PLUGIN_ID").as_deref() == Ok("aca.router") && std::env::var("ACA_INVOKED_BY").as_deref() == Ok("agent")
+}
+
 impl Args {
+    fn watch(&mut self) -> Res<Option<bool>> {
+        Ok(match (self.flag("--watch"), self.flag("--no-watch")) {
+            (true, true) => return Err(t!("只能选 --watch 或 --no-watch 其中一个", "choose one of --watch and --no-watch").into()),
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        })
+    }
+
     /// Whether this switch is there (and take it out if so)
     fn flag(&mut self, name: &str) -> bool {
         match self.0.iter().position(|a| a == name) {
@@ -51,7 +64,14 @@ impl Args {
 
     /// An argument with a value (take out both it and its value)
     fn opt(&mut self, name: &str) -> Res<Option<String>> {
-        let Some(i) = self.0.iter().position(|a| a == name) else { return Ok(None) };
+        let prefix = format!("{name}=");
+        // Packed name=value arguments are private to plugins/router/router.sh.
+        let packed = router_tool();
+        let Some(i) = self.0.iter().position(|a| a == name || packed && a.starts_with(&prefix)) else { return Ok(None) };
+        if let Some(v) = self.0[i].strip_prefix(&prefix).map(String::from) {
+            self.0.remove(i);
+            return Ok(Some(v));
+        }
         if i + 1 >= self.0.len() {
             SHORT.store(true, Ordering::Relaxed);
             return Err(tr!("{name} 后面需要一个值", "{name} needs a value after it"));
@@ -256,7 +276,7 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
                 ),
                 (
                     format!("aca plugin run {id}.hello"),
-                    t!("运行(界面中:在会话列表按 : 再按 h)", "run it (in the interface: : on the session list, then h)"),
+                    t!("运行(界面中:在会话列表按 ? 再按 h)", "run it (in the interface: ? on the session list, then h)"),
                 ),
                 (format!("aca plugin check {dir}"), t!("检查清单", "check the manifest")),
             ];
@@ -410,8 +430,8 @@ fn plugin_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
             plugin::yours::set_key(&id, &target, key.as_deref())?;
             let now = plugin::menu().into_iter().find(|i| i.plugin == id && i.id == target).and_then(|i| i.key);
             match now {
-                Some(k) => println!("{}", tr!("{id}.{target}:在 : 菜单中按 {k}", "{id}.{target}: press {k} in the : menu")),
-                None => println!("{}", tr!("{id}.{target}:未设键(在 : 菜单中选择)", "{id}.{target}: no key (pick it in the : menu)")),
+                Some(k) => println!("{}", tr!("{id}.{target}:在会话列表的 ? 中按 {k}", "{id}.{target}: press {k} in the list's ?")),
+                None => println!("{}", tr!("{id}.{target}:未设键(在会话列表的 ? 中选择)", "{id}.{target}: no key (pick it in the list's ?)")),
             }
             for (_, n) in plugin::key_notes().into_iter().filter(|(p, _)| *p == id) {
                 println!("⚠ {n}");
@@ -628,29 +648,81 @@ fn events(mut a: Args) -> Res<i32> {
     let follow = a.flag("-f");
     let n: usize = a.opt("-n")?.and_then(|n| n.parse().ok()).unwrap_or(if follow { 0 } else { 20 });
     let path = paths::events_log();
+    if follow {
+        return follow_events(&path, n);
+    }
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].iter().for_each(|l| println!("{l}"));
-    let mut at = text.len() as u64;
-    if !follow {
-        return Ok(0);
+    Ok(0)
+}
+
+/// `aca events -f`: the last `n` lines, then every line appended, each once and in order, across rotations (see
+/// `aca_core::event`). Which file is being read is told by its identity (device + inode), not by its size: a new file that
+/// has already grown past where the old one was read to looks no smaller. The old file stays open here, so once
+/// `events.jsonl` is another file, what's left of the one being read (now `events.jsonl.1`) is read to its end first,
+/// then the new one from its start. Nothing more can land in the old one by then: appends and the rename take turns on
+/// `events.lock`. Only whole lines are printed; one still being written waits for the next look
+fn follow_events(path: &Path, n: usize) -> Res<i32> {
+    use std::os::unix::fs::MetadataExt;
+    let same = |a: &std::fs::Metadata, b: &std::fs::Metadata| (a.dev(), a.ino()) == (b.dev(), b.ino());
+    let mut cur = std::fs::File::open(path).ok();
+    let mut at = 0;
+    if let Some(f) = &mut cur {
+        let mut buf = vec![];
+        f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        at = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let text = String::from_utf8_lossy(&buf[..at]);
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(n)..].iter().for_each(|l| println!("{l}"));
     }
+    let mut at = at as u64;
     loop {
-        std::thread::sleep(Duration::from_millis(100));
-        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        // Got smaller = a new file, read from the start
-        at = at.min(len);
-        if len > at {
-            let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-            f.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
-            let mut more = String::new();
-            f.read_to_string(&mut more).map_err(|e| e.to_string())?;
-            // Only emit whole lines
-            let whole = more.rfind('\n').map_or(0, |i| i + 1);
-            print!("{}", &more[..whole]);
-            at += whole as u64;
+        let live = std::fs::metadata(path).ok();
+        let open = cur.as_ref().map(|f| f.metadata());
+        match (&open, &live) {
+            // Between a rename and the first append there's no live file: nothing new anywhere yet. The one open can't be
+            // looked at: leave it for the next look rather than take it for another file and print it all again
+            (_, None) | (Some(Err(_)), _) => {}
+            (Some(Ok(o)), Some(l)) if same(o, l) => {
+                // The same file, shorter: cut in place, read again from the start
+                if o.len() < at {
+                    at = 0;
+                }
+            }
+            _ => {
+                if let Some(old) = &mut cur
+                    && !whole_lines(old, &mut at)
+                {
+                    return Ok(0);
+                }
+                cur = std::fs::File::open(path).ok();
+                at = 0;
+            }
         }
+        if let Some(f) = &mut cur
+            && !whole_lines(f, &mut at)
+        {
+            return Ok(0);
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Prints the whole lines of `f` from `at` on and moves `at` past them. false = stdout is gone (whoever read it quit)
+fn whole_lines(f: &mut std::fs::File, at: &mut u64) -> bool {
+    use std::io::Write;
+    let mut buf = vec![];
+    if f.seek(SeekFrom::Start(*at)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return true;
+    }
+    let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { return true };
+    let mut out = std::io::stdout().lock();
+    if out.write_all(&buf[..=end]).and_then(|()| out.flush()).is_err() {
+        return false;
+    }
+    *at += end as u64 + 1;
+    true
 }
 
 /// A directory given on the command line: expand ~, resolve to a real path, and it must be an existing directory
@@ -662,13 +734,56 @@ fn real_dir(d: &str) -> Res<String> {
     Ok(p.to_string_lossy().into_owned())
 }
 
-fn group_cmd(store: &Store, mut a: Args) -> Res<i32> {
+/// `json`: `--json` (already taken out of the arguments before getting here)
+fn group_cmd(store: &Store, mut a: Args, json: bool) -> Res<i32> {
     match a.next(SUB)?.as_str() {
-        "ls" if a.flag("--json") => println!("{}", serde_json::to_string(&store.groups()?).unwrap()),
+        // Internal output for plugins/router/router.sh.
+        "ls" if a.flag("--routers") => {
+            let routers = store.routers()?;
+            let rows = status::peek(store)?;
+            for g in store.groups()? {
+                let (dir, _) = aca_core::router::defaults(&g, &rows, &aca_tui::new_group_dir());
+                let router = routers.iter().find(|(name, _)| *name == g.path).map(|(_, id)| format!("  @{id}")).unwrap_or_default();
+                println!("{}  {dir}{router}", g.path);
+            }
+        }
+        // The scratch group (the one `aca msg desk` takes its router from) says so; no other group carries the field
+        "ls" if json => {
+            let scratch = aca_tui::scratch_group(store);
+            let groups: Vec<serde_json::Value> = store
+                .groups()?
+                .into_iter()
+                .map(|g| {
+                    let mine = scratch.as_deref() == Some(g.path.as_str());
+                    let mut v = serde_json::to_value(g).unwrap();
+                    if mine {
+                        v["scratch"] = json!(true);
+                    }
+                    v
+                })
+                .collect();
+            println!("{}", serde_json::to_string(&groups).unwrap());
+        }
         "ls" => {
             let groups = store.groups()?;
             if !print::groups(&groups) {
-                groups.iter().for_each(|g| println!("{:>3}  {}  {}", g.order, g.path, g.default_path));
+                // A group that names a router ends with it; the others read as they always did
+                let router = |g: &aca_core::store::Group| if g.router.is_empty() { String::new() } else { format!("  @{}", g.router) };
+                groups.iter().for_each(|g| println!("{:>3}  {}  {}{}", g.order, g.path, g.default_path, router(g)));
+            }
+        }
+        // The session that routes the group's work: print it (nothing and exit 1 when it has none), name one of the group's own
+        // sessions, or '' for nobody (as `group dir` forgets a directory)
+        "router" => {
+            let path = a.next(GROUP_PATH)?;
+            let path = path.trim_matches('/');
+            match a.maybe() {
+                None if !store.groups()?.iter().any(|g| g.path == path) => return Err(tr!("没有分组 {path}", "no group {path}")),
+                None => match store.routers()?.into_iter().find(|(g, _)| g == path) {
+                    Some((_, id)) => println!("{id}"),
+                    None => return Ok(1),
+                },
+                Some(id) => store.group_set_router(path, &id)?,
             }
         }
         "create" => {
@@ -681,7 +796,15 @@ fn group_cmd(store: &Store, mut a: Args) -> Res<i32> {
             }
         }
         "rm" => {
-            let n = store.group_remove(&a.next(GROUP_PATH)?)?;
+            let path = a.next(GROUP_PATH)?;
+            // The scratch group stays (removing a group above it would take it along): sessions with no project go there
+            if let Some(g) = aca_tui::scratch_group(store).filter(|g| aca_tui::group_within(g, path.trim_matches('/'))) {
+                return Err(tr!(
+                    "无法删除随手问所在的分组 {g}(config.toml 的 [scratch] dir)",
+                    "the scratch group {g} can't be deleted ([scratch] dir in config.toml)"
+                ));
+            }
+            let n = store.group_remove(&path)?;
             let s = if n == 1 { "" } else { "s" };
             println!("{}", tr!("已删除,{n} 个会话已移到上一级", "deleted; {n} session{s} moved up a level"));
         }
@@ -717,6 +840,246 @@ fn group_cmd(store: &Store, mut a: Args) -> Res<i32> {
         other => {
             SHORT.store(true, Ordering::Relaxed);
             return Err(tr!("aca group 没有子命令 {other}", "aca group has no {other}"));
+        }
+    }
+    Ok(0)
+}
+
+/// Which group's notebook `aca note ls` / `add` mean: `-g GROUP` (`.` = the one this directory decides); not given, the group
+/// of the session it's run in
+fn note_group(store: &Store, a: &mut Args) -> Res<String> {
+    let me = || std::env::var("ACA_SESSION_ID").ok().filter(|x| !x.is_empty()).or_else(here).and_then(|id| store.get(&id).ok());
+    let group = match a.opt("-g")? {
+        Some(g) if g.trim_matches('/') == session::BY_DIR => {
+            let dir = std::env::current_dir().map_err(|e| e.to_string())?;
+            store.dir_group(&dir.to_string_lossy())?.0
+        }
+        Some(g) => g.trim_matches('/').to_string(),
+        None => match me() {
+            Some(s) if !s.group.is_empty() => s.group,
+            _ => {
+                SHORT.store(true, Ordering::Relaxed);
+                return Err(t!("需要指定分组(-g 分组)", "needs a group (-g GROUP)").into());
+            }
+        },
+    };
+    match store.groups()?.iter().any(|g| g.path == group) {
+        true => Ok(group),
+        false => Err(tr!("没有分组 {group}", "no group {group}")),
+    }
+}
+
+/// One note on a line of `aca note ls`: its id, ★ if pinned, its name, who wrote it, how long since it changed
+fn note_line(store: &Store, n: &aca_core::store::Note, now: u64) -> String {
+    let by = match n.by.as_str() {
+        "" => t!("你", "you").to_string(),
+        id => store.get(id).map(|s| status::title(&s, &runtime::load(&s.id))).unwrap_or_else(|_| id.to_string()),
+    };
+    format!("{}  {} {}  ·  {by}  {}", n.id, if n.pinned { "★" } else { " " }, n.name(), print::age(now.saturating_sub(n.updated)))
+}
+
+/// `json`: `--json` (already taken out of the arguments before getting here)
+fn note_cmd(store: &Store, mut a: Args, json: bool) -> Res<i32> {
+    let sub = a.next(SUB)?;
+    let note_id = Tr::new("笔记 id", "a note id");
+    // The one note a group used to have was kept in a file of the interface's: any still there are notes before anything is read
+    aca_tui::adopt_group_notes(store);
+    match sub.as_str() {
+        "ls" => {
+            let notes = store.notes_in(&note_group(store, &mut a)?)?;
+            match json {
+                true => println!("{}", serde_json::to_string(&notes).unwrap()),
+                false => notes.iter().for_each(|n| println!("{}", note_line(store, n, paths::now()))),
+            }
+        }
+        "add" => {
+            let group = note_group(store, &mut a)?;
+            let text = if a.0.is_empty() {
+                let mut t = String::new();
+                std::io::stdin().read_to_string(&mut t).map_err(|e| e.to_string())?;
+                t
+            } else {
+                std::mem::take(&mut a.0).join(" ")
+            };
+            if text.trim().is_empty() {
+                return Err(t!("没有要写的内容", "nothing to write").into());
+            }
+            // Written from inside a session: it's that session's
+            let by = std::env::var("ACA_SESSION_ID").ok().and_then(|id| store.get(&id).ok()).map(|s| s.id).unwrap_or_default();
+            println!("{}", store.note_add(&group, text.trim_end(), &by)?.id);
+        }
+        "show" => {
+            let n = store.note(&a.next(note_id)?)?;
+            match json {
+                true => println!("{}", serde_json::to_string(&n).unwrap()),
+                false => println!("{}", n.text),
+            }
+        }
+        "rm" => {
+            let n = store.note(&a.next(note_id)?)?;
+            store.note_bin(&n.id)?;
+            println!("{}", tr!("已删除笔记「{}」", "deleted note “{}”", n.name()));
+        }
+        "pin" | "unpin" => {
+            let n = store.note(&a.next(note_id)?)?;
+            store.note_pin(&n.id, sub == "pin")?;
+        }
+        other => {
+            SHORT.store(true, Ordering::Relaxed);
+            return Err(tr!("aca note 没有子命令 {other}", "aca note has no {other}"));
+        }
+    }
+    Ok(0)
+}
+
+/// A session by its title, for a line about it (its id when it's no longer registered; nobody = you)
+fn who_label(store: &Store, id: &str) -> String {
+    match id {
+        "" => t!("你", "you").to_string(),
+        id => store.get(id).map(|s| status::title(&s, &runtime::load(&s.id))).unwrap_or_else(|_| id.to_string()),
+    }
+}
+
+fn task_state(t: &Task) -> (&'static str, &'static str) {
+    match t.state() {
+        TaskState::Todo => ("·", t!("待办", "todo")),
+        TaskState::Doing => ("●", t!("在做", "doing")),
+        TaskState::Done => ("✓", t!("完成", "done")),
+    }
+}
+
+/// One ticket on a line of `aca task ls`: its number, its state's mark, its title, its group, who has it, how long since
+/// it last changed hands, was made or was done
+fn task_line(store: &Store, t: &Task, now: u64) -> String {
+    let with = if t.session.is_empty() { String::new() } else { format!("  ·  {}", who_label(store, &t.session)) };
+    let at = [t.done, t.given, t.created].into_iter().find(|x| *x > 0).unwrap_or(0);
+    format!("#{}  {} {}  {}{with}  {}{}", t.n, task_state(t).0, t.title, t.group, print::age(now.saturating_sub(at)), t.watch_label())
+}
+
+/// `aca task show`: the ticket in full, a line for each thing it has
+fn task_text(store: &Store, t: &Task, now: u64) -> String {
+    let mut v =
+        vec![format!("#{}  {}  ·  {}{}", t.n, t.title, task_state(t).1, t.watch_label()), format!("{}  {}", t!("分组", "group"), t.group)];
+    if !t.criteria.is_empty() {
+        v.push(format!("{}  {}", t!("完成标准", "done when"), t.criteria));
+    }
+    if !t.note.is_empty() {
+        v.push(t.note.clone());
+    }
+    v.push(format!("{}  {}  {}", t!("新建", "made by"), who_label(store, &t.by), print::age(now.saturating_sub(t.created))));
+    if !t.session.is_empty() {
+        let by = format!("{} → {}", who_label(store, &t.given_by), who_label(store, &t.session));
+        v.push(format!("{}  {by}  {}", t!("交给", "handed"), print::age(now.saturating_sub(t.given))));
+        if !t.say.is_empty() {
+            v.push(format!("  {}", t.say));
+        }
+    }
+    if t.done > 0 {
+        v.push(format!("{}  {}  {}", t!("完成", "done"), t.result, print::age(now.saturating_sub(t.done))).replace("    ", "  "));
+    }
+    v.join("\n")
+}
+
+/// `json`: `--json` (already taken out of the arguments before getting here)
+fn task_cmd(store: &Store, cfg: &config::Config, mut a: Args, json: bool, literal: Option<Vec<String>>) -> Res<i32> {
+    let sub = a.next(SUB)?;
+    let num = Tr::new("任务单号", "a task number");
+    // Whose command this is: the session it runs in; outside any, yours
+    let me = task::me(store);
+    let me = me.as_ref();
+    let show = |t: &Task| match json {
+        true => println!("{}", task::json(t)),
+        false => println!("{}", task_line(store, t, paths::now())),
+    };
+    match sub.as_str() {
+        "add" => {
+            let n = task::New {
+                group: note_group(store, &mut a)?,
+                title: a.opt("-t")?.unwrap_or_default(),
+                criteria: a.opt("--criteria")?.unwrap_or_default(),
+                note: a.opt("--note")?.unwrap_or_default(),
+                to: a.opt("--to")?.unwrap_or_default(),
+                watch: a.watch()?.unwrap_or(false),
+                say: literal.unwrap_or(a.0).join(" "),
+            };
+            // Its number is the only line on stdout (scripts read it)
+            let t = task::add(store, cfg, me, n)?;
+            match json {
+                true => println!("{}", task::json(&t)),
+                false => println!("#{}", t.n),
+            }
+        }
+        "ls" => {
+            let all = a.flag("--all");
+            // Internal output for plugins/router/router.sh.
+            let recent = a.flag("--recent");
+            let cutoff = paths::now().saturating_sub(86400);
+            // One group's, or every group's
+            let group = match a.0.iter().any(|x| x == "-g" || router_tool() && x.starts_with("-g=")) {
+                true => Some(note_group(store, &mut a)?),
+                false => None,
+            };
+            let tasks: Vec<Task> = store
+                .tasks()?
+                .into_iter()
+                .filter(|t| group.as_ref().is_none_or(|g| *g == t.group) && (all || t.done == 0 || recent && t.done >= cutoff))
+                .collect();
+            match json {
+                true => println!("{}", serde_json::Value::Array(tasks.iter().map(task::json).collect())),
+                false => tasks.iter().for_each(|t| {
+                    let result = if recent && t.done > 0 { format!("  {}", t.result) } else { String::new() };
+                    println!("{}{result}", task_line(store, t, paths::now()));
+                }),
+            }
+        }
+        "show" => {
+            let t = store.task(task::number(&a.next(num)?)?)?;
+            match json {
+                true => println!("{}", task::json(&t)),
+                false => println!("{}", task_text(store, &t, paths::now())),
+            }
+        }
+        "give" => {
+            let watch = a.watch()?;
+            let n = task::number(&a.next(num)?)?;
+            let to = a.next(Tr::new("会话 id(- = 取回)", "a session id (- takes it back)"))?;
+            show(&task::give(store, cfg, me, n, &to, &literal.unwrap_or(a.0).join(" "), watch)?);
+        }
+        "done" => {
+            // A number first, if that's what the first word is; a session doing just one may leave it out
+            let n = a.0.first().and_then(|x| task::number(x).ok());
+            if n.is_some() {
+                a.0.remove(0);
+            }
+            show(&task::done(store, cfg, me, n, &std::mem::take(&mut a.0).join(" "))?);
+        }
+        "set" => {
+            let (title, criteria, note) = (a.opt("-t")?, a.opt("--criteria")?, a.opt("--note")?);
+            let watch = a.watch()?;
+            let n = task::number(&a.next(num)?)?;
+            if title.is_none() && criteria.is_none() && note.is_none() && watch.is_none() {
+                SHORT.store(true, Ordering::Relaxed);
+                return Err(t!(
+                    "需要 -t、--criteria、--note、--watch 或 --no-watch",
+                    "needs -t, --criteria, --note, --watch or --no-watch"
+                )
+                .into());
+            }
+            show(&task::set(
+                store,
+                cfg,
+                me,
+                n,
+                task::Changes { title: title.as_deref(), criteria: criteria.as_deref(), note: note.as_deref(), watch },
+            )?);
+        }
+        "rm" => {
+            let t = task::remove(store, cfg, me, task::number(&a.next(num)?)?)?;
+            println!("{}", tr!("已删除任务 #{}「{}」", "deleted task #{} “{}”", t.n, t.title));
+        }
+        other => {
+            SHORT.store(true, Ordering::Relaxed);
+            return Err(tr!("aca task 没有子命令 {other}", "aca task has no {other}"));
         }
     }
     Ok(0)
@@ -820,8 +1183,8 @@ fn adopt_cmd(store: &Store, cfg: &config::Config, mut a: Args, args: Option<Vec<
                 println!(
                     "{}",
                     tr!(
-                        "没有可直接接管的 tmux 会话(需未登记过,且第一个窗格中运行着可识别的 claude / codex / pi / opencode)",
-                        "no tmux session to adopt as is (it must be unregistered, a recognizable claude / codex / pi / opencode in the first pane)"
+                        "没有可直接接管的 tmux 会话(需未登记过,且第一个窗格中运行着可识别的 claude / codex / pi / opencode / agy)",
+                        "no tmux session to adopt as is (it must be unregistered, a recognizable claude / codex / pi / opencode / agy in the first pane)"
                     )
                 );
             } else {
@@ -896,8 +1259,9 @@ fn one_line(s: &str, n: usize) -> String {
 fn wait_line(s: &aca_core::store::Session, o: inbox::Outcome) -> String {
     let r = runtime::load(&s.id);
     match o {
-        inbox::Outcome::Done if r.last.trim().is_empty() => tr!("{} 已空闲", "{} is idle", s.id),
-        inbox::Outcome::Done => tr!("{} 完成一轮:「{}」", "{} finished a turn: “{}”", s.id, one_line(&r.last, 120)),
+        inbox::Outcome::Done if !r.last.trim().is_empty() => tr!("{} 完成一轮:「{}」", "{} finished a turn: “{}”", s.id, one_line(&r.last, 120)),
+        inbox::Outcome::Done if r.status == "done" => tr!("{} 完成一轮", "{} finished a turn", s.id),
+        inbox::Outcome::Done => tr!("{} 已空闲", "{} is idle", s.id),
         inbox::Outcome::Asking => tr!(
             "{} 正在等待确认:「{}」  查看选项:aca answer {}",
             "{} is waiting for a confirmation: “{}”  options: aca answer {}",
@@ -911,6 +1275,15 @@ fn wait_line(s: &aca_core::store::Session, o: inbox::Outcome) -> String {
         inbox::Outcome::Timeout => tr!("{} 尚未完成(已超时)", "{} not finished yet (timed out)", s.id),
     }
 }
+
+/// `aca msg desk`: the id of the desk — the router of the group sessions that belong to no project start in
+fn desk(store: &Store) -> Option<String> {
+    let scratch = aca_tui::scratch_group(store)?;
+    store.routers().ok()?.into_iter().find(|(group, _)| *group == scratch).map(|(_, id)| id)
+}
+
+/// What `aca msg desk` exits with when there is no desk yet
+const NO_DESK: i32 = 3;
 
 /// How long until a scheduled message is delivered (`aca msg --in`): `90s`, `10m`, `1h30m`, 7 days at most
 fn in_secs(v: &str) -> Res<u64> {
@@ -968,6 +1341,8 @@ fn inbox_cmd(store: &Store, mut a: Args, json_out: bool) -> Res<i32> {
         let what = match (m.kind.as_str(), m.via.as_str()) {
             ("notice", _) => m.what.clone(),
             (_, "claude") => t!("说(SendMessage)", "said (SendMessage)").into(),
+            // Yours, relayed from a channel outside aca
+            (_, via) if !via.is_empty() => tr!("说({via})", "said ({via})"),
             _ => t!("说", "said").into(),
         };
         let ago = print::age(now.saturating_sub(m.ts));
@@ -1037,6 +1412,11 @@ fn run(mut a: Args) -> Res<i32> {
         "hook" if !help::asked(&a.0) => return Ok(hook::run(&a.next(Tr::new("工具", "which tool"))?)),
         // The one run alongside when Claude starts and on every message sent: hands it the session's name (see aca_core::hook::name_cmd)
         "hook-name" => return Ok(hook::name_cmd()),
+        "hook-title" => return Ok(hook::title_cmd(&a.next(Tr::new("工具", "which tool"))?, aca_records::limits::record_agy)),
+        "agy-question" => {
+            let (id, pane, token) = (a.next(ID)?, a.next(Tr::new("窗格", "pane"))?, a.next(Tr::new("确认序号", "confirmation number"))?);
+            return Ok(hook::agy_question_later(&id, &pane, token.parse().unwrap_or(0)));
+        }
         // A fallback the hook leaves itself: look at the title again in a few seconds
         "retitle" => {
             let (id, tool) = (a.next(ID)?, a.next(Tr::new("工具", "which tool"))?);
@@ -1048,8 +1428,16 @@ fn run(mut a: Args) -> Res<i32> {
             let argv = if a.0.first().is_some_and(|w| w == "--") { &a.0[1..] } else { &a.0[..] };
             return Ok(aca_core::relay::run(argv));
         }
-        // The step that starts the agent (see aca_core::launch::launch): append the opening message from the file to the end of the
-        // command that follows, and exec that
+        // Resolve a default directory or tool for plugins/router/router.sh.
+        "router-default" => {
+            let store = Store::open()?;
+            let group = a.next(GROUP_PATH)?;
+            let g = store.groups()?.into_iter().find(|g| g.path == group).ok_or_else(|| tr!("没有分组 {group}", "no group {group}"))?;
+            let (dir, tool) = aca_core::router::defaults(&g, &status::peek(&store)?, &aca_tui::new_group_dir());
+            println!("{}", if a.maybe().as_deref() == Some("tool") { tool } else { dir });
+            return Ok(0);
+        }
+        // Append the opening message from the file to the command and exec it (see aca_core::launch::launch).
         "exec-saying" => {
             let file = a.next(Tr::new("文件", "a file"))?;
             return Err(tr!("无法启动:{}", "couldn't start it: {}", agent::exec_saying(&file, &a.0)));
@@ -1208,16 +1596,36 @@ fn run(mut a: Args) -> Res<i32> {
                     "--notify takes done, failed, exited, waiting (comma-separated), all or none, not {odd}"
                 ));
             }
+            // A ticket it starts on: whether this caller may hand it out is settled before anything is started. The ticket
+            // leads its opening message (what `--say` gave follows as what's said handing it over), and with no group
+            // named the session goes into the ticket's
+            let me = task::me(&store);
+            let ticket = a.opt("--task")?.map(|n| task::may_start(&store, me.as_ref(), task::number(&n)?)).transpose()?;
+            let said = say.clone().unwrap_or_default();
+            let say = match &ticket {
+                Some(t) => Some(task::brief(&Task { say: task::said(&store, me.as_ref(), &said).into(), ..t.clone() })),
+                None => say,
+            };
             let n = New {
                 title: a.opt("-t")?.unwrap_or_default(),
-                group: a.opt("-g")?.unwrap_or_default(),
+                group: a.opt("-g")?.or_else(|| ticket.as_ref().map(|t| t.group.clone())).unwrap_or_default(),
                 parent: a.opt("--parent")?.unwrap_or_default(),
                 hold: a.flag("--hold"),
                 notify,
                 worktree: a.opt("--worktree")?.or(a.opt("-w")?).unwrap_or_default(),
+                ticket: match (ticket, a.watch()?) {
+                    (Some(t), watch) => Some((t.n, said, watch)),
+                    (None, Some(on)) => {
+                        let flag = if on { "--watch" } else { "--no-watch" };
+                        return Err(tr!("{flag} 要和 --task 一起用", "{flag} goes with --task"));
+                    }
+                    (None, None) => None,
+                },
                 tool: a.next(Tr::new("工具(aca names 查看可用工具)", "a tool (aca names lists them)"))?,
                 dir: a.maybe().unwrap_or_else(|| ".".into()),
                 args: pass,
+                by_you: false,
+                router: false,
             };
             let wt = !n.worktree.is_empty();
             let (s, unsaid) = match say.filter(|t| !t.trim().is_empty()) {
@@ -1239,7 +1647,21 @@ fn run(mut a: Args) -> Res<i32> {
             }
         }
         "ls" => {
-            let rows = status::collect(&store, &cfg, !a.flag("--no-screen"))?;
+            let mut rows = status::collect(&store, &cfg, !a.flag("--no-screen"))?;
+            if let Some(group) = a.opt("-g")? {
+                let g = store.groups()?.into_iter().find(|g| g.path == group).ok_or_else(|| tr!("没有分组 {group}", "no group {group}"))?;
+                rows.retain(|r| r.group == group);
+                if !json_out {
+                    let (dir, _) = aca_core::router::defaults(&g, &rows, &aca_tui::new_group_dir());
+                    let tasks = store.tasks()?;
+                    let now = paths::now();
+                    for r in rows {
+                        let role = if r.id == g.router { "  router" } else { "" };
+                        println!("{}{role}", aca_core::router::session_line(&r, &dir, &tasks, now));
+                    }
+                    return Ok(0);
+                }
+            }
             if json_out {
                 println!("{}", serde_json::to_string(&rows).unwrap());
             } else if !print::rows(&cfg, &store, &rows) {
@@ -1247,8 +1669,14 @@ fn run(mut a: Args) -> Res<i32> {
             }
         }
         "show" => {
+            // Internal output for plugins/router/router.sh.
+            let summary = a.flag("--summary");
             let s = store.get(&a.id()?)?;
             let (row, r) = (status::one(&cfg, &s, true), runtime::load(&s.id));
+            if summary {
+                println!("{} {}  {}  {}", row.glyph(), status::state_name(row.state), row.title, row.ask);
+                return Ok(0);
+            }
             if json_out {
                 let mut v = serde_json::to_value(&row).unwrap();
                 v["run"] = serde_json::to_value(&r).unwrap();
@@ -1294,7 +1722,7 @@ fn run(mut a: Args) -> Res<i32> {
                 let after = config::span(&span).filter(|n| *n > 0).ok_or_else(|| {
                     tr!("--idle 应写为 30m、3h、1d、1h30m 等格式,无法识别 {span}", "write --idle like 30m, 3h, 1d or 1h30m, not {span}")
                 })?;
-                let stopped = session::stop_idle(&store, &cfg, after, &|_| false)?;
+                let stopped = session::stop_idle(&store, &cfg, Some(after), &|_| false)?;
                 if stopped.is_empty() {
                     println!("{}", tr!("没有空闲超过 {span} 且可停止的会话", "no session idle for {span} or more to stop"));
                 }
@@ -1310,11 +1738,7 @@ fn run(mut a: Args) -> Res<i32> {
             let key = a.next(ID)?;
             match to {
                 Some(_) if fresh => {
-                    return Err(t!(
-                        "--as 用于切换账号并继续原对话,不能与 --fresh 同时使用",
-                        "--as carries the conversation over to another account; it doesn't go with --fresh"
-                    )
-                    .into());
+                    return Err(t!("--as 和 --fresh 只能选一个", "choose one of --as and --fresh").into());
                 }
                 Some(to) => {
                     let r = session::rehome(&store, &cfg, &key, &to)?;
@@ -1349,12 +1773,25 @@ fn run(mut a: Args) -> Res<i32> {
             }
         }
         "move" => {
-            let key = a.next(ID)?;
-            let to = a.next(Tr::new("分组", "a group"))?;
-            let got = session::move_to(&store, &key, &to)?;
-            // Decided by directory: say which one it went into
+            let tree = a.flag("--tree");
+            let mut keys = vec![a.next(ID)?];
+            let mut to = a.next(Tr::new("分组", "a group"))?;
+            // Several sessions: the last word is the group
+            for more in std::mem::take(&mut a.0) {
+                keys.push(std::mem::replace(&mut to, more));
+            }
+            // Run inside a session: the event says it was that session's doing
+            let me = std::env::var("ACA_SESSION_ID").ok().and_then(|id| store.get(&id).ok()).map(|s| s.id).unwrap_or_default();
+            let got = session::move_all(&store, &keys, &to, tree, &me)?;
+            // Decided by directory: say which one each went into
             if to.trim_matches('/') == session::BY_DIR {
-                println!("{got}");
+                let mut said: Vec<&str> = vec![];
+                for (_, g) in &got {
+                    if !said.contains(&g.as_str()) {
+                        said.push(g);
+                        println!("{g}");
+                    }
+                }
             }
         }
         "order" => {
@@ -1409,7 +1846,20 @@ fn run(mut a: Args) -> Res<i32> {
         }
         "msg" => {
             let at = a.opt("--in")?.map(|v| in_secs(&v).map(|n| paths::now() + n)).transpose()?.unwrap_or(0);
-            let to = a.next(Tr::new("接收方(会话 id、名称或 parent)", "who to (a session id, a name, or parent)"))?;
+            let via = a.opt("--via")?.unwrap_or_default();
+            let to = a.next(Tr::new("接收方(会话 id、名称、parent 或 desk)", "who to (a session id, a name, parent, or desk)"))?;
+            // The desk is the scratch group's router; which group that is, the interface's settings say. None yet: an exit
+            // code of its own, so a script relaying to it can tell "nobody to hand this to" from a failure
+            let to = match to.as_str() {
+                "desk" => match desk(&store) {
+                    Some(id) => id,
+                    None => {
+                        eprintln!("{}", t!("还没有总台", "there is no desk yet"));
+                        return Ok(NO_DESK);
+                    }
+                },
+                _ => to,
+            };
             let text = if a.0.is_empty() {
                 let mut t = String::new();
                 std::io::stdin().read_to_string(&mut t).map_err(|e| e.to_string())?;
@@ -1420,7 +1870,7 @@ fn run(mut a: Args) -> Res<i32> {
             if text.trim().is_empty() {
                 return Err(t!("没有要发送的内容", "nothing to send").into());
             }
-            let (m, sent) = inbox::send(&store, &cfg, &to, &text, at)?;
+            let (m, sent) = inbox::send(&store, &cfg, &to, &text, at, &via)?;
             println!("{}", tr!("已放入 {} 的收件箱({}):{}", "put into {}'s inbox ({}): {}", m.to, m.id, sent.said()));
         }
         "inbox" => return inbox_cmd(&store, a, json_out),
@@ -1463,6 +1913,8 @@ fn run(mut a: Args) -> Res<i32> {
         "output" => {
             // Flags first: with no id left, id() falls back to the session this window is in
             let turns = a.opt("--turns")?;
+            // Internal output for plugins/router/router.sh.
+            let tail = a.opt("--tail")?.map(|n| n.parse::<usize>().map_err(|e| e.to_string())).transpose()?;
             let file = a.flag("--file");
             let s = store.get(&a.id()?)?;
             if file {
@@ -1476,13 +1928,17 @@ fn run(mut a: Args) -> Res<i32> {
                 print!("{}", aca_records::dialog::turns(&cfg, &s, n)?);
             } else {
                 let last = runtime::load(&s.id).last;
-                if !print::reply(&last) {
+                if let Some(n) = tail {
+                    print!("{}", last.chars().skip(last.chars().count().saturating_sub(n)).collect::<String>());
+                } else if !print::reply(&last) {
                     print!("{last}");
                 }
             }
         }
         "seen" => session::seen(&store, &a.next(ID)?)?,
-        "group" => return group_cmd(&store, a),
+        "group" => return group_cmd(&store, a, json_out),
+        "note" => return note_cmd(&store, a, json_out),
+        "task" => return task_cmd(&store, &cfg, a, json_out, passed.filter(|_| router_tool())),
         "meta" => return meta_cmd(&store, a),
         "plugin" => return plugin_cmd(&store, a, json_out),
         "import" => match a.next(Tr::new("导入来源(agent-deck)", "where from (agent-deck)"))?.as_str() {

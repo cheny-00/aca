@@ -2,6 +2,7 @@
 //! title is the one it writes into the pane title (the conversation record only when that's missing); on screen we read
 //! choice prompts and the "running" line.
 
+use std::borrow::Cow;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,132 @@ use crate::store::Session;
 use crate::{t, tr};
 
 pub struct Claude;
+
+pub(crate) const BELL_SUMMARY: &str = "aca: 收件箱有新消息";
+
+/// Claude inserts a backslash before literal paste tags. Other backslashes belong to the user.
+fn unescape_paste(text: &str) -> Cow<'_, str> {
+    static TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i-u)<\\/?pasted_content\b").unwrap());
+    let mut words = String::new();
+    let mut copied = 0;
+    for tag in TAG.find_iter(text).filter(|tag| !text[tag.end()..].starts_with('-')) {
+        words.push_str(&text[copied..tag.start() + 1]);
+        copied = tag.start() + 2;
+    }
+    if copied == 0 {
+        return text.into();
+    }
+    words.push_str(&text[copied..]);
+    words.into()
+}
+
+/// Only a complete, single paste can acknowledge aca's input. Event excerpts are for display and may end inside a paste.
+pub(crate) fn paste_text(prompt: &str, event_excerpt: bool) -> (&str, Cow<'_, str>) {
+    static OPEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<pasted_content id="([0-9a-f]{4})">\n"#).unwrap());
+    let clipped = event_excerpt && prompt.strip_suffix('…').is_some_and(|s| s.chars().count() == super::lifecycle::PROMPT_CHARS);
+    let mut words = String::new();
+    let mut copied = 0;
+    for tag in OPEN.captures_iter(prompt) {
+        let open = tag.get(0).unwrap();
+        if open.start() < copied {
+            continue;
+        }
+        let close = format!("\n</pasted_content id=\"{}\">", &tag[1]);
+        let tail = &prompt[open.end()..];
+        let (body, rest) = match tail.split_once(&close) {
+            Some(pair) => pair,
+            None if clipped => {
+                // The event may stop partway through the closing tag itself.
+                let partial = tail.strip_suffix('…').and_then(|s| s.rsplit_once('\n'));
+                let body = match partial {
+                    Some((body, end)) if end.starts_with("</") && close[1..].starts_with(end) => body,
+                    _ => tail,
+                };
+                (body, "")
+            }
+            None => continue,
+        };
+        let before = &prompt[copied..open.start()];
+        let after = if clipped { rest.strip_suffix('…').unwrap_or(rest) } else { rest };
+        if copied == 0 && before.trim().is_empty() && after.trim().is_empty() {
+            return (if clipped { prompt } else { body }, unescape_paste(body));
+        }
+        words.push_str(before);
+        words.push_str(&unescape_paste(body));
+        copied = prompt.len() - rest.len();
+    }
+    if copied == 0 {
+        return (prompt, unescape_paste(prompt));
+    }
+    words.push_str(&prompt[copied..]);
+    (prompt, words.into())
+}
+
+pub(crate) fn configure_router(
+    tool: &mut Tool,
+    cfg: &crate::config::Router,
+    role: crate::store::RouterRole,
+    project: PathBuf,
+    account: PathBuf,
+) {
+    let role = match role {
+        crate::store::RouterRole::Desk => t!("desk", "desk-en"),
+        crate::store::RouterRole::Project => t!("router", "router-en"),
+    };
+    tool.args.extend(
+        [
+            "--model",
+            cfg.model(),
+            "--effort",
+            cfg.effort(),
+            "--agent",
+            &format!("aca-router:{role}"),
+            "--tools",
+            "AskUserQuestion",
+            "--strict-mcp-config",
+            "--no-chrome",
+            "--disable-slash-commands",
+            "--autocompact",
+            "100000",
+            "--dangerously-skip-permissions",
+        ]
+        .map(String::from),
+    );
+    tool.router_dirs = Some((project, account));
+}
+
+fn extra(tool: &Tool, s: &Session) -> Vec<String> {
+    if tool.router_dirs.is_some() { tool.args.clone() } else { super::extra(tool, s) }
+}
+
+fn router_settings(all: &str, project: &Path, cwd: &Path, account: &Path) -> Res<String> {
+    let mut obj: Value = serde_json::from_str(all).map_err(|e| e.to_string())?;
+    let mut paths = std::collections::BTreeSet::new();
+    let real_account = account.canonicalize().unwrap_or_else(|_| account.to_owned());
+    let real_project = project.canonicalize().unwrap_or_else(|_| project.to_owned());
+    let real_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
+    for root in [project, cwd, &real_project, &real_cwd] {
+        for dir in root.ancestors() {
+            for name in ["CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md", "AGENTS.md"] {
+                let p = dir.join(name);
+                let parent = p.parent().unwrap_or(dir);
+                if parent != account && parent != real_account && !parent.canonicalize().is_ok_and(|d| d == real_account) {
+                    paths.insert(p);
+                }
+            }
+        }
+        // If the account lives inside the project, recursive globs would hide its own instructions.
+        let resolved = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+        if !account.starts_with(root) && !real_account.starts_with(resolved) {
+            paths.insert(root.join("**/CLAUDE.md"));
+        }
+    }
+    obj["autoMemoryEnabled"] = json!(false);
+    let excludes = obj.as_object_mut().unwrap().entry("claudeMdExcludes").or_insert_with(|| json!([]));
+    let excludes = excludes.as_array_mut().ok_or_else(|| tr!("claudeMdExcludes 需要列表", "claudeMdExcludes needs an array"))?;
+    excludes.extend(paths.into_iter().map(|p| json!(p)));
+    Ok(serde_json::to_string_pretty(&obj).unwrap())
+}
 
 /// Only hook the events the state needs. Of tool events only AskUserQuestion (it's asking you), not `*`: that would start
 /// one more process on every tool call
@@ -73,6 +200,12 @@ fn secs(c: &regex::Captures) -> u64 {
 ///   turn; running, it's slipped into this turn; waiting for you, it's sent after you answer. With none it exits 0 and
 ///   nothing happens. `rewakeMessage` is the marker before that text, `rewakeSummary` the line shown in its interface
 ///   (tested on 2.1.294)
+///
+/// And `advisorModel: ""`: every session starts without the advisor. `/advisor <model>` in one session also saves it as the
+/// account's default (`advisorModel` in its settings.json), which would turn it on in every new session after; an empty one
+/// here outranks that saved one and reads as "none". `/advisor <model>` inside the session still turns it on right away and
+/// stays on after Claude rereads the settings file it just wrote; `--advisor <model>` in the arguments still starts with it
+/// (tested on 2.1.331)
 fn settings(aca: &str) -> String {
     let q = super::sh_quote(aca);
     let command = format!("{q} hook claude");
@@ -97,51 +230,31 @@ fn settings(aca: &str) -> String {
     }
     let take = json!({
         "type": "command", "command": format!("{q} inbox take"), "timeout": 30,
-        "asyncRewake": true, "rewakeMessage": "[aca]", "rewakeSummary": "aca: 收件箱有新消息",
+        "asyncRewake": true, "rewakeMessage": "[aca]", "rewakeSummary": BELL_SUMMARY,
     });
     hooks.insert("FileChanged".into(), json!([{ "hooks": [take] }]));
     let watch = json!({ "type": "command", "command": format!("{q} inbox watch"), "timeout": 10 });
     hooks.insert("CwdChanged".into(), json!([{ "hooks": [watch] }]));
-    serde_json::to_string_pretty(&json!({ "hooks": hooks })).unwrap()
+    serde_json::to_string_pretty(&json!({ "advisorModel": "", "hooks": hooks })).unwrap()
 }
 
 /// Pull out the `--settings` you passed yourself (in the tool's, account's or session's arguments). Claude only honors the
 /// last `--settings` (tested on 2.1.288: with two side by side, none of the hooks in the first one ran), so it can't sit next
 /// to aca's; they have to be merged into one ([`merge`])
 fn take_settings(extra: &mut Vec<String>) -> Option<String> {
-    let (mut found, mut i) = (None, 0);
-    while i < extra.len() {
-        if extra[i] == "--settings" && i + 1 < extra.len() {
-            found = Some(extra.remove(i + 1));
-            extra.remove(i);
-        } else if let Some(v) = extra[i].strip_prefix("--settings=") {
-            found = Some(v.to_string());
-            extra.remove(i);
-        } else {
-            i += 1;
-        }
-    }
-    found
+    super::settings_args(extra).pop()
 }
 
 /// Merge aca's hooks into your settings (a file, or a JSON snippet): under the same event yours come first and aca's after,
-/// everything else as-is. Relative paths are resolved against the session's directory (Claude reads them there too)
+/// everything else as-is; aca's other keys (`advisorModel`) only where you didn't set them. Relative paths are resolved
+/// against the session's directory (Claude reads them there too)
 fn merge(ours: &str, theirs: &str, dir: &str) -> Res<String> {
-    let text = if theirs.trim_start().starts_with('{') {
-        theirs.to_string()
-    } else {
-        let file = Path::new(dir).join(paths::expand(theirs));
-        std::fs::read_to_string(&file)
-            .map_err(|e| tr!("无法读取 --settings 指定的 {}:{e}", "can't read the --settings you passed {}: {e}", file.display()))?
-    };
-    let mut all: Value =
-        serde_json::from_str(&text).map_err(|e| tr!("--settings 不是有效的 JSON:{e}", "the --settings you passed isn't JSON: {e}"))?;
+    let mut obj = super::settings_object(theirs, dir)?;
     let ours: Value = serde_json::from_str(ours).unwrap();
-    let hooks = all
-        .as_object_mut()
-        .ok_or(t!("--settings 不是 JSON 对象", "the --settings you passed isn't a JSON object"))?
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
+    for (k, v) in ours.as_object().unwrap().iter().filter(|(k, _)| *k != "hooks") {
+        obj.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     let hooks = hooks.as_object_mut().ok_or(t!("--settings 中的 hooks 不是对象", "hooks in the --settings you passed isn't an object"))?;
     for (ev, entries) in ours["hooks"].as_object().unwrap() {
         let mine = hooks.entry(ev.clone()).or_insert_with(|| json!([]));
@@ -150,7 +263,7 @@ fn merge(ours: &str, theirs: &str, dir: &str) -> Res<String> {
             .ok_or_else(|| tr!("--settings 中的 hooks.{ev} 不是数组", "hooks.{ev} in the --settings you passed isn't an array"))?;
         mine.extend(entries.as_array().unwrap().iter().cloned());
     }
-    Ok(serde_json::to_string_pretty(&all).unwrap())
+    Ok(serde_json::to_string_pretty(&obj).unwrap())
 }
 
 /// The pure half: no file writes. `settings` is the one to pass (already merged if you passed your own), `mods` is the
@@ -184,7 +297,7 @@ fn plan(tool: &Tool, s: &Session, how: &How, settings: Option<&str>, mods: Optio
     for d in &tool.plugin_dirs {
         a(&["--plugin-dir", d]);
     }
-    let mut extra = super::extra(tool, s);
+    let mut extra = extra(tool, s);
     take_settings(&mut extra);
     argv.extend(extra);
     argv
@@ -431,11 +544,17 @@ impl Agent for Claude {
             return Ok(plan(&Tool { plugin_dirs: vec![], ..tool.clone() }, s, how, None, None, None));
         }
         let ours = settings(aca);
-        let file = match take_settings(&mut super::extra(tool, s)) {
-            None => super::hook_file("claude.json", &ours)?,
-            // The merged file is named by its content: sessions passing different ones don't overwrite each other
-            Some(theirs) => {
-                let all = merge(&ours, &theirs, &s.dir)?;
+        let theirs = take_settings(&mut extra(tool, s));
+        let file = match (&theirs, &tool.router_dirs) {
+            (None, None) => super::hook_file("claude.json", &ours)?,
+            _ => {
+                let mut all = match &theirs {
+                    Some(t) => merge(&ours, t, &s.dir)?,
+                    None => ours,
+                };
+                if let Some((project, account)) = &tool.router_dirs {
+                    all = router_settings(&all, project, Path::new(&s.dir), account)?;
+                }
                 let mut h = DefaultHasher::new();
                 all.hash(&mut h);
                 let file = super::hook_file(&format!("claude-{:016x}.json", h.finish()), &all)?;
@@ -444,7 +563,12 @@ impl Agent for Claude {
                 file
             }
         };
-        let mods = super::claude_mod::offer(tool, &s.id).map(|d| d.to_string_lossy().into_owned());
+        let mods = if tool.router_dirs.is_some() {
+            Some(super::claude_mod::write().ok_or_else(|| tr!("无法写入 aca 插件", "Could not write the aca plugin"))?)
+        } else {
+            super::claude_mod::offer(tool, &s.id)
+        }
+        .map(|d| d.to_string_lossy().into_owned());
         // Plugins' MCP servers: one --mcp-config named by its content (the session id is in the environment, not the file: sessions
         // with the same plugins share one)
         let mcp = match tool.mcp.is_empty() {
@@ -613,6 +737,84 @@ pub fn claude_mcp_config(aca: &str, mcp: &[(String, Vec<String>)]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn router_argv_uses_the_localized_role_and_preserves_account_arguments() {
+        use crate::i18n::{self, Lang};
+        use crate::store::RouterRole::{Desk, Project};
+        let cfg = crate::config::parse("[router]\nmodel='opus'\neffort='medium'");
+        for (lang, role, name) in
+            [(Lang::Zh, Project, "router"), (Lang::Zh, Desk, "desk"), (Lang::En, Project, "router-en"), (Lang::En, Desk, "desk-en")]
+        {
+            i18n::with(lang, || {
+                let mut tool =
+                    Tool { args: vec!["--account-option".into()], plugin_dirs: vec!["/st/router/agent".into()], ..Default::default() };
+                configure_router(&mut tool, &cfg.router, role, "/project".into(), "/account".into());
+                assert_eq!(
+                    plan(&tool, &s("c-1"), &How::Fresh, Some("/settings"), Some("/st/aca"), Some("/mcp")),
+                    [
+                        "claude",
+                        "--session-id",
+                        "c-1",
+                        "--mcp-config",
+                        "/mcp",
+                        "--settings",
+                        "/settings",
+                        "--plugin-dir",
+                        "/st/aca",
+                        "--plugin-dir",
+                        "/st/router/agent",
+                        "--account-option",
+                        "--model",
+                        "opus",
+                        "--effort",
+                        "medium",
+                        "--agent",
+                        &format!("aca-router:{name}"),
+                        "--tools",
+                        "AskUserQuestion",
+                        "--strict-mcp-config",
+                        "--no-chrome",
+                        "--disable-slash-commands",
+                        "--autocompact",
+                        "100000",
+                        "--dangerously-skip-permissions"
+                    ]
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn router_settings_preserve_account_instructions_and_hooks() {
+        let account = Path::new("/home/user/.claude");
+        let ours =
+            merge(&settings("/bin/aca"), r#"{"cleanupPeriodDays":365,"claudeMdExcludes":["/private/CLAUDE.md"]}"#, "/project").unwrap();
+        let text = router_settings(&ours, Path::new("/home/user/project"), Path::new("/home/user/work/src"), account).unwrap();
+        let obj: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(obj["autoMemoryEnabled"], false);
+        assert_eq!(obj["cleanupPeriodDays"], 365);
+        assert_eq!(obj["hooks"], serde_json::from_str::<Value>(&ours).unwrap()["hooks"]);
+        let excludes = obj["claudeMdExcludes"].as_array().unwrap();
+        for pattern in [
+            "/home/user/project/CLAUDE.md",
+            "/home/user/project/CLAUDE.local.md",
+            "/home/user/project/.claude/CLAUDE.md",
+            "/home/user/project/AGENTS.md",
+            "/home/user/project/**/CLAUDE.md",
+            "/home/user/work/src/CLAUDE.md",
+            "/home/user/work/CLAUDE.md",
+            "/home/user/CLAUDE.md",
+            "/home/CLAUDE.md",
+            "/CLAUDE.md",
+            "/private/CLAUDE.md",
+        ] {
+            assert!(excludes.contains(&json!(pattern)), "{pattern}");
+        }
+        assert!(!excludes.iter().any(|x| x == "/home/user/.claude/CLAUDE.md" || x == "**/CLAUDE.md"));
+        let text = router_settings("{}", Path::new("/home/user"), Path::new("/home/user"), account).unwrap();
+        assert!(!text.contains("/home/user/**/CLAUDE.md"));
+    }
+
     fn s(conv: &str) -> Session {
         Session {
             id: "ab12".into(),
@@ -754,6 +956,10 @@ mod tests {
         );
         // The events the state needs, plus the doorbell's two (FileChanged, CwdChanged)
         assert_eq!(all["hooks"].as_object().unwrap().len(), EVENTS.len() + 2);
+        // aca's other keys fill in only what you left out: your own advisor stays
+        assert_eq!(all["advisorModel"], "");
+        let all: Value = serde_json::from_str(&merge(&settings("/bin/aca"), r#"{"advisorModel":"fable"}"#, "/nowhere").unwrap()).unwrap();
+        assert_eq!(all["advisorModel"], "fable");
 
         // Given as a file: relative paths resolve against the session's directory
         let dir = std::env::temp_dir().join(format!("aca-settings-{}", std::process::id()));
@@ -771,6 +977,8 @@ mod tests {
     #[test]
     fn the_settings_file_only_hooks_what_status_and_the_doorbell_need() {
         let v: Value = serde_json::from_str(&settings("/a b/it's/aca")).unwrap();
+        // Starts without the advisor, whatever /advisor saved as the account's default
+        assert_eq!(v["advisorModel"], "");
         let h = v["hooks"].as_object().unwrap();
         assert_eq!(h.len(), EVENTS.len() + 2);
         assert_eq!(h["Stop"][0]["hooks"][0]["command"], r#"'/a b/it'\''s/aca' hook claude"#);

@@ -1,4 +1,5 @@
-//! Claude's subscription quotas, with "when these numbers are from".
+//! Subscription quotas, with "when these numbers are from". Antigravity's title reports use
+//! the same per-session window timestamps as Claude's status bar, without a transcript lookup.
 //!
 //! Recording only "who wrote last" doesn't work: each session's statusLine holds the rate_limits from its own last API call,
 //! and an idle session redrawing its status bar (editing settings.json redraws every session's) writes the old numbers back,
@@ -13,6 +14,9 @@
 //!
 //! The panel takes, per account per window, the copy with the newest time, so it keeps up even when a quota resets early
 //! and the numbers go down.
+//! Each report is the whole set of windows at that moment and replaces what the session held, so the panel follows the plan by
+//! itself: a window a newer report doesn't have is left out (2026-11 a Max 20x account reported no 5h), one that comes (back) shows
+//! with its first report. A session carried on under another account starts over: the old account's windows aren't the new one's.
 //! Stored in ~/.local/state/aca/ui/limits/<session id>.json; deleted after eight days untouched.
 //!
 //! There's another path that skips the status bar: the mod aca loads when starting Claude (`aca_core::agent::claude_mod`,
@@ -56,6 +60,25 @@ struct Rec {
     /// Account dir (the transcripts are under its projects/)
     dir: String,
     wins: Vec<RWin>,
+    /// Antigravity reports can omit the plan even when they have fresh quotas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agy: Option<AgyReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct AgyReport {
+    at: i64,
+    plan: Option<(u64, String)>,
+}
+
+impl Rec {
+    fn read(path: &Path) -> Self {
+        std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    fn save(&self, path: &Path) -> std::io::Result<()> {
+        aca_core::paths::write_atomic(path, &serde_json::to_string(self)?)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -349,18 +372,28 @@ fn usage_of(out: &[u8]) -> Option<Vec<Got>> {
 
 /// The windows a session reported this time → its file; acct is its account dir. `live` = these numbers are current (handed
 /// over by the mod, asked); otherwise the time is inferred from the transcript per the rules at the top of the file.
-/// Returns whether any window's numbers changed (a first report counts)
-fn update(path: &Path, mut got: Vec<Got>, acct: &str, transcript: Option<&Path>, now: i64, live: bool) -> bool {
+/// What's reported replaces what the file held: a window left out this time is gone. What the file held for another account
+/// (the conversation carried on under another one, `aca restart --as`) isn't compared with.
+/// Returns whether any window's numbers changed (a first report and a window gone count)
+fn update(path: &Path, got: Vec<Got>, acct: &str, transcript: Option<&Path>, now: i64, live: bool) -> bool {
     if got.is_empty() {
         return false;
     }
-    got.sort_by_key(|w| order(&w.0));
-    let old: Rec = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let old = Rec::read(path);
     let last = if live { None } else { transcript.and_then(last_reply) };
-    let mut rec = Rec { dir: acct.to_string(), wins: old.wins.clone() };
+    let (rec, moved) = updated(&old, got, acct, last, now, live);
+    if rec != old {
+        let _ = rec.save(path);
+    }
+    moved
+}
+
+fn updated(old: &Rec, got: Vec<Got>, acct: &str, last: Option<i64>, now: i64, live: bool) -> (Rec, bool) {
+    let held: &[RWin] = if old.dir == acct { &old.wins } else { &[] };
+    let mut rec = Rec { dir: acct.to_string(), ..Default::default() };
     let mut moved = false;
     for (label, used, resets) in got {
-        let before = old.wins.iter().find(|w| w.label == label);
+        let before = held.iter().find(|w| w.label == label);
         moved |= before.is_none_or(|w| w.used != used || w.resets != resets);
         let at = match before {
             _ if live => now,
@@ -368,19 +401,56 @@ fn update(path: &Path, mut got: Vec<Got>, acct: &str, transcript: Option<&Path>,
             Some(_) => now,
             None => last.unwrap_or(now),
         };
-        let w = RWin { label: label.clone(), used, resets, at };
-        match rec.wins.iter_mut().find(|w| w.label == label) {
-            Some(x) => *x = w,
-            None => rec.wins.push(w),
-        }
+        rec.wins.retain(|w| w.label != label);
+        rec.wins.push(RWin { label, used, resets, at });
     }
+    moved |= held.iter().any(|h| rec.wins.iter().all(|w| w.label != h.label));
     rec.wins.sort_by_key(|w| order(&w.label));
-    if rec != old
-        && let Ok(text) = serde_json::to_string(&rec)
-    {
-        let _ = crate::paths::write_atomic(path, &text);
+    (rec, moved)
+}
+
+/// Called under the title hook's session lock. Only the bare agy session uses the Google quota.
+pub fn record_agy(id: &str, limits: &aca_core::agent::AgyLimits) -> bool {
+    if !plain(id) {
+        return false;
     }
-    moved
+    let Ok(session) = aca_core::store::Store::open().and_then(|st| st.get(id)) else { return false };
+    if session.tool != "agy" || !session.account.is_empty() {
+        return true;
+    }
+    let Some(dir) = dir() else { return false };
+    let home = aca_core::paths::home();
+    let Some(src) = Source::agy(&aca_core::config::load(), &home.to_string_lossy(), aca_core::agent::on_path) else { return false };
+    // Two sessions may redraw together. Serialize the merged comparison and the event it publishes.
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let Ok(lock) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("agy.lock")) else { return false };
+    if lock.lock().is_err() {
+        return false;
+    }
+    match save_agy(&dir.join(format!("agy.{id}.json")), &src, limits, aca_core::paths::now_ms()) {
+        Ok(true) => emit_change(changed_for(&dir, &[src], "agy", "agy")),
+        Ok(false) => {}
+        Err(_) => return false,
+    }
+    true
+}
+
+fn save_agy(file: &Path, src: &Source, limits: &aca_core::agent::AgyLimits, at_ms: u64) -> std::io::Result<bool> {
+    let now = (at_ms / 1000) as i64;
+    let acct = src.dir.to_string_lossy();
+    let old = Rec::read(file);
+    let got = limits.windows.iter().map(|&(label, used, reset)| (label.into(), used, Some(reset))).collect();
+    let (mut rec, moved) = updated(&old, got, &acct, None, now, false);
+    let plan = if limits.plan.is_empty() { old.agy.as_ref().and_then(|a| a.plan.clone()) } else { Some((at_ms, limits.plan.clone())) };
+    // A plan-only redraw must not retire third-party windows a fresher session has started using.
+    let at = old.agy.as_ref().filter(|_| !moved).map_or(now, |a| a.at);
+    rec.agy = Some(AgyReport { at, plan });
+    if rec != old {
+        rec.save(file)?;
+    }
+    Ok(moved)
 }
 
 /// The transcript is `<account dir>/projects/<project>/<session>.jsonl`; if it doesn't match, guess by Claude Code's own rules
@@ -457,11 +527,39 @@ fn who_of(names: &[(PathBuf, &str)], dir: &str) -> String {
 /// None = this account never recorded any window
 pub fn quota_for(dir: &Path, srcs: &[Source], transcript: Option<&Path>, now: i64) -> Option<Quota> {
     let who = who_of(&names(srcs), &account_dir(transcript));
-    quotas(dir, srcs, now).into_iter().find(|q| q.who == who)
+    quotas(dir, srcs, now).into_iter().find(|q| q.agent == Agent::Claude && q.who == who)
+}
+
+/// Which path a copy came by: the status bar and the mod hand over the same windows (5h, 7d); asking Claude also gives the
+/// per-model weekly ones (Fable)
+#[derive(Clone, Copy, PartialEq)]
+enum Via {
+    Session,
+    Ask,
+}
+
+/// One account while merging
+struct Acc {
+    dir: String,
+    plan: Option<(u64, String)>,
+    /// Per window, the newest copy and the path it came by
+    wins: HashMap<String, (RWin, Via)>,
+    /// Every file's report: its path, the time of its data (its newest window), the windows it has
+    reports: Vec<(Via, i64, Vec<String>)>,
+}
+
+/// A report has every window its path knows of at that moment (Claude's statusLine docs: a window is "present only while the API
+/// reports it and its resets_at has not passed"; asked, a window it doesn't have is null), so a window is gone once a newer
+/// report that would have it doesn't. 5h and 7d come by every path; the others only by the path that recorded them
+fn gone(label: &str, w: &RWin, via: Via, reports: &[(Via, i64, Vec<String>)]) -> bool {
+    let everywhere = label == "5h" || label == "7d";
+    reports.iter().any(|(v, at, has)| *at > w.at && (everywhere || *v == via) && has.iter().all(|l| l != label))
 }
 
 /// One account's merged copy
 struct Merged {
+    tool: &'static str,
+    plan: String,
     /// Account name (as in billing)
     who: String,
     /// Account dir (recorded from what its sessions reported)
@@ -469,12 +567,14 @@ struct Merged {
     wins: Vec<RWin>,
 }
 
-/// Per account per window, the copy with the newest time (on a tie, the later reset and higher usage), sorted by account name.
+/// Per account per window, the copy with the newest time (on a tie, the later reset and higher usage), sorted by account name;
+/// leaving out windows a newer report no longer has (see [`gone`]), so the panel follows the plan: a window the account stops
+/// having goes away, and one it gets (back) shows up with its first report.
 /// Account names are the same as in billing (matched to srcs by account dir); also deletes session files untouched for eight days
 fn merged(dir: &Path, srcs: &[Source]) -> Vec<Merged> {
     let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
     let names = names(srcs);
-    let mut best: HashMap<String, (String, HashMap<String, RWin>)> = HashMap::new();
+    let mut best: HashMap<(&str, String), Acc> = HashMap::new();
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().is_none_or(|x| x != "json") {
@@ -486,23 +586,36 @@ fn merged(dir: &Path, srcs: &[Source]) -> Vec<Merged> {
             continue;
         }
         let Some(rec) = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<Rec>(&b).ok()) else { continue };
-        let (_, wins) = best.entry(who_of(&names, &rec.dir)).or_insert_with(|| (rec.dir.clone(), HashMap::new()));
+        let via = if e.file_name().to_string_lossy().starts_with("ask-") { Via::Ask } else { Via::Session };
+        let key = if rec.agy.is_some() {
+            let Some(s) = srcs.iter().find(|s| s.agent == Agent::Agy && s.dir == Path::new(&rec.dir)) else { continue };
+            ("agy", s.who.clone())
+        } else {
+            ("claude", who_of(&names, &rec.dir))
+        };
+        let acc = best.entry(key).or_insert_with(|| Acc { dir: rec.dir, plan: None, wins: HashMap::new(), reports: vec![] });
+        let at = rec.agy.as_ref().map(|a| a.at).or_else(|| rec.wins.iter().map(|w| w.at).max()).unwrap_or(i64::MIN);
+        if let Some(a) = rec.agy {
+            acc.plan = acc.plan.take().max(a.plan);
+        }
+        acc.reports.push((via, at, rec.wins.iter().map(|w| w.label.clone()).collect()));
         for w in rec.wins {
-            let newer = |o: &RWin| (w.at, w.resets, w.used) > (o.at, o.resets, o.used);
-            if wins.get(&w.label).is_none_or(newer) {
-                wins.insert(w.label.clone(), w);
+            let newer = |(o, _): &(RWin, Via)| (w.at, w.resets, w.used) > (o.at, o.resets, o.used);
+            if acc.wins.get(&w.label).is_none_or(newer) {
+                acc.wins.insert(w.label.clone(), (w, via));
             }
         }
     }
     let mut out: Vec<Merged> = best
         .into_iter()
-        .map(|(who, (dir, m))| {
-            let mut wins: Vec<RWin> = m.into_values().collect();
+        .map(|((tool, who), Acc { dir, plan, wins, reports })| {
+            let mut wins: Vec<RWin> =
+                wins.into_iter().filter(|(label, (w, via))| !gone(label, w, *via, &reports)).map(|(_, (w, _))| w).collect();
             wins.sort_by_key(|w| order(&w.label));
-            Merged { who, dir, wins }
+            Merged { tool, who, dir, wins, plan: plan.map(|p| p.1).unwrap_or_default() }
         })
         .collect();
-    out.sort_by(|a, b| a.who.cmp(&b.who));
+    out.sort_by(|a, b| (&a.who, a.tool).cmp(&(&b.who, b.tool)));
     out
 }
 
@@ -511,9 +624,9 @@ pub fn quotas(dir: &Path, srcs: &[Source], now: i64) -> Vec<Quota> {
     merged(dir, srcs)
         .into_iter()
         .map(|m| Quota {
-            agent: Agent::Claude,
+            agent: crate::agent::kind_of(m.tool),
             who: m.who,
-            plan: String::new(),
+            plan: m.plan,
             updated: m.wins.iter().map(|w| w.at).max().unwrap_or(0).min(now),
             wins: m.wins.into_iter().map(|w| Win { label: w.label, used: w.used, resets: w.resets }).collect(),
             note: String::new(),
@@ -553,11 +666,12 @@ fn codex_all(accounts: &[(Agent, String, String)], home: &str) -> Vec<(PathBuf, 
 /// Accounts never recorded aren't listed
 fn print_json() -> i32 {
     let home = std::env::var("HOME").unwrap_or_default();
-    let accounts = crate::agent::accounts(&aca_core::config::load());
-    let srcs = usage::sources(&accounts, &home);
+    let cfg = aca_core::config::load();
+    let accounts = crate::agent::accounts(&cfg);
+    let srcs = usage::quota_sources(&cfg, &accounts, &home);
     let mut out: Vec<serde_json::Value> = vec![];
     if let Some(d) = dir() {
-        out.extend(merged(&d, &srcs).iter().map(|m| account_json("claude", &m.who, &m.dir, &m.wins)));
+        out.extend(merged(&d, &srcs).iter().map(|m| account_json(m.tool, &m.who, &m.dir, &m.wins)));
     }
     for (dir, q) in codex_all(&accounts, &home) {
         out.push(account_json("codex", &q.who, &dir.to_string_lossy(), &codex_wins(&q)));
@@ -592,9 +706,12 @@ fn differs(dir: &Path, tool: &str, acct: &str, wins: &[RWin]) -> bool {
 /// A session's own numbers moving doesn't mean the account's did (an idle old session's first report of the stale numbers it
 /// holds loses to newer ones in the merge)
 fn changed(dir: &Path, srcs: &[Source], acct: &str) -> Option<serde_json::Value> {
-    let who = who_of(&names(srcs), acct);
-    let m = merged(dir, srcs).into_iter().find(|m| m.who == who)?;
-    differs(dir, "claude", acct, &m.wins).then(|| account_json("claude", &m.who, &m.dir, &m.wins))
+    changed_for(dir, srcs, "claude", &who_of(&names(srcs), acct))
+}
+
+fn changed_for(dir: &Path, srcs: &[Source], tool: &str, who: &str) -> Option<serde_json::Value> {
+    let m = merged(dir, srcs).into_iter().find(|m| m.tool == tool && m.who == who)?;
+    differs(dir, tool, &m.dir, &m.wins).then(|| account_json(tool, &m.who, &m.dir, &m.wins))
 }
 
 /// Which session reported the event: sessions aca starts have `ACA_SESSION_ID` in their environment, carried by subprocesses
@@ -613,7 +730,11 @@ fn announce(dir: &Path, acct: &str) {
     }
     let home = std::env::var("HOME").unwrap_or_default();
     let srcs = usage::sources(&crate::agent::accounts(&aca_core::config::load()), &home);
-    if let Some(data) = changed(dir, &srcs, acct) {
+    emit_change(changed(dir, &srcs, acct));
+}
+
+fn emit_change(change: Option<serde_json::Value>) {
+    if let Some(data) = change {
         aca_core::event::emit("limits.changed", &reporter(), data);
     }
 }
@@ -640,6 +761,53 @@ fn codex_turn() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_windows_merge_with_their_own_timestamps_and_only_active_third_party_limits() {
+        let root = std::env::temp_dir().join(aca_core::paths::short_id());
+        let src = Source { agent: Agent::Agy, who: "agy".into(), dir: root.join(".gemini") };
+        let srcs = std::slice::from_ref(&src);
+        let mut title = serde_json::json!({"plan_tier":"Google AI Pro","quota":{
+            "3p-5h":{"remaining_fraction":1,"reset_time":"1970-01-01T00:00:00Z","reset_in_seconds":0},
+            "3p-weekly":{"remaining_fraction":1,"reset_time":"1970-01-01T00:00:00Z","reset_in_seconds":0},
+            "gemini-5h":{"remaining_fraction":0.9871378,"reset_time":"2026-11-25T08:26:00Z","reset_in_seconds":17716},
+            "gemini-weekly":{"remaining_fraction":0.98928446,"reset_time":"2026-12-02T03:26:00Z","reset_in_seconds":604516}
+        }});
+        let save = |id: &str, v: &serde_json::Value, at| {
+            save_agy(&root.join(format!("agy.{id}.json")), &src, &aca_core::agent::AgyLimits::from_title(v).unwrap(), at * 1000u64).unwrap()
+        };
+        assert!(save("a", &title, 100));
+        let q = &quotas(&root, srcs, 200)[0];
+        assert_eq!((q.agent, q.who.as_str(), q.plan.as_str()), (Agent::Agy, "agy", "Google AI Pro"));
+        assert_eq!(q.wins.len(), 2);
+        assert!((q.wins[0].used - 1.28622).abs() < 1e-9 && (q.wins[1].used - 1.071554).abs() < 1e-9);
+        assert_eq!(q.wins[0].resets, Some(parse_ts("2026-11-25T08:26:00Z")));
+        let mut old_title = title.clone();
+        let quota = &mut title["quota"];
+        quota["3p-5h"] = quota["gemini-5h"].clone();
+        quota["3p-weekly"] = quota["gemini-weekly"].clone();
+        quota["gemini-5h"]["remaining_fraction"] = 0.5.into();
+        title["plan_tier"] = "Google AI Ultra".into();
+        assert!(save("b", &title, 110));
+        title.as_object_mut().unwrap().remove("plan_tier");
+        title["quota"]["gemini-5h"]["remaining_fraction"] = 0.75.into();
+        assert!(save("a", &title, 120));
+        let m = changed_for(&root, srcs, "agy", "agy").unwrap();
+        let wins = m["wins"].as_array().unwrap();
+        assert_eq!(wins.iter().map(|w| w["label"].as_str().unwrap()).collect::<Vec<_>>(), ["5h", "7d", "3p 5h", "3p 7d"]);
+        assert_eq!((wins[0]["used"].as_f64(), wins[0]["at"].as_i64(), wins[1]["at"].as_i64()), (Some(25.0), Some(120), Some(110)));
+        assert_eq!(Rec::read(&root.join("agy.a.json")).wins[1].at, 100);
+        assert_eq!(quotas(&root, srcs, 200)[0].plan, "Google AI Ultra");
+        assert!(changed_for(&root, srcs, "agy", "agy").is_none());
+        assert!(save("c", &old_title, 105));
+        old_title["plan_tier"] = "New plan".into();
+        assert!(!save("c", &old_title, 130));
+        let latest = &quotas(&root, srcs, 200)[0];
+        assert_eq!((latest.plan.as_str(), latest.wins.len()), ("New plan", 4));
+        assert!(changed_for(&root, srcs, "agy", "agy").is_none());
+        assert!(quotas(&root, &[], 200).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn payload(sid: &str, transcript: &Path, five: f64, seven: f64) -> Vec<u8> {
         serde_json::json!({
@@ -821,6 +989,76 @@ mod tests {
         let seen = std::fs::read_dir(&store).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".last")).count();
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!((q.len(), seen), (1, 1));
+    }
+
+    #[test]
+    fn windows_follow_what_the_newest_report_has() {
+        let root = std::env::temp_dir().join(format!("aca-limits-gone-{}", std::process::id()));
+        let (sub, ding) = (root.join(".claude-sub"), root.join(".claude-alt"));
+        let (ps, pd) = (sub.join("projects/-x"), ding.join("projects/-x"));
+        std::fs::create_dir_all(&ps).unwrap();
+        std::fs::create_dir_all(&pd).unwrap();
+        let store = root.join("limits");
+        let t = |s: &str| parse_ts(s);
+        let week_only = |sid: &str, transcript: &Path, seven: f64| {
+            serde_json::json!({"session_id": sid, "transcript_path": transcript,
+                "rate_limits": {"seven_day": {"used_percentage": seven, "resets_at": 9000}}})
+            .to_string()
+            .into_bytes()
+        };
+        let srcs = vec![
+            Source { agent: Agent::Claude, who: "sub".into(), dir: sub.clone() },
+            Source { agent: Agent::Claude, who: "ding".into(), dir: ding.clone() },
+        ];
+        let shown = |who: &str| -> Vec<(String, f64)> {
+            let q = quotas(&store, &srcs, t("2026-11-17T12:00:00Z"));
+            q.into_iter().find(|q| q.who == who).map(|q| q.wins.into_iter().map(|w| (w.label, w.used)).collect()).unwrap_or_default()
+        };
+        let file = |sid: &str| -> Rec { serde_json::from_slice(&std::fs::read(store.join(format!("{sid}.json"))).unwrap()).unwrap() };
+
+        // a: an idle session from before the plan dropped 5h; b, newer, has no 5h: the account has none
+        let (a, b) = (ps.join("a.jsonl"), ps.join("b.jsonl"));
+        std::fs::write(&a, reply("2026-11-17T01:00:00Z")).unwrap();
+        std::fs::write(&b, reply("2026-11-17T02:00:00Z")).unwrap();
+        record(&payload("a", &a, 20.0, 40.0), &store, t("2026-11-17T01:00:05Z"));
+        record(&week_only("b", &b, 41.0), &store, t("2026-11-17T02:00:05Z"));
+        assert_eq!(shown("sub"), vec![("7d".into(), 41.0)]);
+        // 5h comes back: shown with its first report
+        std::fs::write(&b, reply("2026-11-17T03:00:00Z")).unwrap();
+        record(&payload("b", &b, 1.0, 42.0), &store, t("2026-11-17T03:00:05Z"));
+        assert_eq!(shown("sub"), vec![("5h".into(), 1.0), ("7d".into(), 42.0)]);
+        // Gone again: b's own file drops it too (a report replaces what the file held), and a's older copy stays out
+        record(&week_only("b", &b, 42.0), &store, t("2026-11-17T03:10:00Z"));
+        assert_eq!(file("b").wins.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(), vec!["7d"]);
+        assert_eq!(shown("sub"), vec![("7d".into(), 42.0)]);
+
+        // A session carried on under another account (`aca restart --as`): the old account's 5h doesn't come along, even in its own file
+        let (cd, cs) = (pd.join("c.jsonl"), ps.join("c.jsonl"));
+        std::fs::write(&cd, reply("2026-11-17T04:00:00Z")).unwrap();
+        std::fs::write(&cs, reply("2026-11-17T04:00:00Z")).unwrap();
+        record(&payload("c", &cd, 31.0, 56.0), &store, t("2026-11-17T04:00:05Z"));
+        assert_eq!(shown("ding"), vec![("5h".into(), 31.0), ("7d".into(), 56.0)]);
+        record(&week_only("c", &cs, 42.0), &store, t("2026-11-17T04:10:00Z"));
+        let c = file("c");
+        assert_eq!((c.dir.as_str(), c.wins.len()), (sub.to_str().unwrap(), 1));
+        assert_eq!(shown("sub"), vec![("7d".into(), 42.0)]);
+        // Even the same numbers count as the new account's first report (it moved: announced, asked)
+        let (sub_s, ding_s) = (sub.to_string_lossy().into_owned(), ding.to_string_lossy().into_owned());
+        let m = root.join("moved/m.json");
+        assert!(update(&m, vec![("7d".into(), 56.0, Some(9000))], &ding_s, None, 100, true));
+        assert!(update(&m, vec![("7d".into(), 56.0, Some(9000))], &sub_s, None, 200, true));
+
+        // The per-model week only comes by asking: a newer status bar report without it doesn't take it away, a newer answer does
+        let ask = ask_files(&store, &sub_s).0;
+        let fable = |used: f64| ("Fable".to_string(), used, Some(9000));
+        update(&ask, vec![("7d".into(), 42.0, Some(9000)), fable(5.0)], &sub_s, None, t("2026-11-17T05:00:00Z"), true);
+        std::fs::write(&b, reply("2026-11-17T05:30:00Z")).unwrap();
+        record(&week_only("b", &b, 43.0), &store, t("2026-11-17T05:30:05Z"));
+        assert_eq!(shown("sub"), vec![("7d".into(), 43.0), ("Fable".into(), 5.0)]);
+        update(&ask, vec![("7d".into(), 43.0, Some(9000))], &sub_s, None, t("2026-11-17T06:00:00Z"), true);
+        let last = shown("sub");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(last, vec![("7d".into(), 43.0)]);
     }
 
     #[test]
